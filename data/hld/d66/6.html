@@ -1,0 +1,145 @@
+
+        <h2>Deep dives: the hard parts</h2>
+
+        <h3>7.1 Search performance: connections, caching and precomputed routes</h3>
+        <ul>
+          <li><b>Model flights as a graph</b> per day: airports are nodes, flights are edges with times. With max one stop, a connection is A-&gt;X then X-&gt;B where the second departs at least the minimum connection time (MCT) after the first arrives, and within a maximum layover (say 8 hours).</li>
+          <li><b>Precompute</b> valid one-stop pairs for each (origin, destination) when schedules change (daily), store them as a table and in memory. A search then becomes "look up candidates, fetch prices", not a graph search per request.</li>
+          <li><b>Round trip</b> = two one-way searches, combined. Some fares are only valid as a round trip, so suppliers that price round trips natively are asked for the combination too.</li>
+          <li><b>Cache by key</b> <code>(supplier, origin, dest, date, cabin, pax)</code> with TTL that depends on days to departure: a flight next month can be cached for an hour; a flight tomorrow for a few minutes. Skyscanner's partner docs describe a similar rule: serve a cached quote until its age passes a configured limit, then call the partner.</li>
+          <li><b>Serve stale, refresh async</b> for popular routes, and pre-warm the top routes before peak hours.</li>
+          <li><b>Rank</b> by price and duration; cap results per airline so one carrier does not fill the page.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="One-stop connection BLR to DEL via BOM, valid only if layover is between minimum connection time and max layover">
+            <rect class="box client" x="20" y="90" width="110" height="50"/><text class="label" x="75" y="120">BLR</text>
+            <rect class="box plain" x="345" y="90" width="110" height="50"/><text class="label" x="400" y="120">BOM</text>
+            <rect class="box client" x="670" y="90" width="110" height="50"/><text class="label" x="725" y="120">DEL</text>
+            <path class="arrow" d="M130 115 L337 115"/>
+            <path class="arrow" d="M455 115 L662 115"/>
+            <path class="arrow dashed" d="M130 100 Q400 10 670 100"/>
+            <text class="label small" x="235" y="140">06:00 - 07:45</text>
+            <text class="label small" x="560" y="140">09:10 - 11:20</text>
+            <text class="label small" x="400" y="40">nonstop 06:30 - 09:15</text>
+            <text class="label small" x="400" y="170">layover 1 h 25 m: MCT &lt;= gap &lt;= 8 h</text>
+            <text class="label small" x="400" y="200">precomputed nightly, priced at search time</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M130 115 L345 115 L455 115 L670 115"/></circle>
+          </svg>
+          <figcaption>Connections come from the schedule (cheap to precompute); prices come from suppliers (expensive, cached briefly).</figcaption>
+        </figure>
+
+        <h3>7.2 Aggregating 20-200 suppliers</h3>
+        <p>The Agoda IC5 review round focused on exactly this: API contracts and external supplier integrations.</p>
+        <ul>
+          <li><b>Adapter per supplier</b> behind one internal contract: <code>search</code>, <code>price</code>, <code>hold</code>, <code>ticket</code>, <code>cancel</code>, <code>retrieve</code>. Version the contract; map supplier error codes into our small set (SOLD_OUT, PRICE_CHANGED, TIMEOUT, INVALID).</li>
+          <li><b>Scatter-gather with a deadline:</b> call all suppliers in parallel, stream answers, stop waiting at about 1.5-2 s. One slow supplier must not slow the page. See <a href="{{BASE}}interview/glossary#scatter-gather">scatter-gather</a>.</li>
+          <li><b>Bulkheads and circuit breakers per supplier:</b> separate connection pools; a supplier with 50% timeouts is skipped (served from cache only) until it recovers. See <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a>.</li>
+          <li><b>Rate limits and cost:</b> a per-supplier token bucket; prefer cache when near the limit. Some suppliers charge per search, so the look-to-book ratio is a cost metric, not just a technical one.</li>
+          <li><b>Dedup:</b> the same flight can come from a GDS, the airline and a consolidator at different prices. Group by (carrier, flight_no, date, fare family) and show the best offer, keeping alternates for fallback.</li>
+          <li><b>Contract tests:</b> each adapter has recorded responses from the supplier sandbox; the build fails when parsing breaks.</li>
+        </ul>
+
+        <h3>7.3 Seat locking, per-seat prices, and "other platforms sell the same seats"</h3>
+        <p>The CRED SDE-2 follow-up: other platforms sell the same seats, so how do you prevent double booking? The answer the interviewer accepted: <b>the airline (or the GDS acting for it) locks the seats</b>; the platform cannot.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Two platforms race for seat 12C; airline grants hold to the first, refuses the second; hold expires or is ticketed">
+            <rect class="box client" x="20" y="40" width="150" height="56"/><text class="label" x="95" y="64">Our user</text><text class="label small" x="95" y="84">wants 12C</text>
+            <rect class="box client" x="20" y="200" width="150" height="56"/><text class="label" x="95" y="224">Other OTA user</text><text class="label small" x="95" y="244">wants 12C</text>
+            <rect class="box db" x="320" y="110" width="170" height="80"/><text class="label" x="405" y="140">Airline inventory</text><text class="label small" x="405" y="162">seat 12C</text>
+            <g data-step-only="1">
+              <path class="arrow" d="M170 70 L312 130"/>
+              <path class="arrow" d="M170 225 L312 170"/>
+              <text class="label small" x="640" y="150">both ask at the same time</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow ok" d="M312 130 L170 70"/>
+              <path class="arrow bad" d="M312 170 L170 225"/>
+              <rect class="box ok" x="560" y="40" width="220" height="56"/><text class="label small" x="670" y="64">PNR ABC123: 12C HELD</text><text class="label small" x="670" y="84">ticket by 10:15 or release</text>
+              <rect class="box fail" x="560" y="200" width="220" height="56"/><text class="label small" x="670" y="230">SEAT_UNAVAILABLE</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box warn" x="560" y="110" width="220" height="80"/><text class="label small" x="670" y="140">we record hold_expires_at</text><text class="label small" x="670" y="162">our timer = expiry minus margin</text>
+              <path class="arrow" d="M490 150 L552 150"/>
+            </g>
+            <g data-step-only="4">
+              <rect class="box ok" x="560" y="110" width="220" height="80"/><text class="label small" x="670" y="140">paid in time: TICKETED</text><text class="label small" x="670" y="162">else expires: seat free again</text>
+              <path class="arrow ok" d="M490 150 L552 150"/>
+            </g>
+            <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M170 70 L320 130"/></circle>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Race.</b> Two different platforms try to get the same seat. Neither can see the other's database, so a lock in our Redis means nothing to them.</li>
+            <li><b>Single owner decides.</b> The airline's inventory system serialises the requests (its own row-level lock or conditional update). The first gets a hold inside a PNR; the second gets "unavailable" and we offer other seats.</li>
+            <li><b>Time-limited hold.</b> We store the supplier's hold expiry and set our own payment timer shorter than it (for example, 10 minutes for the user when the supplier gives 15), leaving time to ticket.</li>
+            <li><b>Finish or release.</b> Ticket before expiry, or let it expire (or cancel it explicitly to be polite). A GDS guide from Finnair notes that if a ticket is not issued before the time limit, the segments are cancelled.</li>
+          </ol>
+        </div>
+        <ul>
+          <li><b>If we are the airline</b> (the Flipkart framing): a seat row per (flight, seat) with <code>status</code>, <code>hold_owner</code>, <code>hold_expires_at</code>. Hold = <code>UPDATE seat SET status='HELD', hold_owner=?, hold_expires_at=now()+15m WHERE flight_id=? AND seat_no=? AND (status='FREE' OR hold_expires_at &lt; now())</code>; one row changes or none. Same pattern as <a href="{{BASE}}hld/d14">ticket booking</a>.</li>
+          <li><b>Seat count vs seat number:</b> airlines sell <b>fare-class inventory</b> (how many seats left in a price bucket) separately from <b>seat assignment</b>. Booking decrements the bucket; the seat map assigns a specific seat. Say this distinction; it explains why "seats left: 3" and the seat map can disagree.</li>
+          <li><b>Per-seat prices:</b> total = fare (from the fare bucket) + seat fee (by seat type, sometimes by row). The seat price is part of the priced offer and the hold, so it cannot change between selection and payment.</li>
+          <li><b>Never</b> hold seats during search. Holds are scarce and annoy airlines; only create them when the user commits to booking.</li>
+        </ul>
+
+        <h3>7.4 Multi-segment bookings and the payment saga</h3>
+        <p>A round trip or a connection is several segments. The goal: all ticketed and paid, or nothing charged.</p>
+        <ul>
+          <li><b>Best case: one supplier, one PNR.</b> Ask the supplier to hold all segments in one reservation; it is atomic on their side.</li>
+          <li><b>Hard case: different suppliers</b> (outbound on one airline, return on another, or a self-transfer connection). There is no distributed transaction across airlines, so use a <a href="{{BASE}}interview/glossary#saga">saga</a>:</li>
+        </ul>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Step</th><th>Action</th><th>If it fails</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Hold segment 1 (supplier A)</td><td>Fail booking; nothing to undo.</td></tr>
+              <tr><td>2</td><td>Hold segment 2 (supplier B)</td><td>Cancel hold 1; offer alternatives.</td></tr>
+              <tr><td>3</td><td>Authorise payment (not capture)</td><td>Cancel both holds.</td></tr>
+              <tr><td>4</td><td>Ticket segment 1</td><td>Cancel both holds; void authorisation.</td></tr>
+              <tr><td>5</td><td>Ticket segment 2</td><td>Void ticket 1 (voids are usually possible within a short window), or rebook segment 2 on another flight if the user agreed; then void or partially capture.</td></tr>
+              <tr><td>6</td><td>Capture payment; CONFIRMED</td><td>Retry capture (idempotent); tickets exist, so never cancel here.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ul>
+          <li><b>Order of steps:</b> hold everything first (cheap and reversible), then authorise, then ticket (expensive to reverse), then capture. Each step is persisted in the booking state machine before the next, so a crash resumes instead of restarting.</li>
+          <li><b>Unknown results:</b> a ticketing call that times out is "maybe ticketed". Retrieve the PNR from the supplier before retrying. Same rule as any external side effect.</li>
+          <li><b>Idempotency on both sides:</b> our idempotency key per booking step; supplier calls carry our booking reference so a retrieve can find them.</li>
+          <li><b>Reconciliation:</b> a daily job compares our bookings with supplier PNRs and payment settlement files; mismatches go to an ops queue. With money and third parties, reconciliation is not optional.</li>
+        </ul>
+
+        <h3>7.5 Premium-member pricing (the ClearTrip variant)</h3>
+        <ul>
+          <li><b>Cache neutral prices, personalise after.</b> The cache holds supplier net or base prices. The pricing service applies markup, member discounts and coupons per request. Otherwise every member tier multiplies the cache.</li>
+          <li><b>Rules engine:</b> rules by tier, route, airline, date range, with priority and a cap. Loaded in memory, versioned; every price records the rule version used (for audit and disputes).</li>
+          <li><b>Honour the shown price:</b> the price token signs the member price and expiry; booking checks it. If the supplier's live price moved, show the new total and ask the user to confirm.</li>
+          <li>The Paytm SDE-2 round around this question also covered load-balancing algorithms, auto-scaling, DB sharding and health-check thresholds: have one line on each ready (least-connections LB for long supplier calls; scale search on CPU and in-flight requests; shard bookings by booking_id; health checks that test dependencies lightly).</li>
+        </ul>
+
+        <h3>7.6 Observability, CAP, testing and NFR validation (the Agoda rounds)</h3>
+        <ul>
+          <li><b>CAP in one sentence:</b> search chooses availability (serve cached, possibly stale prices during a partition); booking chooses consistency (if we cannot reach the supplier or our DB primary, fail the booking rather than guess). See <a href="{{BASE}}interview/glossary#cap">CAP</a>.</li>
+          <li><b>Network failures:</b> timeouts on every call, retries only on idempotent operations, retrieve-before-retry for holds and tickets, circuit breakers, and graceful degradation (hide a supplier rather than fail the page).</li>
+          <li><b>Metrics:</b> time to first result and to complete; per-supplier latency, error and timeout rates; cache hit rate and <b>quote accuracy</b> (how often re-price differs from search price); look-to-book per supplier; booking funnel conversion; hold expiries; sagas stuck in a state for more than N minutes; reconciliation mismatches.</li>
+          <li><b>Testing:</b> contract tests against recorded supplier responses; integration tests in supplier sandboxes (Amadeus offers a test environment); a fake supplier with injectable latency and errors for chaos tests; load tests replaying real search traffic; synthetic test bookings in production on a sandbox supplier.</li>
+          <li><b>Validating NFRs:</b> write SLOs (p95 first-results under 2 s, booking success rate, zero double charges), load-test at 2x expected peak, canary each release with automatic rollback on SLO burn.</li>
+        </ul>
+
+        <h3>7.7 The newer format: review and improve an existing design</h3>
+        <p>Agoda's IC5 round (October 2026, selected) gave an existing flight search and booking HLD plus its FR/NFR, and asked the candidate to find weaknesses in scalability, reliability and correctness, review API contracts and supplier integrations, and explain how to test and validate the NFRs. Practise with this flawed design:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Smell in the given design</th><th>Why it breaks</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>Search calls every supplier synchronously and waits for all</td><td>Latency = slowest supplier; one outage stalls every search</td><td>Async search, deadline, streaming, circuit breakers</td></tr>
+              <tr><td>No cache, or a cache with a fixed 24 h TTL</td><td>Supplier cost and rate limits; or badly stale prices</td><td>TTL by days-to-departure, re-price before booking</td></tr>
+              <tr><td>Seat "lock" in our Redis</td><td>Other platforms ignore it; double booking</td><td>Supplier hold (PNR) is the lock; store its expiry</td></tr>
+              <tr><td>Charge card, then call supplier</td><td>Charged without a ticket on failure</td><td>Hold, authorise, ticket, capture; compensations</td></tr>
+              <tr><td><code>POST /book</code> without idempotency key</td><td>Double tap = two bookings</td><td>Idempotency key; unique constraint</td></tr>
+              <tr><td>Price sent by the client in the booking request</td><td>Tampering; mismatched member price</td><td>Signed price token from the pricing service</td></tr>
+              <tr><td>Supplier formats leak into the core model</td><td>Every new supplier changes core code</td><td>Adapters behind a versioned contract</td></tr>
+              <tr><td>No reconciliation, no saga metrics</td><td>Silent money and ticket mismatches</td><td>Daily reconciliation, stuck-state alerts</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip"><p>In a review round, rank findings by impact (correctness and money first, then availability, then cost and latency), propose the smallest fix for each, and say how you would prove the fix works. Do not redesign everything from scratch.</p></div>
+      

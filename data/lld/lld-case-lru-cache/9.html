@@ -1,0 +1,56 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>The surprise: <b>get is a write</b>. Every hit moves a node in the LRU list (or a key between LFU buckets). So a reader-writer lock buys nothing; two "readers" would both relink pointers and corrupt the list. Our cache uses one <code>ReentrantLock</code> around every operation, which is correct and simple.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="A get that moves a node races with a put that evicts it; one lock around both keeps the list consistent">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">get(a) thread</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">put(d) thread</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">map + list, cap 3</text><text class="label small" x="400" y="166">c b a (a is the tail)</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. get(a): unlinks a to move it</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. put(d): full, evicts tail a</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">B removes a while A relinks it:</text><text class="label bad" x="645" y="164">broken prev/next, wrong size</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A moves a to the front: a c b</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: one lock for get AND put</text><text class="label mono" x="645" y="66">get writes too: it moves a node</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">B takes the lock after A</text><text class="label small" x="645" y="242">evicts the real tail b, adds d</text><text class="label small" x="645" y="266">list: d a c, size still 3</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>A hit is not a read: <code>get(a)</code> unlinks node a to move it to the front. At the same moment <code>put(d)</code> finds the cache full and evicts the tail, which is a. Two threads rewrite the same prev/next pointers: the list breaks and the size is wrong.</li>
+      <li>The guard: one <code>ReentrantLock</code> around every operation, <code>get</code> included. A read-write lock would not help, because every "read" writes the list. A finishes moving a to the front.</li>
+      <li>B takes the lock next. Now the tail is b, so b is evicted and d goes in. The list is d, a, c and the size is still 3.</li>
+    </ol>
+  </div>
+
+  <ol class="steps">
+    <li><strong>One lock (our code)</strong> Correct, easy to explain. Throughput is limited to one operation at a time, but each operation is a few hundred nanoseconds of pointer work, so this goes surprisingly far.</li>
+    <li><strong>Never do I/O under the lock</strong> Our <code>get</code> releases the lock before <code>store.load</code> and re-checks after. The cost: two threads that miss on the same key both load it (a cache stampede).</li>
+    <li><strong>Coalesce loads</strong> Keep <code>ConcurrentHashMap&lt;K, CompletableFuture&lt;V&gt;&gt; inFlight</code>; the first thread creates the future and loads, the others wait on it. This is what <code>computeIfAbsent</code>-style loaders in Caffeine and Guava give you.</li>
+    <li><strong>Lock striping</strong> Split the cache into N segments by <code>hash(key) % N</code>, each with its own lock, map and policy. Throughput scales with N; the price is that LRU becomes per-segment, an approximation of global LRU. Older Guava caches and <code>ConcurrentHashMap</code> in Java 7 used segments.</li>
+    <li><strong>Record accesses lazily</strong> Production caches avoid touching the list on every hit: Caffeine buffers access events and replays them under a lock in batches; Redis does not keep a full LRU list at all and samples a few keys to evict the oldest (approximated LRU and LFU, see the Redis eviction docs in resources).</li>
+  </ol>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The kernel faces the same problem on every page access, which is why it does not move a page on the LRU list on each touch. It sets an accessed bit (in hardware, in the page table entry) and lets reclaim look at the bits later. Caffeine's buffered access log and Redis sampling are the user-space versions of the same idea: make the hot path cheap, and do the ordering work in batches.</p>
+  </div>
+  <p>More on the locking options: <a href="{{BASE}}lld/lld-conc-rwlock">read-write locks</a> (and why they do not help here), <a href="{{BASE}}lld/lld-conc-collections">concurrent collections</a>, and the worked <a href="{{BASE}}lld/lld-conc-drills">thread-safe LRU drill</a>.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReentrantLock</code> = <code>pthread_mutex_t</code> of the recursive kind (the owning thread may lock it again), with <code>tryLock</code> like <code>mutex_trylock</code>.</li>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>ExecutorService</code> = a thread pool with a work queue, like a kernel <code>workqueue</code>.</li>
+      <li>Python <code>threading.Lock</code> = a plain mutex; <code>with lock:</code> is lock and unlock on every exit path.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

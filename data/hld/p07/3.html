@@ -1,0 +1,104 @@
+
+        <h2>The hard parts interviewers push on</h2>
+
+        <h3>Telling the client: poll, push or call back?</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Method</th><th>How</th><th>Good for</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td>Short polling</td><td><code>GET /jobs/42</code> every few seconds</td><td>Simplest; works everywhere; jobs of seconds to minutes</td><td>Wasted requests; poll interval = extra latency. Back off (2 s, 4 s, 8 s...)</td></tr>
+              <tr><td>Long polling</td><td>Server holds the GET until status changes or 30 s pass</td><td>Fewer requests, quicker updates</td><td>Holds connections; still one request per update</td></tr>
+              <tr><td><a href="{{BASE}}interview/glossary#sse">SSE</a> / <a href="{{BASE}}interview/glossary#websocket">WebSocket</a></td><td>Server pushes progress events on an open connection</td><td>Live progress bars (upload, build logs)</td><td>Stateful connections; reconnect logic. See <a href="{{BASE}}hld/p01">Real-time Updates</a></td></tr>
+              <tr><td>Webhook</td><td>Your server calls the client's URL when done</td><td>Server-to-server APIs (payments, partner exports)</td><td>Must sign requests, retry with backoff, receiver must dedupe</td></tr>
+              <tr><td>Push / email</td><td>Mobile push or email "your export is ready"</td><td>Jobs of many minutes to hours; user left the app</td><td>Goes through a <a href="{{BASE}}hld/d03">notification system</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>A strong answer often combines two: the job table is the source of truth that you can always poll, and push is an optimisation on top. If the push is lost, polling still works.</p>
+
+        <h3>Backpressure: what if jobs arrive faster than you finish them?</h3>
+        <p>A queue hides overload instead of failing fast, which is both its gift and its danger. The AWS Builders' Library article on queue backlogs makes the point with numbers: after a one-hour outage you need roughly double capacity for another hour just to catch up, and if an unthrottled 30-minute spike queues 10x what consumers can handle, the backlog takes about 300 minutes to work off (30 min x 10). Meanwhile every new job waits behind the old ones. Their tools:</p>
+        <ul>
+          <li><b>Measure age, not just depth.</b> "50,000 messages" means nothing without the rate. Alarm on the <b>age of the oldest message</b> (SQS exposes <code>ApproximateAgeOfOldestMessage</code>) and autoscale workers on it.</li>
+          <li><b>Limit what you accept.</b> Per-tenant quotas and a cap on queued jobs per user. When the queue is too deep, return <code>429</code> or <code>503</code> with <code>Retry-After</code>; the system-design-primer calls this <b>back pressure</b>.</li>
+          <li><b>Isolate noisy tenants.</b> Shuffle <a href="{{BASE}}interview/glossary#sharding">sharding</a>: give each customer a small random subset of queues, so one customer's flood mostly lands on queues others barely share.</li>
+          <li><b>Drop or sideline stale work.</b> If a job is older than its usefulness (a "price changed" alert from 2 hours ago), move it aside or drop it so fresh work goes first.</li>
+        </ul>
+        <p><a href="{{BASE}}interview/glossary#littles-law">Little's Law</a> tells you how many workers you need: <b>concurrency = arrival rate x time per job</b>. The AWS article's example: 100 messages a second at 100 ms each needs about 10 threads; if each starts taking 10 seconds, you need about 1,000. That is why a slow dependency turns into a backlog so quickly.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Age of the oldest message rises during a one-hour outage and falls back over the next hour with double capacity">
+            <rect class="zone" x="80" y="30" width="340" height="200"/>
+            <text class="zone-label" x="92" y="50">outage: nothing drains</text>
+            <path class="arrow" d="M80 230 L770 230"/>
+            <path class="arrow" d="M80 230 L80 20"/>
+            <text class="label small start" x="88" y="16">age of oldest message</text>
+            <path class="arrow none thick bad" d="M80 230 L420 60 L760 230"/>
+            <circle class="packet bad" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M80 230 L420 60 L760 230"/></circle>
+            <text class="label small start" x="430" y="56">peak: 60 min old</text>
+            <text class="label small start" x="560" y="110">2x workers:</text>
+            <text class="label small start" x="560" y="130">60 more min</text>
+            <text class="label small start" x="560" y="150">to catch up</text>
+            <text class="label small" x="80" y="252">0</text>
+            <text class="label small" x="250" y="252">30</text>
+            <text class="label small" x="420" y="252">60</text>
+            <text class="label small" x="590" y="252">90</text>
+            <text class="label small" x="760" y="252">120</text>
+            <text class="label small" x="420" y="274">minutes</text>
+          </svg>
+          <figcaption>The age of the oldest message is the number to alarm on. During a one-hour outage every waiting job gets one minute older each minute. When consumers come back at double capacity they can only work the backlog down at the spare rate, so it takes about another hour before new jobs stop waiting behind old ones (the AWS Builders' Library example above). Queue depth alone would not tell you how late the work is.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The job queue is a NIC <b>receive ring</b>. If the CPU drains it slower than packets arrive, it fills, latency climbs, and eventually you drop. Queue depth is ring occupancy; "age of oldest message" is how long the oldest descriptor has waited. <a href="{{BASE}}interview/glossary#backpressure">Backpressure</a> (429/503) is TCP flow control shrinking the receive window. Shuffle sharding is RSS spreading flows across queues so one elephant flow does not starve the mice.</p>
+        </div>
+
+        <h3>Mixed workloads: do not let a 3-hour job block a 3-second one</h3>
+        <p>If thumbnails (2 s) and full-movie transcodes (40 min) share one queue and one worker pool, a burst of movies takes every worker and thumbnails wait an hour. Fix it with <b>separate queues and pools per job class</b> (by type, by size, by priority), each with its own autoscaling. Dropbox ATF does this: one SQS queue per (task type, priority) pair, dedicated worker clusters per task type, and per-type quotas, so one team's tasks cannot starve another's. Within a class, chop big jobs into small chunks (transcode a movie as 10-second segments in parallel) so retries are cheap and workers stay balanced.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Left: one shared queue where movie transcodes take every worker and thumbnails wait. Right: separate queues and pools per job class">
+            <rect class="zone" x="10" y="10" width="380" height="280"/>
+            <text class="zone-label" x="24" y="32">One shared queue and pool</text>
+            <rect class="box queue" x="30" y="50" width="340" height="44"/>
+            <text class="label small" x="200" y="77">4 movies, then 300 thumbnails</text>
+            <path class="arrow" d="M200 94 L200 140"/>
+            <rect class="box fail" x="30" y="146" width="76" height="46"/><text class="label small" x="68" y="174">movie</text>
+            <rect class="box fail" x="118" y="146" width="76" height="46"/><text class="label small" x="156" y="174">movie</text>
+            <rect class="box fail" x="206" y="146" width="76" height="46"/><text class="label small" x="244" y="174">movie</text>
+            <rect class="box fail" x="294" y="146" width="76" height="46"/><text class="label small" x="332" y="174">movie</text>
+            <text class="label small" x="200" y="214">all 4 workers busy for 40 min</text>
+            <text class="label small bad" x="200" y="246">thumbnails wait ~40 min</text>
+            <rect class="zone" x="410" y="10" width="380" height="280"/>
+            <text class="zone-label" x="424" y="32">A queue and pool per job class</text>
+            <rect class="box queue" x="430" y="56" width="160" height="44"/>
+            <text class="label small" x="510" y="83">thumbs (2 s)</text>
+            <path class="arrow" d="M590 78 L636 78"/>
+            <rect class="box svc" x="642" y="56" width="130" height="44"/>
+            <text class="label small" x="707" y="83">pool A: 10</text>
+            <rect class="box queue" x="430" y="140" width="160" height="44"/>
+            <text class="label small" x="510" y="167">movies (40 min)</text>
+            <path class="arrow" d="M590 162 L636 162"/>
+            <rect class="box svc" x="642" y="140" width="130" height="44"/>
+            <text class="label small" x="707" y="167">pool B: 4</text>
+            <text class="label small ok" x="600" y="226">thumbs done in seconds</text>
+            <text class="label small" x="600" y="252">each pool scales on</text>
+            <text class="label small" x="600" y="272">its own queue age</text>
+            <circle class="packet" r="5"><animateMotion dur="1s" repeatCount="indefinite" path="M590 78 L642 78"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M590 162 L642 162"/></circle>
+          </svg>
+          <figcaption>Head-of-line blocking in a job system. On the left, four 40-minute transcodes take every worker, so a 2-second thumbnail waits 40 minutes. On the right, each job class has its own queue and worker pool, so slow work can only delay slow work. Dropbox ATF uses one queue per (task type, priority) for this reason.</figcaption>
+        </figure>
+
+        <h3>Database as the queue?</h3>
+        <p>For modest scale (hundreds of jobs a second) you can skip a separate broker: workers run <code>SELECT ... FROM jobs WHERE status='QUEUED' ORDER BY created_at LIMIT 10 FOR UPDATE SKIP LOCKED</code> in Postgres, which lets many workers grab different rows without blocking each other. You get one system and transactional enqueue for free. It breaks when polling load and row churn start hurting the primary database. Then move to a real queue.</p>
+
+        <h3>Scheduling, cancellation, progress, results</h3>
+        <ul>
+          <li><b>Delayed and recurring jobs</b> (send reminder at 9 AM): store <code>next_run_at</code>, and a scheduler loop moves due jobs onto the queue. Dropbox ATF's store consumer polls for due tasks every couple of seconds and hits a target of 95% of tasks starting within 5 seconds of their scheduled time, at about 9,000 tasks a second. Full design on <a href="{{BASE}}hld/d25">Distributed Job Scheduler</a>.</li>
+          <li><b>Cancellation:</b> set <code>status=CANCEL_REQUESTED</code>; the worker checks it at each checkpoint or heartbeat and stops cleanly.</li>
+          <li><b>Progress and resume:</b> long jobs write checkpoints ("rows 0-4M done") so a retry continues instead of restarting.</li>
+          <li><b>Results:</b> put big outputs in a blob store with a time-limited signed URL (see <a href="{{BASE}}hld/p06">Handling Large Blobs</a>); clean up old jobs with a <a href="{{BASE}}interview/glossary#ttl">TTL</a> (time to live: an expiry time after which the store deletes the entry by itself, like an ARP entry ageing out).</li>
+        </ul>
+      

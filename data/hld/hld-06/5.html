@@ -1,0 +1,70 @@
+
+        <h2>Idempotency keys: making retries safe</h2>
+        <p>Networks fail in three ways for a request like "charge Rs 500". Stripe's idempotency post lists them: the request never arrives, the server fails halfway, or the server succeeds but the <em>response</em> is lost. From the client's side, the last one looks exactly like the first. If the client retries blindly, the customer may be charged twice. If it never retries, the customer may never be charged.</p>
+        <p>The fix: the client generates a unique <strong>idempotency key</strong> (a UUID) per logical operation and sends it with every attempt, for example in an <code>Idempotency-Key</code> header. The server remembers the key and the result. A repeat with the same key returns the stored result instead of running again.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 820 300" role="img" aria-label="Payment request with idempotency key, lost response, retry returns stored result">
+            
+            <rect class="box client" x="20" y="40" width="130" height="220"/>
+            <text class="label" x="85" y="62">client</text>
+            <text class="label small" x="85" y="82">key = 7c9e</text>
+            <rect class="box svc" x="330" y="40" width="150" height="220"/>
+            <text class="label" x="405" y="62">payment API</text>
+            <rect class="box db" x="640" y="40" width="160" height="220"/>
+            <text class="label" x="720" y="62">DB</text>
+            <text class="label small" x="720" y="82">idempotency_keys</text>
+            <g data-step="1">
+              <path class="arrow" d="M150 110 L324 110"/>
+              <text class="label small" x="237" y="98">POST /payments (7c9e)</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M480 130 L634 130"/>
+              <text class="label small" x="557" y="118">insert key + charge</text>
+              <text class="label small" x="557" y="148">one transaction</text>
+              <rect class="box plain" x="655" y="160" width="130" height="30"/>
+              <text class="label small" x="720" y="175">7c9e: 201, pay_88</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow bad dashed" d="M324 200 L156 200"/>
+              <text class="label small bad" x="240" y="188">201 lost (timeout)</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M150 230 L324 230"/>
+              <text class="label small" x="237" y="218">retry, same key 7c9e</text>
+              <circle class="packet" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M150 230 L330 230"/></circle>
+            </g>
+            <g data-step-only="5">
+              <rect class="box highlight" x="170" y="246" width="460" height="40"/>
+              <text class="label small" x="400" y="266">key found: return stored 201 pay_88, no second charge</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Send with a key.</b> The client creates one UUID for this payment and sends it.</li>
+            <li><b>Record atomically.</b> The server stores the key and does the work in the same transaction, so there is never a key without a charge or a charge without a key. (If the work is a call to another system, such as a payment provider, see the note below the code: you record IN_PROGRESS first.)</li>
+            <li><b>Response lost.</b> The charge succeeded, but the client times out.</li>
+            <li><b>Retry.</b> The client retries with exponential backoff and jitter, reusing the <em>same</em> key.</li>
+            <li><b>Replay.</b> The server sees the key and returns the original result. The customer is charged exactly once.</li>
+          </ol>
+        </div>
+<pre><code class="language-sql">CREATE TABLE idempotency_keys (
+  account_id    BIGINT       NOT NULL,
+  idem_key      VARCHAR(64)  NOT NULL,
+  request_hash  CHAR(64)     NOT NULL,     -- detect same key, different body
+  status        VARCHAR(16)  NOT NULL,     -- IN_PROGRESS | DONE
+  response_code INT,
+  response_body JSONB,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, idem_key)       -- the uniqueness is the lock
+);
+-- expire rows after a retention window (for example 24 h to a few days)</code></pre>
+        <p>AWS's Builders' Library article on idempotent APIs adds the details that separate a good answer from a great one:</p>
+        <ul>
+          <li><b>Use a caller-provided token, not a hash of the parameters.</b> Two identical requests can be intentional (launch two identical EC2 instances), so the client must say "this is the same operation". EC2 calls it <code>ClientToken</code>, and the AWS SDKs generate one automatically and reuse it across their own retries.</li>
+          <li><b>Same token, different parameters is an error.</b> Store the original request (or its hash) and reject a mismatch with a validation error, because the caller's intent changed.</li>
+          <li><b>Return a semantically equivalent response</b>, not "AlreadyExists". The caller should not have to guess whether <em>its</em> request created the resource.</li>
+          <li><b>Record the token and the side effect atomically</b>, and keep tokens only for a bounded time.</li>
+        </ul>
+        <div class="callout note"><p><b>When the side effect is outside your database.</b> A call to a payment service provider (PSP) cannot sit inside your DB transaction. So: (1) insert the key as <code>IN_PROGRESS</code> and commit; (2) call the PSP, passing the <em>same</em> idempotency key so the PSP also de-duplicates; (3) record <code>DONE</code> plus the response. If the server crashes between (1) and (3), a recovery job finds rows stuck in <code>IN_PROGRESS</code>, asks the PSP what happened to that key, and finishes or fails the row. Airbnb's Orpheus library uses exactly this pre-RPC / RPC / post-RPC split; see <a href="{{BASE}}hld/hld-10#idempotency">hld-10</a>.</p></div>
+        <div class="callout warn"><p><b>Concurrent duplicates:</b> if two attempts with the same key arrive at the same moment, the primary key insert makes one win. The loser should either wait and return the stored result or return <code>409 Conflict</code> ("request in progress, retry later"). Never let both run.</p></div>
+        <p>Idempotency keys only protect the edge. Inside the system, events from Kafka are delivered at least once, so consumers must also de-duplicate (by event ID, or by making the write itself idempotent: "set status=PAID where status=PENDING"). That is covered in <a href="{{BASE}}hld/hld-10">Distributed transactions &amp; events</a> and <a href="{{BASE}}devops/kafka-06">Kafka delivery semantics</a>. Retry timing (exponential backoff, jitter, retry budgets) is in the AWS article on <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">timeouts, retries and backoff with jitter</a>.</p>
+      

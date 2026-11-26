@@ -1,0 +1,514 @@
+
+  <h2>Code: five proxies and a dynamic one</h2>
+  <p>Each tab is a complete program that was compiled and run; the outputs are real. Java builds the chain from the stepper with an injectable clock (so the demo is deterministic) and adds a JDK dynamic proxy. Python does the same and shows a <code>__getattr__</code> forwarding proxy plus <code>weakref.proxy</code>. C++14 has virtual, caching and protection proxies over an image store, plus an <code>operator-&gt;</code> smart reference. Files live in <code>lld-code/lld-pat-proxy/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>ProxyDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Subject</td><td><code>QuoteService</code></td><td>11-13</td><td>the one interface everyone implements</td></tr>
+    <tr><td>Real subject</td><td><code>ExchangeQuoteService</code></td><td>16-23</td><td>slow and expensive</td></tr>
+    <tr><td>Virtual proxy</td><td><code>LazyQuoteProxy</code></td><td>26-38</td><td>creates the real one on first use</td></tr>
+    <tr><td>Caching proxy</td><td><code>CachingQuoteProxy</code></td><td>43-73</td><td>one in-flight load per key, no lock during I/O</td></tr>
+    <tr><td>Rate-limit proxy</td><td><code>RateLimitProxy</code></td><td>76-95</td><td>permit under the lock, call outside it</td></tr>
+    <tr><td>Protection proxy</td><td><code>AuthQuoteProxy</code></td><td>99-107</td><td>check the role, then forward</td></tr>
+    <tr><td>Dynamic proxy</td><td><code>logged</code></td><td>111-123</td><td>one handler for any interface</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.lang.reflect.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.LongSupplier;
+
+public class ProxyDemo {
+
+    // ---- Subject: the interface both the real object and every proxy implement ----
+    record Quote(String symbol, long pricePaise, String source) { }
+
+    interface QuoteService {
+        Quote quote(String symbol);
+    }
+
+    // ---- Real subject: expensive to create, slow to call ----
+    static final class ExchangeQuoteService implements QuoteService {
+        ExchangeQuoteService() { System.out.println("  [real] connecting to exchange feed (expensive)"); }
+        @Override public Quote quote(String symbol) {
+            System.out.println("  [real] fetching " + symbol);
+            long price = 100_00L + Math.abs(symbol.hashCode() % 900_00);   // deterministic fake price
+            return new Quote(symbol, price, "exchange");
+        }
+    }
+
+    // ---- Virtual proxy: delay creating the real object until the first call ----
+    static final class LazyQuoteProxy implements QuoteService {
+        private volatile QuoteService real;                      // created on first use
+        @Override public Quote quote(String symbol) {
+            QuoteService r = real;
+            if (r == null) {
+                synchronized (this) {
+                    if (real == null) real = new ExchangeQuoteService();
+                    r = real;
+                }
+            }
+            return r.quote(symbol);
+        }
+    }
+
+    // ---- Caching proxy: answer repeated questions without calling the real object ----
+    // One in-flight load per symbol (no stampede) and NO lock held during the slow call:
+    // a slow AAPL fetch never blocks cached INFY reads. TTL, but no size bound (see Q&amp;A).
+    static final class CachingQuoteProxy implements QuoteService {
+        private record Entry(Quote quote, long expiresAtMs) { }
+        private final QuoteService target;
+        private final long ttlMs;
+        private final LongSupplier clock;
+        private final ConcurrentHashMap&lt;String, CompletableFuture&lt;Entry&gt;&gt; cache = new ConcurrentHashMap&lt;&gt;();
+        CachingQuoteProxy(QuoteService target, long ttlMs, LongSupplier clock) {
+            this.target = target; this.ttlMs = ttlMs; this.clock = clock;
+        }
+        private static boolean usable(CompletableFuture&lt;Entry&gt; f, long now) {
+            return !f.isDone()                                     // a load is in flight: wait for it
+                || (!f.isCompletedExceptionally() &amp;&amp; now &lt; f.join().expiresAtMs());
+        }
+        @Override public Quote quote(String symbol) {
+            long now = clock.getAsLong();
+            CompletableFuture&lt;Entry&gt; mine = new CompletableFuture&lt;&gt;();
+            CompletableFuture&lt;Entry&gt; f = cache.compute(symbol,          // short, per-key atomic step
+                    (k, old) -&gt; old != null &amp;&amp; usable(old, now) ? old : mine);
+            if (f != mine)                                          // hit (or join someone's load)
+                return new Quote(symbol, f.join().quote().pricePaise(), "cache");
+            try {                                                   // we own the load; no lock held
+                Quote fresh = target.quote(symbol);                 // &lt;-- the pattern: forward on a miss
+                mine.complete(new Entry(fresh, now + ttlMs));
+                return fresh;
+            } catch (RuntimeException ex) {
+                cache.remove(symbol, mine);                         // do not cache failures
+                mine.completeExceptionally(ex);
+                throw ex;
+            }
+        }
+    }
+
+    // ---- Rate-limit proxy: at most N calls per fixed one-second window ----
+    static final class RateLimitProxy implements QuoteService {
+        private final QuoteService target;
+        private final int maxPerSecond;
+        private final LongSupplier clock;
+        private long windowStartMs = -1;
+        private int used;
+        RateLimitProxy(QuoteService target, int maxPerSecond, LongSupplier clock) {
+            this.target = target; this.maxPerSecond = maxPerSecond; this.clock = clock;
+        }
+        private synchronized void takePermit() {                   // short critical section
+            long now = clock.getAsLong();
+            if (windowStartMs &lt; 0 || now - windowStartMs &gt;= 1000) { windowStartMs = now; used = 0; }
+            if (used &gt;= maxPerSecond) throw new IllegalStateException("429 rate limit exceeded");
+            used++;
+        }
+        @Override public Quote quote(String symbol) {
+            takePermit();
+            return target.quote(symbol);                            // slow call runs outside the lock
+        }
+    }
+
+    // ---- Protection proxy: only callers with the right role get through ----
+    record User(String name, Set&lt;String&gt; roles) { }
+    static final class AuthQuoteProxy implements QuoteService {
+        private final QuoteService target;
+        private final User user;
+        AuthQuoteProxy(QuoteService target, User user) { this.target = target; this.user = user; }
+        @Override public Quote quote(String symbol) {
+            if (!user.roles().contains("TRADER")) throw new SecurityException(user.name() + " may not read quotes");
+            return target.quote(symbol);                            // &lt;-- the pattern: check, then forward
+        }
+    }
+
+    // ---- Dynamic proxy: one InvocationHandler that logs calls on ANY interface ----
+    @SuppressWarnings("unchecked")
+    static &lt;T&gt; T logged(T target, Class&lt;T&gt; iface) {
+        InvocationHandler h = (proxy, method, args) -&gt; {
+            System.out.println("  [log] -&gt; " + iface.getSimpleName() + "." + method.getName() + Arrays.toString(args));
+            try {
+                Object result = method.invoke(target, args);
+                System.out.println("  [log] &lt;- " + method.getName() + " ok");
+                return result;
+            } catch (InvocationTargetException ex) {
+                throw ex.getCause();                              // rethrow the real exception
+            }
+        };
+        return (T) Proxy.newProxyInstance(iface.getClassLoader(), new Class&lt;?&gt;[]{iface}, h);
+    }
+
+    public static void main(String[] args) {
+        long[] now = {0};                                         // fake clock we control
+        LongSupplier clock = () -&gt; now[0];
+
+        // Client code is written against QuoteService and cannot tell which object it holds.
+        QuoteService lazy = new LazyQuoteProxy();
+        QuoteService cached = new CachingQuoteProxy(lazy, 500, clock);
+        QuoteService limited = new RateLimitProxy(cached, 3, clock);
+        User asha = new User("asha", Set.of("TRADER"));
+        User ravi = new User("ravi", Set.of("VIEWER"));
+
+        System.out.println("1) proxies built; real service not created yet");
+        QuoteService forAsha = new AuthQuoteProxy(limited, asha);
+        System.out.println("2) " + forAsha.quote("INFY"));          // creates real, fetches, caches
+        System.out.println("3) " + forAsha.quote("INFY"));          // cache hit, real not called
+        now[0] = 600;                                             // 600 ms later: cache TTL (500 ms) expired, same 1 s window
+        System.out.println("4) " + forAsha.quote("INFY"));          // refetch
+        try {
+            forAsha.quote("TCS");                                 // 4th call in the same 1 s window
+        } catch (IllegalStateException ex) {
+            System.out.println("5) blocked: " + ex.getMessage());
+        }
+        now[0] = 1_200;                                           // new window
+        System.out.println("6) " + forAsha.quote("TCS"));
+
+        try {
+            new AuthQuoteProxy(limited, ravi).quote("INFY");
+        } catch (SecurityException ex) {
+            System.out.println("7) denied: " + ex.getMessage());
+        }
+
+        QuoteService dyn = logged(cached, QuoteService.class);
+        System.out.println("8) " + dyn.quote("TCS"));
+        System.out.println("   dynamic proxy class: " + dyn.getClass().getSimpleName().replaceAll("\\d+", "N")
+                + ", isProxyClass=" + Proxy.isProxyClass(dyn.getClass()));
+
+        // The JDK's own protection proxy:
+        List&lt;String&gt; ro = Collections.unmodifiableList(new ArrayList&lt;&gt;(List.of("a", "b")));
+        try { ro.add("c"); } catch (UnsupportedOperationException ex) {
+            System.out.println("9) unmodifiableList refused add()");
+        }
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out ProxyDemo.java &amp;&amp; java -cp out ProxyDemo
+1) proxies built; real service not created yet
+  [real] connecting to exchange feed (expensive)
+  [real] fetching INFY
+2) Quote[symbol=INFY, pricePaise=11960, source=exchange]
+3) Quote[symbol=INFY, pricePaise=11960, source=cache]
+  [real] fetching INFY
+4) Quote[symbol=INFY, pricePaise=11960, source=exchange]
+5) blocked: 429 rate limit exceeded
+  [real] fetching TCS
+6) Quote[symbol=TCS, pricePaise=92884, source=exchange]
+7) denied: ravi may not read quotes
+  [log] -&gt; QuoteService.quote[TCS]
+  [log] &lt;- quote ok
+8) Quote[symbol=TCS, pricePaise=92884, source=cache]
+   dynamic proxy class: $ProxyN, isProxyClass=true
+9) unmodifiableList refused add()</code></pre>
+      <p>Read the output against the code: call 3 is a cache hit, call 4 refetches because 600 ms passed (TTL 500 ms), and call 5 is refused because the limiter sits in front of the cache, so the three earlier calls (including the hit) used up the window. <code>Proxy.newProxyInstance</code> generated a class named like <code>$Proxy0</code> at run time that implements <code>QuoteService</code> and sends every call to our <code>InvocationHandler</code>. It only works for <b>interfaces</b>.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Proxy: same interface as the real object, but controls access to it (lazy, cache, rate limit, auth)."""
+from dataclasses import dataclass
+from typing import Callable, Protocol
+import weakref
+import zlib
+
+
+@dataclass(frozen=True)
+class Quote:
+    symbol: str
+    price_paise: int
+    source: str
+
+
+class QuoteService(Protocol):                      # Subject
+    def quote(self, symbol: str) -&gt; Quote: ...
+
+
+class ExchangeQuoteService:                        # Real subject: expensive to build, slow to call
+    def __init__(self):
+        print("  [real] connecting to exchange feed (expensive)")
+
+    def quote(self, symbol):
+        print(f"  [real] fetching {symbol}")
+        return Quote(symbol, 10_000 + zlib.crc32(symbol.encode()) % 90_000, "exchange")
+
+
+class LazyQuoteProxy:                              # Virtual proxy
+    def __init__(self, factory: Callable[[], QuoteService]):
+        self._factory, self._real = factory, None
+
+    def quote(self, symbol):
+        if self._real is None:
+            self._real = self._factory()           # built on first use only
+        return self._real.quote(symbol)
+
+
+class CachingQuoteProxy:                           # Caching proxy with a TTL
+    def __init__(self, target: QuoteService, ttl: float, clock: Callable[[], float]):
+        self._target, self._ttl, self._clock = target, ttl, clock
+        self._cache: dict[str, tuple[Quote, float]] = {}
+
+    def quote(self, symbol):
+        now = self._clock()
+        hit = self._cache.get(symbol)
+        if hit and now &lt; hit[1]:
+            return Quote(symbol, hit[0].price_paise, "cache")
+        fresh = self._target.quote(symbol)
+        self._cache[symbol] = (fresh, now + self._ttl)
+        return fresh
+
+
+class RateLimitProxy:                              # at most N calls per fixed 1-second window
+    def __init__(self, target: QuoteService, max_per_sec: int, clock: Callable[[], float]):
+        self._target, self._max, self._clock = target, max_per_sec, clock
+        self._window, self._used = None, 0
+
+    def quote(self, symbol):
+        now = self._clock()
+        if self._window is None or now - self._window &gt;= 1.0:
+            self._window, self._used = now, 0
+        if self._used &gt;= self._max:
+            raise RuntimeError("429 rate limit exceeded")
+        self._used += 1
+        return self._target.quote(symbol)
+
+
+class AuthQuoteProxy:                              # Protection proxy
+    def __init__(self, target: QuoteService, roles: set[str]):
+        self._target, self._roles = target, roles
+
+    def quote(self, symbol):
+        if "TRADER" not in self._roles:
+            raise PermissionError("role TRADER required")
+        return self._target.quote(symbol)
+
+
+class LoggingProxy:                                # "Dynamic" proxy: forwards ANY attribute
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, name):                   # only called for names not found on the proxy
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
+
+        def wrapper(*args, **kwargs):
+            print(f"  [log] -&gt; {type(self._target).__name__}.{name}{args}")
+            result = attr(*args, **kwargs)
+            print(f"  [log] &lt;- {name} ok")
+            return result
+        return wrapper
+
+
+if __name__ == "__main__":
+    now = [0.0]
+    clock = lambda: now[0]
+
+    lazy = LazyQuoteProxy(ExchangeQuoteService)
+    cached = CachingQuoteProxy(lazy, ttl=0.5, clock=clock)
+    limited = RateLimitProxy(cached, max_per_sec=3, clock=clock)
+    trader = AuthQuoteProxy(limited, roles={"TRADER"})
+
+    print("1) proxies built; real service not created yet")
+    print("2)", trader.quote("INFY"))
+    print("3)", trader.quote("INFY"))
+    now[0] = 0.6                                   # cache TTL expired, same rate window
+    print("4)", trader.quote("INFY"))
+    try:
+        trader.quote("TCS")
+    except RuntimeError as e:
+        print("5) blocked:", e)
+    now[0] = 1.2
+    print("6)", trader.quote("TCS"))
+    try:
+        AuthQuoteProxy(limited, roles={"VIEWER"}).quote("INFY")
+    except PermissionError as e:
+        print("7) denied:", e)
+
+    print("8)", LoggingProxy(cached).quote("TCS"))
+
+    class Feed:                                    # stdlib proxy: weakref.proxy does not keep the target alive
+        def name(self):
+            return "NSE feed"
+    feed = Feed()
+    p = weakref.proxy(feed)
+    print("9) weakref.proxy -&gt;", p.name())
+    del feed
+    try:
+        p.name()
+    except ReferenceError:
+        print("   target collected; proxy raises ReferenceError")</code></pre>
+<pre class="terminal"><code>$ python proxy.py
+1) proxies built; real service not created yet
+  [real] connecting to exchange feed (expensive)
+  [real] fetching INFY
+2) Quote(symbol='INFY', price_paise=69202, source='exchange')
+3) Quote(symbol='INFY', price_paise=69202, source='cache')
+  [real] fetching INFY
+4) Quote(symbol='INFY', price_paise=69202, source='exchange')
+5) blocked: 429 rate limit exceeded
+  [real] fetching TCS
+6) Quote(symbol='TCS', price_paise=65206, source='exchange')
+7) denied: role TRADER required
+  [log] -&gt; CachingQuoteProxy.quote('TCS',)
+  [log] &lt;- quote ok
+8) Quote(symbol='TCS', price_paise=65206, source='cache')
+9) weakref.proxy -&gt; NSE feed
+   target collected; proxy raises ReferenceError</code></pre>
+      <p><code>__getattr__</code> runs only for attributes the proxy itself does not have, so one small class can forward <em>any</em> method of <em>any</em> target: Python's version of a dynamic proxy. Magic methods like <code>__len__</code> are looked up on the type, not the instance, so a full transparent proxy must define them explicitly. <code>weakref.proxy</code> is a standard-library smart reference: it forwards calls but does not keep the target alive.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<div class="callout note"><p><b>C++ you need here:</b> <code>std::unique_ptr&lt;T&gt;</code> = an owning pointer that frees its object when it goes out of scope (a <code>kfree()</code> that runs itself on every exit path). A <b>lambda</b> <code>[](args){ body }</code> = an anonymous function: a function pointer plus any variables it captured in the brackets, like a callback with its <code>void *ctx</code> built in. <code>std::function&lt;R(Args)&gt;</code> = a typed slot that can hold any callable (function pointer, lambda, functor). Ownership and RAII in more depth: <a href="{{BASE}}lld/lld-oop-from-c#kref">kref and shared ownership</a>.</p></div>
+<pre><code class="language-cpp">// Proxy in C++14: virtual (lazy), protection, and caching proxies behind one interface,
+// plus a "smart reference" proxy that overloads operator-&gt; like a tiny refcounted pointer.
+// Build: g++ -std=c++14 -Wall proxy.cpp -o proxy
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+// Subject
+class ImageStore {
+public:
+    virtual ~ImageStore() = default;
+    virtual std::string load(const std::string&amp; id) = 0;
+};
+
+// Real subject: expensive constructor (think: mmap a 2 GB archive, open a socket)
+class DiskImageStore : public ImageStore {
+public:
+    DiskImageStore() { std::cout &lt;&lt; "  [real] opening image archive (expensive)\n"; }
+    std::string load(const std::string&amp; id) override {
+        std::cout &lt;&lt; "  [real] reading " &lt;&lt; id &lt;&lt; " from disk\n";
+        return "&lt;pixels of " + id + "&gt;";
+    }
+};
+
+// Virtual proxy: builds the real store on first use.
+class LazyImageStore : public ImageStore {
+public:
+    std::string load(const std::string&amp; id) override {
+        if (!real_) real_ = std::make_unique&lt;DiskImageStore&gt;();
+        return real_-&gt;load(id);
+    }
+private:
+    std::unique_ptr&lt;ImageStore&gt; real_;
+};
+
+// Caching proxy: remembers results.
+class CachingImageStore : public ImageStore {
+public:
+    explicit CachingImageStore(ImageStore&amp; target) : target_(target) {}
+    std::string load(const std::string&amp; id) override {
+        auto it = cache_.find(id);
+        if (it != cache_.end()) { std::cout &lt;&lt; "  [cache] hit " &lt;&lt; id &lt;&lt; "\n"; return it-&gt;second; }
+        return cache_[id] = target_.load(id);
+    }
+private:
+    ImageStore&amp; target_;
+    std::map&lt;std::string, std::string&gt; cache_;
+};
+
+// Protection proxy: checks permission before delegating.
+class PrivateAlbumGuard : public ImageStore {
+public:
+    PrivateAlbumGuard(ImageStore&amp; target, std::string user) : target_(target), user_(std::move(user)) {}
+    std::string load(const std::string&amp; id) override {
+        if (id.compare(0, 8, "private/") == 0 &amp;&amp; user_ != "owner")
+            throw std::runtime_error(user_ + " may not open " + id);
+        return target_.load(id);
+    }
+private:
+    ImageStore&amp; target_;
+    std::string user_;
+};
+
+// Smart reference proxy: operator-&gt; forwards to the object and counts accesses.
+template &lt;typename T&gt;
+class Counted {
+public:
+    explicit Counted(T&amp; obj) : obj_(obj) {}
+    T* operator-&gt;() { ++hits_; return &amp;obj_; }
+    int hits() const { return hits_; }
+private:
+    T&amp; obj_;
+    int hits_ = 0;
+};
+
+static void show(ImageStore&amp; store, const std::string&amp; id) {   // client: knows only ImageStore
+    try { std::string px = store.load(id); std::cout &lt;&lt; id &lt;&lt; " -&gt; " &lt;&lt; px &lt;&lt; "\n"; }
+    catch (const std::exception&amp; e) { std::cout &lt;&lt; id &lt;&lt; " -&gt; denied: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+}
+
+int main() {
+    LazyImageStore lazy;
+    CachingImageStore cached(lazy);
+    PrivateAlbumGuard asGuest(cached, "guest");
+    PrivateAlbumGuard asOwner(cached, "owner");
+    std::cout &lt;&lt; "proxies built; archive not opened yet\n";
+
+    show(asGuest, "beach.jpg");          // opens archive, reads, caches
+    show(asGuest, "beach.jpg");          // cache hit
+    show(asGuest, "private/id.jpg");     // blocked before any disk access
+    show(asOwner, "private/id.jpg");     // allowed
+
+    Counted&lt;ImageStore&gt; counted(cached);
+    counted-&gt;load("beach.jpg");
+    counted-&gt;load("beach.jpg");
+    std::cout &lt;&lt; "smart reference saw " &lt;&lt; counted.hits() &lt;&lt; " accesses\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall proxy.cpp -o proxy &amp;&amp; ./proxy
+proxies built; archive not opened yet
+  [real] opening image archive (expensive)
+  [real] reading beach.jpg from disk
+beach.jpg -&gt; &lt;pixels of beach.jpg&gt;
+  [cache] hit beach.jpg
+beach.jpg -&gt; &lt;pixels of beach.jpg&gt;
+private/id.jpg -&gt; denied: guest may not open private/id.jpg
+  [real] reading private/id.jpg from disk
+private/id.jpg -&gt; &lt;pixels of private/id.jpg&gt;
+  [cache] hit beach.jpg
+  [cache] hit beach.jpg
+smart reference saw 2 accesses</code></pre>
+      <p>The guest's request for a private image was refused before any disk access: the protection proxy sits in front of the cache. Overloading <code>operator-&gt;</code> is the C++ way to write a proxy that looks like a pointer; <code>std::shared_ptr</code> and <code>std::unique_ptr</code> are the standard smart-reference proxies. A small detail we hit: the client stores the loaded string in a variable before printing, because in C++14 the order of evaluation inside one <code>cout &lt;&lt; a &lt;&lt; f()</code> chain is not guaranteed.</p>
+    </div>
+  </div>
+  <h3>The same idea in C</h3>
+  <p>Protection proxy in plain C: a wrapper ops table with the same signature that checks permission and then forwards, the way an LSM hook runs before the real file operation. Illustrative, not real kernel code; it compiles and runs (<code>lld-code/lld-pat-proxy/proxy_sketch.c</code>).</p>
+<pre><code class="language-c">/* Protection proxy in C: a wrapper ops table that checks permission, then forwards.
+   Illustrative, not real kernel code (LSM hooks check before the real file op runs).
+   Build: gcc -std=c99 -Wall proxy_sketch.c -o proxy_sketch */
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+struct store;
+struct store_ops { int (*get)(struct store *s, const char *key, char *out, size_t n); };
+struct store { const struct store_ops *ops; struct store *real; int uid; };
+
+static int real_get(struct store *s, const char *key, char *out, size_t n)
+{
+    (void)s;
+    snprintf(out, n, "value-of-%s", key);
+    return 0;
+}
+
+static int guarded_get(struct store *s, const char *key, char *out, size_t n)
+{
+    if (s-&gt;uid != 0 &amp;&amp; strncmp(key, "secret/", 7) == 0)
+        return -13;                                   /* -EACCES: the real store is never called */
+    return s-&gt;real-&gt;ops-&gt;get(s-&gt;real, key, out, n);   /* same interface: forward */
+}
+
+static const struct store_ops real_ops = { real_get }, guard_ops = { guarded_get };
+
+int main(void)
+{
+    struct store real = { &amp;real_ops, NULL, 0 };
+    struct store user = { &amp;guard_ops, &amp;real, 1000 };  /* the proxy a normal user gets */
+    const char *keys[] = { "motd", "secret/key" };
+    char buf[64];
+    for (int i = 0; i &lt; 2; i++) {
+        int rc = user.ops-&gt;get(&amp;user, keys[i], buf, sizeof buf);
+        printf("%-10s -&gt; %s\n", keys[i], rc == 0 ? buf : "denied (-EACCES)");
+    }
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ gcc -std=c99 -Wall proxy_sketch.c -o proxy_sketch &amp;&amp; ./proxy_sketch
+motd       -&gt; value-of-motd
+secret/key -&gt; denied (-EACCES)</code></pre>

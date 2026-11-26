@@ -1,0 +1,76 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Start with a list of shared state and who touches it, then pick one protection per row. The answer here is <b>one lock per station</b>: every operation is a few map and deque steps, and stations share nothing, so a global lock would serialise the whole country for no reason.</p>
+  <p>Step through the race this section is about, then the fix the code uses:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 310" role="img" aria-label="Two couriers see one free small slot; the station lock lets only one take it">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="42">Courier A</text>
+      <rect class="box client" x="20" y="210" width="150" height="44"/><text class="label small" x="95" y="232">Courier B</text>
+      <rect class="box db" x="300" y="110" width="210" height="70"/><text class="label" x="405" y="136">station S1, small slots</text><text class="label small" x="405" y="160">free = 1 (S02)</text>
+      <g data-step="1"><path class="arrow" d="M170 50 L294 120"/><text class="label small left" x="196" y="56">1. free small? 1 -&gt; take S02</text></g>
+      <g data-step="2"><path class="arrow" d="M170 225 L294 170"/><text class="label small left" x="186" y="268">2. free small? still 1 -&gt; take S02</text></g>
+      <g data-step-only="3">
+        <rect class="box ring fail" x="300" y="110" width="210" height="70"/>
+        <text class="label bad" x="650" y="120">3. both deposit:</text>
+        <text class="label small bad" x="650" y="145">two parcels in S02</text>
+        <text class="label small bad" x="650" y="170">one code opens both</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="510" y="196" width="280" height="118"/>
+        <text class="label small" x="650" y="216">Fix: synchronized deposit</text>
+        <text class="label mono" x="650" y="238">lock(station)</text>
+        <text class="label mono" x="650" y="260">count, poll, mark, issue code</text>
+        <text class="label mono" x="650" y="282">unlock - B upgrades to medium</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Courier A asks for a small slot: one free, S02.</li>
+      <li>Courier B asks before A marks it: still one free, the same S02.</li>
+      <li>Both put a parcel in S02 and both customers get a code for it.</li>
+      <li>The fix: <code>deposit</code> is <code>synchronized</code> on the station, so count, poll, mark and code issue are one step. B then sees no small slot and the best-fit strategy upgrades it to a medium one. The demo's 8-thread stress test never double-allocates.</li>
+    </ol>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Touched by</th><th>Protection</th></tr></thead>
+      <tbody>
+        <tr><td>Station map</td><td>addStation (rare), every lookup</td><td><code>ConcurrentHashMap</code>; stations are never removed</td></tr>
+        <tr><td>Free lists, slot states</td><td>deposit, pickup, collect, maintenance</td><td>Station lock (<code>synchronized</code>)</td></tr>
+        <tr><td><code>byCode</code>, <code>byParcel</code></td><td>deposit, pickup, expire, collect</td><td>Station lock: updated in the same critical section as the slot</td></tr>
+        <tr><td>Keypad counter</td><td>pickup</td><td>Station lock</td></tr>
+        <tr><td>Listeners</td><td>addListener, every event</td><td><code>CopyOnWriteArrayList</code>; called after the lock is released</td></tr>
+        <tr><td>Strategy, code generator, clock</td><td>all stations</td><td>Stateless or internally thread-safe (<code>Random</code>, <code>SecureRandom</code> are)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>The three races to name</h3>
+  <ol class="steps">
+    <li><strong>Double allocation</strong> Two couriers both see one free small slot. Check (count) and act (poll) are in one <code>synchronized</code> method, so the second sees zero.</li>
+    <li><strong>Double pickup</strong> A customer taps "open" in the app while also typing the code on the keypad. Lookup, state check, state change and code removal happen under the lock; the second call finds no code. The demo's 2 racing pickers prove it: 600 opens, 600 refusals.</li>
+    <li><strong>Pickup versus expiry</strong> The sweep runs at the exact moment the customer types. Both paths compare <code>now &gt;= expiresAt</code> under the same lock, so the delivery is either picked up or expired, never both. Pickup also checks expiry itself (lazy expiry), so a late sweep cannot let an expired code through.</li>
+  </ol>
+  <h3>Why not finer locks?</h3>
+  <p>A lock per size class, or a lock-free <code>ConcurrentLinkedDeque</code> per size, sounds faster. But a best-fit deposit may read the small list and then take from the medium list, and the code index must change with the slot. Two locks means lock ordering and a window where invariants break; lock-free deques mean the "count then poll" race comes back. At a few hundred slots and a few operations per second per station, one lock costs microseconds. Say that, and offer finer locks only with a measurement.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is the per-device lock versus big kernel lock decision. The station lock is like a per-device lock protecting a driver's descriptor rings (a sleeping mutex here, because nothing runs in interrupt context; a driver uses <code>spinlock_t</code> only for that reason): the slot free list and the "who owns slot N" map must change atomically together, the way a TX ring's head index and the skb array do. Listeners run after unlock, like deferring work to a workqueue instead of calling out while holding a spinlock.</p>
+  </div>
+  <div class="callout warn"><p><b>Never call listeners under the lock.</b> An SMS gateway that takes 2 seconds would block every courier at that station for 2 seconds, and a listener that calls back into the service (for example, to read availability) would deadlock on a non-reentrant lock in other languages.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>Condition.await()</code> / <code>signal()</code></td><td><code>wait_event()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: test the condition under the lock and re-test in a <code>while</code> loop after every wake.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td><code>Collections.synchronizedList</code></td><td>A list with one mutex taken around every call (but not around a loop over it).</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+        <tr><td><code>CountDownLatch</code></td><td><code>struct completion</code> with a count: <code>countDown()</code> is <code>complete()</code>, <code>await()</code> is <code>wait_for_completion()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>On this page: the expiry sweep is a <code>delayed_work</code> that re-arms itself, and running listeners after unlock is <code>queue_work()</code> from inside a locked section: record the event under the lock, do the slow part (SMS, email) on a worker, never while holding the station lock.</p>
+  </div>

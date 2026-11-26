@@ -1,0 +1,93 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="Command side writes events, query side builds views from the event stream">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="20" width="360" height="190"/>
+            <text class="zone-label" x="22" y="40">Command side (writes)</text>
+            <rect class="box client" x="25" y="60" width="140" height="56"/>
+            <text class="label small" x="95" y="92">tills, orders, DCs</text>
+            <rect class="box k8s" x="210" y="60" width="145" height="56"/>
+            <text class="label small" x="282" y="84">processor</text>
+            <text class="label small" x="282" y="104">(StatefulSet)</text>
+            <rect class="box db" x="210" y="140" width="145" height="50"/>
+            <text class="label small" x="282" y="170">RocksDB state</text>
+            <rect class="box kafka" x="400" y="80" width="140" height="80"/>
+            <text class="label" x="470" y="110">Kafka</text>
+            <text class="label small" x="470" y="132">events +</text>
+            <text class="label small" x="470" y="150">changelog</text>
+            <rect class="zone db" x="570" y="20" width="280" height="190"/>
+            <text class="zone-label" x="582" y="40">Query side (reads)</text>
+            <rect class="box cache" x="585" y="60" width="250" height="40"/>
+            <text class="label small" x="710" y="85">availability view (Redis/Valkey)</text>
+            <rect class="box db" x="585" y="110" width="250" height="40"/>
+            <text class="label small" x="710" y="135">position DB (Cassandra / SQL)</text>
+            <rect class="box queue" x="585" y="160" width="250" height="40"/>
+            <text class="label small" x="710" y="185">lake, replenishment, BI</text>
+            <path class="arrow kafka" d="M165 88 L394 100"/>
+            <path class="arrow" d="M282 116 L282 134"/>
+            <path class="arrow kafka" d="M400 110 L361 92"/>
+            <path class="arrow kafka" d="M540 110 L579 80"/>
+            <path class="arrow kafka" d="M540 120 L579 130"/>
+            <path class="arrow kafka" d="M540 135 L579 180"/>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M165 88 L400 100 L540 115 L585 80"/></circle>
+          </svg>
+          <figcaption>Kafka is the spine between the command side and every read model. Rebuilding a view is "replay the topic into a new store".</figcaption>
+        </figure>
+        <ul>
+          <li><b>Kafka</b>: source topics, the canonical <code>inventory-events</code> topic (key item|location), a compacted <code>inventory-positions</code> topic (keeps only the latest position per key, like a MAC table keeps the latest entry per address), changelog topics for processor state, and a DLQ for events that fail validation. See <a href="{{BASE}}devops/kafka-02">Topics, Partitions, Offsets</a> and <a href="{{BASE}}devops/kafka-09">Connect, Streams &amp; Flink</a>.</li>
+          <li><b>Kubernetes</b>: the processor runs as a <b>StatefulSet</b> with a PersistentVolume for its RocksDB state, so a pod that was shut down cleanly reuses local state instead of replaying the whole changelog. (Under <code>exactly_once_v2</code>, a crash leaves no valid checkpoint, so the store is wiped and fully restored; standby replicas are what keep that failover fast.) Stateless services (transformer, availability API, reservation API) are Deployments with <a href="{{BASE}}interview/glossary#hpa">HPAs</a> (Horizontal Pod Autoscaler: adds or removes pods when CPU or another metric crosses a target). Kafka itself can run on K8s with the Strimzi <a href="{{BASE}}interview/glossary#operator">operator</a> (an operator is a controller that runs Kafka for you: it creates the broker pods, disks and certificates and handles upgrades) (see <a href="{{BASE}}devops/k8s-10">StatefulSets &amp; Operators</a> and <a href="{{BASE}}devops/pipeline-04">Deploy on Kubernetes</a>).</li>
+          <li><b>Docker</b>: each service ships as an image; locally, a Docker Compose file with one Kafka broker, Postgres and Redis is enough to test the whole flow (see <a href="{{BASE}}devops/pipeline-02">Build It Locally</a>).</li>
+        </ul>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Kafka Streams (Java)">
+<pre><code class="language-java">StreamsBuilder builder = new StreamsBuilder();
+
+KStream&lt;String, InventoryEvent&gt; events = builder.stream(
+    "inventory-events", Consumed.with(Serdes.String(), eventSerde));   // key = item|location
+
+KTable&lt;String, Position&gt; positions = events
+    .groupByKey(Grouped.with(Serdes.String(), eventSerde))   // already keyed: no repartition; serdes given
+                                                              // because the config sets no default serdes
+    .aggregate(
+        Position::empty,
+        (key, event, pos) -&gt; pos.apply(event),      // dedupe by event_id, apply delta or count
+        Materialized.&lt;String, Position, KeyValueStore&lt;Bytes, byte[]&gt;&gt;as("positions-store")
+            .withKeySerde(Serdes.String())
+            .withValueSerde(positionSerde));
+
+positions.toStream().to("inventory-positions", Produced.with(Serdes.String(), positionSerde));</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Streams config">
+<pre><code class="language-bash">application.id=inventory-processor
+bootstrap.servers=kafka:9092
+processing.guarantee=exactly_once_v2
+num.standby.replicas=1
+state.dir=/var/lib/kafka-streams
+replication.factor=3
+# internal changelog/repartition topics also need 2 in-sync copies
+topic.min.insync.replicas=2</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Producer config">
+<pre><code class="language-bash"># transformer producing to inventory-events
+# (both are the defaults since Kafka 3.0; write them anyway so the choice is visible)
+acks=all
+enable.idempotence=true</code></pre>
+            <p>Walmart's post reports choosing <code>acks=1</code> for throughput. We show <code>acks=all</code> because with <code>min.insync.replicas=2</code> an acknowledged sale survives a leader crash. See the trade-off table below.</p>
+          </div>
+          <div class="tab-panel" data-title="Create topics">
+<pre><code class="language-bash">kafka-topics.sh --bootstrap-server localhost:9092 --create --topic inventory-events \
+  --partitions 128 --replication-factor 3 --config min.insync.replicas=2
+
+kafka-topics.sh --bootstrap-server localhost:9092 --create --topic inventory-positions \
+  --partitions 128 --replication-factor 3 --config cleanup.policy=compact</code></pre>
+          </div>
+        </div>
+        <p>On a sale morning, the first thing to watch is consumer lag (how far the processor is behind the newest event):</p>
+<pre class="terminal"><code>$ kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group inventory-processor
+GROUP                TOPIC             PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG    CONSUMER-ID              HOST         CLIENT-ID
+inventory-processor  inventory-events  0          1849201         1849230         29     inventory-processor-...  /10.0.1.17   inventory-processor-...
+inventory-processor  inventory-events  1          1790448         1790450         2      inventory-processor-...  /10.0.1.17   inventory-processor-...
+inventory-processor  inventory-events  17         2210933         2398112         187179 inventory-processor-...  /10.0.2.41   inventory-processor-...</code></pre>
+        <p>Partition 17 is far behind while the others are fine: that is a <b>hot key</b> or a slow pod, not a cluster-wide problem. Lag that grows on all partitions means the whole group is under-provisioned or the database is slow.</p>
+      

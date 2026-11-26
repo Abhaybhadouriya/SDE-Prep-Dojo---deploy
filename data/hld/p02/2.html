@@ -1,0 +1,193 @@
+
+        <h2>The solution ladder: naive to best</h2>
+        <p>Climb only as high as you need. Each rung is more powerful, but also more moving parts.</p>
+
+        <h3>Rung 1: one atomic conditional write</h3>
+        <p>Put the check inside the write. The database applies it to one row atomically, so only one of the two requests can succeed.</p>
+        <pre><code class="language-sql">-- returns 1 row updated for the winner, 0 for the loser
+UPDATE concerts
+SET    available_seats = available_seats - 1
+WHERE  concert_id = 'weeknd_tour'
+  AND  available_seats &gt; 0;
+
+-- per-seat version: claim a specific seat only if it is still free
+UPDATE seats
+SET    status = 'BOOKED', booked_by = :user
+WHERE  show_id = :show AND seat_id = :seat AND status = 'AVAILABLE';</code></pre>
+        <p>The application checks the "rows affected" count. Unique constraints are the same idea: a <code>UNIQUE (show_id, seat_id)</code> on a bookings table makes the database reject the second insert. DynamoDB offers the same thing as a <code>ConditionExpression</code>, and <a href="{{BASE}}interview/glossary#redis">Redis</a> as <code>SET key value NX</code>, or <code>DECR</code> whose returned value you check (<code>INCR</code> back and reject if it went below 0), or a Lua check-and-decrement. Note that a bare <code>DECR</code> is atomic but not conditional: it happily goes below zero, which is exactly the oversell in the flash-sale scenario below. This rung solves a surprising number of interview questions on its own. Say it first.</p>
+
+        <h3>Rung 2: pessimistic locking</h3>
+        <p>"Pessimistic" means you assume a conflict will happen, so you lock first. In PostgreSQL, <code>SELECT ... FOR UPDATE</code> locks the rows it returns. Other transactions that try to update or lock them wait until the first transaction ends. Use it when the logic between read and write is more than one statement (check balance, check limits, write two rows).</p>
+        <pre><code class="language-sql">BEGIN;
+SELECT balance FROM accounts WHERE id IN (:from, :to)
+ORDER BY id                      -- always lock in the same order: avoids deadlocks
+FOR UPDATE;
+-- application checks balance &gt;= amount
+UPDATE accounts SET balance = balance - :amt WHERE id = :from;
+UPDATE accounts SET balance = balance + :amt WHERE id = :to;
+COMMIT;</code></pre>
+        <p>Where it breaks: (1) <b>deadlocks</b> when two transactions lock rows in opposite orders; PostgreSQL detects them and aborts one, and the docs warn you cannot predict which; (2) <b>long holds</b>: never keep a row lock open while a human types a card number; (3) <b>hot rows</b>: every buyer queues behind one lock. Useful options: <code>NOWAIT</code> (fail at once instead of waiting) and <code>SKIP LOCKED</code> (skip rows someone else holds, which is how job queues let many workers claim different jobs).</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Pessimistic lock makes requests wait in line">
+            <rect class="box client" x="20" y="30" width="120" height="40"/><text class="label" x="80" y="56">Tx A</text>
+            <rect class="box client" x="20" y="90" width="120" height="40"/><text class="label" x="80" y="116">Tx B</text>
+            <rect class="box client" x="20" y="150" width="120" height="40"/><text class="label" x="80" y="176">Tx C</text>
+            <path class="arrow ok" d="M140 50 L438 95"/>
+            <path class="arrow dashed" d="M140 110 L290 110"/>
+            <path class="arrow dashed" d="M140 170 L290 170"/>
+            <rect class="box ghost" x="300" y="90" width="110" height="100"/>
+            <text class="label small" x="355" y="130">waiting</text>
+            <text class="label small" x="355" y="150">for lock</text>
+            <rect class="box db" x="445" y="70" width="170" height="70"/>
+            <text class="label" x="530" y="98">row: seat 12</text>
+            <text class="label small" x="530" y="120">locked by Tx A</text>
+            <text class="label small" x="530" y="175">B and C run only after A commits</text>
+            <text class="label small bad" x="700" y="60">hot row =</text>
+            <text class="label small bad" x="700" y="80">one at a time</text>
+            <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M140 50 L438 95"/></circle>
+          </svg>
+          <figcaption>Pessimistic locking is correct and simple, but turns a hot row into a single-file line.</figcaption>
+        </figure>
+
+        <div class="level-up" data-level="3">Level 3 - Intermediate</div>
+        <h3>Rung 3: optimistic concurrency control (OCC)</h3>
+        <p>"Optimistic" means you assume conflicts are rare, so you do not lock. You read the row and its <b>version</b>, do your work, and write only if the version is unchanged. If someone else got there first, your write affects zero rows and you retry (or tell the user). AWS documents this for DynamoDB: each item carries a version attribute, and an update succeeds only if the server-side version still matches.</p>
+        <pre><code class="language-sql">-- read
+SELECT booked, total, version FROM rooms_inventory WHERE hotel=:h AND day=:d;   -- version = 7
+-- write only if nobody changed it
+UPDATE rooms_inventory
+SET    booked = booked + 1, version = version + 1
+WHERE  hotel=:h AND day=:d AND version = 7 AND booked &lt; total;</code></pre>
+        <p>Great when conflicts are rare (editing a profile, booking a hotel room-night most days). Bad when conflicts are common: under a flash sale, 1,000 requests read version 7, one wins, and 999 retry, then 998 retry again. That is a retry storm, and it costs more than it looks. With N requests racing on one version, round 1 makes N attempts and 1 wins, round 2 makes N - 1 attempts, and so on: N + (N - 1) + ... + 1 = N(N + 1)/2, roughly <b>N<sup>2</sup>/2 attempts</b>. For N = 1,000 that is about 500,000 database writes to sell 1,000 units, against 1,000 writes for a rung-1 conditional decrement. A version number that only goes up also avoids the <b>ABA problem</b> (a value that changes A to B and back to A looks unchanged if you compare values, but not if you compare versions).</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 210" role="img" aria-label="Optimistic concurrency with a version check">
+            <rect class="box db" x="320" y="20" width="160" height="60"/>
+            <text class="label" x="400" y="45">row</text>
+            <text class="label small" x="400" y="66">version 7</text>
+            <rect class="box client" x="40" y="130" width="160" height="50"/>
+            <text class="label" x="120" y="160">Writer 1</text>
+            <rect class="box client" x="600" y="130" width="160" height="50"/>
+            <text class="label" x="680" y="160">Writer 2</text>
+            <path class="arrow ok" d="M200 140 L330 80"/>
+            <text class="label small ok" x="200" y="105">WHERE version=7</text>
+            <text class="label small ok" x="200" y="200">1 row updated, now v8</text>
+            <path class="arrow bad" d="M600 140 L470 80"/>
+            <text class="label small bad" x="600" y="105">WHERE version=7</text>
+            <text class="label small bad" x="600" y="200">0 rows: re-read, retry</text>
+          </svg>
+          <figcaption>Both writers read version 7. The first conditional write bumps it to 8, so the second matches nothing and must retry. No locks were held.</figcaption>
+        </figure>
+
+        <h3>Rung 4: reservations with a TTL (holds)</h3>
+        <p>Checkout takes minutes. Users hate typing a card number only to hear the seat is gone, but you cannot hold a database lock for 5 minutes. So split the flow into <b>reserve</b> and <b>confirm</b>. A seat moves AVAILABLE &rarr; HELD (with <code>held_by</code> and <code>hold_expires_at</code>) &rarr; BOOKED. The hold itself is taken with a rung-1 conditional write. The Hello Interview Ticketmaster breakdown calls long-running database locks a bad solution, and recommends either this status-plus-expiry design or a Redis lock with a <a href="{{BASE}}interview/glossary#ttl">TTL</a> (time to live: an expiry time after which the store deletes the entry by itself).</p>
+        <div class="bridge"><h4>From your world</h4><p>A hold with a TTL is an ARP or MAC table entry that ages out. Nobody has to send a "delete": if the owner stops refreshing it, the entry expires on its own and the slot is free again. That is why abandoned checkouts do not lock seats forever.</p></div>
+        <pre><code class="language-sql">-- take a 10-minute hold; also steals holds that have already expired
+UPDATE seats
+SET    status='HELD', held_by=:user, hold_expires_at = now() + interval '10 minutes'
+WHERE  show_id=:show AND seat_id=:seat
+  AND  (status='AVAILABLE' OR (status='HELD' AND hold_expires_at &lt; now()));</code></pre>
+        <p>The neat trick is in the last line: "free" means "available, or held but expired". So correctness never depends on a sweeper job running on time. A sweeper can still tidy rows later. The Redis variant is <code>SET hold:{show}:{seat} {user} NX EX 600</code>; for several seats, use a Lua script so the hold is all-or-nothing.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Seat state machine with a TTL">
+            <rect class="box highlight" x="40" y="70" width="170" height="60"/>
+            <text class="label" x="125" y="105">AVAILABLE</text>
+            <rect class="box hot" x="315" y="70" width="170" height="60"/>
+            <text class="label" x="400" y="98">HELD</text>
+            <text class="label small" x="400" y="118">expires in 10 min</text>
+            <rect class="box db" x="590" y="70" width="170" height="60"/>
+            <text class="label" x="675" y="105">BOOKED</text>
+            <path class="arrow" d="M210 90 L308 90"/>
+            <text class="label small" x="260" y="80">reserve</text>
+            <path class="arrow ok" d="M485 100 L583 100"/>
+            <text class="label small ok" x="535" y="90">paid</text>
+            <path class="arrow dashed" d="M400 130 Q 260 190 140 135"/>
+            <text class="label small" x="260" y="186">TTL passed or user cancelled</text>
+          </svg>
+          <figcaption>A hold is a lock with an expiry date. Expiry is checked inside the conditional write, so a late sweeper never causes double booking.</figcaption>
+        </figure>
+
+        <div class="level-up" data-level="4">Level 4 - Advanced</div>
+        <h3>Rung 5: distributed locks (and why they need fencing tokens)</h3>
+        <p>Sometimes the thing you protect is not one database row: a file in S3, a call to a payment provider, a job that must run on one machine. Then you need a lock that lives outside the database. Redis documents the single-instance version as <code>SET resource my_random_value NX PX 30000</code>: set only if absent, expire after 30 s, and release only if the stored value is still yours. The multi-node Redlock algorithm takes the lock on a majority of N independent masters (the docs use N=5, so at least 3).</p>
+        <p>Martin Kleppmann's well-known critique asks the key question: is the lock for <b>efficiency</b> (avoid doing work twice; an occasional failure is fine) or for <b>correctness</b> (two holders would corrupt data)? For correctness, any lease-based lock can fail, because the holder can pause (a GC stop-the-world, a page fault, even a SIGSTOP), the lease expires, someone else takes it, and the first holder wakes up and writes anyway. The fix is a <b>fencing token</b>: the lock service hands out an increasing number with each lease, and the storage rejects writes with a token older than one it has already seen. In his example, client 1 gets token 33, pauses, client 2 gets 34 and writes; client 1's late write with 33 is rejected.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Fencing tokens stop a paused lock holder">
+            <line class="arrow none" x1="40" y1="60" x2="760" y2="60"/>
+            <line class="arrow none" x1="40" y1="130" x2="760" y2="130"/>
+            <line class="arrow none" x1="40" y1="210" x2="760" y2="210"/>
+            <text class="label left" x="40" y="48">Client 1</text>
+            <text class="label left" x="40" y="118">Client 2</text>
+            <text class="label left" x="40" y="198">Storage (checks token)</text>
+            <rect class="box highlight" x="80" y="45" width="80" height="30"/>
+            <text class="label small" x="120" y="65">lock: 33</text>
+            <rect class="box ghost" x="170" y="45" width="300" height="30"/>
+            <text class="label small" x="320" y="65">GC pause... lease expires</text>
+            <rect class="box highlight" x="300" y="115" width="80" height="30"/>
+            <text class="label small" x="340" y="135">lock: 34</text>
+            <path class="arrow ok" d="M390 130 L440 208"/>
+            <text class="label small ok" x="470" y="175">write(34) OK</text>
+            <path class="arrow bad" d="M480 60 L600 208"/>
+            <text class="label small bad" x="640" y="175">write(33) REJECTED</text>
+            <text class="label small" x="640" y="240">33 &lt; 34 already seen</text>
+          </svg>
+          <figcaption>A lease alone cannot stop a holder who wakes up late. The storage layer must compare tokens. ZooKeeper's zxid or a znode version can serve as the token; Redlock does not provide one.</figcaption>
+        </figure>
+        <p>Practical rule for interviews: use Redis locks for efficiency (dedupe a cron run, avoid two workers rebuilding the same cache). For correctness, prefer the database's own atomic operations, or a consensus-backed lock service (ZooKeeper, etcd) <em>plus</em> fencing at the storage layer. The deep version is in <a href="{{BASE}}hld/hld-09">Replication, Consensus &amp; Coordination</a> and <a href="{{BASE}}hld/d55">Distributed Lock Service</a>.</p>
+
+        <h3>Rung 6: remove the contention: single writer, queues and sharding</h3>
+        <p>The best lock is the one you never take. If all updates for one key go to one thread, there is nothing to race against.</p>
+        <ul>
+          <li><b>Partition by key so one consumer owns it.</b> Walmart's real-time inventory (written up on Confluent's blog) needed to make sure no two consumer threads updated the same item-store at once, so each item-store key always goes to one Kafka partition and therefore one consumer.</li>
+          <li><b>Single-threaded core.</b> The LMAX exchange, described by Martin Fowler, runs its business logic on a single thread that handles about 6 million orders per second, with no locks at all. Stock matching engines (<a href="{{BASE}}hld/d26">d26</a>) work this way per symbol.</li>
+          <li><b>Split the hot row.</b> 10,000 units of stock can be 10 rows of 1,000; a like counter can be 100 sub-counters summed on read (see <a href="{{BASE}}hld/d39">Distributed Counter</a> and <a href="{{BASE}}hld/p05">Scaling Writes</a>).</li>
+        </ul>
+
+        <h3>Rung 7: admission control and virtual waiting rooms</h3>
+        <p>When demand is 100x supply, protect the contended path by letting in only what it can handle. Shopify's Part I post describes a leaky-bucket throttle at the Nginx/OpenResty edge that admitted a fixed number of checkouts per 5-second window. Throttled users saw a cached "you are in line" page that polled, and admitted users got a signed cookie to skip the throttle. Polling at random made the queue unfair, so Part II added a first-attempt timestamp in a signed cookie and a stateless "now serving" threshold on each load balancer, tuned with a <a href="{{BASE}}interview/glossary#pid-controller">PID controller</a>. Ticketmaster's Verified Fan adds pre-registration and bot filtering before the queue.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Flash sale funnel with waiting room">
+            <rect class="box client" x="20" y="80" width="120" height="70"/>
+            <text class="label" x="80" y="110">1M users</text>
+            <text class="label small" x="80" y="130">click Buy</text>
+            <path class="arrow" d="M140 115 L188 115"/>
+            <rect class="box svc" x="195" y="70" width="140" height="90"/>
+            <text class="label" x="265" y="100">CDN + bot</text>
+            <text class="label" x="265" y="120">filter</text>
+            <text class="label small" x="265" y="142">static queue page</text>
+            <path class="arrow" d="M335 115 L383 115"/>
+            <rect class="box queue" x="390" y="70" width="140" height="90"/>
+            <text class="label" x="460" y="100">Waiting room</text>
+            <text class="label small" x="460" y="122">admit N per 5 s</text>
+            <text class="label small" x="460" y="142">signed token</text>
+            <path class="arrow" d="M530 115 L578 115"/>
+            <rect class="box cache" x="585" y="70" width="90" height="90"/>
+            <text class="label" x="630" y="110">Redis</text>
+            <text class="label small" x="630" y="130">DECR stock</text>
+            <path class="arrow" d="M675 115 L713 115"/>
+            <rect class="box db" x="720" y="80" width="70" height="70"/>
+            <text class="label small" x="755" y="112">orders</text>
+            <text class="label small" x="755" y="130">DB</text>
+            <text class="label small" x="400" y="200">Each stage shrinks the crowd before it reaches the one contended number.</text>
+            <circle class="packet" r="6"><animateMotion dur="3.2s" repeatCount="indefinite" path="M140 115 L265 115 L460 115 L630 115 L755 115"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3.2s" begin="1.1s" repeatCount="indefinite" path="M140 115 L265 115 L460 115"/></circle>
+          </svg>
+          <figcaption>The orange dot is admitted and buys; the second dot waits in the queue. The database only sees the admitted rate.</figcaption>
+        </figure>
+        <div class="bridge"><h4>From your world</h4><p>The "now serving" threshold tuned by a PID controller is the same feedback loop as a fan-speed controller or a rate shaper. The controller measures checkout latency, compares it with a target (say 300 ms), and raises or lowers the admit rate by an amount based on how far off it is now (P), how long it has been off (I) and how fast the error is changing (D). Too slow: admit fewer. Plenty of headroom: admit more.</p></div>
+        <div class="callout note">
+          <h4>Worked estimate: how fast should the waiting room admit?</h4>
+          <p>Example numbers (made up for practice, not from a source): 1M users click Buy for 10,000 units. The checkout database handles about 2,000 writes per second, and each checkout costs about 3 writes (take the hold, create the order, record the payment result).</p>
+          <ol class="steps">
+            <li><strong>Capacity.</strong> 2,000 writes/s / 3 writes per checkout = about 666 checkouts/s.</li>
+            <li><strong>Headroom.</strong> Keep about 10% spare for retries and other traffic, so admit about <b>600 users/s</b> (3,000 per 5-second window, in Shopify's style).</li>
+            <li><strong>Drain time.</strong> If every admitted user buys one unit, 10,000 units / 600 per second = about <b>17 seconds</b> to sell out.</li>
+            <li><strong>The other 990,000.</strong> Once stock reaches 0, flip a "sold out" flag that the <a href="{{BASE}}interview/glossary#cdn">CDN</a> serves, so the queue stops and those users never touch the database.</li>
+          </ol>
+          <p>Say the chain out loud in the interview: "DB write budget / writes per checkout = admit rate; units / admit rate = sell-out time." Without the waiting room, 1M concurrent requests hit a store that can take 2,000 writes a second.</p>
+        </div>
+      

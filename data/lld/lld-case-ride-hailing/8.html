@@ -1,0 +1,911 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language. The Java demo includes the rush-hour test: 40 threads released together by a <code>CountDownLatch</code> fight over 5 PREMIUM cabs. The Python test does the same with a <code>Barrier</code>. The C++14 build on our toolchain has no <code>std::thread</code>, so its demo is single-threaded, but the reservation is still an atomic compare-exchange. Source: <code>lld-code/lld-case-ride-hailing/</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: the happy path, the receipts observer, the release-on-failure check, then the 40-thread rush hour.</li><li><code>RideService.requestRide</code>: snapshot, rank, CAS claim, release on failure. This is the heart (about 25 lines).</li><li><code>Driver.tryReserve</code> and <code>TripStatus.canMoveTo</code>: the one atomic step and the legal-move table.</li><li><code>Trip.moveTo</code> / <code>complete</code>: state change under the lock, listeners after it.</li><li>Then the strategies (<code>NearestDriverFirst</code>, <code>SurgeFare</code>). Skip <code>Location</code> and the enums.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.stream.*;
+
+// ---------- model ----------
+enum CabType {
+    MINI(4000, 1000, 100), SEDAN(6000, 1400, 150), PREMIUM(10000, 2200, 300);   // paise: base, per km, per minute
+    final long base, perKm, perMin;
+    CabType(long base, long perKm, long perMin) { this.base = base; this.perKm = perKm; this.perMin = perMin; }
+}
+
+final class Location {
+    final double x, y;                                   // km on a city grid (real code: lat/lng + haversine)
+    Location(double x, double y) { this.x = x; this.y = y; }
+    double km(Location o) { return Math.hypot(x - o.x, y - o.y); }
+    public String toString() { return "(" + x + "," + y + ")"; }
+}
+
+final class Rider {
+    final String id, name;
+    Rider(String id, String name) { this.id = id; this.name = name; }
+}
+
+enum DriverStatus { OFFLINE, AVAILABLE, ON_TRIP }
+
+final class Driver {
+    final String id, name; final CabType cab; final double rating;
+    private volatile Location location;
+    private final AtomicReference&lt;DriverStatus&gt; status = new AtomicReference&lt;&gt;(DriverStatus.AVAILABLE);
+    Driver(String id, String name, CabType cab, Location at, double rating) {
+        this.id = id; this.name = name; this.cab = cab; this.location = at; this.rating = rating;
+    }
+    /** The one line that prevents double booking: only one thread can win AVAILABLE -&gt; ON_TRIP. */
+    boolean tryReserve() { return status.compareAndSet(DriverStatus.AVAILABLE, DriverStatus.ON_TRIP); }
+    void release()       { status.compareAndSet(DriverStatus.ON_TRIP, DriverStatus.AVAILABLE); }
+    boolean goOffline()  { return status.compareAndSet(DriverStatus.AVAILABLE, DriverStatus.OFFLINE); }
+    boolean goOnline()   { return status.compareAndSet(DriverStatus.OFFLINE, DriverStatus.AVAILABLE); }
+    DriverStatus status() { return status.get(); }
+    Location location() { return location; }
+    void moveTo(Location l) { location = l; }
+}
+
+// ---------- trip state machine ----------
+enum TripStatus {
+    REQUESTED, DRIVER_ASSIGNED, IN_PROGRESS, COMPLETED, CANCELLED;
+    boolean canMoveTo(TripStatus next) {
+        switch (this) {
+            case REQUESTED:       return next == DRIVER_ASSIGNED || next == CANCELLED;
+            case DRIVER_ASSIGNED: return next == IN_PROGRESS || next == CANCELLED;
+            case IN_PROGRESS:     return next == COMPLETED;
+            default:              return false;           // COMPLETED and CANCELLED are terminal
+        }
+    }
+}
+
+interface TripListener { void onChange(Trip t, TripStatus from, TripStatus to); }     // Observer
+
+final class Trip {
+    final String id; final Rider rider; final CabType cab; final Location pickup, drop;
+    private Driver driver;
+    private TripStatus status = TripStatus.REQUESTED;
+    private long farePaise;
+    private final List&lt;TripListener&gt; listeners;
+    Trip(String id, Rider rider, CabType cab, Location pickup, Location drop, List&lt;TripListener&gt; listeners) {
+        this.id = id; this.rider = rider; this.cab = cab; this.pickup = pickup; this.drop = drop; this.listeners = listeners;
+    }
+    /** Caller holds the lock. Checks the transition table and records the move. */
+    private TripStatus transition(TripStatus next) {
+        if (!status.canMoveTo(next)) throw new IllegalStateException("trip " + id + ": " + status + " -&gt; " + next + " not allowed");
+        TripStatus from = status;
+        status = next;
+        return from;
+    }
+    /** State changes under the lock; listeners run AFTER it is released (never call out while holding a lock). */
+    void moveTo(TripStatus next) {
+        TripStatus from;
+        synchronized (this) { from = transition(next); }
+        fire(from, next);
+    }
+    void assign(Driver d) {
+        TripStatus from;
+        synchronized (this) { from = transition(TripStatus.DRIVER_ASSIGNED); driver = d; }
+        fire(from, TripStatus.DRIVER_ASSIGNED);
+    }
+    /** The fare is written in the same critical section as COMPLETED, before anyone is told. */
+    void complete(long fare) {
+        TripStatus from;
+        synchronized (this) { from = transition(TripStatus.COMPLETED); farePaise = fare; }
+        fire(from, TripStatus.COMPLETED);
+    }
+    private void fire(TripStatus from, TripStatus to) { for (TripListener l : listeners) l.onChange(this, from, to); }
+    synchronized TripStatus status() { return status; }
+    synchronized Driver driver() { return driver; }
+    synchronized long fare() { return farePaise; }
+}
+
+// ---------- strategies ----------
+interface DriverMatchingStrategy { List&lt;Driver&gt; rank(List&lt;Driver&gt; candidates, Location pickup); }
+
+final class NearestDriverFirst implements DriverMatchingStrategy {
+    public List&lt;Driver&gt; rank(List&lt;Driver&gt; c, Location p) {
+        return c.stream().sorted(Comparator.comparingDouble((Driver d) -&gt; d.location().km(p)).thenComparing(d -&gt; d.id))
+                .collect(Collectors.toList());
+    }
+}
+
+final class BestRatedFirst implements DriverMatchingStrategy {
+    public List&lt;Driver&gt; rank(List&lt;Driver&gt; c, Location p) {
+        return c.stream().sorted(Comparator.comparingDouble((Driver d) -&gt; -d.rating).thenComparingDouble(d -&gt; d.location().km(p)))
+                .collect(Collectors.toList());
+    }
+}
+
+interface FareStrategy { long fare(CabType cab, double km, long minutes); }
+
+final class StandardFare implements FareStrategy {
+    public long fare(CabType c, double km, long min) { return c.base + Math.round(c.perKm * km) + c.perMin * min; }
+}
+
+final class SurgeFare implements FareStrategy {                 // Decorator over any other fare rule
+    private final FareStrategy inner; private final double multiplier;
+    SurgeFare(FareStrategy inner, double multiplier) { this.inner = inner; this.multiplier = multiplier; }
+    public long fare(CabType c, double km, long min) { return Math.round(inner.fare(c, km, min) * multiplier); }
+}
+
+class NoDriverAvailableException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    NoDriverAvailableException(String m) { super(m); }
+}
+
+// ---------- service ----------
+final class RideService {
+    private final Map&lt;String, Rider&gt; riders = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Driver&gt; drivers = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Trip&gt; trips = new ConcurrentHashMap&lt;&gt;();
+    private final Set&lt;String&gt; busyRiders = ConcurrentHashMap.newKeySet();   // one active trip per rider
+    private final AtomicInteger nextTrip = new AtomicInteger(1);
+    private final List&lt;TripListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private volatile DriverMatchingStrategy matcher;
+    private volatile FareStrategy fareRule;
+    private final double radiusKm;
+
+    RideService(DriverMatchingStrategy matcher, FareStrategy fareRule, double radiusKm) {
+        this.matcher = matcher; this.fareRule = fareRule; this.radiusKm = radiusKm;
+    }
+    void addListener(TripListener l) { listeners.add(l); }
+    void setMatcher(DriverMatchingStrategy m) { matcher = m; }
+    void setFareRule(FareStrategy f) { fareRule = f; }
+
+    void addRider(String id, String name) { riders.put(id, new Rider(id, name)); }
+    void addDriver(String id, String name, CabType cab, Location at, double rating) {
+        drivers.put(id, new Driver(id, name, cab, at, rating));
+    }
+    void updateLocation(String driverId, Location at) { driver(driverId).moveTo(at); }
+    boolean goOffline(String driverId) { return driver(driverId).goOffline(); }
+
+    Trip requestRide(String riderId, Location pickup, Location drop, CabType cab) {
+        Rider r = riders.get(riderId);
+        if (r == null) throw new IllegalArgumentException("unknown rider " + riderId);
+        if (!busyRiders.add(riderId)) throw new IllegalStateException(riderId + " already has an active trip");
+        try {
+            List&lt;Driver&gt; nearby = drivers.values().stream()
+                    .filter(d -&gt; d.cab == cab &amp;&amp; d.status() == DriverStatus.AVAILABLE &amp;&amp; d.location().km(pickup) &lt;= radiusKm)
+                    .collect(Collectors.toList());                       // a snapshot: may be stale a moment later
+            for (Driver d : matcher.rank(nearby, pickup)) {
+                if (d.tryReserve()) {                                     // the CAS decides; the snapshot only suggests
+                    try {
+                        Trip t = new Trip("T" + nextTrip.getAndIncrement(), r, cab, pickup, drop, listeners);
+                        t.assign(d);
+                        trips.put(t.id, t);
+                        return t;
+                    } catch (RuntimeException e) {
+                        d.release();                                      // release on failure: never leak a claimed driver
+                        throw e;
+                    }
+                }
+            }
+            throw new NoDriverAvailableException("no " + cab + " within " + radiusKm + " km of " + pickup);
+        } catch (RuntimeException e) {
+            busyRiders.remove(riderId);
+            throw e;
+        }
+    }
+
+    void startTrip(String tripId) { trip(tripId).moveTo(TripStatus.IN_PROGRESS); }
+
+    long endTrip(String tripId, long minutes) {
+        Trip t = trip(tripId);
+        t.complete(fareRule.fare(t.cab, t.pickup.km(t.drop), minutes));  // fare first, then COMPLETED, then listeners
+        Driver d = t.driver();
+        d.moveTo(t.drop);
+        d.release();
+        busyRiders.remove(t.rider.id);
+        return t.fare();
+    }
+
+    void cancelTrip(String tripId) {
+        Trip t = trip(tripId);
+        t.moveTo(TripStatus.CANCELLED);                                   // throws if already started
+        if (t.driver() != null) t.driver().release();
+        busyRiders.remove(t.rider.id);
+    }
+
+    Driver driver(String id) {
+        Driver d = drivers.get(id);
+        if (d == null) throw new IllegalArgumentException("unknown driver " + id);
+        return d;
+    }
+    Trip trip(String id) {
+        Trip t = trips.get(id);
+        if (t == null) throw new IllegalArgumentException("unknown trip " + id);
+        return t;
+    }
+}
+
+// ---------- driver + assertions ----------
+public class Main {
+    static int passed = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); passed++; }
+    static String rs(long p) { return String.format("%d.%02d", p / 100, p % 100); }
+
+    public static void main(String[] args) throws Exception {
+        RideService svc = new RideService(new NearestDriverFirst(), new StandardFare(), 5.0);
+        List&lt;String&gt; events = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        svc.addListener((t, from, to) -&gt; events.add(t.id + " " + from + " -&gt; " + to));
+        List&lt;Long&gt; receipts = Collections.synchronizedList(new ArrayList&lt;&gt;());   // a "receipts" observer
+        svc.addListener((t, from, to) -&gt; { if (to == TripStatus.COMPLETED) receipts.add(t.fare()); });
+
+        svc.addDriver("d1", "Arun", CabType.MINI, new Location(1, 1), 4.6);
+        svc.addDriver("d2", "Bala", CabType.SEDAN, new Location(2, 2), 4.5);
+        svc.addDriver("d3", "Chen", CabType.SEDAN, new Location(3, 3), 4.9);
+        for (String r : new String[]{"r1", "r2", "r3", "r4"}) svc.addRider(r, r.toUpperCase());
+
+        Location home = new Location(0, 0), office = new Location(6, 8);
+        Trip t1 = svc.requestRide("r1", home, office, CabType.SEDAN);
+        System.out.println(t1.id + " assigned " + t1.driver().name + " (nearest SEDAN)");
+        check(t1.driver().id.equals("d2"), "nearest sedan is d2");
+
+        Trip t2 = svc.requestRide("r2", home, office, CabType.SEDAN);
+        System.out.println(t2.id + " assigned " + t2.driver().name + " (d2 is busy)");
+        check(t2.driver().id.equals("d3"), "next sedan is d3");
+
+        try { svc.requestRide("r3", home, office, CabType.SEDAN); check(false, "no sedan left"); }
+        catch (NoDriverAvailableException e) { System.out.println("r3: " + e.getMessage()); }
+
+        try { svc.requestRide("r1", home, office, CabType.MINI); check(false, "r1 already riding"); }
+        catch (IllegalStateException e) { System.out.println("r1: " + e.getMessage()); }
+
+        svc.startTrip(t1.id);
+        long fare = svc.endTrip(t1.id, 25);           // 10 km, 25 min: 60 + 140 + 37.50
+        System.out.println(t1.id + " fare " + rs(fare));
+        check(fare == 23750, "sedan fare 237.50");
+        check(t1.driver().status() == DriverStatus.AVAILABLE, "driver free again");
+
+        svc.cancelTrip(t2.id);
+        System.out.println(t2.id + " cancelled; " + t2.driver().name + " is " + t2.driver().status());
+        try { svc.startTrip(t2.id); check(false, "cancelled trip cannot start"); }
+        catch (IllegalStateException e) { System.out.println("rejected: " + e.getMessage()); }
+
+        svc.setFareRule(new SurgeFare(new StandardFare(), 1.5));
+        svc.addDriver("d4", "Dev", CabType.SEDAN, new Location(1, 0), 4.2);   // closer than d3, lower rating
+        svc.setMatcher(new BestRatedFirst());
+        Trip t3 = svc.requestRide("r3", home, office, CabType.SEDAN);
+        System.out.println(t3.id + " assigned " + t3.driver().name + " (best rated)");
+        check(t3.driver().id.equals("d3"), "best rated d3 (4.9) beats nearer d4 (4.2)");
+        svc.startTrip(t3.id);
+        long surge = svc.endTrip(t3.id, 25);
+        System.out.println(t3.id + " fare with 1.5x surge " + rs(surge));
+        check(surge == 35625, "surge fare 356.25");
+        System.out.println("receipts observer saw fares " + receipts);
+        check(receipts.equals(List.of(23750L, 35625L)), "a listener sees the final fare on COMPLETED");
+
+        // ---- release on failure: a step after the CAS throws, the driver must not stay ON_TRIP ----
+        RideService flaky = new RideService(new NearestDriverFirst(), new StandardFare(), 5.0);
+        flaky.addDriver("f1", "Faiz", CabType.MINI, new Location(1, 1), 4.0);
+        flaky.addRider("x1", "X1");
+        flaky.addListener((t, from, to) -&gt; { if (to == TripStatus.DRIVER_ASSIGNED) throw new IllegalStateException("listener down"); });
+        try { flaky.requestRide("x1", home, office, CabType.MINI); check(false, "listener failure surfaces"); }
+        catch (IllegalStateException e) { System.out.println("x1: " + e.getMessage() + "; driver f1 is " + flaky.driver("f1").status()); }
+        check(flaky.driver("f1").status() == DriverStatus.AVAILABLE, "claimed driver released after a failure");
+
+        // ---- concurrency: 40 riders, 5 premium cabs, all at the same instant ----
+        RideService rush = new RideService(new NearestDriverFirst(), new StandardFare(), 50.0);
+        for (int i = 1; i &lt;= 5; i++) rush.addDriver("p" + i, "P" + i, CabType.PREMIUM, new Location(i, 0), 4.8);
+        for (int i = 1; i &lt;= 40; i++) rush.addRider("u" + i, "U" + i);
+        ExecutorService pool = Executors.newFixedThreadPool(16);
+        CountDownLatch go = new CountDownLatch(1);
+        List&lt;Future&lt;String&gt;&gt; results = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 40; i++) {
+            final String rider = "u" + i;
+            results.add(pool.submit(() -&gt; {
+                go.await();
+                try { return rush.requestRide(rider, new Location(0, 0), new Location(9, 9), CabType.PREMIUM).driver().id; }
+                catch (NoDriverAvailableException e) { return null; }
+            }));
+        }
+        go.countDown();
+        List&lt;String&gt; got = new ArrayList&lt;&gt;();
+        for (Future&lt;String&gt; f : results) { String d = f.get(); if (d != null) got.add(d); }
+        pool.shutdown();
+        System.out.println("rush hour: " + got.size() + " of 40 riders got a cab; drivers " + new TreeSet&lt;&gt;(got));
+        check(got.size() == 5, "exactly 5 trips");
+        check(new HashSet&lt;&gt;(got).size() == 5, "no driver booked twice");
+
+        System.out.println("events: " + events);
+        System.out.println("All " + passed + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Ride hailing / cab booking - machine-coding solution (in-memory, fares in integer paise)."""
+import itertools
+import math
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
+
+class CabType(Enum):
+    MINI = (4000, 1000, 100)        # paise: base, per km, per minute
+    SEDAN = (6000, 1400, 150)
+    PREMIUM = (10000, 2200, 300)
+
+    @property
+    def base(self): return self.value[0]
+    @property
+    def per_km(self): return self.value[1]
+    @property
+    def per_min(self): return self.value[2]
+
+@dataclass(frozen=True)
+class Location:
+    x: float
+    y: float
+
+    def km(self, o):
+        return math.hypot(self.x - o.x, self.y - o.y)
+
+@dataclass(frozen=True)
+class Rider:
+    id: str
+    name: str
+
+class DriverStatus(Enum):
+    OFFLINE = "OFFLINE"
+    AVAILABLE = "AVAILABLE"
+    ON_TRIP = "ON_TRIP"
+
+class Driver:
+    def __init__(self, id_, name, cab, at, rating):
+        self.id, self.name, self.cab, self.rating = id_, name, cab, rating
+        self.location = at
+        self._status = DriverStatus.AVAILABLE
+        self._lock = threading.Lock()          # Python has no CAS; a tiny per-driver lock does the same job
+
+    def _cas(self, expect, new):
+        with self._lock:
+            if self._status is not expect:
+                return False
+            self._status = new
+            return True
+
+    def try_reserve(self): return self._cas(DriverStatus.AVAILABLE, DriverStatus.ON_TRIP)
+    def release(self): self._cas(DriverStatus.ON_TRIP, DriverStatus.AVAILABLE)
+    def go_offline(self): return self._cas(DriverStatus.AVAILABLE, DriverStatus.OFFLINE)
+
+    @property
+    def status(self): return self._status
+
+class TripStatus(Enum):
+    REQUESTED = "REQUESTED"
+    DRIVER_ASSIGNED = "DRIVER_ASSIGNED"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+ALLOWED = {
+    TripStatus.REQUESTED: {TripStatus.DRIVER_ASSIGNED, TripStatus.CANCELLED},
+    TripStatus.DRIVER_ASSIGNED: {TripStatus.IN_PROGRESS, TripStatus.CANCELLED},
+    TripStatus.IN_PROGRESS: {TripStatus.COMPLETED},
+    TripStatus.COMPLETED: set(),
+    TripStatus.CANCELLED: set(),
+}
+
+class Trip:
+    def __init__(self, id_, rider, cab, pickup, drop, listeners):
+        self.id, self.rider, self.cab, self.pickup, self.drop = id_, rider, cab, pickup, drop
+        self.driver = None
+        self.status = TripStatus.REQUESTED
+        self.fare_paise = 0
+        self._listeners = listeners
+        self._lock = threading.RLock()
+
+    def _transition(self, nxt):                  # caller holds the lock
+        if nxt not in ALLOWED[self.status]:
+            raise ValueError(f"trip {self.id}: {self.status.name} -&gt; {nxt.name} not allowed")
+        frm, self.status = self.status, nxt
+        return frm
+
+    def _fire(self, frm, nxt):                   # listeners run after the lock is released
+        for listener in self._listeners:
+            listener(self, frm, nxt)
+
+    def move_to(self, nxt):
+        with self._lock:
+            frm = self._transition(nxt)
+        self._fire(frm, nxt)
+
+    def assign(self, d):
+        with self._lock:
+            frm = self._transition(TripStatus.DRIVER_ASSIGNED)
+            self.driver = d
+        self._fire(frm, TripStatus.DRIVER_ASSIGNED)
+
+    def complete(self, fare_paise):
+        """Fare and COMPLETED are set together, before any listener hears about it."""
+        with self._lock:
+            frm = self._transition(TripStatus.COMPLETED)
+            self.fare_paise = fare_paise
+        self._fire(frm, TripStatus.COMPLETED)
+
+# ---------- strategies ----------
+class MatchingStrategy(ABC):
+    @abstractmethod
+    def rank(self, candidates, pickup): ...
+
+class NearestDriverFirst(MatchingStrategy):
+    def rank(self, candidates, pickup):
+        return sorted(candidates, key=lambda d: (d.location.km(pickup), d.id))
+
+class BestRatedFirst(MatchingStrategy):
+    def rank(self, candidates, pickup):
+        return sorted(candidates, key=lambda d: (-d.rating, d.location.km(pickup)))
+
+class FareStrategy(ABC):
+    @abstractmethod
+    def fare(self, cab, km, minutes): ...
+
+class StandardFare(FareStrategy):
+    def fare(self, cab, km, minutes):
+        return cab.base + round(cab.per_km * km) + cab.per_min * minutes
+
+class SurgeFare(FareStrategy):                # decorator over any fare rule
+    def __init__(self, inner, multiplier):
+        self.inner, self.multiplier = inner, multiplier
+
+    def fare(self, cab, km, minutes):
+        return round(self.inner.fare(cab, km, minutes) * self.multiplier)
+
+class NoDriverAvailable(Exception):
+    pass
+
+class RideService:
+    def __init__(self, matcher, fare_rule, radius_km):
+        self.matcher, self.fare_rule, self.radius_km = matcher, fare_rule, radius_km
+        self.riders, self.drivers, self.trips = {}, {}, {}
+        self.listeners = []
+        self._busy = set()
+        self._busy_lock = threading.Lock()
+        self._ids = itertools.count(1)
+
+    def add_rider(self, id_, name): self.riders[id_] = Rider(id_, name)
+    def add_driver(self, id_, name, cab, at, rating): self.drivers[id_] = Driver(id_, name, cab, at, rating)
+
+    def request_ride(self, rider_id, pickup, drop, cab):
+        rider = self.riders.get(rider_id)
+        if rider is None:
+            raise ValueError(f"unknown rider {rider_id}")
+        with self._busy_lock:
+            if rider_id in self._busy:
+                raise ValueError(f"{rider_id} already has an active trip")
+            self._busy.add(rider_id)
+        try:
+            nearby = [d for d in list(self.drivers.values())
+                      if d.cab is cab and d.status is DriverStatus.AVAILABLE and d.location.km(pickup) &lt;= self.radius_km]
+            for d in self.matcher.rank(nearby, pickup):
+                if d.try_reserve():                       # the reservation decides; the snapshot only suggests
+                    try:
+                        t = Trip(f"T{next(self._ids)}", rider, cab, pickup, drop, self.listeners)
+                        t.assign(d)
+                        self.trips[t.id] = t
+                        return t
+                    except Exception:
+                        d.release()                       # release on failure: never leak a claimed driver
+                        raise
+            raise NoDriverAvailable(f"no {cab.name} within {self.radius_km} km")
+        except Exception:
+            with self._busy_lock:
+                self._busy.discard(rider_id)
+            raise
+
+    def start_trip(self, trip_id):
+        self.trips[trip_id].move_to(TripStatus.IN_PROGRESS)
+
+    def end_trip(self, trip_id, minutes):
+        t = self.trips[trip_id]
+        t.complete(self.fare_rule.fare(t.cab, t.pickup.km(t.drop), minutes))   # fare first, then COMPLETED
+        t.driver.location = t.drop
+        t.driver.release()
+        self._free(t.rider.id)
+        return t.fare_paise
+
+    def cancel_trip(self, trip_id):
+        t = self.trips[trip_id]
+        t.move_to(TripStatus.CANCELLED)
+        if t.driver:
+            t.driver.release()
+        self._free(t.rider.id)
+
+    def _free(self, rider_id):
+        with self._busy_lock:
+            self._busy.discard(rider_id)
+
+def rs(p):
+    return f"{p // 100}.{p % 100:02d}"
+
+def demo():
+    svc = RideService(NearestDriverFirst(), StandardFare(), 5.0)
+    events = []
+    svc.listeners.append(lambda t, a, b: events.append(f"{t.id} {a.name} -&gt; {b.name}"))
+    svc.add_driver("d1", "Arun", CabType.MINI, Location(1, 1), 4.6)
+    svc.add_driver("d2", "Bala", CabType.SEDAN, Location(2, 2), 4.5)
+    svc.add_driver("d3", "Chen", CabType.SEDAN, Location(3, 3), 4.9)
+    for r in ("r1", "r2", "r3"):
+        svc.add_rider(r, r.upper())
+    home, office = Location(0, 0), Location(6, 8)
+    t1 = svc.request_ride("r1", home, office, CabType.SEDAN)
+    print(t1.id, "assigned", t1.driver.name)
+    t2 = svc.request_ride("r2", home, office, CabType.SEDAN)
+    print(t2.id, "assigned", t2.driver.name)
+    try:
+        svc.request_ride("r3", home, office, CabType.SEDAN)
+    except NoDriverAvailable as e:
+        print("r3:", e)
+    svc.start_trip(t1.id)
+    print(t1.id, "fare", rs(svc.end_trip(t1.id, 25)))
+    svc.cancel_trip(t2.id)
+    print(t2.id, "cancelled;", t2.driver.name, "is", t2.driver.status.name)
+    print("events:", events)
+
+if __name__ == "__main__":
+    demo()</code></pre>
+<p>Tests (<code>python -m unittest test_main</code>):</p>
+<pre><code class="language-python">import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+from main import (BestRatedFirst, CabType, DriverStatus, Location, NearestDriverFirst, NoDriverAvailable,
+                  RideService, StandardFare, SurgeFare, TripStatus)
+
+HOME, OFFICE = Location(0, 0), Location(6, 8)       # 10 km apart
+
+def city():
+    s = RideService(NearestDriverFirst(), StandardFare(), 5.0)
+    s.add_driver("d2", "Bala", CabType.SEDAN, Location(2, 2), 4.5)
+    s.add_driver("d3", "Chen", CabType.SEDAN, Location(3, 3), 4.9)
+    s.add_driver("d4", "Dev", CabType.SEDAN, Location(1, 0), 4.2)
+    for r in ("r1", "r2", "r3", "r4"):
+        s.add_rider(r, r.upper())
+    return s
+
+class RideTest(unittest.TestCase):
+    def test_nearest_then_best_rated(self):
+        s = city()
+        self.assertEqual(s.request_ride("r1", HOME, OFFICE, CabType.SEDAN).driver.id, "d4")
+        s.matcher = BestRatedFirst()
+        self.assertEqual(s.request_ride("r2", HOME, OFFICE, CabType.SEDAN).driver.id, "d3")
+
+    def test_fare_and_surge(self):
+        s = city()
+        t = s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        s.start_trip(t.id)
+        self.assertEqual(s.end_trip(t.id, 25), 23750)         # 60 + 140 + 37.50
+        s.fare_rule = SurgeFare(StandardFare(), 1.5)
+        t = s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        s.start_trip(t.id)
+        self.assertEqual(s.end_trip(t.id, 25), 35625)
+
+    def test_listener_sees_final_fare_on_completed(self):
+        s = city()
+        seen = []
+        s.listeners.append(lambda trip, a, b: seen.append(trip.fare_paise) if b is TripStatus.COMPLETED else None)
+        t = s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        s.start_trip(t.id)
+        s.end_trip(t.id, 25)
+        self.assertEqual(seen, [23750])
+
+    def test_driver_released_when_a_step_after_the_claim_fails(self):
+        s = city()
+
+        def broken(trip, a, b):
+            if b is TripStatus.DRIVER_ASSIGNED:
+                raise RuntimeError("listener down")
+        s.listeners.append(broken)
+        with self.assertRaises(RuntimeError):
+            s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        self.assertTrue(all(d.status is DriverStatus.AVAILABLE for d in s.drivers.values()))
+
+    def test_state_machine_rejects_bad_moves(self):
+        s = city()
+        t = s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        with self.assertRaises(ValueError):
+            s.end_trip(t.id, 5)                               # cannot complete before starting
+        s.cancel_trip(t.id)
+        self.assertIs(t.status, TripStatus.CANCELLED)
+        self.assertIs(t.driver.status, DriverStatus.AVAILABLE)
+        with self.assertRaises(ValueError):
+            s.start_trip(t.id)
+
+    def test_one_active_trip_per_rider_and_offline(self):
+        s = city()
+        s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        with self.assertRaises(ValueError):
+            s.request_ride("r1", HOME, OFFICE, CabType.SEDAN)
+        for d in s.drivers.values():
+            d.go_offline()
+        with self.assertRaises(NoDriverAvailable):
+            s.request_ride("r2", HOME, OFFICE, CabType.SEDAN)
+        self.assertNotIn("r2", s._busy)          # r2 may retry after a failed request
+
+    def test_no_double_booking_under_contention(self):
+        s = RideService(NearestDriverFirst(), StandardFare(), 50.0)
+        for i in range(1, 6):
+            s.add_driver(f"p{i}", f"P{i}", CabType.PREMIUM, Location(i, 0), 4.8)
+        for i in range(1, 41):
+            s.add_rider(f"u{i}", f"U{i}")
+        gate = threading.Barrier(40)
+
+        def book(i):
+            gate.wait()
+            try:
+                return s.request_ride(f"u{i}", HOME, OFFICE, CabType.PREMIUM).driver.id
+            except NoDriverAvailable:
+                return None
+
+        with ThreadPoolExecutor(max_workers=40) as pool:
+            got = [d for d in pool.map(book, range(1, 41)) if d]
+        self.assertEqual(len(got), 5)
+        self.assertEqual(len(set(got)), 5)
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Ride hailing - C++14 version. The demo is single-threaded (this toolchain has no std::thread).
+// Driver reservation already uses an atomic compare-exchange (the step that prevents double booking);
+// in a threaded build the service maps (drivers_, trips_, busy_) would also need a std::mutex.
+#include &lt;algorithm&gt;
+#include &lt;atomic&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;iomanip&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using std::string; using std::vector;
+
+struct CabSpec { long long base, perKm, perMin; };        // paise
+enum class CabType { MINI, SEDAN, PREMIUM };
+static CabSpec spec(CabType t) {
+    switch (t) { case CabType::MINI: return {4000, 1000, 100}; case CabType::SEDAN: return {6000, 1400, 150}; default: return {10000, 2200, 300}; }
+}
+
+struct Location { double x, y; double km(const Location&amp; o) const { return std::hypot(x - o.x, y - o.y); } };
+
+enum DriverStatus { OFFLINE = 0, AVAILABLE = 1, ON_TRIP = 2 };
+
+struct Driver {
+    string id, name; CabType cab; Location at; double rating;
+    std::atomic&lt;int&gt; status;
+    Driver(string i, string n, CabType c, Location l, double r) : id(i), name(n), cab(c), at(l), rating(r), status(AVAILABLE) {}
+    bool tryReserve() { int expect = AVAILABLE; return status.compare_exchange_strong(expect, ON_TRIP); }
+    void release()    { int expect = ON_TRIP;   status.compare_exchange_strong(expect, AVAILABLE); }
+};
+
+enum class TripStatus { REQUESTED, DRIVER_ASSIGNED, IN_PROGRESS, COMPLETED, CANCELLED };
+static const char* name(TripStatus s) {
+    static const char* n[] = {"REQUESTED", "DRIVER_ASSIGNED", "IN_PROGRESS", "COMPLETED", "CANCELLED"};
+    return n[(int)s];
+}
+static bool canMove(TripStatus a, TripStatus b) {
+    switch (a) {
+        case TripStatus::REQUESTED:       return b == TripStatus::DRIVER_ASSIGNED || b == TripStatus::CANCELLED;
+        case TripStatus::DRIVER_ASSIGNED: return b == TripStatus::IN_PROGRESS || b == TripStatus::CANCELLED;
+        case TripStatus::IN_PROGRESS:     return b == TripStatus::COMPLETED;
+        default:                          return false;
+    }
+}
+
+struct Trip;
+typedef std::function&lt;void(const Trip&amp;, TripStatus, TripStatus)&gt; Listener;   // Observer
+
+struct Trip {
+    string id, rider; CabType cab; Location pickup, drop;
+    Driver* driver = nullptr;
+    TripStatus status = TripStatus::REQUESTED;
+    long long fare = 0;
+    const vector&lt;Listener&gt;* listeners = nullptr;
+    void moveTo(TripStatus next) {
+        if (!canMove(status, next)) throw std::logic_error("trip " + id + ": " + name(status) + " -&gt; " + name(next) + " not allowed");
+        TripStatus from = status; status = next;
+        for (const auto&amp; l : *listeners) l(*this, from, next);
+    }
+    // Fare first, then COMPLETED: a listener that hears COMPLETED reads the final fare.
+    // (Single-threaded build; the Java version also calls listeners only after releasing the trip lock.)
+    void complete(long long finalFare) {
+        if (!canMove(status, TripStatus::COMPLETED)) throw std::logic_error("trip " + id + ": cannot complete from " + name(status));
+        fare = finalFare;
+        moveTo(TripStatus::COMPLETED);
+    }
+};
+
+// ---------- strategies ----------
+struct MatchingStrategy {
+    virtual ~MatchingStrategy() {}
+    virtual void rank(vector&lt;Driver*&gt;&amp; c, const Location&amp; p) const = 0;
+};
+struct NearestFirst : MatchingStrategy {
+    void rank(vector&lt;Driver*&gt;&amp; c, const Location&amp; p) const override {
+        std::sort(c.begin(), c.end(), [&amp;](Driver* a, Driver* b) { return a-&gt;at.km(p) &lt; b-&gt;at.km(p); });
+    }
+};
+struct BestRatedFirst : MatchingStrategy {
+    void rank(vector&lt;Driver*&gt;&amp; c, const Location&amp; p) const override {
+        std::sort(c.begin(), c.end(), [&amp;](Driver* a, Driver* b) {
+            return a-&gt;rating != b-&gt;rating ? a-&gt;rating &gt; b-&gt;rating : a-&gt;at.km(p) &lt; b-&gt;at.km(p); });
+    }
+};
+struct FareStrategy {
+    virtual ~FareStrategy() {}
+    virtual long long fare(CabType c, double km, long long min) const = 0;
+};
+struct StandardFare : FareStrategy {
+    long long fare(CabType c, double km, long long min) const override {
+        CabSpec s = spec(c); return s.base + std::llround(s.perKm * km) + s.perMin * min;
+    }
+};
+struct SurgeFare : FareStrategy {                          // decorator
+    std::shared_ptr&lt;FareStrategy&gt; inner; double mult;
+    SurgeFare(std::shared_ptr&lt;FareStrategy&gt; i, double m) : inner(i), mult(m) {}
+    long long fare(CabType c, double km, long long min) const override { return std::llround(inner-&gt;fare(c, km, min) * mult); }
+};
+
+struct NoDriver : std::runtime_error { explicit NoDriver(const string&amp; m) : std::runtime_error(m) {} };
+
+class RideService {
+    std::map&lt;string, std::unique_ptr&lt;Driver&gt;&gt; drivers_;
+    std::map&lt;string, std::unique_ptr&lt;Trip&gt;&gt; trips_;
+    std::map&lt;string, bool&gt; busy_;
+    vector&lt;Listener&gt; listeners_;
+    std::shared_ptr&lt;MatchingStrategy&gt; matcher_;
+    std::shared_ptr&lt;FareStrategy&gt; fare_;
+    double radius_;
+    int next_ = 1;
+public:
+    RideService(std::shared_ptr&lt;MatchingStrategy&gt; m, std::shared_ptr&lt;FareStrategy&gt; f, double r) : matcher_(m), fare_(f), radius_(r) {}
+    void addListener(Listener l) { listeners_.push_back(l); }
+    void setMatcher(std::shared_ptr&lt;MatchingStrategy&gt; m) { matcher_ = m; }
+    void setFare(std::shared_ptr&lt;FareStrategy&gt; f) { fare_ = f; }
+    void addDriver(const string&amp; id, const string&amp; n, CabType c, Location l, double r) { drivers_[id].reset(new Driver(id, n, c, l, r)); }
+
+    Trip&amp; requestRide(const string&amp; rider, Location pickup, Location drop, CabType cab) {
+        if (busy_[rider]) throw std::logic_error(rider + " already has an active trip");
+        vector&lt;Driver*&gt; nearby;
+        for (auto&amp; kv : drivers_) {
+            Driver* d = kv.second.get();
+            if (d-&gt;cab == cab &amp;&amp; d-&gt;status.load() == AVAILABLE &amp;&amp; d-&gt;at.km(pickup) &lt;= radius_) nearby.push_back(d);
+        }
+        matcher_-&gt;rank(nearby, pickup);
+        for (Driver* d : nearby) {
+            if (!d-&gt;tryReserve()) continue;
+            try {
+                std::unique_ptr&lt;Trip&gt; t(new Trip());
+                t-&gt;id = "T" + std::to_string(next_++); t-&gt;rider = rider; t-&gt;cab = cab; t-&gt;pickup = pickup; t-&gt;drop = drop;
+                t-&gt;listeners = &amp;listeners_;
+                t-&gt;driver = d;
+                t-&gt;moveTo(TripStatus::DRIVER_ASSIGNED);
+                busy_[rider] = true;
+                Trip&amp; ref = *t;
+                trips_[ref.id] = std::move(t);
+                return ref;
+            } catch (...) {
+                d-&gt;release();                       // release on failure: never leak a claimed driver
+                throw;
+            }
+        }
+        throw NoDriver("no driver of that type nearby");
+    }
+    void start(const string&amp; id) { trips_.at(id)-&gt;moveTo(TripStatus::IN_PROGRESS); }
+    long long end(const string&amp; id, long long minutes) {
+        Trip&amp; t = *trips_.at(id);
+        t.complete(fare_-&gt;fare(t.cab, t.pickup.km(t.drop), minutes));
+        t.driver-&gt;at = t.drop; t.driver-&gt;release(); busy_[t.rider] = false;
+        return t.fare;
+    }
+    void cancel(const string&amp; id) {
+        Trip&amp; t = *trips_.at(id);
+        t.moveTo(TripStatus::CANCELLED);
+        if (t.driver) t.driver-&gt;release();
+        busy_[t.rider] = false;
+    }
+};
+
+static int passed = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); } ++passed; }
+static string rs(long long p) { std::ostringstream o; o &lt;&lt; p / 100 &lt;&lt; '.' &lt;&lt; std::setw(2) &lt;&lt; std::setfill('0') &lt;&lt; p % 100; return o.str(); }
+
+int main() {
+    RideService svc(std::make_shared&lt;NearestFirst&gt;(), std::make_shared&lt;StandardFare&gt;(), 5.0);
+    vector&lt;string&gt; events;
+    svc.addListener([&amp;](const Trip&amp; t, TripStatus a, TripStatus b) { events.push_back(t.id + " " + name(a) + "-&gt;" + name(b)); });
+    vector&lt;long long&gt; receipts;                                   // a "receipts" observer
+    svc.addListener([&amp;](const Trip&amp; t, TripStatus, TripStatus b) { if (b == TripStatus::COMPLETED) receipts.push_back(t.fare); });
+    svc.addDriver("d2", "Bala", CabType::SEDAN, {2, 2}, 4.5);
+    svc.addDriver("d3", "Chen", CabType::SEDAN, {3, 3}, 4.9);
+    Location home{0, 0}, office{6, 8};
+
+    Trip&amp; t1 = svc.requestRide("r1", home, office, CabType::SEDAN);
+    std::cout &lt;&lt; t1.id &lt;&lt; " assigned " &lt;&lt; t1.driver-&gt;name &lt;&lt; "\n";
+    check(t1.driver-&gt;id == "d2", "nearest is d2");
+    Trip&amp; t2 = svc.requestRide("r2", home, office, CabType::SEDAN);
+    check(t2.driver-&gt;id == "d3", "then d3");
+    try { svc.requestRide("r3", home, office, CabType::SEDAN); check(false, "no sedan left"); }
+    catch (const NoDriver&amp; e) { std::cout &lt;&lt; "r3: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    check(!t1.driver-&gt;tryReserve(), "a reserved driver cannot be reserved again");
+
+    svc.start(t1.id);
+    long long f = svc.end(t1.id, 25);
+    std::cout &lt;&lt; t1.id &lt;&lt; " fare " &lt;&lt; rs(f) &lt;&lt; "\n";
+    check(f == 23750, "fare 237.50");
+
+    svc.cancel(t2.id);
+    try { svc.start(t2.id); check(false, "cancelled cannot start"); }
+    catch (const std::logic_error&amp; e) { std::cout &lt;&lt; "rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+
+    svc.addDriver("d4", "Dev", CabType::SEDAN, {1, 0}, 4.2);
+    svc.setMatcher(std::make_shared&lt;BestRatedFirst&gt;());
+    svc.setFare(std::make_shared&lt;SurgeFare&gt;(std::make_shared&lt;StandardFare&gt;(), 1.5));
+    Trip&amp; t3 = svc.requestRide("r3", home, office, CabType::SEDAN);
+    check(t3.driver-&gt;id == "d3", "best rated d3");
+    svc.start(t3.id);
+    long long s = svc.end(t3.id, 25);
+    std::cout &lt;&lt; t3.id &lt;&lt; " assigned " &lt;&lt; t3.driver-&gt;name &lt;&lt; ", surge fare " &lt;&lt; rs(s) &lt;&lt; "\n";
+    check(s == 35625, "surge 356.25");
+    check(receipts.size() == 2 &amp;&amp; receipts[0] == 23750 &amp;&amp; receipts[1] == 35625, "listener sees the final fare on COMPLETED");
+    std::cout &lt;&lt; "events:";
+    for (const auto&amp; e : events) std::cout &lt;&lt; " [" &lt;&lt; e &lt;&lt; "]";
+    std::cout &lt;&lt; "\nAll " &lt;&lt; passed &lt;&lt; " checks passed\n";
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+T1 assigned Bala (nearest SEDAN)
+T2 assigned Chen (d2 is busy)
+r3: no SEDAN within 5.0 km of (0.0,0.0)
+r1: r1 already has an active trip
+T1 fare 237.50
+T2 cancelled; Chen is AVAILABLE
+rejected: trip T2: CANCELLED -&gt; IN_PROGRESS not allowed
+T3 assigned Chen (best rated)
+T3 fare with 1.5x surge 356.25
+receipts observer saw fares [23750, 35625]
+x1: listener down; driver f1 is AVAILABLE
+rush hour: 5 of 40 riders got a cab; drivers [p1, p2, p3, p4, p5]
+events: [T1 REQUESTED -&gt; DRIVER_ASSIGNED, T2 REQUESTED -&gt; DRIVER_ASSIGNED, T1 DRIVER_ASSIGNED -&gt; IN_PROGRESS, T1 IN_PROGRESS -&gt; COMPLETED, T2 DRIVER_ASSIGNED -&gt; CANCELLED, T3 REQUESTED -&gt; DRIVER_ASSIGNED, T3 DRIVER_ASSIGNED -&gt; IN_PROGRESS, T3 IN_PROGRESS -&gt; COMPLETED]
+All 10 checks passed
+
+$ python -m unittest test_main
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.025s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main
+T1 assigned Bala
+r3: no driver of that type nearby
+T1 fare 237.50
+rejected: trip T2: CANCELLED -&gt; IN_PROGRESS not allowed
+T3 assigned Chen, surge fare 356.25
+events: [T1 REQUESTED-&gt;DRIVER_ASSIGNED] [T2 REQUESTED-&gt;DRIVER_ASSIGNED] [T1 DRIVER_ASSIGNED-&gt;IN_PROGRESS] [T1 IN_PROGRESS-&gt;COMPLETED] [T2 DRIVER_ASSIGNED-&gt;CANCELLED] [T3 REQUESTED-&gt;DRIVER_ASSIGNED] [T3 DRIVER_ASSIGNED-&gt;IN_PROGRESS] [T3 IN_PROGRESS-&gt;COMPLETED]
+All 7 checks passed</code></pre>

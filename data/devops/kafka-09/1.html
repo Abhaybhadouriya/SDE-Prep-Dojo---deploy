@@ -1,0 +1,120 @@
+
+        <h2>Kafka Connect: moving data with config, not code</h2>
+        <p>Imagine you need to copy every new row of a <code>customers</code> table into Kafka, and every record of a Kafka topic into Elasticsearch. You could write two small programs with a producer and a consumer. But then you must also handle retries, offsets, restarts, scaling, schema conversion and monitoring yourself. And every team in the company would write their own slightly broken version.</p>
+        <p>Kafka Connect solves this once. You run a few <strong>worker</strong> processes, and you give them a JSON config that says "use the Elasticsearch sink connector, read topic <code>orders</code>, write to this URL". The worker does the rest. Cloudflare, for example, describes building shared connectors and a common library so that each team does not misuse Kafka on its own (see their post in the resources).</p>
+
+        <h3>The five words you need</h3>
+        <ol class="steps">
+          <li><strong>Worker</strong> A JVM process that runs Connect. Several workers with the same <code>group.id</code> form a Connect cluster and share the work.</li>
+          <li><strong>Connector</strong> A plug-in plus its config, for example "Debezium Postgres connector for the shop database". It knows how to talk to one outside system. A <em>source</em> connector reads from outside and writes to Kafka. A <em>sink</em> connector reads from Kafka and writes outside.</li>
+          <li><strong>Task</strong> The unit of real work. A connector splits its job into up to <code>tasks.max</code> tasks, and the workers run tasks in threads. A sink connector reading a 12-partition topic can run up to 12 useful tasks.</li>
+          <li><strong>Converter</strong> Turns Connect's internal record format into bytes and back (JSON, Avro, Protobuf, plain string). Set by <code>key.converter</code> and <code>value.converter</code>. This is where <a href="{{BASE}}devops/kafka-10">Schema Registry</a> plugs in.</li>
+          <li><strong>SMT</strong> (single message transform) A small per-record change on the way through: rename a field, drop a field, add a timestamp, route to a different topic. Fine for light edits; anything bigger belongs in a stream processor.</li>
+        </ol>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 340" role="img" aria-label="Inside a Connect cluster: workers run tasks; each record passes connector, SMTs, converter, then Kafka">
+            <rect class="zone docker" x="20" y="20" width="560" height="300"/>
+            <text class="zone-label" x="32" y="42">Connect cluster (group.id = connect-shop)</text>
+
+            <rect class="box docker" x="40" y="60" width="250" height="120"/>
+            <text class="label" x="165" y="82">Worker 1</text>
+            <rect class="box plain" x="55" y="95" width="105" height="34"/><text class="label small" x="107" y="117">pg-cdc task 0</text>
+            <rect class="box plain" x="170" y="95" width="105" height="34"/><text class="label small" x="222" y="117">es-sink task 0</text>
+            <rect class="box plain" x="55" y="137" width="105" height="34"/><text class="label small" x="107" y="159">es-sink task 2</text>
+
+            <rect class="box docker" x="310" y="60" width="250" height="120"/>
+            <text class="label" x="435" y="82">Worker 2</text>
+            <rect class="box plain" x="325" y="95" width="105" height="34"/><text class="label small" x="377" y="117">es-sink task 1</text>
+            <rect class="box plain" x="440" y="95" width="105" height="34"/><text class="label small" x="492" y="117">s3-sink task 0</text>
+
+            <text class="label small" x="300" y="205">One record's trip through a source task:</text>
+            <rect class="box db" x="40" y="220" width="100" height="44"/><text class="label small" x="90" y="246">source DB</text>
+            <rect class="box docker" x="160" y="220" width="100" height="44"/><text class="label small" x="210" y="246">connector</text>
+            <rect class="box svc" x="280" y="220" width="100" height="44"/><text class="label small" x="330" y="246">SMT chain</text>
+            <rect class="box cache" x="400" y="220" width="100" height="44"/><text class="label small" x="450" y="246">converter</text>
+            <path class="arrow" d="M140 242 L158 242"/>
+            <path class="arrow" d="M260 242 L278 242"/>
+            <path class="arrow" d="M380 242 L398 242"/>
+            <path class="arrow kafka" d="M500 242 L618 242"/>
+            <text class="label small" x="450" y="290">bytes (JSON / Avro / Protobuf)</text>
+
+            <rect class="zone kafka" x="600" y="20" width="180" height="300"/>
+            <text class="zone-label" x="612" y="42">Kafka</text>
+            <rect class="box kafka" x="620" y="60" width="140" height="34"/><text class="label small" x="690" y="82">connect-configs</text>
+            <rect class="box kafka" x="620" y="104" width="140" height="34"/><text class="label small" x="690" y="126">connect-offsets</text>
+            <rect class="box kafka" x="620" y="148" width="140" height="34"/><text class="label small" x="690" y="170">connect-status</text>
+            <rect class="box kafka hot" x="620" y="225" width="140" height="34"/><text class="label small" x="690" y="247">shop.public.orders</text>
+            <path class="arrow dashed" d="M560 120 L618 120"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M90 242 L210 242 L330 242 L450 242 L690 242"/></circle>
+          </svg>
+          <figcaption>Workers share tasks. If Worker 2 dies, its tasks are rebalanced onto Worker 1. Connector configs, source offsets and status live in three internal Kafka topics, so the workers themselves are stateless.</figcaption>
+        </figure>
+
+        <p>Connect runs in two modes. <strong>Standalone</strong> mode is one process with its offsets in a local file, good for a laptop demo. <strong>Distributed</strong> mode is what you use in production: many workers, one REST API on each (port 8083 by default), and all state stored in Kafka topics. Because state lives in Kafka, you can kill any worker and the others pick up its tasks. This is the same group-membership idea as a <a href="{{BASE}}devops/kafka-04">consumer group</a>.</p>
+
+        <h3>A real distributed worker config</h3>
+<pre><code class="language-bash"># config/connect-distributed.properties (the important lines)
+bootstrap.servers=kafka-1:9092,kafka-2:9092,kafka-3:9092
+# workers with the same id form one cluster
+group.id=connect-shop
+# connector configs (compacted)
+config.storage.topic=connect-configs
+# where source connectors keep their position
+offset.storage.topic=connect-offsets
+# RUNNING / FAILED per connector and task
+status.storage.topic=connect-status
+config.storage.replication.factor=3
+offset.storage.replication.factor=3
+status.storage.replication.factor=3
+key.converter=org.apache.kafka.connect.json.JsonConverter
+value.converter=org.apache.kafka.connect.json.JsonConverter
+# folder with connector JARs (Debezium, ES, S3...)
+plugin.path=/opt/connectors
+# lets connector configs reference secrets in files, e.g. ${file:/opt/secrets/pg.properties:password}
+config.providers=file
+config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider</code></pre>
+        <div class="callout note"><p><b>Why the comments sit on their own lines:</b> in a <code>.properties</code> file, <code>#</code> only starts a comment at the beginning of a line. An inline <code>group.id=connect-shop  # ...</code> would make the comment part of the group id.</p></div>
+<pre class="terminal"><code>$ bin/connect-distributed.sh config/connect-distributed.properties &amp;
+$ curl -s localhost:8083/ | jq .
+{
+  "version": "4.4.0",
+  "commit": "...",
+  "kafka_cluster_id": "MkU3OEVBNTcwNTJENDM2Qg"
+}
+$ curl -s localhost:8083/connector-plugins | jq '.[].class'
+"io.debezium.connector.postgresql.PostgresConnector"
+"org.apache.kafka.connect.mirror.MirrorSourceConnector"
+...</code></pre>
+        <p>The three internal topics are <em>compacted</em> (see <a href="{{BASE}}devops/kafka-07">storage internals</a>), because only the latest config, offset and status per key matter. This is a nice real example of why compaction exists.</p>
+
+        <h3>Creating and checking a connector through the REST API</h3>
+        <p>You never "deploy code" to Connect. You <code>PUT</code> JSON. Here is a sink that writes topic <code>orders</code> into Elasticsearch, with bad records sent to a dead-letter topic instead of killing the task:</p>
+<pre><code class="language-bash">curl -s -X PUT localhost:8083/connectors/orders-to-es/config \
+  -H 'Content-Type: application/json' -d '{
+    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
+    "topics": "orders",
+    "connection.url": "http://elasticsearch:9200",
+    "tasks.max": "3",
+    "key.ignore": "false",
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "orders.dlq",
+    "errors.deadletterqueue.context.headers.enable": "true",
+    "errors.deadletterqueue.topic.replication.factor": "3"
+  }'</code></pre>
+<pre class="terminal"><code>$ curl -s localhost:8083/connectors/orders-to-es/status | jq .
+{
+  "name": "orders-to-es",
+  "connector": { "state": "RUNNING", "worker_id": "10.0.1.7:8083" },
+  "tasks": [
+    { "id": 0, "state": "RUNNING", "worker_id": "10.0.1.7:8083" },
+    { "id": 1, "state": "RUNNING", "worker_id": "10.0.1.8:8083" },
+    { "id": 2, "state": "RUNNING", "worker_id": "10.0.1.7:8083" }
+  ],
+  "type": "sink"
+}
+$ curl -s -X POST 'localhost:8083/connectors/orders-to-es/restart?includeTasks=true&amp;onlyFailed=true'</code></pre>
+        <p>The <code>errors.*</code> lines matter in real life. The default <code>errors.tolerance=none</code> means one record that cannot be converted stops the task (state <code>FAILED</code>) and the whole sink stalls. With <code>all</code>, bad records go to <code>orders.dlq</code> with headers that explain the error, and the rest keep flowing. Note that the dead-letter queue setting exists for <em>sink</em> connectors. The <a href="{{BASE}}devops/pipeline-03">pipeline DLQ page</a> shows how to re-drive those records later.</p>
+
+        <div class="callout warn"><p><b>Sink delivery is at-least-once.</b> A sink task commits its consumer offsets after it writes to the target. If it crashes in between, the same records are written again after restart. So design sinks to be <b>idempotent</b>: upsert by primary key (Elasticsearch document id = record key, JDBC sink in upsert mode). This also answers the pipeline question "how do I avoid duplicates at the sink?"</p></div>
+      

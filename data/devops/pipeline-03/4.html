@@ -1,0 +1,32 @@
+
+        <h2>The dead-letter topic: a quarantine with labels</h2>
+        <p>A DLQ is only useful if a person can answer three questions from it: <b>what</b> was the record, <b>why</b> did it fail, and <b>where</b> did it come from. ShopStream keeps the original key and value untouched and adds headers (small key-value labels Kafka stores next to each record): <code>error</code>, <code>origin</code> (<code>topic/partition/offset</code>) and <code>failed-at-ms</code>.</p>
+        <p>Try it with the drill script. It writes three bad records straight into <code>orders.created</code>, sends one good order, and reads the DLQ:</p>
+<pre><code class="language-bash">bash scripts/chaos/03-poison-message.sh
+# PowerShell: .\scripts\chaos\03-poison-message.ps1</code></pre>
+<pre class="terminal"><code>==&gt; Writing 3 bad records straight into orders.created
+
+==&gt; A good order still works
+{"order_id":"7c0e...","status":"ACCEPTED","partition":4,"offset":112}
+
+==&gt; Reading the DLQ (with headers)
+error:not valid JSON: Expecting value: line 1 column 1 (char 0),origin:orders.created/2/88,failed-at-ms:1795...	C-POISON	this is not json
+error:missing field items,origin:orders.created/2/89,failed-at-ms:1795...	C-POISON	{"order_id":"bad-1","customer_id":"C-POISON"}
+error:unknown product P-NOPE,origin:orders.created/2/90,failed-at-ms:1795...	C-POISON	{"order_id":"bad-2","customer_id":"C-POISON","items":[{"product_id":"P-NOPE","quantity":1}]}
+Processed a total of 3 messages</code></pre>
+        <p>Your partition and offset numbers will differ, but notice two things. All three bad records went to the same partition, because they share the key <code>C-POISON</code>. And the good order was accepted and processed: the enricher did not get stuck. The enricher log shows the same story:</p>
+<pre class="terminal"><code>$ docker compose logs enricher | grep poison
+... WARNING enricher poison -&gt; DLQ: not valid JSON: Expecting value: line 1 column 1 (char 0) (orders.created/2/88)
+... WARNING enricher poison -&gt; DLQ: missing field items (orders.created/2/89)
+... WARNING enricher poison -&gt; DLQ: unknown product P-NOPE (orders.created/2/90)</code></pre>
+
+        <h3>What happens to DLQ records next?</h3>
+        <ol class="steps">
+          <li><strong>Alert.</strong> <a href="{{BASE}}interview/glossary#prometheus">Prometheus</a> has a rule <code>DLQReceivingMessages</code> that fires when the DLQ's end offset is growing. A DLQ nobody watches is a silent data-loss bin.</li>
+          <li><strong>Triage.</strong> Group by the <code>error</code> header. One kind of error in thousands of records usually means one bug or one bad deploy upstream.</li>
+          <li><strong>Fix the cause.</strong> Add the missing product to the catalog, fix the <a href="{{BASE}}interview/glossary#producer">producer</a> that writes bad JSON, and so on.</li>
+          <li><strong>Redrive.</strong> Re-publish the fixed records to the start of the pipeline (here <code>orders.created</code>). Because the sink is idempotent on <code>order_id</code>, a record that somehow got through earlier is not duplicated.</li>
+        </ol>
+        <p>Uber's engineering blog describes the same layered idea at large scale: a failed message goes to retry topic 1, then retry topic 2 with longer delays, then a DLQ, and DLQ messages can be merged back into the first retry topic once fixed. Kafka 4.4 also added DLQ support for the new share groups (KIP-1191), which shows how common this pattern is.</p>
+        <div class="callout tip"><p><b>Tip:</b> give the DLQ a longer retention than the main topic (ShopStream: 14 days vs 7) so a long weekend does not delete evidence. And never let the DLQ writer itself fail silently: in ShopStream the DLQ write is inside the same transaction, so if it fails, the whole batch is retried.</p></div>
+      

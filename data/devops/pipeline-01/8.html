@@ -1,0 +1,61 @@
+
+        <h2>Processing: exactly-once in the enricher</h2>
+        <p>The enricher is the heart of the pipeline. It is a <b>read-process-write</b> loop: read from <code>orders.created</code>, compute, write to another topic. The danger in any such loop is a crash in the middle: outputs written but input position not saved (duplicates on restart), or position saved but outputs not written (lost orders). The enricher closes that gap with a <b>Kafka transaction</b> per batch.</p>
+        <p>One term first: <b><a href="{{BASE}}interview/glossary#read-committed">read_committed</a></b> is a consumer setting (<code>isolation.level</code>) that hides records from transactions that are still open or were aborted. Every ShopStream consumer uses it.</p>
+        <p>In one sentence: the enricher writes its outputs and "I have read up to here" in one Kafka transaction, so either both happen or neither does. That sentence is enough for most SDE-1 interviews.</p>
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> The stepper below and the rest of this section show the transaction step by step. It is Level 4 material that page 03 (<a href="{{BASE}}devops/pipeline-03#eos">exactly-once inside Kafka</a>) explains slowly and fully. Skim it now, or skip to <a href="#guarantees">the guarantee table</a> and come back after page 03.</p></div>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 280" role="img" aria-label="Enricher transaction: consume batch, begin, produce outputs, send offsets, commit">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="100" width="150" height="70"/><text class="label" x="95" y="125">orders.created</text><text class="label small" x="95" y="148">offsets 100-299</text>
+            <rect class="box svc" x="320" y="100" width="160" height="70"/><text class="label" x="400" y="125">enricher</text><text class="label small" x="400" y="148">txn id enricher-host</text>
+
+            <g data-step="1"><path class="arrow" d="M170 135 L316 135"/><text class="label small" x="243" y="120">consume 200</text></g>
+            <g data-step="2"><rect class="box queue" x="330" y="30" width="140" height="44"/><text class="label small" x="400" y="52">begin_transaction</text></g>
+            <g data-step="3">
+              <rect class="box kafka" x="630" y="20" width="160" height="44"/><text class="label small" x="710" y="42">orders.enriched</text>
+              <rect class="box kafka" x="630" y="80" width="160" height="44"/><text class="label small" x="710" y="102">orders.retry</text>
+              <rect class="box fail" x="630" y="140" width="160" height="44"/><text class="label small" x="710" y="162">orders.dlq</text>
+              <path class="arrow" d="M480 118 L626 44"/><path class="arrow" d="M480 128 L626 102"/><path class="arrow bad" d="M480 140 L626 160"/>
+              <text class="label small" x="560" y="206">uncommitted: invisible to read_committed</text>
+            </g>
+            <g data-step="4">
+              <rect class="box queue" x="250" y="210" width="300" height="50"/><text class="label small" x="400" y="226">send_offsets_to_transaction</text><text class="label small" x="400" y="246">"next read = 300" joins the txn</text>
+            </g>
+            <g data-step-only="5">
+              <rect class="box client hot" x="20" y="210" width="200" height="50"/><text class="label small" x="120" y="235">commit: all visible at once</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box fail" x="20" y="210" width="200" height="50"/><text class="label small" x="120" y="226">crash: txn aborted</text><text class="label small" x="120" y="246">re-read from offset 100</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Consume a batch.</b> <code>consumer.consume(num_messages=BATCH_SIZE, timeout=1.0)</code> returns up to 200 records (here offsets 100 to 299 of one partition).</li>
+            <li><b>Begin.</b> <code>producer.begin_transaction()</code>. The producer has a stable <code>transactional.id</code> (<code>enricher-&lt;hostname&gt;</code>) registered with a broker-side <b>transaction coordinator</b>.</li>
+            <li><b>Produce outputs.</b> Each record is routed to <code>orders.enriched</code>, <code>orders.retry</code> or <code>orders.dlq</code>. They are written to the logs now, but marked as part of an open transaction, so <code>read_committed</code> consumers do not see them yet.</li>
+            <li><b>Add the input position to the transaction.</b> <code>send_offsets_to_transaction(consumer.position(...))</code> puts "this group has read up to 300" into the same transaction. The commit of the read position is now part of the write.</li>
+            <li><b>Commit.</b> <code>commit_transaction()</code>. The coordinator writes commit markers; all outputs and the new offset become visible together.</li>
+            <li><b>Or crash.</b> If anything fails before commit, the transaction is aborted (or times out after <code>transaction.timeout.ms</code>, 60 s here), the outputs stay invisible forever, and the enricher (or its replacement) re-reads from the last committed offset. No loss, no duplicates inside Kafka.</li>
+          </ol>
+        </div>
+
+        <h3>Three kinds of outcome per record</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Outcome</th><th>Example</th><th>Exception in code</th><th>Goes to</th></tr></thead>
+            <tbody>
+              <tr><td>Success</td><td>Valid order, all products known</td><td>none</td><td><code>orders.enriched</code></td></tr>
+              <tr><td>Transient failure</td><td>Price lookup timed out, catalog DB unreachable</td><td><code>TransientError</code></td><td><code>orders.retry</code> with <code>attempt</code> +1 and a backoff time; after 4 retries (<code>MAX_ATTEMPTS</code>; 5 tries in total), <code>orders.dlq</code></td></tr>
+              <tr><td>Poison</td><td>Not JSON, missing <code>order_id</code>, empty items, bad quantity, unknown product</td><td><code>PoisonMessage</code></td><td><code>orders.dlq</code> immediately</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Backoff is exponential with full jitter: a random wait between 0 and <code>2 s x 2^(attempt-1)</code>, capped at 60 s. With the default <code>MAX_ATTEMPTS=4</code> the caps are 2, 4, 8 and 16 s, so the whole ladder waits at most about 30 s (about 15 s on average) and the 60 s cap is never reached. That is short: a database restart longer than that sends good orders to the DLQ (page <a href="{{BASE}}devops/pipeline-03#retry">03</a> discusses the fix). Jitter spreads retries out so a recovering dependency is not hit by every retry at the same instant (the "thundering herd").</p>
+        <p>The <b>retry-worker</b> reads <code>orders.retry</code>. If a record's <code>retry-at-ms</code> is still in the future, it <b>pauses</b> that partition and seeks back to the record, instead of sleeping. Sleeping inside the poll loop for minutes would exceed <code>max.poll.interval.ms</code> (5 minutes by default) and get the worker kicked out of its group. When the time comes, it resumes, and sends the original bytes back to <code>orders.created</code>, again inside a transaction with its offset.</p>
+
+        <div class="callout interview"><p><b>Interviewers love this.</b> Kafka's exactly-once covers <b>Kafka to Kafka only</b>. It cannot cover a database write, an email or a payment call. Say this before they ask. For the Postgres hop, ShopStream uses a different technique (next section). Candidates who claim "Kafka gives us exactly-once end to end" lose points.</p></div>
+
+        <h3>Batch or streaming?</h3>
+        <p>Could all this be a nightly batch job? The Postgres table could be: nobody would notice orders appearing once a night in a report. But revenue per minute, low-stock alerts, fraud checks and "your order is confirmed" emails all need seconds, not hours. A useful rule: if the answer is only needed tomorrow, batch is simpler and cheaper; if someone or something acts on it within minutes, stream it. Many companies do both from the same Kafka topic: a streaming consumer for the live view and a sink to a data lake for the nightly heavy queries.</p>
+      

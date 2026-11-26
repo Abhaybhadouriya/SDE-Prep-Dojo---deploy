@@ -1,0 +1,594 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java in five files, Python as one module plus a driver and unit tests, and a single-file C++14 version. All three implement the same design and the same tests.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main</code>: the passengers and the printed trace.</li><li><code>ElevatorController.submit</code> and <code>tick</code>: requests in, one time step for all cars.</li><li>The four <code>ElevatorState</code> classes (Elevator.java): each <code>tick()</code> returns the next state. This is the heart.</li><li><code>LookPolicy</code> and <code>NearestCarDispatch</code> (Policies.java): the two strategies.</li><li>Skip on first read: the records and the listener interface in Model.java.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <h3>Java 21</h3>
+  <p>Run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code> (sealed interfaces, records, pattern matching for <code>instanceof</code>). The demo output is below the files.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java: Model.java">
+<pre><code class="language-java">import java.util.*;
+
+enum Direction {
+    UP, DOWN, IDLE;
+    Direction opposite() { return this == UP ? DOWN : this == DOWN ? UP : IDLE; }
+    int step() { return this == UP ? 1 : this == DOWN ? -1 : 0; }
+}
+
+/** Command: a button press captured as an object. Any thread may create one; only the controller thread runs it. */
+sealed interface Request permits HallCall, CarCall {
+    void execute(ElevatorController c);
+}
+
+/** Up/Down button on a floor. */
+record HallCall(int floor, Direction direction) implements Request {
+    public void execute(ElevatorController c) { c.assignHallCall(this); }
+}
+
+/** Floor button inside a car. */
+record CarCall(int elevatorId, int floor) implements Request {
+    public void execute(ElevatorController c) { c.elevator(elevatorId).addCarCall(floor); }
+}
+
+/** Observer for displays, logs and tests. Every method has a no-op default. */
+interface ElevatorListener {
+    default void onDispatch(int time, HallCall call, Elevator chosen) {}
+    default void onMove(int time, Elevator e) {}
+    default void onDoorsOpen(int time, Elevator e) {}
+    default void onStateChange(int time, Elevator e, String from, String to) {}
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Policies.java">
+<pre><code class="language-java">import java.util.*;
+
+/** Strategy inside one car: keep going in the current direction, or turn around? */
+interface MovementPolicy {
+    boolean continueAhead(Elevator e, Direction d);
+}
+
+/** LOOK: turn around as soon as there is nothing more to do ahead. */
+final class LookPolicy implements MovementPolicy {
+    public boolean continueAhead(Elevator e, Direction d) { return e.hasStopsBeyond(d); }
+}
+
+/** SCAN: sweep to the last floor before turning around (the classic disk-arm elevator). */
+final class ScanPolicy implements MovementPolicy {
+    public boolean continueAhead(Elevator e, Direction d) { return e.hasStops() &amp;&amp; !e.atEnd(d); }
+}
+
+/** Strategy across cars: which car answers a hall call. */
+interface DispatchStrategy {
+    Optional&lt;Elevator&gt; choose(List&lt;Elevator&gt; candidates, HallCall call);
+}
+
+/** Closest car by floor distance, ignoring direction (simple, but sends cars the wrong way). */
+final class NearestCarDispatch implements DispatchStrategy {
+    public Optional&lt;Elevator&gt; choose(List&lt;Elevator&gt; cars, HallCall call) {
+        return cars.stream().min(Comparator.comparingInt((Elevator e) -&gt; Math.abs(e.floor() - call.floor()))
+                                           .thenComparingInt(Elevator::id));
+    }
+}
+
+/** Estimated floors to travel before reaching the caller, respecting the car's current sweep. */
+final class DirectionalCostDispatch implements DispatchStrategy {
+    public Optional&lt;Elevator&gt; choose(List&lt;Elevator&gt; cars, HallCall call) {
+        return cars.stream().min(Comparator.comparingInt((Elevator e) -&gt; cost(e, call)).thenComparingInt(Elevator::id));
+    }
+    static int cost(Elevator e, HallCall call) {
+        int f = e.floor(), target = call.floor();
+        Direction d = e.direction();
+        if (d == Direction.IDLE) return Math.abs(f - target);
+        boolean ahead = (target - f) * d.step() &gt;= 0;
+        if (ahead &amp;&amp; call.direction() == d) return Math.abs(target - f);   // on the way: pick up as we pass
+        int turn = e.farthestStop(d);                                      // finish this sweep first, then come back
+        return Math.abs(turn - f) + Math.abs(turn - target);
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Elevator.java">
+<pre><code class="language-java">import java.util.*;
+
+/** State pattern: each state decides what one tick means and which state comes next. */
+interface ElevatorState {
+    ElevatorState tick(Elevator e);
+    String name();
+}
+
+final class IdleState implements ElevatorState {
+    static final IdleState INSTANCE = new IdleState();
+    public String name() { return "IDLE"; }
+    public ElevatorState tick(Elevator e) {
+        if (e.hasCallAt(e.floor())) { e.serveHere(); return DoorsOpenState.INSTANCE; }
+        Direction d = e.nextDirection();
+        if (d == Direction.IDLE) return e.maintenanceRequested() ? OutOfServiceState.INSTANCE : this;
+        e.setDirection(d);
+        return MovingState.INSTANCE;
+    }
+}
+
+final class MovingState implements ElevatorState {
+    static final MovingState INSTANCE = new MovingState();
+    public String name() { return "MOVING"; }
+    public ElevatorState tick(Elevator e) {
+        e.moveOneFloor();
+        if (e.shouldStopHere()) { e.serveHere(); return DoorsOpenState.INSTANCE; }
+        Direction d = e.nextDirection();              // SCAN reaches the last floor and turns here
+        if (d == Direction.IDLE) { e.setDirection(Direction.IDLE); return IdleState.INSTANCE; }
+        e.setDirection(d);
+        return this;
+    }
+}
+
+/** The only state in which doors are open, and it never moves the car: that is the safety rule. */
+final class DoorsOpenState implements ElevatorState {
+    static final DoorsOpenState INSTANCE = new DoorsOpenState();
+    public String name() { return "DOORS_OPEN"; }
+    public ElevatorState tick(Elevator e) {
+        if (e.holdDoors()) return this;                // still dwelling
+        Direction d = e.nextDirection();
+        e.setDirection(d);
+        if (d != Direction.IDLE) return MovingState.INSTANCE;
+        return e.maintenanceRequested() ? OutOfServiceState.INSTANCE : IdleState.INSTANCE;
+    }
+}
+
+final class OutOfServiceState implements ElevatorState {
+    static final OutOfServiceState INSTANCE = new OutOfServiceState();
+    public String name() { return "OUT_OF_SERVICE"; }
+    public ElevatorState tick(Elevator e) { return this; }
+}
+
+final class Elevator {
+    static final int DOOR_DWELL_TICKS = 1;
+
+    private final int id, minFloor, maxFloor;
+    private final MovementPolicy policy;
+    private final List&lt;ElevatorListener&gt; listeners;
+    private final TreeSet&lt;Integer&gt; carCalls = new TreeSet&lt;&gt;(), hallUp = new TreeSet&lt;&gt;(), hallDown = new TreeSet&lt;&gt;();
+    private int floor, doorTicks, floorsTravelled, now;
+    private Direction direction = Direction.IDLE;
+    private ElevatorState state = IdleState.INSTANCE;
+    private boolean maintenanceRequested;
+
+    Elevator(int id, int minFloor, int maxFloor, int startFloor, MovementPolicy policy, List&lt;ElevatorListener&gt; listeners) {
+        this.id = id; this.minFloor = minFloor; this.maxFloor = maxFloor; this.floor = startFloor;
+        this.policy = policy; this.listeners = listeners;
+    }
+
+    int id() { return id; }
+    int floor() { return floor; }
+    Direction direction() { return direction; }
+    String stateName() { return state.name(); }
+    int floorsTravelled() { return floorsTravelled; }
+    boolean maintenanceRequested() { return maintenanceRequested; }
+    boolean acceptsNewCalls() { return !maintenanceRequested &amp;&amp; state != OutOfServiceState.INSTANCE; }
+    boolean busy() { return hasStops() || state == DoorsOpenState.INSTANCE || state == MovingState.INSTANCE; }
+
+    // ---- requests ----
+    /** Returns false when the car is going out of service and refuses new destinations. */
+    boolean addCarCall(int f) {
+        checkFloor(f);
+        if (!acceptsNewCalls()) return false;
+        if (f == floor &amp;&amp; state == DoorsOpenState.INSTANCE) { doorTicks = DOOR_DWELL_TICKS; return true; }  // hold doors
+        carCalls.add(f);
+        return true;
+    }
+    void addHallCall(HallCall c) {
+        checkFloor(c.floor());
+        hall(c.direction()).add(c.floor());
+        if (c.floor() == floor &amp;&amp; state == DoorsOpenState.INSTANCE) serveHere();   // doors re-open for the caller
+    }
+    void requestMaintenance() { maintenanceRequested = true; }       // finish current stops, then park
+    void endMaintenance() {
+        maintenanceRequested = false;
+        if (state == OutOfServiceState.INSTANCE) change(IdleState.INSTANCE);
+    }
+
+    // ---- one simulation step ----
+    void tick(int now) {
+        this.now = now;
+        change(state.tick(this));
+    }
+    private void change(ElevatorState next) {
+        if (next == state) return;
+        String from = state.name();
+        state = next;
+        listeners.forEach(l -&gt; l.onStateChange(now, this, from, next.name()));
+    }
+
+    // ---- helpers the states use ----
+    boolean hasStops() { return !carCalls.isEmpty() || !hallUp.isEmpty() || !hallDown.isEmpty(); }
+    boolean hasCallAt(int f) { return carCalls.contains(f) || hallUp.contains(f) || hallDown.contains(f); }
+    boolean atEnd(Direction d) { return d == Direction.UP ? floor &gt;= maxFloor : d == Direction.DOWN ? floor &lt;= minFloor : true; }
+    boolean hasStopsBeyond(Direction d) {
+        if (d == Direction.UP) return higher(carCalls) || higher(hallUp) || higher(hallDown);
+        if (d == Direction.DOWN) return lower(carCalls) || lower(hallUp) || lower(hallDown);
+        return false;
+    }
+    private TreeSet&lt;Integer&gt; hall(Direction d) { return d == Direction.UP ? hallUp : hallDown; }
+    private boolean higher(TreeSet&lt;Integer&gt; s) { return s.higher(floor) != null; }
+    private boolean lower(TreeSet&lt;Integer&gt; s) { return s.lower(floor) != null; }
+
+    /** Farthest stop in direction d (used by the dispatcher to estimate cost). */
+    int farthestStop(Direction d) {
+        int best = floor;
+        for (TreeSet&lt;Integer&gt; s : List.of(carCalls, hallUp, hallDown)) {
+            if (s.isEmpty()) continue;
+            best = d == Direction.UP ? Math.max(best, s.last()) : Math.min(best, s.first());
+        }
+        return best;
+    }
+
+    Direction nextDirection() {
+        if (!hasStops()) return Direction.IDLE;
+        if (direction != Direction.IDLE &amp;&amp; policy.continueAhead(this, direction)) return direction;
+        if (hasStopsBeyond(Direction.UP)) return Direction.UP;
+        if (hasStopsBeyond(Direction.DOWN)) return Direction.DOWN;
+        return Direction.IDLE;                                   // only calls at this very floor are left
+    }
+
+    boolean shouldStopHere() {
+        if (carCalls.contains(floor)) return true;
+        TreeSet&lt;Integer&gt; same = direction == Direction.UP ? hallUp : hallDown;
+        TreeSet&lt;Integer&gt; other = direction == Direction.UP ? hallDown : hallUp;
+        if (same.contains(floor)) return true;
+        return other.contains(floor) &amp;&amp; !policy.continueAhead(this, direction);   // turnaround pick-up
+    }
+
+    void moveOneFloor() {
+        if (state == DoorsOpenState.INSTANCE) throw new IllegalStateException("safety: moving with doors open");
+        int next = floor + direction.step();
+        if (next &lt; minFloor || next &gt; maxFloor) throw new IllegalStateException("safety: floor " + next + " out of shaft");
+        floor = next;
+        floorsTravelled++;
+        listeners.forEach(l -&gt; l.onMove(now, this));
+    }
+
+    /** Open doors and clear the calls this stop satisfies. */
+    void serveHere() {
+        carCalls.remove(floor);
+        if (direction != Direction.IDLE) hall(direction).remove(floor);      // we stopped while going this way
+        Direction leaving = nextDirection();                                 // and we will leave this way
+        if (leaving == Direction.IDLE) { hallUp.remove(floor); hallDown.remove(floor); }
+        else hall(leaving).remove(floor);
+        doorTicks = DOOR_DWELL_TICKS;
+        listeners.forEach(l -&gt; l.onDoorsOpen(now, this));
+    }
+
+    boolean holdDoors() { return --doorTicks &gt; 0; }
+    void setDirection(Direction d) { direction = d; }
+
+    private void checkFloor(int f) {
+        if (f &lt; minFloor || f &gt; maxFloor) throw new IllegalArgumentException("floor " + f + " outside " + minFloor + ".." + maxFloor);
+    }
+    @Override public String toString() { return "E" + id; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: ElevatorController.java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+/**
+ * Mediator: buttons, cars and displays never talk to each other, only to the controller.
+ * Threading model: submit() may be called from any thread; tick() runs on ONE controller thread,
+ * which is the only code that touches elevator state (single-writer, like a softirq draining a queue).
+ */
+final class ElevatorController {
+    private final int minFloor, maxFloor;
+    private final List&lt;Elevator&gt; elevators = new ArrayList&lt;&gt;();
+    private final DispatchStrategy dispatch;
+    private final BlockingQueue&lt;Request&gt; inbox = new LinkedBlockingQueue&lt;&gt;();
+    private final Deque&lt;HallCall&gt; unassigned = new ArrayDeque&lt;&gt;();     // no car could take it yet: retry, never drop
+    private final List&lt;ElevatorListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private int time;
+
+    ElevatorController(int minFloor, int maxFloor, DispatchStrategy dispatch) {
+        if (maxFloor &lt;= minFloor) throw new IllegalArgumentException("need at least two floors");
+        this.minFloor = minFloor; this.maxFloor = maxFloor; this.dispatch = dispatch;
+    }
+
+    Elevator addElevator(int startFloor, MovementPolicy policy) {
+        Elevator e = new Elevator(elevators.size() + 1, minFloor, maxFloor, startFloor, policy, listeners);
+        elevators.add(e);
+        return e;
+    }
+    void addListener(ElevatorListener l) { listeners.add(l); }
+    int time() { return time; }
+    List&lt;Elevator&gt; elevators() { return Collections.unmodifiableList(elevators); }
+
+    /** Thread-safe entry point for every button. Validates, then queues the command. */
+    void submit(Request r) {
+        if (r instanceof HallCall h) {
+            if (h.floor() &lt; minFloor || h.floor() &gt; maxFloor) throw new IllegalArgumentException("no floor " + h.floor());
+            if (h.direction() == Direction.IDLE) throw new IllegalArgumentException("hall call needs UP or DOWN");
+            if (h.direction() == Direction.UP &amp;&amp; h.floor() == maxFloor) throw new IllegalArgumentException("no UP button on the top floor");
+            if (h.direction() == Direction.DOWN &amp;&amp; h.floor() == minFloor) throw new IllegalArgumentException("no DOWN button on the ground floor");
+        }
+        inbox.add(r);
+    }
+
+    /** One time unit: run queued commands, retry unassigned calls, then advance every car by one step. */
+    void tick() {
+        time++;
+        List&lt;Request&gt; batch = new ArrayList&lt;&gt;();
+        inbox.drainTo(batch);
+        for (Request r : batch) r.execute(this);
+        for (int n = unassigned.size(); n &gt; 0; n--) assignHallCall(unassigned.pollFirst());
+        for (Elevator e : elevators) e.tick(time);
+    }
+
+    boolean allIdle() {
+        return inbox.isEmpty() &amp;&amp; unassigned.isEmpty() &amp;&amp; elevators.stream().noneMatch(Elevator::busy);
+    }
+
+    int runUntilIdle(int maxTicks) {
+        int start = time;
+        do {
+            if (time - start &gt;= maxTicks) throw new IllegalStateException("still busy after " + maxTicks + " ticks");
+            tick();
+        } while (!allIdle());
+        return time - start;
+    }
+
+    // ---- called by commands, on the controller thread ----
+    void assignHallCall(HallCall call) {
+        List&lt;Elevator&gt; candidates = elevators.stream().filter(Elevator::acceptsNewCalls).toList();
+        Optional&lt;Elevator&gt; chosen = dispatch.choose(candidates, call);
+        if (chosen.isEmpty()) { unassigned.addLast(call); return; }
+        chosen.get().addHallCall(call);
+        listeners.forEach(l -&gt; l.onDispatch(time, call, chosen.get()));
+    }
+    Elevator elevator(int id) {
+        if (id &lt; 1 || id &gt; elevators.size()) throw new IllegalArgumentException("no elevator " + id);
+        return elevators.get(id - 1);
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    /** Simulated people: press a hall button, board a car going their way, press a car button, get off. */
+    static final class Passengers implements ElevatorListener {
+        record Person(String name, int from, int to, int spawnAt) {
+            Direction dir() { return to &gt; from ? Direction.UP : Direction.DOWN; }
+        }
+        private final ElevatorController c;
+        private final boolean print;
+        final List&lt;Person&gt; waiting = new ArrayList&lt;&gt;(), pending = new ArrayList&lt;&gt;();
+        final Map&lt;Person, Elevator&gt; riding = new LinkedHashMap&lt;&gt;();
+        final Map&lt;Person, int[]&gt; times = new LinkedHashMap&lt;&gt;();       // person -&gt; {boardedAt, arrivedAt}
+        Passengers(ElevatorController c, boolean print) { this.c = c; this.print = print; }
+
+        void add(String name, int from, int to, int spawnAt) { pending.add(new Person(name, from, to, spawnAt)); }
+
+        /** Call before each tick: people who arrive now press their hall button. */
+        void spawn(int now) {
+            for (Iterator&lt;Person&gt; it = pending.iterator(); it.hasNext(); ) {
+                Person p = it.next();
+                if (p.spawnAt() != now) continue;
+                it.remove();
+                waiting.add(p);
+                c.submit(new HallCall(p.from(), p.dir()));
+            }
+        }
+        boolean done() { return pending.isEmpty() &amp;&amp; waiting.isEmpty() &amp;&amp; riding.isEmpty(); }
+
+        public void onDispatch(int t, HallCall call, Elevator e) {
+            if (print) System.out.printf("t=%2d  hall call %d %s -&gt; %s (at %d, %s)%n", t, call.floor(), call.direction(), e, e.floor(), e.direction());
+        }
+        public void onDoorsOpen(int t, Elevator e) {
+            StringBuilder sb = new StringBuilder();
+            riding.entrySet().removeIf(en -&gt; {
+                if (en.getValue() != e || en.getKey().to() != e.floor()) return false;
+                times.get(en.getKey())[1] = t;
+                sb.append(" | ").append(en.getKey().name()).append(" gets off");
+                return true;
+            });
+            Direction going = e.nextDirection();
+            for (Iterator&lt;Person&gt; it = waiting.iterator(); it.hasNext(); ) {
+                Person p = it.next();
+                if (p.from() != e.floor()) continue;
+                boolean myWay = e.direction() == p.dir() || going == p.dir() || going == Direction.IDLE;
+                if (!myWay) continue;
+                it.remove();
+                riding.put(p, e);
+                times.put(p, new int[] {t, -1});
+                c.submit(new CarCall(e.id(), p.to()));
+                sb.append(" | ").append(p.name()).append(" boards, presses ").append(p.to());
+            }
+            if (print) System.out.printf("t=%2d  %s doors open at %d%s%n", t, e, e.floor(), sb);
+        }
+    }
+
+    static Passengers runScenario(ElevatorController c, Passengers ps, int maxTicks) {
+        while (!(ps.done() &amp;&amp; c.allIdle())) {
+            if (c.time() &gt; maxTicks) throw new IllegalStateException("scenario did not finish");
+            ps.spawn(c.time() + 1);
+            c.tick();
+        }
+        return ps;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("== Two cars, floors 0..10, LOOK + directional dispatch ==");
+        ElevatorController c = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        c.addElevator(0, new LookPolicy());
+        c.addElevator(8, new LookPolicy());
+        Passengers ps = new Passengers(c, true);
+        c.addListener(ps);
+        ps.add("Asha", 3, 8, 1);
+        ps.add("Ravi", 9, 0, 1);
+        ps.add("Meera", 6, 2, 3);
+        ps.add("Kabir", 0, 10, 4);
+        runScenario(c, ps, 200);
+        ps.times.forEach((p, t) -&gt; System.out.printf("  %-5s %d-&gt;%-2d waited %d, rode %d%n", p.name(), p.from(), p.to(), t[0] - p.spawnAt(), t[1] - t[0]));
+
+        System.out.println("== One car at floor 4, car calls 6 and 2: LOOK vs SCAN ==");
+        System.out.println("  LOOK floors travelled: " + travel(new LookPolicy()));
+        System.out.println("  SCAN floors travelled: " + travel(new ScanPolicy()));
+
+        runTests();
+    }
+
+    static int travel(MovementPolicy policy) {
+        ElevatorController c = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        Elevator e = c.addElevator(4, policy);
+        c.tick();                               // car is IDLE at 4
+        c.submit(new CarCall(1, 6));
+        c.submit(new CarCall(1, 2));
+        c.runUntilIdle(100);
+        return e.floorsTravelled();
+    }
+
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static void rejects(Runnable r, String what) {
+        try { r.run(); } catch (IllegalArgumentException e) { checks++; return; }
+        throw new AssertionError("FAILED (accepted): " + what);
+    }
+
+    static void runTests() throws Exception {
+        check(travel(new LookPolicy()) == 6, "LOOK: 4 -&gt; 6 -&gt; 2 is 6 floors");
+        check(travel(new ScanPolicy()) == 14, "SCAN: 4 -&gt; 6 -&gt; 10 -&gt; 2 is 14 floors");
+
+        ElevatorController v = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        v.addElevator(0, new LookPolicy());
+        rejects(() -&gt; v.submit(new HallCall(10, Direction.UP)), "UP on the top floor");
+        rejects(() -&gt; v.submit(new HallCall(0, Direction.DOWN)), "DOWN on the ground floor");
+        rejects(() -&gt; v.submit(new HallCall(11, Direction.DOWN)), "floor outside the shaft");
+        rejects(() -&gt; v.submit(new HallCall(5, Direction.IDLE)), "hall call without a direction");
+
+        // dispatch: E1 at floor 2 going up to 10, E2 idle at 5, call at 3 going DOWN
+        ElevatorController d = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        Elevator e1 = d.addElevator(0, new LookPolicy()), e2 = d.addElevator(5, new LookPolicy());
+        d.submit(new CarCall(1, 10));
+        d.tick(); d.tick(); d.tick();
+        check(e1.floor() == 2 &amp;&amp; e1.direction() == Direction.UP, "E1 is at 2 going up");
+        HallCall call = new HallCall(3, Direction.DOWN);
+        check(new NearestCarDispatch().choose(d.elevators(), call).get() == e1, "nearest picks E1 (1 floor away, wrong way)");
+        check(new DirectionalCostDispatch().choose(d.elevators(), call).get() == e2, "directional picks idle E2");
+
+        // safety: the car only moves in MOVING, never with doors open, and stays inside 0..10
+        ElevatorController s = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        s.addElevator(0, new ScanPolicy());
+        List&lt;String&gt; badMoves = new ArrayList&lt;&gt;();
+        s.addListener(new ElevatorListener() {
+            public void onMove(int t, Elevator e) {
+                if (!e.stateName().equals("MOVING") || e.floor() &lt; 0 || e.floor() &gt; 10) badMoves.add(t + ":" + e.stateName());
+            }
+        });
+        Random rnd = new Random(3);
+        for (int i = 0; i &lt; 300; i++) {
+            if (i % 3 == 0) s.submit(new CarCall(1, rnd.nextInt(11)));
+            s.tick();
+        }
+        s.runUntilIdle(500);
+        check(badMoves.isEmpty(), "never moved outside MOVING or outside the shaft: " + badMoves);
+
+        // maintenance: finish the current trip, then park; calls go to the other car, or wait
+        ElevatorController m = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        Elevator m1 = m.addElevator(0, new LookPolicy()), m2 = m.addElevator(10, new LookPolicy());
+        m.submit(new CarCall(1, 4));
+        m.tick();
+        m1.requestMaintenance();
+        m.submit(new HallCall(1, Direction.UP));          // nearer to E1, but E1 is going out of service
+        m.runUntilIdle(100);
+        check(m1.stateName().equals("OUT_OF_SERVICE") &amp;&amp; m1.floor() == 4, "E1 finished its trip to 4 and parked");
+        check(m2.floor() == 1, "E2 took the hall call");
+        m2.requestMaintenance();
+        m.runUntilIdle(10);
+        m.submit(new HallCall(7, Direction.DOWN));
+        for (int i = 0; i &lt; 5; i++) m.tick();
+        check(!m.allIdle(), "with every car out of service the call waits, it is not dropped");
+        m1.endMaintenance();
+        m.runUntilIdle(100);
+        check(m1.floor() == 7, "after maintenance ends, E1 serves the waiting call");
+
+        // no starvation: 120 random passengers, 2 cars, everyone arrives
+        ElevatorController r = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        r.addElevator(0, new LookPolicy());
+        r.addElevator(10, new LookPolicy());
+        Passengers load = new Passengers(r, false);
+        r.addListener(load);
+        Random pr = new Random(42);
+        for (int i = 0; i &lt; 120; i++) {
+            int from = pr.nextInt(11), to;
+            do { to = pr.nextInt(11); } while (to == from);
+            load.add("p" + i, from, to, 1 + pr.nextInt(200));
+        }
+        runScenario(r, load, 5000);
+        check(load.times.size() == 120 &amp;&amp; load.times.values().stream().allMatch(t -&gt; t[1] &gt; 0), "all 120 passengers delivered");
+
+        // concurrency: 4 button threads submit while the controller thread ticks
+        ElevatorController cc = new ElevatorController(0, 10, new DirectionalCostDispatch());
+        cc.addElevator(0, new LookPolicy());
+        cc.addElevator(5, new LookPolicy());
+        cc.addElevator(10, new LookPolicy());
+        AtomicInteger dispatched = new AtomicInteger();
+        cc.addListener(new ElevatorListener() { public void onDispatch(int t, HallCall h, Elevator e) { dispatched.incrementAndGet(); } });
+        ExecutorService buttons = Executors.newFixedThreadPool(4);
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int b = 0; b &lt; 4; b++) {
+            final int seed = b;
+            fs.add(buttons.submit(() -&gt; {
+                Random br = new Random(seed);
+                for (int i = 0; i &lt; 200; i++) {
+                    int f = 1 + br.nextInt(9);
+                    cc.submit(new HallCall(f, br.nextBoolean() ? Direction.UP : Direction.DOWN));
+                }
+            }));
+        }
+        Thread controller = new Thread(() -&gt; { for (int i = 0; i &lt; 50; i++) cc.tick(); });
+        controller.start();
+        for (Future&lt;?&gt; f : fs) f.get();
+        controller.join();
+        buttons.shutdown();
+        cc.runUntilIdle(1000);
+        check(dispatched.get() == 800, "every one of 800 concurrent presses was dispatched exactly once: " + dispatched.get());
+        check(cc.allIdle(), "and every stop was served");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+  </div>
+<pre class="terminal"><code>== Two cars, floors 0..10, LOOK + directional dispatch ==
+t= 1  hall call 3 UP -&gt; E1 (at 0, IDLE)
+t= 1  hall call 9 DOWN -&gt; E2 (at 8, IDLE)
+t= 2  E2 doors open at 9 | Ravi boards, presses 0
+t= 3  hall call 6 DOWN -&gt; E2 (at 9, UP)
+t= 4  hall call 0 UP -&gt; E1 (at 2, UP)
+t= 4  E1 doors open at 3 | Asha boards, presses 8
+t= 6  E2 doors open at 6 | Meera boards, presses 2
+t=10  E1 doors open at 8 | Asha gets off
+t=11  E2 doors open at 2 | Meera gets off
+t=14  E2 doors open at 0 | Ravi gets off | Kabir boards, presses 10
+t=19  E1 doors open at 0
+t=25  E2 doors open at 10 | Kabir gets off
+  Ravi  9-&gt;0  waited 1, rode 12
+  Asha  3-&gt;8  waited 3, rode 6
+  Meera 6-&gt;2  waited 3, rode 5
+  Kabir 0-&gt;10 waited 10, rode 11
+== One car at floor 4, car calls 6 and 2: LOOK vs SCAN ==
+  LOOK floors travelled: 6
+  SCAN floors travelled: 14
+All 17 checks passed</code></pre>
+  <p>Read the trace. At t=1 two calls arrive; E1 (idle at 0) takes floor 3 and E2 (idle at 8) takes floor 9. At t=3 Meera presses DOWN at 6: E2, which has just picked up Ravi at 9 and will go down, costs 3, while E1, still going up, costs 4, so E2 takes it and stops at 6 on its way down. Kabir presses UP at 0 at t=4, and E1 gets it (cost 4 against 9). Then a real-world effect shows up: E2 reaches 0 first at t=14 to drop Ravi, its doors open, and Kabir gets in. E1 still arrives at 0 at t=19 for a hall call nobody is waiting for. Real lifts do this too; the fix is in <a href="#extensibility">Extensibility</a> ("cancel the hall call on other cars").</p>
+  

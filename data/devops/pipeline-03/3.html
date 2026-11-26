@@ -1,0 +1,158 @@
+
+        <h2>The retry loop, step by step</h2>
+        <p>Click <b>Next</b> or <b>Play</b> to follow one order whose price lookup timed out.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 330" role="img" aria-label="One order fails a price lookup, goes to orders.retry with headers, waits while the retry-worker pauses the partition, returns to orders.created and succeeds or goes to the DLQ after four attempts">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="40" width="170" height="56"/>
+            <text class="label" x="105" y="60">orders.created</text>
+            <text class="label small" x="105" y="80">p3 @ offset 57</text>
+            <rect class="box svc" x="300" y="40" width="160" height="56"/>
+            <text class="label" x="380" y="68">enricher</text>
+            <path class="arrow" d="M190 68 L295 68"/>
+
+            <g data-step="1">
+              <rect class="box db" x="560" y="40" width="160" height="56"/>
+              <text class="label" x="640" y="60">price lookup</text>
+              <text class="label small bad" x="640" y="80">timeout!</text>
+              <path class="arrow bad" d="M460 68 L555 68"/>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M380 96 L380 150"/>
+              <rect class="box queue" x="300" y="155" width="160" height="56"/>
+              <text class="label" x="380" y="175">orders.retry</text>
+              <text class="label small" x="380" y="195">same key + value</text>
+              <rect class="box plain" x="490" y="140" width="350" height="86"/>
+              <text class="label mono left" x="505" y="160">attempt: 1</text>
+              <text class="label mono left" x="505" y="181">retry-at-ms: now + backoff</text>
+              <text class="label mono left" x="505" y="202">error: price service timeout</text>
+              <text class="label mono left" x="505" y="221">origin: orders.created/3/57</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M300 183 L195 183"/>
+              <rect class="box svc" x="20" y="155" width="170" height="56"/>
+              <text class="label" x="105" y="175">retry-worker</text>
+              <text class="label small" x="105" y="195">poll() each second</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box hot" x="20" y="240" width="420" height="50"/>
+              <text class="label" x="230" y="265">Not time yet: seek back + pause(partition)</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow ok" d="M105 155 L105 101"/>
+              <text class="label small ok" x="215" y="128">resume, produce in a txn</text>
+            </g>
+            <g data-step-only="5">
+              <path class="arrow ok" d="M460 55 L555 25"/>
+              <rect class="box kafka" x="560" y="5" width="170" height="36"/>
+              <text class="label" x="645" y="23">orders.enriched</text>
+              <rect class="box client" x="490" y="250" width="350" height="50"/>
+              <text class="label ok" x="665" y="275">Price service back: success on attempt 2</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box fail" x="490" y="250" width="350" height="50"/>
+              <text class="label bad" x="665" y="275">attempt 5 &gt; MAX_ATTEMPTS=4: to orders.dlq</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Fail.</b> The enricher reads offset 57 and calls the price lookup. It times out, so <code>Catalog.price()</code> raises <code>TransientError</code>.</li>
+            <li><b>Move aside.</b> Inside the same transaction as the batch, the enricher writes the <em>original</em> record to <code>orders.retry</code> with headers: the attempt number, the earliest retry time, the error text and where it came from. Offset 57 is marked done, and offset 58 is processed right away.</li>
+            <li><b>Wait without sleeping.</b> The retry-worker reads it. <code>retry-at-ms</code> is in the future, so it seeks back to that record and <b>pauses</b> the partition. It keeps calling <code>poll()</code> every second, so the group coordinator still sees a live member.</li>
+            <li><b>Send back.</b> When the time comes it resumes the partition and, in one transaction, produces the record to <code>orders.created</code> (keeping the <code>attempt</code> header) and commits the retry offset.</li>
+            <li><b>Try again.</b> The enricher sees the order a second time. The price service is back, so it is enriched normally.</li>
+            <li><b>Give up.</b> If it keeps failing, each attempt waits longer. "4 attempts" means 4 retries after the first try, so 5 tries in total: the fifth failure routes it to <code>orders.dlq</code> with "gave up after 4 attempts" in the error header. The whole ladder waits at most 2 + 4 + 8 + 16 = 30 s, about 15 s on average.</li>
+          </ol>
+        </div>
+
+        <p>The routing decision in the enricher's loop is short. Note the backoff function: <b>exponential backoff with full jitter</b>. The waiting time cap doubles each attempt (2 s, 4 s, 8 s, 16 s; the code has a 60 s ceiling, but with the default <code>MAX_ATTEMPTS=4</code> it is never reached), and the actual wait is a random number between 0 and that cap, so a thousand orders that failed together do not all come back in the same millisecond and knock the price service over again.</p>
+<pre><code class="language-python"># services/enricher/enricher.py (excerpt)
+def backoff_ms(attempt: int) -&gt; int:
+    """Exponential backoff with full jitter: 2s, 4s, 8s ... capped at 60s."""
+    return random.randint(0, min(60000, BASE_BACKOFF_MS * (2 ** (attempt - 1))))
+
+                except TransientError as exc:
+                    nxt = attempt + 1
+                    if nxt &gt; MAX_ATTEMPTS:
+                        route, reason = TOPIC_DLQ, f"gave up after {attempt} attempts: {exc}"
+                    else:
+                        route, reason = TOPIC_RETRY, str(exc)
+                    producer.produce(route, key=m.key(), value=m.value(), headers={
+                        "attempt": str(nxt),
+                        "retry-at-ms": str(now_ms() + backoff_ms(nxt)),
+                        "error": reason[:500],
+                        "origin": f"{m.topic()}/{m.partition()}/{m.offset()}",
+                    })</code></pre>
+
+        <p>And the heart of the retry-worker: "if it is not time yet, rewind and pause". <code>pause()</code> tells librdkafka to stop fetching that partition while <code>poll()</code> keeps the membership alive.</p>
+<pre><code class="language-python"># services/enricher/retry_worker.py (excerpt)
+        msg = consumer.poll(1.0)
+        if msg is None or msg.error():
+            continue
+        hdrs = headers_to_dict(msg.headers())
+        retry_at = int(hdrs.get("retry-at-ms", "0"))
+        if retry_at &gt; now_ms():
+            # Not yet. Rewind to this record and pause the partition until retry_at.
+            tp = TopicPartition(msg.topic(), msg.partition(), msg.offset())
+            consumer.seek(tp)
+            consumer.pause([tp])
+            paused[(msg.topic(), msg.partition())] = retry_at
+            continue</code></pre>
+        <div class="callout note"><p><b>Small head-of-line blocking on the retry topic.</b> The worker pauses a whole partition for its <em>head</em> record. With full jitter, a record behind the head can be due sooner (attempt 1, under 2 s) but still waits while the head (attempt 4, up to 16 s) keeps the partition paused. At ShopStream's volume that costs a few seconds and nobody notices. At scale, use one topic per delay tier (for example <code>orders.retry.5s</code>, <code>orders.retry.1m</code>, <code>orders.retry.10m</code>) so every record in one topic has the same delay and the head is always the first one due. That is the real reason Uber's retry design uses fixed-delay tiers.</p></div>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p><code>pause()</code> plus a polling loop is the same trick as NAPI: stop taking new work from one source (mask the interrupt) without going to sleep, and keep the watchdog fed. Exponential backoff with jitter is what Ethernet's CSMA/CD did after a collision: wait a random slot count from a window that doubles each time. Where it breaks: NAPI drains the ring in budgets and then re-enables the interrupt; <code>pause()</code> drains nothing, it only stops fetching, and records already fetched for that partition are thrown away and fetched again after <code>resume()</code>.</p>
+        </div>
+
+        <h3>The ordering trade-off you must say out loud</h3>
+        <p>Orders are keyed by <code>customer_id</code>, so one customer's orders sit in one partition, in order. A retried order leaves that line. If customer C-42 places order A (fails, goes to retry) and then order B (succeeds), B reaches <code>orders.enriched</code> before A. For a shop, that is fine: two orders are independent. For a bank account balance it is not.</p>
+        <p>When per-key order matters, you <b>park the key</b> instead: when a record for key K fails, remember K, and send <em>every later record for K</em> to the retry path too, until K's oldest record succeeds. The README of the project describes this option; ShopStream does not implement it because shop orders do not need it.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 300" role="img" aria-label="Park the key: order A for C-42 fails and goes to retry, key C-42 is parked, order B for C-42 is also sent to retry, A succeeds and the key is unparked, B follows in order">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="40" width="200" height="60"/>
+            <text class="label" x="120" y="64">orders.created</text>
+            <text class="label small" x="120" y="86">C-42: A, then B</text>
+            <rect class="box svc" x="330" y="40" width="200" height="60"/>
+            <text class="label" x="430" y="64">enricher</text>
+            <text class="label small" x="430" y="86">checks parked set first</text>
+            <rect class="box queue" x="640" y="40" width="200" height="60"/>
+            <text class="label" x="740" y="64">orders.retry</text>
+            <text class="label small" x="740" y="86">keeps A before B</text>
+            <rect class="box kafka" x="640" y="200" width="200" height="60"/>
+            <text class="label" x="740" y="224">orders.enriched</text>
+            <text class="label small" x="740" y="246">output</text>
+            <rect class="box cache" x="330" y="200" width="200" height="60"/>
+            <text class="label" x="430" y="222">parked keys</text>
+            <text class="label small" x="430" y="244">compacted topic + memory</text>
+            <path class="arrow" d="M220 70 L325 70"/>
+
+            <g data-step-only="1">
+              <path class="arrow bad" d="M530 70 L635 70"/>
+              <text class="label small bad" x="583" y="30">A fails</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow dashed" d="M430 100 L430 195"/>
+              <text class="label small" x="300" y="160">park C-42</text>
+            </g>
+            <g data-step-only="2"><text class="label small" x="430" y="285">set = { C-42 }</text></g>
+            <g data-step-only="3">
+              <path class="arrow" d="M530 70 L635 70"/>
+              <text class="label small" x="583" y="30">B also to retry</text>
+              <text class="label small" x="430" y="285">B is fine, but C-42 is parked</text>
+            </g>
+            <g data-step-only="4">
+              <path class="arrow ok" d="M740 100 L740 195"/>
+              <text class="label small ok" x="800" y="150">A, then B</text>
+              <text class="label small ok" x="430" y="285">A succeeds: unpark C-42 once B is drained</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>A fails.</b> Order A for customer C-42 hits a transient error and is moved to <code>orders.retry</code>, as before.</li>
+            <li><b>Park the key.</b> The enricher adds C-42 to a "parked keys" set. To survive a restart, the set is written to a small compacted topic (key = customer, value = parked or a tombstone), and every instance rebuilds it on start-up from that topic. Memory alone would forget the park after a crash and let B overtake A.</li>
+            <li><b>B follows A.</b> Order B for C-42 would succeed, but its key is parked, so it is sent to the retry topic too, behind A. Other customers are not affected.</li>
+            <li><b>Unpark.</b> A is retried and succeeds, B goes right after it, and when no record for C-42 is waiting any more the key is removed (tombstone). Order per key is kept; the cost is that one customer's orders all wait for the slowest one.</li>
+          </ol>
+        </div>
+        <div class="callout interview"><p>Say this in interviews: "A retry topic trades per-key ordering for throughput. If ordering per key matters, I park the key: later events for that key also wait until the failed one succeeds."</p></div>
+      

@@ -1,0 +1,126 @@
+
+        <h2>Interview: how to drive it</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Use Snowflake: 41 bits of milliseconds, 10 bits of worker ID, 12 bits of sequence; each worker makes IDs in memory, and if the clock goes backwards it waits or refuses."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"Worker IDs are leased from etcd with fencing so a paused zombie cannot reuse one, the bit split is sized from the fleet and rate numbers, and I would pick segments or UUIDv7 if the interviewer drops time order or the 64-bit limit."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>This question is often a 25 to 30 minute warm-up or part of a bigger design. A good split:</p>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements.</strong> 64-bit? Numeric? Sorted? Rate? Multi-datacenter? Write the numbers on the board.</li>
+          <li><strong>5-12 min: options ladder.</strong> Auto-increment, multi-master offsets, UUID, ticket server, Snowflake. One line each on why it fails or wins.</li>
+          <li><strong>12-20 min: Snowflake detail.</strong> Bit layout with math, <code>nextId()</code> logic, library vs service.</li>
+          <li><strong>20-30 min: deep dives.</strong> Clock rollback, worker-ID assignment, sequence overflow, multi-DC, security.</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes:</b> jumping straight to UUID without asking about size and order; saying "use a timestamp" without a sequence (two IDs in the same ms collide); forgetting the sign bit; not saying what happens when the clock moves back; putting a network call in front of every ID without batching.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft">
+          <summary>Design a distributed, highly available unique ID generator.</summary>
+          <div class="answer">
+            <p>Clarify: 64-bit numeric, roughly time ordered, about 1M IDs/s peak, multiple datacenters. Then Snowflake: 1 sign bit + 41 bits ms since a custom epoch (about 69 years) + 10 bits worker (1,024 generators, e.g. 5 DC + 5 worker) + 12 bits sequence (4,096 per ms per worker). Each worker builds IDs locally, so there is no coordination per ID and availability is that of the caller's own process if you embed it as a library. Worker IDs come from a ZooKeeper/etcd lease at startup and are cached. Handle clock rollback by refusing or waiting, and persist the last timestamp.</p>
+            <div class="approach"><h5>How to answer</h5><p>Requirements first, then the options ladder in one minute, then commit to Snowflake with the bit math, then volunteer the two deep dives (clock, worker IDs) before being asked.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if you need 2,000 workers?</li><li>Library or service, and why?</li><li>How do you make it survive a datacenter loss?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>Why not just use UUIDs?</summary>
+          <div class="answer">
+            <p>UUIDv4 needs no coordination, which is great, but it is 128 bits (double the index size of a BIGINT, and every secondary index repeats the key) and fully random, so inserts land on random B-tree pages, causing page splits and poor cache hit rates. It is also not sortable by time, so "latest 20 posts" needs a separate timestamp index. If 128 bits is acceptable, UUIDv7 (RFC 9562) fixes the ordering problem by putting a 48-bit ms timestamp first.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not dismiss UUIDs. Name the two real costs (size, randomness), then mention UUIDv7/ULID as the modern middle ground.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the collision probability of UUIDv4?</li><li>When would you pick UUIDv7 over Snowflake?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>The NTP daemon steps the clock back 50 ms on a worker. What happens and what should happen?</summary>
+          <div class="answer">
+            <p>Without a guard, the worker would reuse milliseconds it already used and could reissue the same (timestamp, worker, sequence), which is a duplicate. With the guard, <code>now &lt; last</code> is detected and the worker refuses (Twitter's behaviour) or, for small jumps, waits (Leaf waits for rollbacks up to 5 ms). For 50 ms, return a retryable error and let the client try another worker, raise an alert, and configure NTP to slew instead of step. Across restarts, persist the last issued timestamp (Leaf reports it to ZooKeeper every 3 s) and refuse to start below it.</p>
+            <div class="approach"><h5>How to answer</h5><p>State the exact failure (duplicate), then three layers: detect, react (wait vs refuse by size), prevent (NTP slew, persisted high-water mark).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you use a logical clock instead?</li><li>What about leap seconds?</li><li>How do you test this?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>How do you assign worker IDs in an autoscaling environment?</summary>
+          <div class="answer">
+            <p>Use a strongly consistent coordinator. On startup the worker creates an ephemeral or sequential node in ZooKeeper/etcd (or takes the first free slot of 0..1023 with a lease and TTL). It heartbeats to keep the lease, stops issuing if it cannot renew in time, and caches its ID locally to survive short coordinator outages. On Kubernetes a StatefulSet ordinal plus a cluster prefix also works. If pods churn a lot, give more bits to the machine field (Baidu uses 22) and fewer to time or sequence.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the danger (two holders = duplicates), then the lease mechanism, then the zombie case and fencing.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A GC pause outlives the lease. Now what?</li><li>Can you reuse IDs of dead workers?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Flipkart">
+          <summary>One worker gets more than 4,096 requests in one millisecond. What happens?</summary>
+          <div class="answer">
+            <p>The 12-bit sequence wraps to 0, so the worker spins until the next millisecond and continues with sequence 0. The worst-case delay is under 1 ms. If that happens often, add workers (spread load), or rebalance bits: more sequence bits, fewer machine bits. Baidu's generator instead lets the timestamp run ahead of real time, borrowing future seconds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the exact mechanism (wrap, wait for next tick), its cost, then the two knobs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is 4 million IDs/s per worker realistic? What is the real bottleneck?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>For a URL shortener or Pastebin, how do you generate short keys?</summary>
+          <div class="answer">
+            <p>Generate a unique 64-bit number (Snowflake or a segment counter) and base62-encode it. 62<sup>7</sup> is about 3.5 trillion, so 7 characters cover a lot. Counter-based keys are sequential and guessable; if that matters, permute the number with a keyed bijection (for example a small Feistel cipher) before encoding, or use a pre-generated pool of random keys (a key-generation service) that hands out blocks to app servers. Hashing the long URL works too but needs collision checks.</p>
+            <div class="approach"><h5>How to answer</h5><p>Link back to this page: "unique number, then encode". Mention guessability, which interviewers often probe. Details in <a href="{{BASE}}hld/d01">URL Shortener</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long should the key be for 100M new URLs/day for 10 years?</li><li>How does the key service avoid handing the same block twice?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>Are Snowflake IDs strictly increasing? Can you use them for ordering chat messages?</summary>
+          <div class="answer">
+            <p>Only per worker. Across workers they are k-sorted: ordered within the clock skew between machines (milliseconds with good NTP). Two messages sent 1 ms apart from different workers may sort the wrong way. For a chat, if strict order matters within one conversation, use a per-conversation sequence assigned by the conversation's owner (one partition / one leader), and keep the Snowflake ID as the global unique key. Discord, for example, stores messages keyed by channel plus Snowflake IDs.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "k-sorted, not strictly sorted", give the bound, then propose a per-entity sequence where strict order is needed.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you get a total order globally? (Single sequencer, or TrueTime-style bounded clocks like Spanner.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>Library inside each service, or a central ID service?</summary>
+          <div class="answer">
+            <p>Library: zero network latency, no extra service to keep up, availability equals the caller's. But every service instance needs a worker ID, so the pool of 1,024 IDs drains quickly with hundreds of microservices, and every language needs a correct implementation. Service: a few dozen workers own the IDs, one implementation, central monitoring, but every ID costs an RPC (batch it) and the service becomes critical infrastructure. Many companies run a service with client-side batching and caching to get most of both.</p>
+            <div class="approach"><h5>How to answer</h5><p>Make a table in the air: latency, availability, worker-ID pool, polyglot cost. Pick one for the stated scale.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big should a client-side batch be?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>How does this work across multiple datacenters or regions?</summary>
+          <div class="answer">
+            <p>Put the region/DC into the ID (Snowflake's 5 datacenter bits), so each region issues IDs independently with zero cross-region traffic. During a region failover, the surviving region keeps its own DC bits; never reassign a dead region's DC ID to a new region until you are sure the old one is fenced off. Clock skew between regions only affects ordering, not uniqueness.</p>
+            <div class="approach"><h5>How to answer</h5><p>The key insight: uniqueness comes from the machine bits, not from time, so regions never need to talk.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if you need more than 32 DCs?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Exposing sequential order IDs to customers: any problem?</summary>
+          <div class="answer">
+            <p>Yes. Competitors can estimate your order volume by comparing two IDs a day apart, and attackers can enumerate resources (IDOR) if authorization is weak. Keep the Snowflake ID internal and expose an opaque public ID (random token, or the ID encrypted with a block cipher such as a 64-bit Feistel/format-preserving scheme). Always check authorization regardless.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name both leaks (business volume, enumeration) and give the internal/external ID split.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>See <a href="{{BASE}}hld/hld-14">Security &amp; Identity</a>.</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: duplicate IDs in production</h4>
+          <div class="situation"><p>Monitoring shows two orders with the same ID, created 8 ms apart, from two different hosts.</p></div>
+          <div class="bad"><p>Weak answer: "Add a unique constraint and retry on conflict."</p></div>
+          <div class="good"><p>Strong answer: the decoded worker bits will show the same worker ID on two hosts, so the lease system failed (a zombie after a pause, a cloned VM, or a worker ID baked into an image). Decode both IDs, compare worker bits and timestamps, check lease history in ZooKeeper/etcd. Fix: fencing (stop issuing when the lease is not fresh), refuse to start if another live holder exists, alert on duplicate detections. Keep the unique constraint as a last-line safety net.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you find all other duplicates already written?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: 2,000 microservices want IDs</h4>
+          <div class="situation"><p>Every service team embeds the library; you run out of the 1,024 worker IDs.</p></div>
+          <div class="bad"><p>Weak answer: "Reuse worker IDs randomly."</p></div>
+          <div class="good"><p>Strong answer: move to a central ID service with a few dozen workers and client-side batching, or change the layout for new ID spaces (fewer time bits with a later epoch, more machine bits, like Sonyflake's 16). Existing IDs stay valid because the format is versioned per ID space.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you migrate without breaking ordering?</li></ul></div>
+        </div>
+      

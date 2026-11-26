@@ -1,0 +1,125 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: requirements.</strong> Throughput and message size, ordering scope, delivery guarantee, retention and replay, number of consumer groups, durability under failure.</li>
+          <li><strong>5-10: estimate.</strong> Ingress, replication, egress, storage x RF, the point that disk decides; partitions from consumer throughput.</li>
+          <li><strong>10-18: single node.</strong> One append-only log per partition, segments + sparse index, offsets, pull API. Why it is fast.</li>
+          <li><strong>18-30: distribute.</strong> Partitions over brokers, key hashing, leader/followers, ISR, HW, acks + min ISR, controller.</li>
+          <li><strong>30-40: consumers and semantics.</strong> Groups, offset commits, rebalancing, at-least-once vs exactly-once, retries and DLQ.</li>
+          <li><strong>40-45: operate.</strong> Failure table, metrics (under-replicated partitions, lag, request latency), retention vs tiered storage, scaling.</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes:</b> promising global ordering; forgetting where consumer offsets are stored; deleting messages on read and then also promising replay; push delivery with no flow-control story; acks=all without min.insync.replicas; claiming exactly-once covers database writes; saying "add partitions" without mentioning that it remaps keys; no controller (who elects leaders?); never doing the storage math.</p></div>
+        <div class="callout interview"><p><b>Turn your background into an answer.</b> When an interviewer says "you have no web experience", answer with a translation, not an apology (the full script is on the <a href="{{BASE}}hld/hld-03">interview framework</a> page). Examples for this design: "I tuned interrupt coalescing on a NIC driver: that is the same latency-for-throughput trade as <code>linger.ms</code> and <code>batch.size</code>." "I debugged ring-buffer overruns between a producer and consumer thread: consumer lag is the same queue depth, and retention is what happens when the ring wraps." "Key hashing to partitions is ECMP flow hashing: per-flow order, spread across links, and resizing the group re-hashes flows." Then go straight back to the design.</p></div>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "I'd model each topic as N partitions, each an append-only log split into segment files with a sparse offset index, so writes are sequential and reads by offset are a binary search plus a short scan. Producers hash the key to a partition, which gives per-key ordering, and send compressed batches to the partition leader. Followers on other brokers in other zones fetch from the leader; the in-sync set defines a high watermark, and with RF 3, acks=all and min ISR 2 no acked write is lost if one broker dies. Consumers pull from the leader up to the high watermark, served from the page cache with zero-copy, and commit one offset per partition per group to an internal compacted topic, so each group replays independently. A Raft controller quorum stores metadata and elects leaders. Retention deletes whole segments by time or size, compaction keeps the latest per key, and tiered storage moves old segments to object storage, because at 7 days and RF 3, disk, not throughput, sizes the cluster."</p></div>
+
+        <details class="qa" data-level="3" data-topic="kafka" data-company="Walmart,Amazon">
+          <summary>How does partitioning work, and how would you scale a Kafka-based system?</summary>
+          <div class="answer">
+            <p>The producer hashes the key (murmur2 in Kafka) modulo the partition count; same key, same partition, same order. Partitions are the unit of parallelism: a consumer group can use at most one consumer per partition. To scale consumption, add consumers up to the partition count; beyond that, add partitions. But adding partitions changes the key mapping, so ordering for a key is broken at the switch moment. Plan partitions up front from throughput (target / per-consumer rate), and watch per-partition skew from hot keys.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mechanism (hash mod N), consequence (order per key, parallelism = partitions), the trap (adding partitions remaps keys), then how you size it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you add partitions safely for an ordered topic? (create a new topic and migrate, or drain then switch)</li><li>What if one key is 30% of traffic?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="kafka" data-company="Walmart,Flipkart">
+          <summary>How do you make sure related events go to the same partition?</summary>
+          <div class="answer">
+            <p>Give them the same message key (for example order ID or user ID), so the default partitioner sends them to the same partition. If "related" spans several IDs, choose the entity whose order matters (the order, not the user) or write a custom partitioner. Keep the partition count stable. With a null key, Kafka spreads records with a sticky partitioner and gives no ordering.</p>
+            <div class="approach"><h5>How to answer</h5><p>One sentence on keys, one on choosing the right key, one on the partition-count caveat.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does retry ever reorder messages within a partition? (not with idempotence and max.in.flight &lt;= 5)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Amazon">
+          <summary>How do you persist messages safely and handle failed ones?</summary>
+          <div class="answer">
+            <p>Persistence: RF 3 across zones, min.insync.replicas 2, acks=all, idempotent producer, unclean leader election off. Failed processing: the consumer retries a few times in-process for transient errors, then publishes the message to a delayed retry topic and commits the original offset; after N attempts it goes to a dead-letter topic with error headers, which is alerted on and can be replayed after a fix. Consumers must be idempotent, because at-least-once means duplicates.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split it into two halves: "safe in the broker" and "safe through processing". Interviewers often mean the second.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you keep order for a key if one of its messages goes to retry?</li><li>How do you replay the DLQ?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Google,Microsoft">
+          <summary>Explain ISR, high watermark and min.insync.replicas.</summary>
+          <div class="answer">
+            <p>ISR is the set of replicas caught up with the leader within replica.lag.time.max.ms. The high watermark is the smallest log-end offset in the ISR; records below it are on all in-sync replicas and visible to consumers. With acks=all the leader acks once all ISR members have the record; min.insync.replicas sets the smallest ISR size allowed to accept such writes. RF 3 and min ISR 2 tolerate one broker loss with no data loss and still accept writes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define each term in one line, then show how they combine in the RF 3 / min ISR 2 example.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can acks=all with min ISR 1 still lose data?</li><li>What is unclean leader election?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Google">
+          <summary>Why pull instead of push for consumers?</summary>
+          <div class="answer">
+            <p>Pull lets each consumer go at its own speed and gives natural backpressure: a slow consumer just fetches less, the broker never buffers per-consumer state. It also enables large batched fetches and replay from any offset. The downside, busy-polling an empty topic, is solved with long polling (fetch.min.bytes, fetch.max.wait.ms).</p>
+            <div class="approach"><h5>How to answer</h5><p>Name backpressure in the first sentence; connect it to TCP flow control if you like.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>When is push better? (low-latency fan-out to many clients, like notifications)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Microsoft,Walmart">
+          <summary>Is exactly-once really possible?</summary>
+          <div class="answer">
+            <p>Within Kafka, yes: the idempotent producer removes retry duplicates, transactions make writes to many partitions plus the consumer's offset commit atomic, and read_committed consumers skip aborted data. That gives exactly-once for read-process-write pipelines inside Kafka. For external side effects (DB, email, payment), Kafka cannot undo them, so you need idempotent sinks: upserts keyed by message ID, idempotency keys, or the outbox pattern.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Yes inside the boundary, no outside it, and here is what you do outside." That structure is the whole answer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is a zombie producer and how is it fenced?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon">
+          <summary>A consumer group has 10 partitions and 15 consumers. What happens? And with 10 partitions and 3 consumers?</summary>
+          <div class="answer">
+            <p>15 consumers: 10 get one partition each, 5 are idle standbys that take over during a rebalance if someone leaves. 3 consumers: each gets 3 or 4 partitions. Throughput scales with consumers only up to the partition count. Share groups (Kafka 4.2+) remove this limit for queue-style work, at the cost of per-partition ordering.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give both cases with numbers, then mention share groups as the modern escape hatch.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does a rebalance affect processing, and how do you reduce its impact?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Google,Microsoft">
+          <summary>How does a consumer find message offset 368,800 quickly?</summary>
+          <div class="answer">
+            <p>Segment files are named by their base offset, so a binary search over segment names finds the file. Its sparse .index maps some offsets to byte positions; a binary search there finds the nearest entry at or below 368,800, and the broker scans forward a few KB. Replay by time uses the .timeindex to turn a timestamp into an offset first.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the three-level lookup; mention why the index is sparse (small enough to stay in memory, mmapped).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not a dense index? (size: one entry per record would be huge and rarely needed)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="5" data-topic="kafka" data-company="Walmart,Google">
+          <summary>Retention is 7 days and the cluster is out of disk. What are your options?</summary>
+          <div class="answer">
+            <p>Short term: lower retention on the biggest topics (with owners' agreement), check for a topic someone forgot to set retention or compaction on, enable or raise compression. Medium term: tiered storage, keeping only a day locally and the rest in object storage. Long term: add brokers and reassign partitions (Cruise Control). Also confirm the math: retention x ingress x RF; disk is usually what decides size.</p>
+            <div class="approach"><h5>How to answer</h5><p>Triage now, fix structurally later, show the formula.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What are the limits of tiered storage? (compacted topics cannot be tiered)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="5" data-topic="kafka" data-company="Amazon,Microsoft">
+          <summary>What happens if the controller quorum goes down?</summary>
+          <div class="answer">
+            <p>Brokers keep serving reads and writes for partitions whose leaders are alive; the data plane does not depend on the controller per request. What stops: leader elections (so a broker failure now makes its partitions unavailable), topic creation, config changes and ISR updates. With 3 controllers the quorum survives one loss; with 5, two. Run controllers on separate machines and zones.</p>
+            <div class="approach"><h5>How to answer</h5><p>Control plane vs data plane, then what you lose, then quorum math (n-1)/2.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why did Kafka move from ZooKeeper to KRaft?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="5" data-topic="kafka" data-company="Walmart,Amazon">
+          <summary>Design a "notify me when my request is provisioned" feature on top of your queue.</summary>
+          <div class="answer">
+            <p>The provisioning service writes a <code>request.provisioned</code> event (key = request ID) to a topic, using the outbox pattern so the DB state change and the event cannot disagree. A notification consumer group reads it, looks up the user's channels, and sends email or push with an idempotency key (the event ID) so retries do not double-notify. Failures go to retry topics and a DLQ. Lag on the notification group is the "time to notify" SLO metric.</p>
+            <div class="approach"><h5>How to answer</h5><p>Reported as a Walmart follow-up; show you can use the queue you just designed, end to end.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid notifying twice after a consumer crash?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: consumer lag keeps growing during a sale</h4>
+          <div class="situation"><p>The order-processing group's lag grows from 0 to 2 million in an hour. Brokers look healthy.</p></div>
+          <div class="bad"><p>Weak answer: "Add more partitions."</p></div>
+          <div class="good"><p>Strong answer: lag growing with healthy brokers means consumers are slower than producers. Check per-partition lag: if it is one partition, it is a hot key or a poison message (a stuck offset). If it is all partitions, check processing time per record (a slow database call), rebalance churn, and whether consumers &lt; partitions (then add consumers, which is instant). Adding partitions is last, because it remaps keys. Short-term relief: batch DB writes, move slow side effects out of the critical path.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Lag in messages or in seconds: which do you alert on?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: messages lost after a broker failure</h4>
+          <div class="situation"><p>A broker's disk failed; afterwards a team reports missing orders that their producer had received acks for.</p></div>
+          <div class="bad"><p>Weak answer: "Kafka is not reliable."</p></div>
+          <div class="good"><p>Strong answer: check the configs. Likely <code>acks=1</code> (the leader acked before followers copied), or <code>min.insync.replicas=1</code> with a shrunken ISR, or <code>unclean.leader.election.enable=true</code>, or RF 1. Fix: RF 3 across zones, min ISR 2, acks=all, idempotence, unclean election off, and alert on under-min-ISR partitions. Recover the missing data from the source system or outbox.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does that configuration cost you in availability?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: every deploy causes a 30-second processing pause</h4>
+          <div class="situation"><p>On Kubernetes, each rolling update of a 20-pod consumer group stalls all processing several times.</p></div>
+          <div class="bad"><p>Weak answer: "Deploy at night."</p></div>
+          <div class="good"><p>Strong answer: each pod restart triggers a rebalance, and with eager rebalancing every consumer gives up every partition. Use static membership (<code>group.instance.id</code> set to the pod name, with a session timeout longer than a restart), cooperative or KIP-848 incremental rebalancing (<code>group.protocol=consumer</code>), and close consumers cleanly on SIGTERM so partitions are handed over quickly.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why does a StatefulSet help with static membership? (stable pod names)</li></ul></div>
+        </div>
+      

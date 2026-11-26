@@ -1,0 +1,39 @@
+
+        <h2>Under the hood: how the service images are built</h2>
+        <p>All four service images follow the same multi-stage pattern. Here is the real <a href="{{BASE}}data/files/pipeline/code/services/order-api/Dockerfile"><code>order-api/Dockerfile</code></a>:</p>
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+# Stage 1 "builder": install dependencies into a virtualenv (has pip, caches).
+FROM python:3.12-slim AS builder
+ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN python -m venv /venv
+COPY order-api/requirements.txt /tmp/requirements.txt
+RUN /venv/bin/pip install -r /tmp/requirements.txt
+
+# Stage 2 "runtime": only the venv + our code. No compilers, no pip cache.
+FROM python:3.12-slim
+ENV PATH=/venv/bin:$PATH PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
+# Run as an unprivileged user (uid 10001), never as root.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+COPY --from=builder /venv /venv
+WORKDIR /app
+COPY common/shopstream_common.py ./
+COPY order-api/*.py ./
+USER 10001
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]</code></pre>
+        <ul>
+          <li><b>Build context is <code>services/</code></b> (<code>build: {context: ./services, dockerfile: order-api/Dockerfile}</code>), so the shared <code>common/shopstream_common.py</code> can be copied into every image.</li>
+          <li><b>Requirements are copied before code.</b> Editing <code>app.py</code> does not invalidate the slow <code>pip install</code> layer. See <a href="{{BASE}}devops/docker-02">Images &amp; Layers</a> for why order matters.</li>
+          <li><b><code>--host 0.0.0.0</code></b>, not <code>127.0.0.1</code>. Inside a container, localhost is the container's own loopback; binding there makes the app unreachable through the published port. This is the number one "works on my laptop, not in Docker" bug.</li>
+          <li><b>Non-root user 10001.</b> If someone breaks into the process, they are not root in the container. <a href="{{BASE}}devops/docker-09">Production &amp; Security</a> covers more.</li>
+          <li><b><code>PYTHONUNBUFFERED=1</code></b> makes logs appear immediately in <code>docker compose logs</code> instead of sitting in a buffer.</li>
+          <li><b>The enricher image runs two programs.</b> <code>retry-worker</code> reuses <code>shopstream/enricher:dev</code> with <code>command: ["python", "retry_worker.py"]</code>. One image, two roles.</li>
+        </ul>
+
+        <h3>Graceful shutdown</h3>
+        <p>When you run <code>docker compose stop</code> or <code>down</code>, Docker sends <code>SIGTERM</code>, waits (10 s by default), then <code>SIGKILL</code>. Ten seconds is too short for us: the order-api flushes for up to 15 s, and an enricher batch with <code>PROCESSING_DELAY_MS=50</code> can take 200 x 50 ms = 10 s. So <code>docker-compose.yml</code> sets <code>stop_grace_period: 30s</code> on the five services, to match Kubernetes' <code>terminationGracePeriodSeconds</code>. Every ShopStream consumer installs a <code>GracefulExit</code> handler that flips a flag; the loop finishes its current batch, commits, and calls <code>consumer.close()</code>, which tells the group coordinator "I am leaving" so the rebalance starts immediately instead of after the 45 s session timeout. The order-api flushes its producer buffer for up to 15 s on shutdown so in-flight orders are not lost. Kubernetes uses the same signal sequence, which is why page 04 needs no code change.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the same discipline as a line-card driver's remove path: stop taking new work, drain the rings, write back state, then release resources. A hard kill (<code>SIGKILL</code>, like yanking the card) skips all of that, and the cluster only notices through a timeout (the 45 s session timeout here, like a BFD or hello dead interval). Where it breaks: a driver's remove path has no deadline, but a container's does. If draining takes longer than the grace period, <code>SIGKILL</code> arrives mid-drain, exactly like a hot-swap with no wait.</p>
+        </div>
+      

@@ -1,0 +1,82 @@
+
+  <h2>Interview follow-ups</h2>
+  <details class="qa" data-level="3" data-topic="lld" data-company="Uber">
+    <summary>How do keys expire? Do you need a thread per key or a background job?</summary>
+    <div class="answer">
+      <p>No thread per key. Each entry stores an absolute <code>expiresAt</code>. Every read checks it, so an expired key is invisible at the exact deadline (lazy, or passive, expiry). Keys nobody reads would still sit in memory, so a min-heap of (expiresAt, key, version) lets a sweep pop only the keys that are due, in time order; we run a bounded batch on every write, and a scheduler can call it too. Redis documents the same two mechanisms, passive on access and active sampling in the background.</p>
+      <div class="approach"><h5>How to answer</h5><p>Correctness from the lazy check, memory from the active sweep, cost proportional to expired keys.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a key is rewritten before its old deadline? (Version on the heap item.)</li><li>Millions of TTLs? (Timing wheel.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Uber">
+    <summary>Count active keys in O(1), with keys arriving as (key, timestamp) in time order.</summary>
+    <div class="answer">
+      <p>Because timestamps arrive in increasing order, a plain FIFO queue of (timestamp, key) is already sorted by expiry (timestamp + TTL), so no heap is needed. Keep a map key to count and a global total. On every call, first pop from the head while the head has expired, decrementing that key's count and the total. Then answer from the counters. Each event is pushed once and popped once, so the cost is amortised O(1). This matches what the 2025 Uber interviewer asked for instead of a queue per key.</p>
+      <div class="approach"><h5>How to answer</h5><p>Spot the sorted input, use one global queue, counters, amortised analysis.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Timestamps out of order? (Heap instead of queue.)</li><li>Thread safety? (One lock, tiny sections, or a single writer thread.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="3" data-topic="lld" data-company="Razorpay,Salesforce">
+    <summary>How do nested transactions work? What does rollback undo?</summary>
+    <div class="answer">
+      <p>Each client session has a stack of maps. <code>begin</code> pushes an empty map; writes go to the top map; a delete writes a tombstone. Reads look from the top map down, then at the store. <code>rollback</code> pops the top map only. <code>commit</code> of an inner transaction merges the top map into the one below; the outermost commit sends the whole map to the store, which applies it atomically under the write lock.</p>
+      <div class="approach"><h5>How to answer</h5><p>Draw the stack; show the tombstone; say who sees what when.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Layers vs undo log?</li><li>What about two clients?</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Razorpay">
+    <summary>Write-set layers or an undo log: which would you choose?</summary>
+    <div class="answer">
+      <p>Layers keep uncommitted data private and make rollback free (drop a map), at the cost of a short walk on reads inside a transaction. An undo log writes in place and records inverses; reads are direct and commit is free, but rollback replays the log and, without locks, other clients see uncommitted values (dirty reads). For a multi-client store I pick layers; an undo log fits a single-user editor or a database that also holds row locks until commit.</p>
+      <div class="approach"><h5>How to answer</h5><p>Compare visibility, rollback cost, read cost, commit cost.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does a real database do it? (Write-ahead log for durability plus locks or MVCC for isolation.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Uber,Salesforce">
+    <summary>Two clients read a balance, both add 10 and commit. How do you prevent the lost update?</summary>
+    <div class="answer">
+      <p>Each entry has a version that changes on every write. A transaction records the version of every key it reads from the store. At commit, under the write lock, the store checks those versions are unchanged; if one moved, it throws <code>ConflictException</code> and applies nothing. The second client retries with the fresh value. Our 8-thread test does 4,000 increments this way and ends at exactly 4000. The pessimistic alternative is locking keys on first access until commit, with ordering to avoid deadlock.</p>
+      <div class="approach"><h5>How to answer</h5><p>Name the anomaly, show the version check, mention retries and the lock-based alternative.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why do blind writes not conflict?</li><li>A very hot key? (Atomic incr, or sharded counters.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Uber">
+    <summary>Why does get() not delete an expired key it finds?</summary>
+    <div class="answer">
+      <p>Reads hold the shared read lock so they can run in parallel. Deleting needs the write lock, and a <code>ReentrantReadWriteLock</code> read lock cannot be upgraded to a write lock (the thread would wait for itself). So get just reports the key as absent; the next write's purge or the scheduled sweep removes it. Correctness does not depend on when that happens. In a single-threaded store, deleting on read is fine and is what Redis does.</p>
+      <div class="approach"><h5>How to answer</h5><p>Correctness vs cleanup, and the lock-upgrade rule.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would <code>StampedLock</code> help? (It has a tryConvertToWriteLock, but more complex code.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="3" data-topic="lld" data-company="Salesforce">
+    <summary>Implement snapshot and restore. Which pattern, and what does it cost?</summary>
+    <div class="answer">
+      <p>Memento: <code>snapshot()</code> returns an object whose state only the store can read; the caller (caretaker) just keeps it and hands it back to <code>restore()</code>. Because entries are immutable records, the snapshot copies only the map of references, O(n) time and memory for n keys, no deep copy. Expiry times are absolute, so a key that expired meanwhile is still dead after restore. Restore writes new versions, so open transactions that read affected keys will conflict instead of committing on stale data. For large stores use copy-on-write or a persistent (immutable) map so a snapshot is O(1).</p>
+      <div class="approach"><h5>How to answer</h5><p>Opaque memento, cost, TTL semantics, interaction with transactions.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Memento vs Command for undo?</li><li>Snapshots to disk without pausing writes? (Fork-style copy-on-write, as Redis does for its RDB file.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Uber">
+    <summary>A key is set with a 5 s TTL, then rewritten with 60 s. What stops the sweep from deleting it at 5 s?</summary>
+    <div class="answer">
+      <p>Every heap item carries the version of the write that created it. At 5 s the sweep pops the old item, compares its version with the entry's current version, sees they differ, and drops the heap item without touching the key. This is lazy deletion from the heap: removing the old item at rewrite time would cost O(n) in a binary heap. The price is extra heap items; if keys are rewritten very often, compact the heap when stale items exceed, say, half of it.</p>
+      <div class="approach"><h5>How to answer</h5><p>The bug, the version, the trade-off.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could an indexed heap work? (Yes: store each key's heap index for O(log n) decrease-key.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="3" data-topic="lld" data-company="Razorpay">
+    <summary>Turn this into an in-memory database with tables and an index.</summary>
+    <div class="answer">
+      <p>A <code>Database</code> holds named <code>Table</code>s; a table has a schema (column names and types, validated on insert), rows by an auto-increment id, and optional secondary indexes (map from column value to the set of row ids). Insert, update and delete change the row map and every index in the same write-locked step. Queries on an indexed column use the index; others scan. The transaction layers from this page work unchanged if the key is "table:id".</p>
+      <div class="approach"><h5>How to answer</h5><p>Reuse the KV core, add schema validation and index maintenance, keep writes atomic.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Unique index? Range queries? (TreeMap index.)</li></ul></div>
+    </div>
+  </details>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Uber,Salesforce">
+    <summary>How would you make it scale on a 32-core box?</summary>
+    <div class="answer">
+      <p>One read-write lock becomes the bottleneck for writes. Shard the key space: N independent stores (say 64), each with its own lock, heap and version counter, chosen by key hash. Single-key operations scale almost linearly. Transactions touching one shard stay as they are; cross-shard transactions need all involved shard locks taken in shard order at commit (or two-phase commit if shards are separate processes). Alternatively, like Redis, run each shard single-threaded behind a queue and avoid locks entirely.</p>
+      <div class="approach"><h5>How to answer</h5><p>Find the contention point, shard it, then say what happens to cross-shard transactions.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is <code>ConcurrentHashMap</code> enough? (For single-key ops yes; not for atomic multi-key commit plus heap.)</li></ul></div>
+    </div>
+  </details>

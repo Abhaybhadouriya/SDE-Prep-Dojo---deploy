@@ -1,0 +1,137 @@
+
+        <h2>Kafka Streams inside: tasks, state stores, changelogs</h2>
+        <p>Kafka Streams is "just a library". You add a JAR to your Spring Boot or plain Java service, describe a <strong>topology</strong> (a graph of steps), and start it. There is no Streams cluster to run. To scale, you start more copies of your service with the same <code>application.id</code>; they form a group and split the work, the same way consumers in a group split partitions. That makes it ideal for "processing inside a microservice".</p>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Orders per city (Java)">
+<pre><code class="language-java">Properties p = new Properties();
+p.put(StreamsConfig.APPLICATION_ID_CONFIG, "order-stats");         // group id + prefix of internal topics
+p.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "kafka:9092");
+p.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+p.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+p.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.StringSerde.class);
+
+StreamsBuilder b = new StreamsBuilder();
+KStream&lt;String, String&gt; orders = b.stream("orders");             // key = orderId, value = city
+
+orders
+  .filter((orderId, city) -&gt; city != null)
+  .groupBy((orderId, city) -&gt; city)                                // re-key by city -&gt; repartition topic
+  .windowedBy(TimeWindows.ofSizeAndGrace(Duration.ofMinutes(1), Duration.ofSeconds(30)))
+  .count(Materialized.as("orders-per-city"))                        // RocksDB store + changelog topic
+  .toStream()
+  .map((win, count) -&gt; KeyValue.pair(win.key() + "@" + win.window().startTime(), count.toString()))
+  .to("orders.stats");
+
+KafkaStreams app = new KafkaStreams(b.build(), p);
+Runtime.getRuntime().addShutdownHook(new Thread(app::close));
+app.start();</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Join a stream to a table">
+<pre><code class="language-java">// Enrich every payment with the latest customer record (a KTable from a compacted topic)
+KTable&lt;String, Customer&gt; customers = b.table("customers");          // key = customerId
+KStream&lt;String, Payment&gt; payments = b.stream("payments");          // key MUST be customerId too
+
+payments
+  .join(customers, (pay, cust) -&gt; new EnrichedPayment(pay, cust.tier(), cust.country()))
+  .to("payments.enriched");
+// Both topics must be co-partitioned: same key and the same number of partitions,
+// otherwise Streams refuses to start (or you must repartition first).</code></pre>
+          </div>
+        </div>
+
+        <h3>What the library builds for you</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 360" role="img" aria-label="Kafka Streams: input partitions map to tasks across two app instances, each task with a RocksDB store backed by a changelog partition">
+            <rect class="zone kafka" x="20" y="20" width="150" height="320"/>
+            <text class="zone-label" x="30" y="42">orders (4 partitions)</text>
+            <rect class="box kafka" x="35" y="60" width="120" height="36"/><text class="label small" x="95" y="83">P0</text>
+            <rect class="box kafka" x="35" y="110" width="120" height="36"/><text class="label small" x="95" y="133">P1</text>
+            <rect class="box kafka" x="35" y="160" width="120" height="36"/><text class="label small" x="95" y="183">P2</text>
+            <rect class="box kafka" x="35" y="210" width="120" height="36"/><text class="label small" x="95" y="233">P3</text>
+
+            <rect class="zone k8s" x="200" y="20" width="380" height="150"/>
+            <text class="zone-label" x="210" y="42">App instance A (pod order-stats-0)</text>
+            <rect class="box svc" x="215" y="55" width="170" height="100"/><text class="label" x="300" y="78">Task 0_0</text>
+            <rect class="box cache" x="230" y="95" width="140" height="44"/><text class="label small" x="300" y="122">RocksDB store</text>
+            <rect class="box svc" x="395" y="55" width="170" height="100"/><text class="label" x="480" y="78">Task 0_1</text>
+            <rect class="box cache" x="410" y="95" width="140" height="44"/><text class="label small" x="480" y="122">RocksDB store</text>
+
+            <rect class="zone k8s" x="200" y="190" width="380" height="150"/>
+            <text class="zone-label" x="210" y="212">App instance B (pod order-stats-1)</text>
+            <rect class="box svc" x="215" y="225" width="170" height="100"/><text class="label" x="300" y="248">Task 0_2</text>
+            <rect class="box cache" x="230" y="265" width="140" height="44"/><text class="label small" x="300" y="292">RocksDB store</text>
+            <rect class="box svc" x="395" y="225" width="170" height="100"/><text class="label" x="480" y="248">Task 0_3</text>
+            <rect class="box cache" x="410" y="265" width="140" height="44"/><text class="label small" x="480" y="292">RocksDB store</text>
+
+            <path class="arrow" d="M155 78 L213 90"/>
+            <path class="arrow" d="M155 128 L393 90"/>
+            <path class="arrow" d="M155 178 L213 260"/>
+            <path class="arrow" d="M155 228 L393 260"/>
+
+            <rect class="zone kafka" x="610" y="20" width="170" height="320"/>
+            <text class="zone-label" x="620" y="42">internal topics</text>
+            <rect class="box kafka" x="620" y="70" width="150" height="50"/><text class="label small" x="695" y="92">...-changelog</text><text class="label small" x="695" y="110">(compacted)</text>
+            <rect class="box kafka" x="620" y="150" width="150" height="50"/><text class="label small" x="695" y="172">...-repartition</text><text class="label small" x="695" y="190">(re-keyed data)</text>
+            <rect class="box kafka" x="620" y="240" width="150" height="50"/><text class="label small" x="695" y="270">orders.stats</text>
+            <path class="arrow dashed" d="M550 117 L618 95"/>
+            <path class="arrow dashed" d="M550 287 L618 105"/>
+            <circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M370 117 L620 95"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3.4s" repeatCount="indefinite" path="M550 287 L620 100"/></circle>
+          </svg>
+          <figcaption>One task per input partition. Tasks are spread over instances and threads (<code>num.stream.threads</code>). Every write to a local store is also written to a changelog partition, so another instance can rebuild the store.</figcaption>
+        </figure>
+        <ul>
+          <li><strong>Task</strong>: the unit of parallelism, one per input partition (per sub-topology). With 4 partitions, at most 4 tasks do useful work, so a fifth instance would sit idle. Partition count caps your parallelism, just like with plain consumers.</li>
+          <li><strong>State store</strong>: by default RocksDB on local disk (or in-memory). Fast local reads and writes.</li>
+          <li><strong>Changelog topic</strong> <code>&lt;application.id&gt;-&lt;store&gt;-changelog</code>: compacted, receives every store update. This is the store's backup.</li>
+          <li><strong>Repartition topic</strong>: created when you change the key (<code>groupBy</code>, <code>selectKey</code> before an aggregation or join). Records are written out and read back so that all records with the new key land in the same task. This costs a network round trip and storage; avoid needless re-keying.</li>
+          <li><strong>Standby replicas</strong> (<code>num.standby.replicas=1</code>): another instance keeps a warm copy of a store by reading its changelog, so failover does not wait for a full restore.</li>
+          <li><strong>Exactly-once</strong> (<code>processing.guarantee=exactly_once_v2</code>): reading input, updating the store's changelog, writing output and committing offsets all happen in one Kafka transaction. See <a href="{{BASE}}devops/kafka-06">delivery semantics</a>. It is exactly-once <em>inside Kafka</em>; a side effect like calling an email API is still at-least-once.</li>
+        </ul>
+
+        <h3>What happens when an instance dies</h3>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Kafka Streams failover: tasks move, store restored from changelog">
+            <rect class="box svc" x="40" y="40" width="200" height="90"/><text class="label" x="140" y="65">Instance A</text>
+            <text class="label small" x="140" y="90">tasks 0_0, 0_1</text>
+            <rect class="box svc" x="40" y="170" width="200" height="90"/><text class="label" x="140" y="195">Instance B</text>
+            <text class="label small" x="140" y="220">tasks 0_2, 0_3</text>
+            <rect class="box kafka" x="560" y="110" width="200" height="70"/><text class="label" x="660" y="140">changelog</text><text class="label small" x="660" y="162">partitions 0..3</text>
+
+            <g data-step-only="1">
+              <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M240 85 L560 130"/></circle>
+              <circle class="packet alt" r="6"><animateMotion dur="2.3s" repeatCount="indefinite" path="M240 215 L560 160"/></circle>
+            </g>
+            <g data-step="2">
+              <rect class="box fail" x="40" y="170" width="200" height="90"/>
+              <text class="label bad" x="140" y="210">Instance B down</text>
+              <text class="label small bad" x="140" y="235">heartbeats stop</text>
+            </g>
+            <g data-step="3">
+              <text class="label small" x="140" y="112">+ tasks 0_2, 0_3</text>
+              <path class="arrow ok" d="M140 168 L140 134"/>
+              <text class="label small" x="330" y="150">group rebalance</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M558 140 L242 100"/>
+              <text class="label small" x="400" y="100">replay changelog into RocksDB</text>
+              <circle class="packet gold" r="6"><animateMotion dur="1.8s" repeatCount="indefinite" path="M560 140 L240 100"/></circle>
+            </g>
+            <g data-step-only="5">
+              <rect class="box highlight" x="300" y="210" width="460" height="60"/>
+              <text class="label" x="530" y="235">Restore time = size of changelog to replay</text>
+              <text class="label small" x="530" y="257">standby replicas make it near-instant</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Normal.</b> Each instance owns two tasks, keeps their stores in RocksDB and streams every update to the changelog.</li>
+            <li><b>Failure.</b> Instance B's pod is killed. After the session timeout (or immediately on a clean shutdown) the group notices.</li>
+            <li><b>Rebalance.</b> The group coordinator moves tasks 0_2 and 0_3 to instance A. With the new Streams rebalance protocol (KIP-1071, GA in Kafka 4.2, <code>group.protocol=streams</code>) the broker drives this assignment.</li>
+            <li><b>Restore.</b> Instance A rebuilds the two missing stores by reading their changelog partitions from the start (compaction keeps this bounded). Processing for those tasks waits until the restore is done.</li>
+            <li><b>Lesson.</b> Big state means slow failover. Use standby replicas, keep stores small (windows with retention), and on Kubernetes use a StatefulSet with persistent volumes so a restarted pod finds its RocksDB files and replays only the tail.</li>
+          </ol>
+        </div>
+
+        <div class="callout tip"><p><b>Your question answered: "How do I replay data if I find a bug in my consumer?"</b> For a plain consumer group: stop it, then <code>kafka-consumer-groups.sh --reset-offsets --to-datetime ... --execute</code>, fix the bug, restart. For a Streams app, local state and internal topics also need resetting: use <code>kafka-streams-application-reset.sh --application-id order-stats --input-topics orders --bootstrap-server kafka:9092</code>, delete local state (<code>KafkaStreams#cleanUp()</code>), then restart. Make the output idempotent (upserts) so re-processed results overwrite old ones. Replay only works if input retention still covers the period, which is a good reason for longer retention or <a href="{{BASE}}devops/kafka-07">tiered storage</a>.</p></div>
+      

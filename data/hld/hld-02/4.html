@@ -1,0 +1,87 @@
+
+        <h2>Rate limiting algorithms</h2>
+        <div class="eli5">
+          <h4>Explain like I'm 5</h4>
+          <p>A cookie jar holds at most 5 cookies, and one new cookie drops in every minute. You may eat a cookie only if one is in the jar. You can eat 5 quickly at a party (a burst), but after that you get only one a minute.</p>
+        </div>
+        <p>A <strong><a href="{{BASE}}interview/glossary#rate-limiter">rate limiter</a></strong> caps how many requests a caller (a user, an API key, an IP) may make in a time period. It protects the service from one noisy caller, from bots and from accidental retry storms. When a caller is over the limit, the server replies <b>HTTP 429 Too Many Requests</b> (defined in RFC 6585), ideally with a <code>Retry-After</code> header.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Token bucket: tokens drip in at a fixed rate, each request takes one">
+            <rect class="box queue" x="40" y="20" width="160" height="44"/><text class="label" x="120" y="42">refill: 1 token/s</text>
+            <path class="box kafka" d="M60 90 L80 250 L160 250 L180 90 Z"/>
+            <text class="label small" x="120" y="270">bucket, capacity 5</text>
+            <circle class="packet gold" r="9" cx="120" cy="230"/><circle class="packet gold" r="9" cx="120" cy="208"/><circle class="packet gold" r="9" cx="120" cy="186"/>
+            <circle class="packet gold" r="8"><animateMotion dur="2s" repeatCount="indefinite" path="M120 64 L120 160"/></circle>
+            <rect class="box client" x="300" y="70" width="150" height="50"/><text class="label" x="375" y="95">request 1</text>
+            <rect class="box client" x="300" y="150" width="150" height="50"/><text class="label" x="375" y="175">request 2</text>
+            <path class="arrow" d="M300 95 L190 180"/><path class="arrow" d="M300 175 L190 200"/>
+            <rect class="box svc hot" x="540" y="70" width="230" height="50"/><text class="label ok" x="655" y="95">token taken -&gt; 200 OK</text>
+            <rect class="box fail" x="540" y="150" width="230" height="50"/><text class="label bad" x="655" y="175">bucket empty -&gt; 429</text>
+            <path class="arrow ok" d="M450 95 L532 95"/><path class="arrow bad" d="M450 175 L532 175"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M300 95 L190 180 L190 180 L540 95"/></circle>
+          </svg>
+          <figcaption>Token bucket. Tokens drip in at the refill rate up to the capacity. A request spends one token. Capacity sets the allowed burst; refill rate sets the long-run average.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Algorithm</th><th>How it works</th><th>Strength</th><th>Weakness</th><th>Seen in</th></tr></thead>
+            <tbody>
+              <tr><td>Token bucket</td><td>Bucket of B tokens, refilled at r per second; each request takes 1</td><td>Allows short bursts, smooth average, 2 numbers per key</td><td>Two knobs to tune</td><td>Stripe's main limiter, AWS API Gateway</td></tr>
+              <tr><td>Leaky bucket</td><td>Requests join a queue that drains at a fixed rate</td><td>Perfectly smooth output</td><td>Bursts wait or drop; adds latency</td><td>NGINX <code>limit_req</code></td></tr>
+              <tr><td>Fixed window counter</td><td><code>INCR user:42:1430</code> for each minute; reset each minute</td><td>Simplest, one counter</td><td>2x burst at the boundary (100 at 14:30:59 + 100 at 14:31:00)</td><td>Quick internal limits</td></tr>
+              <tr><td>Sliding window log</td><td>Store every request timestamp; count those in the last 60 s</td><td>Exact</td><td>Memory grows with traffic</td><td>Low-volume, strict limits</td></tr>
+              <tr><td>Sliding window counter</td><td>current count + previous window count x overlap fraction</td><td>Cheap (2 counters) and close to exact</td><td>An approximation</td><td>Cloudflare</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Run the token bucket in your head with this tiny simulation (capacity 5, 1 token per second, 8 requests arrive at once, then one per second):</p>
+<pre><code class="language-python">class TokenBucket:
+    def __init__(self, capacity, refill_per_sec):
+        self.capacity = capacity
+        self.rate = refill_per_sec
+        self.tokens = capacity
+        self.last = 0.0
+    def allow(self, now):
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens &gt;= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+b = TokenBucket(capacity=5, refill_per_sec=1)
+for t in [0]*8 + [1, 2, 3]:
+    print(f"t={t}s allowed={b.allow(t)} tokens_left={b.tokens:.0f}")</code></pre>
+<pre class="terminal" data-title="python tb.py"><code>$ python tb.py
+t=0s allowed=True tokens_left=4
+t=0s allowed=True tokens_left=3
+t=0s allowed=True tokens_left=2
+t=0s allowed=True tokens_left=1
+t=0s allowed=True tokens_left=0
+t=0s allowed=False tokens_left=0
+t=0s allowed=False tokens_left=0
+t=0s allowed=False tokens_left=0
+t=1s allowed=True tokens_left=0
+t=2s allowed=True tokens_left=0
+t=3s allowed=True tokens_left=0</code></pre>
+        <h3>Distributed: many servers, one limit</h3>
+        <p>With 50 API servers behind a load balancer, each server's local bucket only sees 1/50 of a user's traffic. So the counters go in a shared, fast store - usually Redis. The read-refill-decrement must be <b>atomic</b>, or two servers read "1 token left" at the same moment and both allow. Redis runs a Lua script atomically, so the whole check is one step:</p>
+<pre><code class="language-lua">-- KEYS[1] = bucket key, ARGV = capacity, refill_per_sec, now_ms
+local cap  = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now  = tonumber(ARGV[3])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or cap
+local ts     = tonumber(b[2]) or now
+tokens = math.min(cap, tokens + (now - ts) / 1000 * rate)
+local allowed = 0
+if tokens &gt;= 1 then tokens = tokens - 1; allowed = 1 end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('PEXPIRE', KEYS[1], math.ceil(cap / rate * 1000) * 2)
+return allowed</code></pre>
+        <p>Two production lessons from Stripe's post on their rate limiters: <b>fail open</b> (if Redis is down, let requests through and alert, rather than taking the whole API down), and dark-launch new limits (log "would have blocked" first). The full design is in <a href="{{BASE}}hld/d02">Distributed Rate Limiter</a>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the token-bucket policer from QoS. Capacity is the committed burst size (CBS), refill rate is the committed information rate (CIR), and a 429 is a "drop" action for exceeding traffic. The leaky bucket is a shaper draining a queue at line rate. You already know how to pick these numbers. <b>Where this breaks:</b> a policer runs on one ASIC with one counter in hardware; a web rate limiter shares its counter across many servers over the network, so it adds a Redis round trip and must decide what to do when that store is unreachable.</p>
+        </div>
+      

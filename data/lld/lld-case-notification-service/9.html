@@ -1,0 +1,351 @@
+
+  <h2>The same design in C++14</h2>
+  <p>One file. A <code>ChannelSender</code> is a struct with one virtual <code>send</code>, the C++ spelling of an ops table; each decorator holds a <code>std::shared_ptr</code> to the sender it wraps (shared so the demo can keep handles to the fake providers and inspect them). The core is single-threaded: <code>processDue()</code> with an injected clock, because MinGW.org g++ 6.3 on this machine has no <code>std::thread</code>. The worker thread would be the same <code>std::condition_variable::wait_until</code> loop as in Java. The demo is shorter (6 checks) but covers dedupe, retry, failover, opt-out, priority, rate limit, scheduling and validation.</p>
+<pre><code class="language-cpp">// Notification service in C++14 (single-threaded core: synchronous processDue with an injected clock).
+// Channel senders are a small virtual interface (like a struct of function pointers); retries, failover
+// and rate limiting are decorators that wrap one. Build: g++ -std=c++14 -O2 -Wall -Wextra main.cpp -o notify
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;queue&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class Channel { EMAIL, SMS, PUSH, IN_APP };
+enum class Priority { HIGH, MEDIUM, LOW };
+enum class Status { SENT, FAILED, SKIPPED_OPT_OUT, NO_ADDRESS, RATE_LIMITED };
+static const char* str(Channel c) { static const char* n[] = {"EMAIL", "SMS", "PUSH", "IN_APP"}; return n[int(c)]; }
+static const char* str(Status s) {
+    static const char* n[] = {"SENT", "FAILED", "SKIPPED_OPT_OUT", "NO_ADDRESS", "RATE_LIMITED"};
+    return n[int(s)];
+}
+using Params = std::map&lt;std::string, std::string&gt;;
+
+struct User {
+    std::string id, name, email, phone, device;      // empty = no address
+    std::string addressFor(Channel c) const {
+        switch (c) {
+            case Channel::EMAIL: return email;
+            case Channel::SMS: return phone;
+            case Channel::PUSH: return device;
+            default: return id;
+        }
+    }
+};
+struct Request {
+    std::string key, userId, templateId;
+    Params params;
+    std::vector&lt;Channel&gt; channels;
+    Priority priority;
+    long sendAt;                                      // seconds on the injected clock
+};
+struct Message { std::string id, userId; Channel channel; std::string to, body; Priority priority; };
+struct Record { std::string id, userId; Channel channel; Status status; std::string detail; };
+
+struct DeliveryError : std::runtime_error {
+    bool retryable;
+    DeliveryError(const std::string&amp; m, bool r = true) : std::runtime_error(m), retryable(r) {}
+};
+struct RateLimited : DeliveryError { explicit RateLimited(const std::string&amp; m) : DeliveryError(m, false) {} };
+
+struct ChannelSender {                                // Strategy
+    virtual ~ChannelSender() = default;
+    virtual std::string send(const Message&amp; m) = 0;  // returns the provider that delivered
+};
+using SenderPtr = std::shared_ptr&lt;ChannelSender&gt;;
+
+struct FakeProvider : ChannelSender {
+    std::string name;
+    int failNext = 0;
+    bool down = false;
+    std::vector&lt;std::string&gt; delivered;
+    explicit FakeProvider(std::string n) : name(std::move(n)) {}
+    std::string send(const Message&amp; m) override {
+        if (down) throw DeliveryError(name + " is down");
+        if (failNext &gt; 0) { --failNext; throw DeliveryError(name + " timeout"); }
+        delivered.push_back(m.to + ": " + m.body);
+        return name;
+    }
+};
+
+struct Retrying : ChannelSender {                     // Decorator
+    SenderPtr inner;
+    int maxAttempts, retries = 0;
+    Retrying(SenderPtr i, int n) : inner(std::move(i)), maxAttempts(n) {}
+    std::string send(const Message&amp; m) override {
+        for (int attempt = 1;; ++attempt) {
+            try { return inner-&gt;send(m); }
+            catch (const DeliveryError&amp; e) {
+                if (!e.retryable || attempt &gt;= maxAttempts) throw;
+                ++retries;                            // a real one sleeps base &lt;&lt; (attempt-1) here
+            }
+        }
+    }
+};
+
+struct Failover : ChannelSender {
+    std::vector&lt;SenderPtr&gt; providers;
+    explicit Failover(std::vector&lt;SenderPtr&gt; p) : providers(std::move(p)) {}
+    std::string send(const Message&amp; m) override {
+        std::string last;
+        for (auto&amp; p : providers) {
+            try { return p-&gt;send(m); } catch (const DeliveryError&amp; e) { last = e.what(); }
+        }
+        throw DeliveryError("all providers failed, last: " + last);
+    }
+};
+
+struct RateLimiting : ChannelSender {                 // Decorator: sliding-window log per user
+    SenderPtr inner;
+    size_t maxPerWindow;
+    long window;
+    std::function&lt;long()&gt; clock;
+    std::map&lt;std::string, std::deque&lt;long&gt;&gt; sentAt;
+    RateLimiting(SenderPtr i, size_t n, long w, std::function&lt;long()&gt; c)
+        : inner(std::move(i)), maxPerWindow(n), window(w), clock(std::move(c)) {}
+    std::string send(const Message&amp; m) override {
+        if (m.priority != Priority::HIGH) {
+            long now = clock();
+            auto&amp; q = sentAt[m.userId];
+            while (!q.empty() &amp;&amp; q.front() &lt;= now - window) q.pop_front();
+            if (q.size() &gt;= maxPerWindow)
+                throw RateLimited(std::to_string(maxPerWindow) + " per " + std::to_string(window) + "s for " + m.userId);
+            q.push_back(now);
+        }
+        return inner-&gt;send(m);
+    }
+};
+
+class Templates {
+public:
+    Templates&amp; add(const std::string&amp; id, Channel c, const std::string&amp; body) { t_[id][c] = body; return *this; }
+    bool exists(const std::string&amp; id) const { return t_.count(id) &gt; 0; }
+    bool supports(const std::string&amp; id, Channel c) const { auto it = t_.find(id); return it != t_.end() &amp;&amp; it-&gt;second.count(c); }
+    std::string render(const std::string&amp; id, Channel c, const Params&amp; p) const {
+        const std::string&amp; b = t_.at(id).at(c);
+        std::string out;
+        for (size_t i = 0; i &lt; b.size(); ++i) {
+            if (b[i] != '{') { out += b[i]; continue; }
+            size_t j = b.find('}', i);
+            std::string var = b.substr(i + 1, j - i - 1);
+            auto it = p.find(var);
+            if (it == p.end()) throw std::invalid_argument("missing {" + var + "} for " + id);
+            out += it-&gt;second;
+            i = j;
+        }
+        return out;
+    }
+private:
+    std::map&lt;std::string, std::map&lt;Channel, std::string&gt;&gt; t_;
+};
+
+class EventBus {                                      // Observer
+public:
+    using Listener = std::function&lt;void(const Params&amp;)&gt;;
+    void subscribe(const std::string&amp; type, Listener l) { l_[type].push_back(std::move(l)); }
+    void publish(const std::string&amp; type, const Params&amp; data) {
+        for (auto&amp; l : l_[type]) {
+            try { l(data); } catch (const std::exception&amp; e) { std::printf("  [bus] listener failed: %s\n", e.what()); }
+        }
+    }
+private:
+    std::map&lt;std::string, std::vector&lt;Listener&gt;&gt; l_;
+};
+
+class NotificationService {
+public:
+    NotificationService(std::function&lt;long()&gt; clock, Templates t) : clock_(std::move(clock)), t_(std::move(t)) {}
+    void addUser(const User&amp; u) { users_[u.id] = u; }
+    void addSender(Channel c, SenderPtr s) { senders_[c] = std::move(s); }
+    void optOut(const std::string&amp; user, Channel c) { optedOut_[user].insert(c); }
+
+    // returns "" when the idempotency key was seen before
+    std::string submit(const Request&amp; r) {
+        if (!users_.count(r.userId)) throw std::invalid_argument("unknown user " + r.userId);
+        if (!t_.exists(r.templateId)) throw std::invalid_argument("unknown template " + r.templateId);
+        for (Channel c : r.channels) if (t_.supports(r.templateId, c)) t_.render(r.templateId, c, r.params);
+        if (!r.key.empty() &amp;&amp; !seen_.insert(r.key).second) return "";
+        Job j{"n" + std::to_string(++seq_), r, seq_};
+        q_.push(j);
+        return j.id;
+    }
+    int processDue() {
+        int n = 0;
+        while (!q_.empty() &amp;&amp; q_.top().req.sendAt &lt;= clock_()) {
+            Job j = q_.top();
+            q_.pop();
+            deliver(j);
+            ++n;
+        }
+        return n;
+    }
+    size_t pending() const { return q_.size(); }
+    std::vector&lt;Record&gt; history;
+private:
+    struct Job { std::string id; Request req; long seq; };
+    struct Later {                                    // priority_queue is a max-heap: "a after b"
+        bool operator()(const Job&amp; a, const Job&amp; b) const {
+            if (a.req.sendAt != b.req.sendAt) return a.req.sendAt &gt; b.req.sendAt;
+            if (a.req.priority != b.req.priority) return a.req.priority &gt; b.req.priority;
+            return a.seq &gt; b.seq;
+        }
+    };
+    void deliver(const Job&amp; j) {
+        const User&amp; u = users_[j.req.userId];
+        for (Channel c : j.req.channels) {
+            Status st;
+            std::string detail, to = u.addressFor(c);
+            if (optedOut_[u.id].count(c)) st = Status::SKIPPED_OPT_OUT;
+            else if (to.empty() || !senders_.count(c) || !t_.supports(j.req.templateId, c)) {
+                st = Status::NO_ADDRESS;
+                detail = std::string("no ") + str(c) + " address";
+            } else {
+                Message m{j.id, u.id, c, to, t_.render(j.req.templateId, c, j.req.params), j.req.priority};
+                try { detail = "via " + senders_[c]-&gt;send(m); st = Status::SENT; }
+                catch (const RateLimited&amp; e) { st = Status::RATE_LIMITED; detail = e.what(); }
+                catch (const DeliveryError&amp; e) { st = Status::FAILED; detail = e.what(); }
+            }
+            history.push_back(Record{j.id, u.id, c, st, detail});
+        }
+    }
+    std::function&lt;long()&gt; clock_;
+    Templates t_;
+    std::map&lt;std::string, User&gt; users_;
+    std::map&lt;std::string, std::set&lt;Channel&gt;&gt; optedOut_;
+    std::map&lt;Channel, SenderPtr&gt; senders_;
+    std::set&lt;std::string&gt; seen_;
+    std::priority_queue&lt;Job, std::vector&lt;Job&gt;, Later&gt; q_;
+    long seq_ = 0;
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::printf("FAILED: %s\n", what); std::exit(1); } ++checks; }
+static size_t printed = 0;
+static std::vector&lt;Record&gt; fresh(const NotificationService&amp; s) {
+    std::vector&lt;Record&gt; out(s.history.begin() + printed, s.history.end());
+    for (auto&amp; r : out)
+        std::printf("  %s: %s %s %s%s%s%s\n", r.userId.c_str(), r.id.c_str(), str(r.channel), str(r.status),
+                    r.detail.empty() ? "" : " (", r.detail.c_str(), r.detail.empty() ? "" : ")");
+    printed = s.history.size();
+    return out;
+}
+
+int main() {
+    long now = 0;
+    auto clock = [&amp;now] { return now; };
+    Templates t;
+    t.add("order_placed", Channel::EMAIL, "Hi {name}, order {orderId} is confirmed. Total Rs {amount}.")
+     .add("order_placed", Channel::SMS, "Order {orderId} confirmed.")
+     .add("order_placed", Channel::PUSH, "Order {orderId} confirmed")
+     .add("seller_new_order", Channel::IN_APP, "New order {orderId}: please pack it")
+     .add("otp", Channel::SMS, "OTP {otp}, valid 5 min")
+     .add("promo", Channel::PUSH, "{name}, 20% off today")
+     .add("rate_order", Channel::EMAIL, "How was order {orderId}?");
+    NotificationService svc(clock, t);
+    svc.addUser(User{"asha", "Asha", "asha@example.com", "+91-90000-00001", "dev-asha"});
+    svc.addUser(User{"ravi", "Ravi", "ravi@example.com", "+91-90000-00002", ""});
+    svc.addUser(User{"seller-7", "Kirana 7", "", "", ""});
+    svc.optOut("ravi", Channel::SMS);
+
+    auto ses = std::make_shared&lt;FakeProvider&gt;("ses");
+    ses-&gt;failNext = 1;
+    auto smsA = std::make_shared&lt;FakeProvider&gt;("sms-A");
+    smsA-&gt;down = true;
+    auto smsB = std::make_shared&lt;FakeProvider&gt;("sms-B");
+    auto email = std::make_shared&lt;Retrying&gt;(ses, 3);
+    svc.addSender(Channel::EMAIL, email);
+    svc.addSender(Channel::SMS, std::make_shared&lt;RateLimiting&gt;(
+        std::make_shared&lt;Retrying&gt;(std::make_shared&lt;Failover&gt;(std::vector&lt;SenderPtr&gt;{smsA, smsB}), 3), 3, 60, clock));
+    svc.addSender(Channel::PUSH, std::make_shared&lt;FakeProvider&gt;("fcm"));
+    svc.addSender(Channel::IN_APP, std::make_shared&lt;FakeProvider&gt;("inbox"));
+
+    EventBus bus;
+    int dupes = 0;
+    auto submit = [&amp;](const Request&amp; r) { if (svc.submit(r).empty()) ++dupes; };
+    bus.subscribe("ORDER_PLACED", [&amp;](const Params&amp; d) {
+        submit(Request{d.at("orderId") + "/placed/customer", d.at("customer"), "order_placed", d,
+                       {Channel::EMAIL, Channel::SMS, Channel::PUSH}, Priority::MEDIUM, 0});
+    });
+    bus.subscribe("ORDER_PLACED", [&amp;](const Params&amp; d) {
+        submit(Request{d.at("orderId") + "/placed/seller", d.at("seller"), "seller_new_order", d,
+                       {Channel::IN_APP}, Priority::MEDIUM, 0});
+    });
+    bus.subscribe("ORDER_DELIVERED", [&amp;](const Params&amp; d) {
+        submit(Request{d.at("orderId") + "/rate", d.at("customer"), "rate_order", d, {Channel::EMAIL},
+                       Priority::LOW, now + 3600});
+    });
+
+    Params o101{{"orderId", "101"}, {"customer", "asha"}, {"name", "Asha"}, {"seller", "seller-7"}, {"amount", "499"}};
+    std::printf("== ORDER_PLACED 101 (published twice) ==\n");
+    bus.publish("ORDER_PLACED", o101);
+    bus.publish("ORDER_PLACED", o101);
+    std::printf("  duplicates suppressed: %d\n", dupes);
+    svc.processDue();
+    auto r1 = fresh(svc);
+    check(dupes == 2 &amp;&amp; r1.size() == 4 &amp;&amp; email-&gt;retries == 1 &amp;&amp; smsB-&gt;delivered.size() == 1, "placed");
+
+    std::printf("== ORDER_PLACED 102 for ravi ==\n");
+    bus.publish("ORDER_PLACED", Params{{"orderId", "102"}, {"customer", "ravi"}, {"name", "Ravi"},
+                                       {"seller", "seller-7"}, {"amount", "120"}});
+    svc.processDue();
+    auto r2 = fresh(svc);
+    check(r2[1].status == Status::SKIPPED_OPT_OUT &amp;&amp; r2[2].status == Status::NO_ADDRESS, "prefs");
+
+    std::printf("== Priority and rate limit ==\n");
+    svc.submit(Request{"", "asha", "promo", {{"name", "Asha"}}, {Channel::PUSH}, Priority::LOW, 0});
+    svc.submit(Request{"", "asha", "otp", {{"otp", "4321"}}, {Channel::SMS}, Priority::HIGH, 0});
+    for (int i = 0; i &lt; 3; ++i)
+        svc.submit(Request{"", "asha", "order_placed", o101, {Channel::SMS}, Priority::MEDIUM, 0});
+    svc.processDue();
+    auto r3 = fresh(svc);
+    check(r3.front().channel == Channel::SMS &amp;&amp; r3.back().channel == Channel::PUSH, "HIGH first, LOW last");
+    check(r3[3].status == Status::RATE_LIMITED, "4th non-urgent SMS limited");
+
+    std::printf("== Scheduling ==\n");
+    bus.publish("ORDER_DELIVERED", o101);
+    int nowCount = svc.processDue();
+    std::printf("  now: delivered %d, pending %d\n", nowCount, static_cast&lt;int&gt;(svc.pending()));
+    now += 3600;
+    int laterCount = svc.processDue();
+    std::printf("  +1h: delivered %d, pending %d\n", laterCount, static_cast&lt;int&gt;(svc.pending()));
+    check(nowCount == 0 &amp;&amp; laterCount == 1, "scheduled");
+    fresh(svc);
+
+    try {
+        svc.submit(Request{"", "asha", "order_placed", {{"orderId", "105"}}, {Channel::EMAIL}, Priority::MEDIUM, 0});
+    } catch (const std::invalid_argument&amp; e) {
+        std::printf("  rejected: %s\n", e.what());
+        ++checks;
+    }
+    std::printf("ALL %d CHECKS PASSED\n", checks);
+    return 0;
+}</code></pre>
+  <p><code>g++ -std=c++14 -O2 -Wall -Wextra main.cpp -o notify &amp;&amp; ./notify</code></p>
+<pre class="terminal"><code>== ORDER_PLACED 101 (published twice) ==
+  duplicates suppressed: 2
+  asha: n1 EMAIL SENT (via ses)
+  asha: n1 SMS SENT (via sms-B)
+  asha: n1 PUSH SENT (via fcm)
+  seller-7: n2 IN_APP SENT (via inbox)
+== ORDER_PLACED 102 for ravi ==
+  ravi: n3 EMAIL SENT (via ses)
+  ravi: n3 SMS SKIPPED_OPT_OUT
+  ravi: n3 PUSH NO_ADDRESS (no PUSH address)
+  seller-7: n4 IN_APP SENT (via inbox)
+== Priority and rate limit ==
+  asha: n6 SMS SENT (via sms-B)
+  asha: n7 SMS SENT (via sms-B)
+  asha: n8 SMS SENT (via sms-B)
+  asha: n9 SMS RATE_LIMITED (3 per 60s for asha)
+  asha: n5 PUSH SENT (via fcm)
+== Scheduling ==
+  now: delivered 0, pending 1
+  +1h: delivered 1, pending 0
+  asha: n10 EMAIL SENT (via ses)
+  rejected: missing {name} for order_placed
+ALL 6 CHECKS PASSED</code></pre>

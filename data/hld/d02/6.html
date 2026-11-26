@@ -1,0 +1,69 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> For SDE-1, knowing the algorithms, the Redis + atomic script design and "fail open" is a strong answer. SDE-2 candidates should also handle deep dives 2-5 below.</p></div>
+
+        <h3>Deep dive 1: race conditions (must know)</h3>
+        <p>The naive code is <code>count = GET key; if count &lt; limit: SET key count+1</code>. With 50 gateway pods, two pods can GET the same value at the same time and both allow. Fixes, from simplest to most flexible:</p>
+        <ul>
+          <li><b><code>INCR</code> first, check after:</b> <code>INCR</code> is atomic and returns the new value; if it is above the limit, reject. Perfect for fixed windows.</li>
+          <li><b>Lua script:</b> for token buckets and sliding windows, which need read + compute + write together.</li>
+          <li><b>Avoid</b> distributed locks per request: far too slow for 500k checks/s.</li>
+        </ul>
+
+        <h3>Deep dive 2: Redis is down. Fail open or fail closed? (must know)</h3>
+        <p>The limiter is a protection layer. If it becomes the reason the API is down, it has failed at its own job. So most API limiters <b>fail open</b>: if Redis times out (use a tight timeout, a few milliseconds), allow the request and raise an alarm. Stripe's post says exactly this: their limiters fail open when Redis is unavailable, and they added kill switches and dark-launched new limiters (log the decision without enforcing) before turning them on.</p>
+        <ul>
+          <li><b>Fail closed</b> where letting traffic through is worse than refusing it: login attempts, OTP sends, money transfers.</li>
+          <li><b>Middle ground:</b> fall back to a <b>local in-memory bucket</b> in each gateway pod with limit ÷ number of pods. Rough, but it still stops a runaway client.</li>
+          <li>Wrap Redis calls in a <b>circuit breaker</b>, so that when Redis is sick the gateways stop waiting on it for every request.</li>
+        </ul>
+
+        <h3>Deep dive 3: hot keys and very high rates (good to know)</h3>
+        <p>One huge customer at 50,000 requests/s means all checks for that key go to one Redis shard. Options:</p>
+        <ul>
+          <li><b>Local token buckets with periodic sync:</b> each gateway pod gets a share of the budget (or leases a batch of tokens, for example 100 at a time, from Redis) and spends it locally with no network call. Accuracy drops a little; latency and Redis load drop a lot. This is the same "lease a block" idea as the <a href="{{BASE}}hld/d01">URL shortener's ID ranges</a>.</li>
+          <li><b>Split the key</b> into N sub-buckets (<code>k_8f2:0..7</code>) each with limit ÷ N, and pick one at random per request.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Gateway pods lease batches of tokens from Redis and spend them locally">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="22">Token leasing for a hot key</text>
+            <rect class="box cache" x="310" y="40" width="180" height="56"/>
+            <text class="label" x="400" y="60">Redis: k_8f2</text>
+            <text class="label small" x="400" y="80">global bucket</text>
+            <rect class="box k8s" x="60" y="160" width="170" height="56"/><text class="label" x="145" y="180">gateway pod 1</text><text class="label small" x="145" y="200">local: 100 tokens</text>
+            <rect class="box k8s" x="315" y="160" width="170" height="56"/><text class="label" x="400" y="180">gateway pod 2</text><text class="label small" x="400" y="200">local: 100 tokens</text>
+            <rect class="box k8s" x="570" y="160" width="170" height="56"/><text class="label" x="655" y="180">gateway pod 3</text><text class="label small" x="655" y="200">local: 100 tokens</text>
+            <path class="arrow both dashed" d="M360 96 L170 156"/>
+            <path class="arrow both dashed" d="M400 96 L400 156"/>
+            <path class="arrow both dashed" d="M440 96 L630 156"/>
+            <text class="label small" x="230" y="118">lease 100</text>
+            <text class="label small" x="580" y="118">lease 100</text>
+            <circle class="packet gold" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M400 96 L170 160"/></circle>
+            <text class="label small" x="400" y="238">thousands of requests per second served from local memory; Redis sees one call per 100</text>
+          </svg>
+          <figcaption>Each pod takes a batch of tokens in one Redis call and spends them locally. Redis load drops by the batch size; the cost is that tokens leased by a pod that dies are lost, and the limit is enforced slightly loosely.</figcaption>
+        </figure>
+
+        <h3>Deep dive 4: multi-region (SDE-2)</h3>
+        <p>A client might hit Mumbai and Singapore at once. Options:</p>
+        <ul>
+          <li><b>Per-region limits</b> (each region enforces limit ÷ regions, or its own full limit): simple and fast, but not exact.</li>
+          <li><b>Local enforcement + async sync:</b> each region counts locally and gossips counts to others every second; the client may get a bit more than the limit during that second.</li>
+          <li><b>One global store:</b> exact, but adds a cross-region round trip (tens to hundreds of milliseconds) to every request. Almost never worth it.</li>
+        </ul>
+        <p>Say the trade-off clearly: <i>"I accept a small overshoot in exchange for keeping every check inside one region."</i></p>
+
+        <h3>Deep dive 5: beyond request counts (good to know)</h3>
+        <ul>
+          <li><b>Concurrency limiter:</b> limit requests <i>in flight</i>, not per second. Stripe runs one; it protects slow, expensive endpoints. Implement with a counter incremented on start and decremented on finish (with a TTL in case the decrement is lost).</li>
+          <li><b>Load shedding:</b> when the whole fleet is overloaded, reject low-priority traffic first and keep capacity for critical calls. Stripe's fleet usage shedder reserves a share of capacity (their example is 20%) for critical requests and answers the rest with 503. See the AWS Builders' Library on <a href="https://aws.amazon.com/builders-library/using-load-shedding-to-avoid-overload/" target="_blank" rel="noopener">load shedding</a>.</li>
+          <li><b>Cost-based limits:</b> a search query might cost 10 tokens, a GET by ID 1 token (the <code>cost</code> argument in our script).</li>
+          <li><b>Client behaviour:</b> clients should retry 429s with <b>exponential backoff and jitter</b>, honouring <code>Retry-After</code>. Otherwise all rejected clients retry at the same instant and create the next spike. See <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">timeouts, retries and backoff with jitter</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Backoff with jitter is <b>Ethernet's binary exponential backoff</b> after a collision: wait a random slot from a window that doubles each try, so stations stop colliding in lockstep. And the "local bucket, sync later" idea is like <b>distributed policers</b> on a multi-line-card chassis, where each card gets a share of the aggregate rate. <i>Where it breaks:</i> Ethernet stations share one wire and see every collision; API clients are independent programs you do not control, so you can only <i>ask</i> them to back off (with <code>Retry-After</code>) and must still survive the ones that ignore it.</p>
+        </div>
+        <div class="callout tip"><p><b>Go deeper.</b> How rate limiting fits into a WAF and bot-defence stack, and why to key limits on identity rather than IP, is in <a href="{{BASE}}hld/hld-18">Edge Defense: Bot Detection</a>.</p></div>
+      

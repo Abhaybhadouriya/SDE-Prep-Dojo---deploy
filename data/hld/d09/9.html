@@ -1,0 +1,139 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: Clarify.</strong> How many units, how many users, one product or many deals? One per user? Payment window? Must we never oversell, or is a tiny oversell with apology acceptable? Write: "demand far greater than supply, so funnel".</li>
+          <li><strong>5-10: Estimate the funnel.</strong> Requests at T0 (Flipkart's 1.5M/s anchor), the bandwidth that forces the CDN, the admission rate, the 0.2% win ratio, and how fast the units go.</li>
+          <li><strong>10-15: API.</strong> Queue, status, reserve (410 / 409 / 201) and pay. Point out the signed tokens.</li>
+          <li><strong>15-25: Architecture.</strong> Draw the funnel: CDN -&gt; waiting room -&gt; gateway -&gt; reservation + Redis -&gt; Kafka -&gt; order writer -&gt; SQL, with the expiry worker and the sold-out flag.</li>
+          <li><strong>25-40: Deep dives.</strong> The Lua script and why not a DB row; sharded buckets and their two problems; Kafka as the shock absorber; Redis failover honesty; payment TTL with conditional expiry; fairness and bots.</li>
+          <li><strong>40-45: Operations.</strong> Pre-scaling, game days, feature flags, retry storms, the war-room dashboard (admitted rate, Redis latency, stock left, consumer lag, payment success), reconciliation after the sale.</li>
+        </ol>
+        <div class="callout note"><p><b>SDE-1 vs SDE-2.</b> SDE-1: a CDN, a rate limiter, an atomic Redis decrement, async order creation and a payment timeout. SDE-2: a waiting room with fairness, why the DB row lock fails, bucket sharding <em>and its problems</em>, the Redis failover oversell window, conditional expiry, blast-radius isolation and pre-scaling, all without being led.</p></div>
+        <div class="callout danger"><p><b>Common mistakes:</b> decrementing stock in the database for every click; "add more servers" with no admission control; returning errors that trigger refreshes; a non-atomic GET-then-DECR in Redis; trusting Redis as the only record; forgetting stock must come back on unpaid reservations; relying on autoscaling; running the sale on the same database shard as the rest of the shop.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon,Meesho">
+          <summary>Why can't we just decrement the stock row in the database?</summary>
+          <div class="answer">
+            <p>The conditional UPDATE is correct, but every buyer targets the same row. The database serialises them on one row lock, so throughput is capped by how fast one row can be locked, updated, committed and unlocked. Waiting transactions hold connections, pools fill up, and because the database is shared, the whole shop slows down. Shopify's Kylie Cosmetics sale took down every store on the shared shard. So I keep the database out of the hot path: an atomic counter in Redis behind a waiting room, with the database written asynchronously.</p>
+            <div class="approach"><h5>How to answer</h5><p>Agree the SQL is correct first (do not claim it oversells), then explain the contention and blast radius. That shows you know the difference between correctness and capacity.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>At what rate would the DB row be good enough?</li><li>What about SELECT ... FOR UPDATE SKIP LOCKED with one row per unit?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>Show me the exact Redis logic. Why Lua and not GET then DECR?</summary>
+          <div class="answer">
+            <p>GET then DECR from the application is two round trips, and another client can run between them, so two users can both see 1. DECR alone is atomic, but then you need "if the result is below 0, INCR back", which works but briefly shows negative stock, and it cannot also enforce one-per-user. A Lua script runs atomically on the Redis thread: check the buyers set, check stock, DECRBY, SADD, return what is left. Both keys share a hash tag so they sit in one cluster slot.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the five lines of the script. Point out the hash tag; it is a detail that proves you have used Redis Cluster.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Isn't a long Lua script dangerous? (Yes. It blocks the shard, so keep it O(1).)</li><li>What happens to the script if the primary fails over?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>One Redis key is now the hot spot. How do you scale past it?</summary>
+          <div class="answer">
+            <p>First check that you need to: one shard does on the order of 100k simple ops per second, and the waiting room may admit far less. If you do need more, split the stock into N buckets with different hash tags so they live on different shards. Route a user by hash(userId) to a bucket. When a bucket is empty, try the next ones before saying sold out. The per-user limit now spans buckets, so add a global SET NX claim per user and the SQL unique constraint as a backstop. Near the end, merge leftovers to avoid "sold out" while stock still exists.</p>
+            <div class="approach"><h5>How to answer</h5><p>Push back with a number first, then shard, then name the two new problems yourself. Mention the kernel's per-CPU counters as the same idea.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many buckets? (Enough to spread over your shards, few enough that leftovers are small.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>Redis says the user got the phone, but the database write fails. What happens?</summary>
+          <div class="answer">
+            <p>The reservation is first recorded in Kafka with <code>acks=all</code> before we reply, so the promise is durable even if the database is down. The order-writer consumer retries the insert with backoff and does not commit its offset until it succeeds. Inserts are idempotent by reservationId, so retries cannot duplicate. If the Kafka write itself fails, we put the unit back in Redis and tell the user to retry, so we never say yes without a durable record. After the sale, reconciliation compares Redis, Kafka and SQL.</p>
+            <div class="approach"><h5>How to answer</h5><p>Make the ordering explicit: decrement, durable log, reply, then async DB. Then cover both failure points.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The event is poison (bad data). Where does it go? (A DLQ with an alert; it is a real customer, so a human fixes it.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>Can Redis failover cause an oversell? How would you handle it?</summary>
+          <div class="answer">
+            <p>Yes. Redis replication is asynchronous, so a promoted replica can miss the latest decrements and let a few extra units sell. Kafka still has every reservation, so no order is lost, but the counter is now too high. Handling: after any failover, pause that shard's buckets and rebuild the counters as total minus reservations recorded in Kafka/SQL; use WAIT to narrow the window; optionally hold back a small buffer released after reconciliation; or, if the business forbids any risk, use a strongly consistent store for the counter and accept lower throughput behind the waiting room.</p>
+            <div class="approach"><h5>How to answer</h5><p>Admitting the weakness unprompted is a senior signal. Give the mechanism, the detection, the repair and the business trade-off.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does WAIT make Redis strongly consistent? (No. It reduces the window but is not consensus.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Myntra,Amazon">
+          <summary>Design the waiting room. How do you make it fair and keep it from falling over?</summary>
+          <div class="answer">
+            <p>Make it stateless at the edge: on arrival, issue a signed token with the arrival time. Each edge node admits tokens below a "now serving" threshold that rises at the backend's capacity, adjusted by a feedback loop on backend health (Shopify used a PID controller). Users already waiting at T0 get a random order, so network speed does not decide. Throttled users see a cached queue page that polls at server-chosen intervals with jitter. Admitted users get a short-lived admission token bound to their account. If the room fails, fail closed with "sale paused".</p>
+            <div class="approach"><h5>How to answer</h5><p>Cover state (signed tokens), rate (threshold + feedback), fairness (lottery then FIFO) and the failure mode. Cite Shopify Part I and Part II.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show an honest queue position without a central store?</li><li>Build or buy (for example a managed waiting room)?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon,Meesho">
+          <summary>A winner does not pay within 10 minutes. Walk me through returning the stock.</summary>
+          <div class="answer">
+            <p>A worker pops due items from a sorted set of (reservationId, payBy). For each, it runs <code>UPDATE ... SET status='EXPIRED' WHERE id=? AND status='HELD'</code>. Only when that affects one row does it INCRBY the bucket and clear the sold-out flag, which admits the next wave from the waiting room. If the payment callback arrives later, it sees EXPIRED and either re-reserves (if stock is left) or refunds automatically. The conditional update is what makes "paid" and "expired" mutually exclusive.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the race (late payment vs expiry) and resolve it with a single conditional transition.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not use Redis key expiry events? (They can be missed.)</li><li>Should the TTL change if a payment provider is degraded?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>How do you stop bots from buying all the stock?</summary>
+          <div class="answer">
+            <p>Layers: no admission token, no reserve call (so scripts cannot skip the room); tokens are short-lived and bound to the account; limits per account, device, address and payment instrument; risk scoring with challenges only for suspicious sessions, so real users are not punished; pre-registration or verified buyers for the hottest drops; and after the sale, cancel orders that break the rules and return the stock. Ticketmaster's Eras Tour statement is the cautionary tale: 3.5 billion requests, largely bots and people without codes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show defence in depth at different layers and say what each layer costs real users.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A bot farm has 10,000 real accounts. What now?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="k8s" data-company="Flipkart,Walmart,Amazon">
+          <summary>Why not rely on the Kubernetes HPA to handle the spike?</summary>
+          <div class="answer">
+            <p>The HPA reacts to metrics with a delay, new pods need image pulls and warm-up, and if nodes are full the cluster autoscaler needs minutes to add machines. The spike arrives in one second. So I pre-scale: raise minReplicas ahead of T0 (a scheduled job or the KEDA cron trigger), keep placeholder pods with a negative PriorityClass so spare nodes already exist, pre-pull images and warm caches. The HPA remains as a safety net for the hours after.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the three delays (metrics, pods, nodes), then the pre-scale toolkit. Link it to <a href="{{BASE}}devops/k8s-09">autoscaling</a> concepts.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you size the pre-scale? (From the load test at the expected admitted rate plus headroom.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Flipkart,Walmart">
+          <summary>Why put Kafka between the reservation and the order database?</summary>
+          <div class="answer">
+            <p>The reservation burst happens in seconds, but the database wants a steady rate. Kafka records each reservation durably (replicated, <code>acks=all</code>), so we can answer the user immediately and let an order-writer consumer group insert at a controlled pace. If the database slows or fails, events wait in the log instead of failing users. Every reservation is replayable for reconciliation and for rebuilding Redis after a failover. Consumers must be idempotent because delivery is at-least-once.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name it a shock absorber or buffer, then give durability, decoupled pace and replay. Admit the cost: order rows appear slightly later.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What partition key, and why does ordering not matter here?</li><li>How many partitions do you need?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>Your service gets 10x traffic tomorrow for a sale. What do you do today?</summary>
+          <div class="answer">
+            <p>Run a load test at the expected peak, including failure drills. Pre-scale compute and pre-provision nodes; check every dependency's limits (database connections, Redis memory, Kafka partitions, payment provider quotas). Put the waiting room and rate limits in front, with tested settings. Add feature flags to turn off non-critical features, and a kill switch to pause the sale. Freeze deploys. Prepare the war-room dashboard and alerts (admitted rate, error rate, p99, stock left, consumer lag, payment success), write runbooks for each failure, and agree who decides what.</p>
+            <div class="approach"><h5>How to answer</h5><p>Group it into capacity, protection, observability and people. It is a frequently reported behavioural-technical prompt at Flipkart and Amazon.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the first thing you would cut if things go wrong?</li></ul></div>
+          </div>
+        </details>
+
+        <h3>60-second answer (say it out loud)</h3>
+        <div class="callout interview"><p>"Demand is thousands of times bigger than supply, so I design a funnel and reject traffic as early and cheaply as possible. The product page is static on a CDN with a server-time countdown. At T0 users enter a stateless waiting room at the edge with signed arrival-time tokens, and it admits them at the rate the backend can take, fairly. Admitted users call the reservation service, which runs one atomic Lua script in Redis: check the user has not won, check stock, decrement and record the buyer. If one key gets too hot, I split stock into buckets on different shards. A winner's reservation is written to Kafka with acks=all before we reply 'pay within 10 minutes', and an idempotent consumer writes orders to SQL at a steady rate. Unpaid reservations expire with a conditional update and return their stock. When stock hits zero, a sold-out flag goes to the edge so 99% of users get the cheapest possible answer. I isolate the sale in its own cell, pre-scale instead of autoscaling, and reconcile Redis, Kafka and SQL afterwards."</p></div>
+
+        <div class="scenario">
+          <h4>Scenario: the database melts at T0 + 3 seconds</h4>
+          <div class="situation">At sale open, the shared orders database hits 100% CPU. Search and "My orders" for all customers start timing out. Redis looks healthy.</div>
+          <div class="bad">Weak answer: "Add read replicas and scale the database vertically."</div>
+          <div class="good">Strong answer: "Something in the hot path writes to the shared database synchronously. First, protect the shop: lower the waiting room admission rate and pause the order-writer consumers (Kafka holds the reservations safely). Then find the culprit: probably a synchronous insert or a stock read in the reserve path, or the payment page querying the order row. Fix: move it behind Kafka or read from the reservation. Afterwards, move the sale onto its own database cell and add a load test that fails if any reserve call touches the shared database."</div>
+          <div class="followups">Follow-ups: How do you know Kafka will not lose the reservations while the consumers are paused? (Retention, replication factor 3, min.insync.replicas=2.)</div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: you sold 10,040 units of 10,000</h4>
+          <div class="situation">Post-sale reconciliation finds 10,040 PAID or HELD reservations. The logs show a Redis primary failover at T0 + 8 s.</div>
+          <div class="bad">Weak answer: "Redis is unreliable; switch to the database next time."</div>
+          <div class="good">Strong answer: "The promoted replica missed about 40 decrements because replication is asynchronous. Short term: honour or cancel the 40 last reservations (ordered by reservation timestamp or the time-ordered Snowflake reservation_id, not by Kafka offset, which is only ordered within one partition) following the business policy, with compensation for affected users, and check whether the warehouse has spare units. Long term: on any failover, auto-pause the affected buckets and rebuild counters from the Kafka log before reopening; add WAIT on the reserve path; hold back a small buffer released only after reconciliation; and alert on 'reservations in Kafka &gt; total - Redis stock' in real time."</div>
+          <div class="followups">Follow-ups: How would you detect this during the sale rather than after? (Stream a running count of reservation events and compare it to Redis every second.)</div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: "sold out" shows, but stock is left</h4>
+          <div class="situation">Users see SOLD OUT at T0 + 20 s, yet SQL shows only 9,200 reservations, and support is flooded.</div>
+          <div class="bad">Weak answer: "Clear the cache."</div>
+          <div class="good">Strong answer: "With sharded buckets, the sold-out flag was probably set when <em>a</em> bucket emptied, or a user's fallback did not try the other buckets. Check the flag-setting code and the bucket counters. Fix: set sold-out only when all buckets are 0 (track an empty-bucket bitmap), make fallback scan every bucket, merge leftovers into one bucket near the end, and add a 'stock left vs flag' consistency alert. Re-open the sale from the waiting room queue so the people who waited get the units first."</div>
+          <div class="followups">Follow-ups: How do you tell users fairly that stock is back?</div>
+        </div>
+      

@@ -1,0 +1,72 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Buttons are pressed on many threads; cars move on a clock. The tempting design is a lock per car. It breaks on dispatch: to choose a car, the controller must read every car's floor, direction and stops at the same moment, so it would take every car's lock (in a fixed order, or deadlock), while each car's own thread holds its lock to move. That is a lot of locking for a decision that should be quick.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="A button thread edits a car's stops while the controller iterates them; the single-writer rule moves all writes to one thread">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">button thread (floor 5)</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">controller tick thread</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">car E1</text><text class="label small" x="400" y="166">stops {3}</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. adds stop 5 to E1 directly</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. iterates E1's stops to move</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">the set changes during iteration:</text><text class="label bad" x="645" y="164">an exception or a lost stop</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. puts an immutable record in a queue</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: the single-writer rule</text><text class="label mono" x="645" y="66">submit() only queues a HallCall</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">tick() drains the queue first,</text><text class="label small" x="645" y="242">then dispatches and moves cars:</text><text class="label small" x="645" y="266">cars need no locks at all</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>If a button thread wrote into a car's stop set while the controller thread was iterating it to decide the next move, the iteration could fail or a stop could be lost.</li>
+      <li>The guard: button threads never touch a car. <code>submit()</code> validates and puts an immutable <code>HallCall</code> into a <code>LinkedBlockingQueue</code>, which is thread-safe.</li>
+      <li>Only the controller thread reads or writes car state: each <code>tick()</code> drains the queue, dispatches the calls and steps every car. One writer means no locks on the cars at all.</li>
+    </ol>
+  </div>
+
+  <p>This design uses the <b>single-writer</b> rule instead:</p>
+  <ul>
+    <li><b>Any thread</b> may call <code>submit()</code>. It only validates (reads immutable fields: <code>minFloor</code>, <code>maxFloor</code>) and puts an immutable record into a <code>LinkedBlockingQueue</code>, which is thread-safe.</li>
+    <li><b>One controller thread</b> calls <code>tick()</code>. It drains the queue with <code>drainTo</code>, runs the commands, retries unassigned calls and steps each car. It is the only code that reads or writes car state, so cars need no locks at all.</li>
+    <li><b>Listeners</b> live in a <code>CopyOnWriteArrayList</code>, so a display can register while the controller is iterating. Listener callbacks run on the controller thread and must be quick; a slow display should hand off to its own queue.</li>
+    <li><b>Reads from outside</b> (a status API asking "where is E2?") should not touch car fields from another thread. Publish a snapshot after each tick (an immutable record in a <code>volatile</code> field), or send a query command through the inbox.</li>
+  </ul>
+<pre><code class="language-java">// BROKEN alternative: button threads call the car directly
+void press(int floor, Direction d) {
+    Elevator e = dispatch.choose(elevators, new HallCall(floor, d)).get();  // reads cars while they move
+    e.addHallCall(new HallCall(floor, d));     // TreeSet.add races with the car's own tick()
+}
+// Two presses can choose using stale positions, and two threads mutating one TreeSet can corrupt it.</code></pre>
+  <p>The tests prove the queue design: 4 button threads submit 200 hall calls each while a controller thread ticks 50 times; afterwards <code>runUntilIdle</code> finishes the work and the test asserts exactly 800 <code>onDispatch</code> events and every car idle. Python does the same with <code>queue.Queue</code> and <code>threading.Thread</code>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is the top half / bottom half split. A NIC interrupt handler does the minimum (acknowledge, queue the packet, raise a softirq), and NAPI processing runs later in one context per queue that owns the ring. Here a button press is the interrupt, the inbox is the ring, and <code>tick()</code> is the softirq. The same idea is a workqueue drained by one kworker, or the Linux rule that only the owning CPU touches its per-CPU data. In C++ with threads, the only lock is a <code>std::mutex</code> held to push in <code>submit</code> and to <code>swap</code> the deque out in <code>tick</code>, never while running commands.</p>
+  </div>
+  <h3>Other options</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Approach</th><th>Good</th><th>Watch out</th></tr></thead>
+      <tbody>
+        <tr><td><b>Single writer + queue</b> (our code)</td><td>No locks on car state; deterministic; easy to test and replay</td><td>One thread does all the work (fine: an elevator bank is tiny); status reads need snapshots</td></tr>
+        <tr><td>One global lock on the controller</td><td>Simple; correct</td><td>Every button press waits for the whole tick; easy to deadlock if listeners call back in</td></tr>
+        <tr><td>Lock per car + thread per car</td><td>Feels like real hardware</td><td>Dispatch needs all locks in order; races between dispatch and movement; hard to test</td></tr>
+        <tr><td>Actor per car (mailbox per car)</td><td>Scales to many cars; each car is single-writer</td><td>Dispatch must ask cars for state asynchronously, so decisions use slightly stale data</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>More: <a href="{{BASE}}lld/lld-conc-producer-consumer">producer-consumer</a> (the inbox is one) and <a href="{{BASE}}lld/lld-conc-locks">locks</a>.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>CopyOnWriteArrayList</code> = an RCU-style list: readers walk a snapshot with no lock, writers copy the array and publish it; good for read-mostly listener sets.</li>
+      <li><code>BlockingQueue</code> = a bounded producer-consumer ring with a mutex and two condition variables (a <code>kfifo</code> plus wait queues).</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

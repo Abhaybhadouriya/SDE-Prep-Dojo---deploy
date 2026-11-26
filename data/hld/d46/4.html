@@ -1,0 +1,63 @@
+
+        <h2>Data model</h2>
+        <p>Split data by how hot it is. Live game state is tiny and hot, so it sits in memory on the owner game server and is journaled to a fast log. Finished games are cold, written once, and go to a scalable document or wide-column store. Users and ratings need transactions, so they go in a relational database. Rankings need sorted order, so they go in a Redis sorted set. Chess.com's 2023 outage post is a lesson here: its overloaded database held both user and gameplay data, and one of the fixes was to separate them.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Why this store</th></tr></thead>
+            <tbody>
+              <tr><td>Live game (board, ply, clocks, players)</td><td>Game server RAM + Redis (hash + stream as a move journal; a Redis <b>stream</b> is an append-only log inside Redis, like a tiny Kafka partition)</td><td><code>game:{gameId}</code></td><td>Sub-millisecond reads; journal lets a new owner rebuild the game after a crash</td></tr>
+              <tr><td>Matchmaking queue</td><td>Redis sorted set per time control and region</td><td><code>mm:blitz:eu</code>, score = rating</td><td><code>ZRANGEBYSCORE</code> finds neighbours in a rating window in O(log n)</td></tr>
+              <tr><td>Player status</td><td>Redis string with a TTL (time to live: Redis deletes the key by itself when it expires, so a crashed client cannot leave a player stuck "searching")</td><td><code>player:{userId}:status</code> = idle | searching | in_game:{gameId}</td><td>Atomic <code>SET NX</code> ("set only if Not eXists", a one-step test-and-set) prevents double-matching</td></tr>
+              <tr><td>Users, ratings (Glicko-2: rating, RD, volatility)</td><td>PostgreSQL, sharded by userId later</td><td><code>users(id)</code>, <code>ratings(user_id, perf)</code></td><td>Rating updates for two players must commit together</td></tr>
+              <tr><td>Finished games</td><td>MongoDB / Cassandra / DynamoDB</td><td>partition by <code>gameId</code>; secondary table by <code>(userId, endedAt)</code></td><td>Write-once, billions of rows, simple lookups; Lichess uses MongoDB for 12B+ games</td></tr>
+              <tr><td>Leaderboard</td><td>Redis sorted set</td><td><code>lb:blitz</code>, member = userId, score = rating</td><td><code>ZREVRANK</code> gives rank in O(log n)</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">CREATE TABLE ratings (
+  user_id     BIGINT      NOT NULL,
+  perf        TEXT        NOT NULL,          -- 'blitz', 'bullet', ...
+  rating      REAL        NOT NULL DEFAULT 1500,
+  rd          REAL        NOT NULL DEFAULT 350, -- rating deviation (uncertainty)
+  volatility  REAL        NOT NULL DEFAULT 0.06,
+  games       INT         NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, perf)
+);
+
+CREATE TABLE processed_games (            -- idempotency for rating updates
+  game_id     TEXT PRIMARY KEY,
+  processed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+        <p><b>Glicko-2</b> is the rating system Lichess and Chess.com use. Besides a rating it keeps a <b>rating deviation (RD)</b>, the uncertainty of the rating, which starts at 350 for a new player, and a <b>volatility</b> that starts at 0.06. A 95% confidence range is roughly rating +/- 1.96 x RD. Matchmaking can use RD: a new player with a wide range can be matched more loosely.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Where each kind of chess data lives">
+            <rect class="zone" x="20" y="20" width="360" height="260"/>
+            <text class="zone-label" x="36" y="42">hot: live games</text>
+            <rect class="box svc" x="50" y="64" width="300" height="56"/>
+            <text class="label" x="200" y="86">Game server RAM</text>
+            <text class="label small" x="200" y="106">board, ply, clocks (truth)</text>
+            <rect class="box cache" x="50" y="146" width="300" height="56"/>
+            <text class="label" x="200" y="168">Redis journal per game</text>
+            <text class="label small" x="200" y="188">every accepted move appended</text>
+            <rect class="box cache" x="50" y="216" width="300" height="50"/>
+            <text class="label" x="200" y="241">Matchmaking ZSET + status keys</text>
+            <path class="arrow" d="M200 120 L200 140"/>
+
+            <rect class="zone db" x="420" y="20" width="360" height="260"/>
+            <text class="zone-label" x="436" y="42">cold + transactional</text>
+            <rect class="box db" x="450" y="64" width="300" height="56"/>
+            <text class="label" x="600" y="86">PostgreSQL</text>
+            <text class="label small" x="600" y="106">users, Glicko-2 ratings</text>
+            <rect class="box db" x="450" y="146" width="300" height="56"/>
+            <text class="label" x="600" y="168">Game archive (Mongo/Cassandra)</text>
+            <text class="label small" x="600" y="188">PGN, written once at game end</text>
+            <rect class="box cache" x="450" y="216" width="300" height="50"/>
+            <text class="label" x="600" y="241">Leaderboard ZSET (score = rating)</text>
+            <path class="arrow dashed" d="M350 174 L444 174"/>
+            <text class="label small" x="397" y="160">on end</text>
+          </svg>
+          <figcaption>Hot state stays in memory with a journal; finished games and ratings move to durable stores when the game ends.</figcaption>
+        </figure>
+      

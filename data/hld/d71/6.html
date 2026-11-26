@@ -1,0 +1,136 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Exactly one order and one charge per cycle</h3>
+        <p>The scheduler will run twice (a deploy, a crash after work but before commit), workers will retry, the gateway will time out after actually charging. The design must make every repetition harmless:</p>
+        <ul>
+          <li><b>Cycle row as the anchor.</b> <code>PRIMARY KEY (subscription_id, cycle_no)</code>. Creating cycle 5 twice fails on the second insert; the scheduler treats that as "already done".</li>
+          <li><b>Derived idempotency keys downstream.</b> Order service: <code>sub_881:5</code>. Payment: <code>sub_881:5:attempt</code>. If the worker crashes and retries, Order returns the same order and the gateway returns the same charge. Stripe, Razorpay and most gateways accept an idempotency key on create calls for exactly this reason.</li>
+          <li><b>State machine with guarded transitions.</b> <code>UPDATE cycle SET state='CHARGING' WHERE ... AND state='ORDERED'</code>. Zero rows updated means another worker owns it; stop.</li>
+          <li><b>Unknown outcome is a state.</b> If the charge call times out, the cycle stays <code>CHARGING</code> and a reconciler asks the gateway "what happened to key sub_881:5:1?" before any retry. Never retry a timed-out charge with a new key.</li>
+          <li><b>Outbox</b> for events (<code>cycle.ordered</code>, <code>cycle.paid</code>), so the database change and the message cannot disagree. See <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Events</a>.</li>
+        </ul>
+        <div class="callout warn"><p>The classic double charge: worker calls the gateway, the gateway charges, the response is lost, the worker retries with a fresh request. Without a stable idempotency key the customer pays twice. Say this failure out loud; interviewers wait for it.</p></div>
+
+        <h3>2. The scheduler: finding due subscriptions</h3>
+        <p>Three designs, from simple to scalable. Pick based on volume and say why. The Amazon candidate noted that job-scheduler designs are the closest reference; see <a href="{{BASE}}hld/d25">Job Scheduler</a>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Three scheduler options: indexed poll, time-bucketed table, delayed queue">
+            <rect class="zone" x="10" y="20" width="250" height="220"/>
+            <text class="label" x="135" y="44">A. Indexed poll</text>
+            <rect class="box db" x="35" y="60" width="200" height="50"/>
+            <text class="label small" x="135" y="90">next_cycle_at &lt;= now()</text>
+            <rect class="box k8s" x="35" y="150" width="200" height="50"/>
+            <text class="label small" x="135" y="180">N pollers, SKIP LOCKED</text>
+            <path class="arrow both" d="M135 110 L135 146"/>
+            <text class="label small" x="135" y="225">simple; fine to ~10M subs</text>
+            <rect class="zone" x="275" y="20" width="250" height="220"/>
+            <text class="label" x="400" y="44">B. Time buckets</text>
+            <rect class="box db" x="295" y="60" width="65" height="50"/>
+            <text class="label small" x="327" y="90">20:00</text>
+            <rect class="box kafka" x="367" y="60" width="65" height="50"/>
+            <text class="label small" x="399" y="90">20:05</text>
+            <rect class="box db" x="439" y="60" width="65" height="50"/>
+            <text class="label small" x="471" y="90">20:10</text>
+            <rect class="box k8s" x="300" y="150" width="200" height="50"/>
+            <text class="label small" x="400" y="180">worker per bucket, shard</text>
+            <path class="arrow" d="M399 110 L399 146"/>
+            <text class="label small" x="400" y="225">PK (bucket, shard, sub_id)</text>
+            <rect class="zone" x="540" y="20" width="250" height="220"/>
+            <text class="label" x="665" y="44">C. Delayed queue</text>
+            <rect class="box queue" x="565" y="60" width="200" height="50"/>
+            <text class="label small" x="665" y="90">message visible at due time</text>
+            <rect class="box k8s" x="565" y="150" width="200" height="50"/>
+            <text class="label small" x="665" y="180">consumers</text>
+            <path class="arrow" d="M665 110 L665 146"/>
+            <text class="label small" x="665" y="225">DB stays source of truth</text>
+          </svg>
+          <figcaption>Whatever triggers the work, the database row decides whether the cycle runs. Triggers can be duplicated or lost; the row cannot.</figcaption>
+        </figure>
+        <ul>
+          <li><b>A. Indexed poll.</b> A partial index on <code>next_cycle_at</code> for active subscriptions; pollers run <code>SELECT ... WHERE next_cycle_at &lt;= now() ORDER BY next_cycle_at LIMIT 500 FOR UPDATE SKIP LOCKED</code>, process, commit. Several pollers never pick the same row. Good up to millions of subscriptions; most teams should start here.</li>
+          <li><b>B. Time-bucketed table.</b> <code>due(bucket_start, shard, subscription_id)</code> with 5-minute buckets and, say, 64 shards. A worker owns <code>(bucket, shard)</code> via a lease and reads exactly its slice, like a timer wheel. Spreads the Monday spike and avoids one hot index. Rewrite the entry when the subscription is rescheduled.</li>
+          <li><b>C. Delayed queue.</b> Put a message that becomes visible at the due time (SQS delay up to 15 minutes, so chain or combine with polling; RabbitMQ delayed exchange; Redis sorted set by score). Fast, but queues lose or duplicate messages, so the worker must check the database row before acting, and a nightly sweeper catches anything missed.</li>
+          <li><b>Look-ahead.</b> The scheduler does not act at the delivery time, it acts at the <b>action time</b>: the order cut-off for goods (for example 20:00 the day before) and the pre-debit time for Indian charges (26 h before, following Stripe's documented wait). Store <code>next_cycle_at</code> as that action time.</li>
+          <li><b>Catch-up.</b> If the scheduler was down for an hour, it processes everything with <code>next_cycle_at</code> in the past, oldest first, and for goods it skips cycles whose delivery date has passed (with a notice) instead of delivering Monday's milk on Wednesday.</li>
+        </ul>
+
+        <h3>3. Mandates, card-on-file and the callback flow</h3>
+        <p>Recurring payments need standing permission, and that permission is created with the customer present and then used without them. In India the rules are specific: register the e-mandate once with AFA (3-D Secure for cards, UPI PIN for UPI), alert the customer at least 24 hours before each debit with an option to opt out, and require AFA again for any recurring debit above Rs 15,000 (summarised in <a href="https://docs.stripe.com/india-recurring-payments" target="_blank" rel="noopener">Stripe's India recurring payments guide</a>).</p>
+        <ol class="steps">
+          <li><strong>Create intent</strong> Subscription service asks the payment service for a mandate setup with max amount (for example Rs 5,000), frequency (weekly or as presented) and end date (one year).</li>
+          <li><strong>Redirect</strong> The app opens the gateway page; the customer enters card or UPI details there, never on our servers. We store only the gateway's token and mandate reference (this keeps us out of most of PCI DSS scope).</li>
+          <li><strong>Bank 2FA</strong> OTP or 3-D Secure or UPI PIN at the bank or UPI app.</li>
+          <li><strong>Callback</strong> The browser returns to our <code>return_url</code> (show "processing") and, separately, the gateway sends a signed webhook. Trust the webhook (verify the signature; dedupe by event id), not the browser redirect, which the user can close or fake.</li>
+          <li><strong>First charge</strong> Often taken during setup (on-session), so the customer pays cycle 1 with 2FA and later cycles happen off-session.</li>
+          <li><strong>Each cycle</strong> Send the pre-debit notice with the exact amount, wait the window, then charge. If the amount exceeds the mandate's max or Rs 15,000, the customer must authenticate that debit: model it as a cycle state <code>AWAITING_CUSTOMER_AUTH</code>.</li>
+          <li><strong>Mandate lifecycle</strong> Customers can revoke a mandate from their bank or UPI app; the gateway tells us by webhook, and we move the subscription to <code>PAST_DUE</code> and ask for a new payment method before the next cycle.</li>
+        </ol>
+        <div class="callout note"><p>Outside India, the flow is lighter (card networks allow merchant-initiated transactions on a saved card after one authenticated payment), but the shape is the same: authorise once with the customer present, charge later with a stable idempotency key, react to webhooks.</p></div>
+
+        <h3>4. Failed payments: retries and dunning</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Subscription states ACTIVE, PAST_DUE, PAUSED, CANCELLED with retry loop">
+            <rect class="box db" x="20" y="100" width="130" height="56"/>
+            <text class="label" x="85" y="133">ACTIVE</text>
+            <rect class="box kafka" x="250" y="100" width="150" height="56"/>
+            <text class="label" x="325" y="133">PAST_DUE</text>
+            <rect class="box queue" x="500" y="30" width="140" height="56"/>
+            <text class="label" x="570" y="63">SUSPENDED</text>
+            <rect class="box svc" x="500" y="170" width="140" height="56"/>
+            <text class="label" x="570" y="203">CANCELLED</text>
+            <rect class="box cache" x="660" y="100" width="130" height="56"/>
+            <text class="label" x="725" y="133">COMPLETED</text>
+            <path class="arrow" d="M150 120 L246 120"/>
+            <text class="label small" x="198" y="110">charge fails</text>
+            <path class="arrow" d="M250 142 L154 142"/>
+            <text class="label small" x="198" y="166">retry succeeds</text>
+            <path class="arrow dashed" d="M300 100 C 280 40 370 40 350 100"/>
+            <text class="label small" x="325" y="30">retry 1..N (soft declines)</text>
+            <path class="arrow" d="M400 115 L496 65"/>
+            <text class="label small" x="440" y="78">retries exhausted</text>
+            <path class="arrow" d="M400 145 L496 195"/>
+            <text class="label small" x="430" y="185">hard decline + no new card</text>
+            <path class="arrow dashed" d="M85 156 C 120 245 640 250 725 156"/>
+            <text class="label small" x="400" y="242">last cycle done (max_cycles reached)</text>
+          </svg>
+          <figcaption>What happens after the last retry is a merchant setting: suspend, cancel, or stay past due. Stripe exposes the same choices.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Soft vs hard declines.</b> Insufficient funds or a network timeout: retry later. Lost or stolen card, revoked authorisation: do not retry with the same method; ask for a new one. Stripe documents a list of hard decline codes it never retries automatically.</li>
+          <li><b>Schedule.</b> Spread retries over days (for example day 1, 3, 5, 7), at times more likely to succeed (after typical salary dates, early morning local time). Stripe's default Smart Retries policy is up to 8 retries within 2 weeks; a custom schedule is up to three retries at chosen day offsets. Note Stripe does not auto-retry India-issued card payments, because every debit needs its own pre-debit notice: the retry is a new notified attempt.</li>
+          <li><b>Communication.</b> Email and push on each failure with a link to update the payment method ("card expiring" reminders a week before expiry prevent many failures).</li>
+          <li><b>Goods are different.</b> For milk, decide the policy: deliver on credit and retry (good customers), or hold the order until paid (charge before the cut-off). Many grocery subscriptions charge at order creation; if the charge fails, the order is not released to the warehouse.</li>
+          <li><b>Every retry is a new <code>payment_attempt</code></b> with its own idempotency key <code>sub:cycle:attempt</code>; the cycle remembers the attempt count.</li>
+        </ul>
+
+        <h3>5. Pause, skip, cancel, change: races with the scheduler</h3>
+        <p>A customer taps "skip next Monday" at 19:59:58; the scheduler claims the subscription at 20:00:00. Who wins?</p>
+        <ul>
+          <li><b>Cut-off rule</b> (from requirements): changes at or after the cut-off apply from the next cycle. The UI shows it ("changes now apply from 14 December").</li>
+          <li><b>Serialise per subscription</b>: both the API and the scheduler update the subscription row with <code>WHERE version = ?</code> (or take a row lock). One commits first; the other re-reads and acts on the new state.</li>
+          <li><b>Skip</b> writes a <code>schedule_change</code> for that cycle date; the cycle worker marks the cycle <code>SKIPPED</code> instead of ordering. <b>Pause</b> sets status <code>PAUSED</code> with a resume date; the scheduler skips paused subscriptions and resumes automatically. Pausing does not count towards <code>max_cycles</code> (decide and say it).</li>
+          <li><b>Cancel</b>: immediately (refund or no refund of the current period per policy) or at period end (<code>cancel_at_period_end</code>). Never delete: keep history for invoices, support and analytics. Also cancel the mandate at the gateway if no other subscription uses it.</li>
+          <li><b>Plan change</b>: upgrade now with proration (charge the difference for the rest of the period) or from the next cycle; downgrades usually from the next cycle. Proration is a nice SDE-2 detail; mention it, do not implement it.</li>
+          <li><b>Out of stock</b> at order time: substitute (if the customer allowed it), partially fulfil, or skip the cycle and do not charge. The cycle stores the outcome.</li>
+        </ul>
+
+        <h3>6. Reuse vs build (the PhonePe question)</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Capability</th><th>Reuse or build</th><th>Contract</th></tr></thead>
+            <tbody>
+              <tr><td>Catalogue, pricing</td><td>Reuse</td><td>Read product and current price; the plan references a product</td></tr>
+              <tr><td>Cart / checkout UI</td><td>Reuse (for the first payment)</td><td>"Subscribe" is a checkout option with a schedule</td></tr>
+              <tr><td>Order management</td><td>Reuse</td><td><code>POST /orders</code> with <code>source=SUBSCRIPTION</code>, <code>idempotencyKey</code></td></tr>
+              <tr><td>Inventory, warehouse, delivery slots</td><td>Reuse</td><td>Orders reserve stock and slot as usual; subscriptions add a demand forecast</td></tr>
+              <tr><td>Payments (gateway, tokens)</td><td>Reuse, extend for mandates</td><td>Create mandate, charge mandate, webhooks</td></tr>
+              <tr><td>Notifications</td><td>Reuse</td><td>Templates for pre-debit, failure, receipt</td></tr>
+              <tr><td>Subscription service (plans, subscriptions, cycles, changes)</td><td><b>Build</b></td><td>The APIs above</td></tr>
+              <tr><td>Scheduler and cycle workers</td><td><b>Build</b> (or reuse a company job scheduler)</td><td>Claims due subscriptions, emits <code>cycle.due</code></td></tr>
+              <tr><td>Dunning and reconciliation</td><td><b>Build</b> (or use the gateway's billing product)</td><td>Retry schedule, daily reconcile with gateway reports</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Reconciliation deserves one sentence: every day, compare our <code>payment_attempt</code> rows with the gateway's settlement report; mismatches (charged but marked failed, or the reverse) go to a fix-up queue. Payments people at Razorpay and PhonePe will look for this.</p>
+      

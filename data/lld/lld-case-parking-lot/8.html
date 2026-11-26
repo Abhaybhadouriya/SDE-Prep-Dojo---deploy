@@ -1,0 +1,1138 @@
+
+  <h2>Full code</h2>
+  <p>Complete, runnable, and the same files that sit in <code>lld-code/lld-case-parking-lot/</code>. Java is the primary version (four files, no packages, so <code>javac *.java</code> just works). Python mirrors it with a unittest file. The C++14 version is single-threaded because the MinGW g++ 6.3 used to build it has no <code>std::thread</code>; the comments mark where the mutexes go.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code> (Main.java): run it first and match the output to the lot map from the story.</li><li><code>ParkingLot.park</code> and <code>unpark</code> (ParkingLot.java, about 40 lines): the facade and the heart of the design. Note the plate claim with <code>putIfAbsent</code> and its undo.</li><li><code>Level.tryTake</code> / <code>release</code>: one atomic <code>pollFirst()</code> per spot claim.</li><li><code>NearestFirstAllocation</code> and <code>HourlyFee</code> (Strategies.java): the two strategies; then <code>PeakHourFee</code>.</li><li>Skip on first read: the enums, records and exceptions in Model.java.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+      <p><b>Model.java</b> - enums, value objects, the vehicle factory, exceptions.</p>
+<pre><code class="language-java">import java.time.LocalDateTime;
+import java.util.List;
+
+// ---------- enums: the fixed vocabulary of the problem ----------
+enum SpotSize { SMALL, MEDIUM, LARGE }
+
+enum VehicleType {
+    // which spot sizes a vehicle may use, smallest first
+    MOTORCYCLE(List.of(SpotSize.SMALL, SpotSize.MEDIUM, SpotSize.LARGE)),
+    CAR(List.of(SpotSize.MEDIUM, SpotSize.LARGE)),
+    TRUCK(List.of(SpotSize.LARGE));
+
+    private final List&lt;SpotSize&gt; fits;
+    VehicleType(List&lt;SpotSize&gt; fits) { this.fits = fits; }
+    List&lt;SpotSize&gt; fits() { return fits; }
+}
+
+// ---------- value objects (immutable) ----------
+record Vehicle(String plate, VehicleType type) {}
+
+record Ticket(String id, Vehicle vehicle, ParkingSpot spot, LocalDateTime entry) {}
+
+record Receipt(Ticket ticket, LocalDateTime exit, long minutes, long feeRupees) {}
+
+// ---------- Factory: turns raw input ("car", "ka01ab1234") into a valid Vehicle ----------
+final class VehicleFactory {
+    private VehicleFactory() {}
+
+    static Vehicle create(String type, String plate) {
+        if (plate == null || plate.isBlank()) throw new IllegalArgumentException("plate is required");
+        if (type == null) throw new IllegalArgumentException("vehicle type is required");
+        VehicleType t;
+        try {
+            t = VehicleType.valueOf(type.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("unknown vehicle type: " + type);
+        }
+        return new Vehicle(plate.trim().toUpperCase(), t);
+    }
+}
+
+// ---------- a spot is identity + size; "free or taken" lives in Level's free sets ----------
+final class ParkingSpot implements Comparable&lt;ParkingSpot&gt; {
+    private final int level;
+    private final int number;
+    private final SpotSize size;
+
+    ParkingSpot(int level, int number, SpotSize size) {
+        this.level = level;
+        this.number = number;
+        this.size = size;
+    }
+
+    int level() { return level; }
+    int number() { return number; }
+    SpotSize size() { return size; }
+    String id() { return "L" + level + "-" + number; }
+
+    // lower number = nearer the entry gate of that level
+    @Override public int compareTo(ParkingSpot o) { return Integer.compare(number, o.number); }
+    @Override public String toString() { return id() + "(" + size + ")"; }
+}
+
+// ---------- domain exceptions: callers can tell "full" from "bad ticket" ----------
+class LotFullException extends RuntimeException {
+    LotFullException(String msg) { super(msg); }
+}
+
+class InvalidTicketException extends RuntimeException {
+    InvalidTicketException(String msg) { super(msg); }
+}</code></pre>
+      <p><b>Strategies.java</b> - allocation and pricing strategies, the pricing factory, the listener interface.</p>
+<pre><code class="language-java">import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+// ---------- Strategy 1: which spot does a vehicle get? ----------
+interface SpotAllocationStrategy {
+    String name();
+    Optional&lt;ParkingSpot&gt; allocate(List&lt;Level&gt; levels, Vehicle vehicle);
+}
+
+// lowest level first; inside a level, the smallest size that fits
+final class NearestFirstAllocation implements SpotAllocationStrategy {
+    public String name() { return "nearest-first"; }
+
+    public Optional&lt;ParkingSpot&gt; allocate(List&lt;Level&gt; levels, Vehicle v) {
+        for (Level level : levels)
+            for (SpotSize size : v.type().fits()) {
+                Optional&lt;ParkingSpot&gt; spot = level.tryTake(size);
+                if (spot.isPresent()) return spot;
+            }
+        return Optional.empty();
+    }
+}
+
+// smallest size that fits anywhere in the lot first, so big spots stay free for trucks
+final class BestFitAllocation implements SpotAllocationStrategy {
+    public String name() { return "best-fit"; }
+
+    public Optional&lt;ParkingSpot&gt; allocate(List&lt;Level&gt; levels, Vehicle v) {
+        for (SpotSize size : v.type().fits())
+            for (Level level : levels) {
+                Optional&lt;ParkingSpot&gt; spot = level.tryTake(size);
+                if (spot.isPresent()) return spot;
+            }
+        return Optional.empty();
+    }
+}
+
+// ---------- Strategy 2: how much does a stay cost? ----------
+interface FeeStrategy {
+    String name();
+    long fee(VehicleType type, LocalDateTime entry, LocalDateTime exit);
+
+    // every started hour is billed, minimum one hour
+    static long billableHours(LocalDateTime entry, LocalDateTime exit) {
+        long minutes = Duration.between(entry, exit).toMinutes();
+        return Math.max(1, (minutes + 59) / 60);
+    }
+}
+
+final class HourlyFee implements FeeStrategy {
+    private final Map&lt;VehicleType, Long&gt; ratePerHour;
+    HourlyFee(Map&lt;VehicleType, Long&gt; ratePerHour) { this.ratePerHour = Map.copyOf(ratePerHour); }
+
+    public String name() { return "hourly"; }
+
+    public long fee(VehicleType type, LocalDateTime entry, LocalDateTime exit) {
+        return FeeStrategy.billableHours(entry, exit) * ratePerHour.get(type);
+    }
+}
+
+// each billed hour that STARTS inside [peakStart, peakEnd) costs peakPercent% of the base rate
+final class PeakHourFee implements FeeStrategy {
+    private final Map&lt;VehicleType, Long&gt; ratePerHour;
+    private final int peakStartHour, peakEndHour, peakPercent;
+
+    PeakHourFee(Map&lt;VehicleType, Long&gt; ratePerHour, int peakStartHour, int peakEndHour, int peakPercent) {
+        this.ratePerHour = Map.copyOf(ratePerHour);
+        this.peakStartHour = peakStartHour;
+        this.peakEndHour = peakEndHour;
+        this.peakPercent = peakPercent;
+    }
+
+    public String name() { return "peak " + peakStartHour + "-" + peakEndHour + "h x" + peakPercent + "%"; }
+
+    public long fee(VehicleType type, LocalDateTime entry, LocalDateTime exit) {
+        long hours = FeeStrategy.billableHours(entry, exit);
+        long base = ratePerHour.get(type), total = 0;
+        for (long h = 0; h &lt; hours; h++) {
+            int hourOfDay = entry.plusHours(h).getHour();
+            boolean peak = hourOfDay &gt;= peakStartHour &amp;&amp; hourOfDay &lt; peakEndHour;
+            total += peak ? base * peakPercent / 100 : base;
+        }
+        return total;
+    }
+}
+
+// ---------- Factory: build a pricing strategy from a config string ----------
+final class FeeStrategyFactory {
+    private FeeStrategyFactory() {}
+
+    static FeeStrategy create(String name, Map&lt;VehicleType, Long&gt; rates) {
+        return switch (name.trim().toLowerCase()) {
+            case "hourly" -&gt; new HourlyFee(rates);
+            case "peak" -&gt; new PeakHourFee(rates, 17, 21, 150);
+            default -&gt; throw new IllegalArgumentException("unknown pricing: " + name);
+        };
+    }
+}
+
+// ---------- Observer: anyone who wants to hear about entries and exits ----------
+interface ParkingEventListener {
+    void onParked(Ticket ticket);
+    void onLeft(Receipt receipt);
+}</code></pre>
+      <p><b>ParkingLot.java</b> - Level (free sets), ParkingLot (the service), DisplayBoard (an observer).</p>
+<pre><code class="language-java">import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+
+// One floor. Free spots are kept per size in a concurrent sorted set:
+// pollFirst() removes the nearest free spot atomically, so two threads can never get the same spot.
+final class Level {
+    private final int number;
+    private final Map&lt;SpotSize, ConcurrentSkipListSet&lt;ParkingSpot&gt;&gt; free = new EnumMap&lt;&gt;(SpotSize.class);
+    private final Map&lt;SpotSize, Integer&gt; capacity = new EnumMap&lt;&gt;(SpotSize.class);
+
+    Level(int number, int small, int medium, int large) {
+        this.number = number;
+        for (SpotSize s : SpotSize.values()) free.put(s, new ConcurrentSkipListSet&lt;&gt;());
+        int next = 1;
+        next = addSpots(SpotSize.SMALL, small, next);
+        next = addSpots(SpotSize.MEDIUM, medium, next);
+        addSpots(SpotSize.LARGE, large, next);
+    }
+
+    private int addSpots(SpotSize size, int count, int next) {
+        capacity.put(size, count);
+        for (int i = 0; i &lt; count; i++) free.get(size).add(new ParkingSpot(number, next++, size));
+        return next;
+    }
+
+    int number() { return number; }
+    Optional&lt;ParkingSpot&gt; tryTake(SpotSize size) { return Optional.ofNullable(free.get(size).pollFirst()); }
+
+    void release(ParkingSpot spot) {
+        if (!free.get(spot.size()).add(spot)) throw new IllegalStateException("spot released twice: " + spot.id());
+    }
+
+    int freeCount(SpotSize size) { return free.get(size).size(); }
+    int capacity(SpotSize size) { return capacity.get(size); }
+}
+
+// The service the gates talk to. Plain class, created once by main and passed around (no global Singleton).
+final class ParkingLot {
+    private final List&lt;Level&gt; levels;
+    private volatile SpotAllocationStrategy allocation;
+    private volatile FeeStrategy pricing;
+    private final ConcurrentHashMap&lt;String, Ticket&gt; activeTickets = new ConcurrentHashMap&lt;&gt;();
+    private final ConcurrentHashMap&lt;String, String&gt; ticketByPlate = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicLong ticketSeq = new AtomicLong();
+    private final List&lt;ParkingEventListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+    ParkingLot(List&lt;Level&gt; levels, SpotAllocationStrategy allocation, FeeStrategy pricing) {
+        this.levels = List.copyOf(levels);
+        this.allocation = allocation;
+        this.pricing = pricing;
+    }
+
+    void setAllocation(SpotAllocationStrategy s) { this.allocation = s; }
+    void setPricing(FeeStrategy p) { this.pricing = p; }
+    void addListener(ParkingEventListener l) { listeners.add(l); }
+
+    Ticket park(Vehicle vehicle, LocalDateTime at) {
+        String ticketId = "T" + ticketSeq.incrementAndGet();
+        // claim the plate first: the same car cannot be inside twice
+        if (ticketByPlate.putIfAbsent(vehicle.plate(), ticketId) != null)
+            throw new IllegalStateException(vehicle.plate() + " is already parked");
+        Optional&lt;ParkingSpot&gt; spot = allocation.allocate(levels, vehicle);
+        if (spot.isEmpty()) {
+            ticketByPlate.remove(vehicle.plate(), ticketId);   // undo the claim
+            throw new LotFullException("no free spot for " + vehicle.type() + " " + vehicle.plate());
+        }
+        Ticket ticket = new Ticket(ticketId, vehicle, spot.get(), at);
+        activeTickets.put(ticketId, ticket);
+        listeners.forEach(l -&gt; l.onParked(ticket));
+        return ticket;
+    }
+
+    Receipt unpark(String ticketId, LocalDateTime at) {
+        Ticket ticket = activeTickets.get(ticketId);
+        if (ticket == null) throw new InvalidTicketException("unknown or already used ticket " + ticketId);
+        if (at.isBefore(ticket.entry())) throw new IllegalArgumentException("exit time is before entry time");
+        // remove(key, value) is atomic: if two exits race with one ticket, only one wins
+        if (!activeTickets.remove(ticketId, ticket))
+            throw new InvalidTicketException("ticket " + ticketId + " was already used");
+        long fee = pricing.fee(ticket.vehicle().type(), ticket.entry(), at);
+        long minutes = Duration.between(ticket.entry(), at).toMinutes();
+        levels.get(ticket.spot().level() - 1).release(ticket.spot());
+        ticketByPlate.remove(ticket.vehicle().plate(), ticketId);
+        Receipt receipt = new Receipt(ticket, at, minutes, fee);
+        listeners.forEach(l -&gt; l.onLeft(receipt));
+        return receipt;
+    }
+
+    Map&lt;SpotSize, Integer&gt; freeSpots() {
+        Map&lt;SpotSize, Integer&gt; out = new EnumMap&lt;&gt;(SpotSize.class);
+        for (SpotSize s : SpotSize.values()) {
+            int n = 0;
+            for (Level l : levels) n += l.freeCount(s);
+            out.put(s, n);
+        }
+        return out;
+    }
+
+    List&lt;Ticket&gt; activeTickets() {
+        List&lt;Ticket&gt; list = new ArrayList&lt;&gt;(activeTickets.values());
+        list.sort((a, b) -&gt; a.spot().id().compareTo(b.spot().id()));
+        return Collections.unmodifiableList(list);
+    }
+
+    String allocationName() { return allocation.name(); }
+    String pricingName() { return pricing.name(); }
+}
+
+// Observer example: an entrance display that shows free spots per size
+final class DisplayBoard implements ParkingEventListener {
+    private final ParkingLot lot;
+    private volatile String text = "";
+    DisplayBoard(ParkingLot lot) { this.lot = lot; }
+
+    public void onParked(Ticket t) { refresh(); }
+    public void onLeft(Receipt r) { refresh(); }
+    private void refresh() { text = "FREE " + lot.freeSpots(); }
+    String text() { return text; }
+}</code></pre>
+      <p><b>Main.java</b> - the demo driver with assertions and the 200-cars concurrency test.</p>
+<pre><code class="language-java">import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static void expectThrows(Class&lt;? extends RuntimeException&gt; type, Runnable r, String what) {
+        try {
+            r.run();
+        } catch (RuntimeException e) {
+            check(type.isInstance(e), what + " (got " + e.getClass().getSimpleName() + ")");
+            System.out.println("  rejected as expected: " + e.getMessage());
+            return;
+        }
+        throw new AssertionError("FAILED: expected " + type.getSimpleName() + " for " + what);
+    }
+
+    static LocalDateTime at(int h, int m) { return LocalDateTime.of(2026, 11, 23, h, m); }
+
+    public static void main(String[] args) throws Exception {
+        Map&lt;VehicleType, Long&gt; rates = Map.of(VehicleType.MOTORCYCLE, 10L, VehicleType.CAR, 20L, VehicleType.TRUCK, 50L);
+        // L1: spots 1 small, 2-3 medium, 4 large.  L2: 1-2 small, 3-4 medium, 5 large.
+        List&lt;Level&gt; levels = List.of(new Level(1, 1, 2, 1), new Level(2, 2, 2, 1));
+        ParkingLot lot = new ParkingLot(levels, new NearestFirstAllocation(), FeeStrategyFactory.create("hourly", rates));
+        DisplayBoard board = new DisplayBoard(lot);
+        lot.addListener(board);
+
+        System.out.println("== 1. park with " + lot.allocationName() + " ==");
+        Ticket bike = lot.park(VehicleFactory.create("motorcycle", "ka01-b1"), at(9, 0));
+        Ticket c1 = lot.park(VehicleFactory.create("car", "ka01-c1"), at(9, 10));
+        Ticket c2 = lot.park(VehicleFactory.create("car", "ka01-c2"), at(9, 15));
+        Ticket c3 = lot.park(VehicleFactory.create("car", "ka01-c3"), at(9, 20));
+        for (Ticket t : List.of(bike, c1, c2, c3)) System.out.println("  " + t.id() + " " + t.vehicle().plate() + " -&gt; " + t.spot());
+        check(bike.spot().id().equals("L1-1"), "bike takes the small spot on L1");
+        check(c3.spot().id().equals("L1-4"), "nearest-first puts the 3rd car in L1's LARGE spot");
+        System.out.println("  board: " + board.text());
+
+        System.out.println("== 2. switch allocation to best-fit ==");
+        lot.setAllocation(new BestFitAllocation());
+        Ticket c4 = lot.park(VehicleFactory.create("car", "ka01-c4"), at(9, 30));
+        Ticket truck = lot.park(VehicleFactory.create("truck", "ka01-t1"), at(9, 40));
+        System.out.println("  " + c4.id() + " " + c4.vehicle().plate() + " -&gt; " + c4.spot());
+        System.out.println("  " + truck.id() + " " + truck.vehicle().plate() + " -&gt; " + truck.spot());
+        check(c4.spot().id().equals("L2-3"), "best-fit gives the car a MEDIUM spot on L2");
+        check(truck.spot().id().equals("L2-5"), "truck gets the only free LARGE spot");
+
+        System.out.println("== 3. invalid operations ==");
+        expectThrows(LotFullException.class, () -&gt; lot.park(VehicleFactory.create("truck", "ka01-t2"), at(9, 45)), "no large spot left");
+        expectThrows(IllegalStateException.class, () -&gt; lot.park(VehicleFactory.create("car", "KA01-C1"), at(9, 50)), "same plate twice");
+        expectThrows(IllegalArgumentException.class, () -&gt; VehicleFactory.create("rocket", "x1"), "unknown vehicle type");
+        expectThrows(IllegalArgumentException.class, () -&gt; lot.unpark(c2.id(), at(9, 0)), "exit before entry");
+
+        System.out.println("== 4. exit with " + lot.pricingName() + " pricing ==");
+        Receipt r1 = lot.unpark(c1.id(), at(11, 30));   // 2h20m -&gt; 3 billed hours x 20
+        System.out.println("  " + r1.ticket().vehicle().plate() + " stayed " + r1.minutes() + " min, pays Rs " + r1.feeRupees());
+        check(r1.feeRupees() == 60, "2h20m car = 3 hours x Rs 20");
+        expectThrows(InvalidTicketException.class, () -&gt; lot.unpark(c1.id(), at(11, 31)), "same ticket used twice");
+        Receipt r2 = lot.unpark(bike.id(), at(9, 5));   // 5 minutes -&gt; minimum 1 hour
+        check(r2.feeRupees() == 10, "minimum one billed hour");
+
+        System.out.println("== 5. peak pricing (17:00-21:00 at 150%) ==");
+        lot.setPricing(FeeStrategyFactory.create("peak", rates));
+        Ticket c5 = lot.park(VehicleFactory.create("car", "ka01-c5"), at(16, 30));
+        Receipt r3 = lot.unpark(c5.id(), at(19, 10));   // hours start 16:30, 17:30, 18:30 -&gt; 20 + 30 + 30
+        System.out.println("  " + r3.ticket().vehicle().plate() + " stayed " + r3.minutes() + " min, pays Rs " + r3.feeRupees());
+        check(r3.feeRupees() == 80, "one normal hour + two peak hours = 80");
+        System.out.println("  board: " + board.text());
+        check(lot.freeSpots().get(SpotSize.MEDIUM) == 2, "two MEDIUM spots free after exits");
+
+        System.out.println("== 6. concurrency: 200 cars race for 50 spots on 8 threads ==");
+        concurrencyTest();
+
+        System.out.println("All " + checks + " checks passed");
+    }
+
+    static void concurrencyTest() throws Exception {
+        ParkingLot lot = new ParkingLot(List.of(new Level(1, 0, 50, 0)), new NearestFirstAllocation(),
+                new HourlyFee(Map.of(VehicleType.MOTORCYCLE, 10L, VehicleType.CAR, 20L, VehicleType.TRUCK, 50L)));
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        ConcurrentLinkedQueue&lt;Ticket&gt; issued = new ConcurrentLinkedQueue&lt;&gt;();
+        AtomicInteger full = new AtomicInteger();
+        for (int i = 0; i &lt; 200; i++) {
+            final int n = i;
+            pool.submit(() -&gt; {
+                try {
+                    start.await();
+                    issued.add(lot.park(new Vehicle("CAR-" + n, VehicleType.CAR), at(10, 0)));
+                } catch (LotFullException e) {
+                    full.incrementAndGet();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        start.countDown();   // release all threads at once
+        pool.shutdown();
+        check(pool.awaitTermination(10, TimeUnit.SECONDS), "threads finished");
+        Set&lt;String&gt; spotIds = new HashSet&lt;&gt;();
+        for (Ticket t : issued) spotIds.add(t.spot().id());
+        System.out.println("  parked=" + issued.size() + " rejected=" + full.get() + " distinct spots=" + spotIds.size());
+        check(issued.size() == 50 &amp;&amp; full.get() == 150, "exactly 50 cars parked");
+        check(spotIds.size() == 50, "no spot was given to two cars");
+
+        // everyone leaves at once; each ticket must be accepted exactly once
+        ExecutorService exitPool = Executors.newFixedThreadPool(8);
+        AtomicInteger exits = new AtomicInteger(), rejectedExits = new AtomicInteger();
+        List&lt;Ticket&gt; tickets = new ArrayList&lt;&gt;(issued);
+        for (Ticket t : tickets)
+            for (int k = 0; k &lt; 2; k++)   // every ticket is presented twice
+                exitPool.submit(() -&gt; {
+                    try { lot.unpark(t.id(), at(11, 0)); exits.incrementAndGet(); }
+                    catch (InvalidTicketException e) { rejectedExits.incrementAndGet(); }
+                });
+        exitPool.shutdown();
+        check(exitPool.awaitTermination(10, TimeUnit.SECONDS), "exit threads finished");
+        System.out.println("  exits=" + exits.get() + " duplicate exits rejected=" + rejectedExits.get() + " free=" + lot.freeSpots().get(SpotSize.MEDIUM));
+        check(exits.get() == 50 &amp;&amp; rejectedExits.get() == 50, "each ticket exits once");
+        check(lot.freeSpots().get(SpotSize.MEDIUM) == 50, "all 50 spots free again");
+    }
+}</code></pre>
+      <p>Build and run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code></p>
+<pre class="terminal"><code>== 1. park with nearest-first ==
+  T1 KA01-B1 -&gt; L1-1(SMALL)
+  T2 KA01-C1 -&gt; L1-2(MEDIUM)
+  T3 KA01-C2 -&gt; L1-3(MEDIUM)
+  T4 KA01-C3 -&gt; L1-4(LARGE)
+  board: FREE {SMALL=2, MEDIUM=2, LARGE=1}
+== 2. switch allocation to best-fit ==
+  T5 KA01-C4 -&gt; L2-3(MEDIUM)
+  T6 KA01-T1 -&gt; L2-5(LARGE)
+== 3. invalid operations ==
+  rejected as expected: no free spot for TRUCK KA01-T2
+  rejected as expected: KA01-C1 is already parked
+  rejected as expected: unknown vehicle type: rocket
+  rejected as expected: exit time is before entry time
+== 4. exit with hourly pricing ==
+  KA01-C1 stayed 140 min, pays Rs 60
+  rejected as expected: unknown or already used ticket T2
+== 5. peak pricing (17:00-21:00 at 150%) ==
+  KA01-C5 stayed 160 min, pays Rs 80
+  board: FREE {SMALL=3, MEDIUM=2, LARGE=0}
+== 6. concurrency: 200 cars race for 50 spots on 8 threads ==
+  parked=50 rejected=150 distinct spots=50
+  exits=50 duplicate exits rejected=50 free=50
+All 19 checks passed</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+      <p><b>parking_lot.py</b> - the whole model. One lock per level guards its heaps; one lock guards the ticket maps.</p>
+<pre><code class="language-python">"""Parking lot - machine-coding reference (Python 3.11). Same design as the Java version."""
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+
+
+class SpotSize(Enum):
+    SMALL = 1
+    MEDIUM = 2
+    LARGE = 3
+
+
+class VehicleType(Enum):
+    MOTORCYCLE = (SpotSize.SMALL, SpotSize.MEDIUM, SpotSize.LARGE)   # smallest fit first
+    CAR = (SpotSize.MEDIUM, SpotSize.LARGE)
+    TRUCK = (SpotSize.LARGE,)
+
+    @property
+    def fits(self) -&gt; tuple[SpotSize, ...]:
+        return self.value
+
+
+@dataclass(frozen=True)
+class Vehicle:
+    plate: str
+    type: VehicleType
+
+
+@dataclass(frozen=True, order=True)
+class ParkingSpot:
+    level: int
+    number: int
+    size: SpotSize
+
+    @property
+    def id(self) -&gt; str:
+        return f"L{self.level}-{self.number}"
+
+    def __str__(self) -&gt; str:
+        return f"{self.id}({self.size.name})"
+
+
+@dataclass(frozen=True)
+class Ticket:
+    id: str
+    vehicle: Vehicle
+    spot: ParkingSpot
+    entry: datetime
+
+
+@dataclass(frozen=True)
+class Receipt:
+    ticket: Ticket
+    exit: datetime
+    minutes: int
+    fee_rupees: int
+
+
+class LotFullError(Exception):
+    pass
+
+
+class InvalidTicketError(Exception):
+    pass
+
+
+class VehicleFactory:
+    @staticmethod
+    def create(kind: str, plate: str) -&gt; Vehicle:
+        if not plate or not plate.strip():
+            raise ValueError("plate is required")
+        try:
+            vtype = VehicleType[kind.strip().upper()]
+        except KeyError:
+            raise ValueError(f"unknown vehicle type: {kind}") from None
+        return Vehicle(plate.strip().upper(), vtype)
+
+
+class Level:
+    """One floor. A min-heap of free spots per size; one lock per level guards the heaps."""
+
+    def __init__(self, number: int, small: int, medium: int, large: int) -&gt; None:
+        self.number = number
+        self._lock = threading.Lock()
+        self._free: dict[SpotSize, list[ParkingSpot]] = {s: [] for s in SpotSize}
+        n = itertools.count(1)
+        for size, count in ((SpotSize.SMALL, small), (SpotSize.MEDIUM, medium), (SpotSize.LARGE, large)):
+            for _ in range(count):
+                self._free[size].append(ParkingSpot(number, next(n), size))
+            heapq.heapify(self._free[size])
+
+    def try_take(self, size: SpotSize) -&gt; ParkingSpot | None:
+        with self._lock:                      # check-then-take must be one critical section
+            heap = self._free[size]
+            return heapq.heappop(heap) if heap else None
+
+    def release(self, spot: ParkingSpot) -&gt; None:
+        with self._lock:
+            if spot in self._free[spot.size]:
+                raise RuntimeError(f"spot released twice: {spot.id}")
+            heapq.heappush(self._free[spot.size], spot)
+
+    def free_count(self, size: SpotSize) -&gt; int:
+        with self._lock:
+            return len(self._free[size])
+
+
+# ---------- Strategy: allocation ----------
+class SpotAllocationStrategy(ABC):
+    name = "?"
+
+    @abstractmethod
+    def allocate(self, levels: list[Level], vehicle: Vehicle) -&gt; ParkingSpot | None: ...
+
+
+class NearestFirstAllocation(SpotAllocationStrategy):
+    name = "nearest-first"
+
+    def allocate(self, levels, vehicle):
+        for level in levels:
+            for size in vehicle.type.fits:
+                if spot := level.try_take(size):
+                    return spot
+        return None
+
+
+class BestFitAllocation(SpotAllocationStrategy):
+    name = "best-fit"
+
+    def allocate(self, levels, vehicle):
+        for size in vehicle.type.fits:
+            for level in levels:
+                if spot := level.try_take(size):
+                    return spot
+        return None
+
+
+# ---------- Strategy: pricing ----------
+def billable_hours(entry: datetime, exit_: datetime) -&gt; int:
+    minutes = int((exit_ - entry).total_seconds() // 60)
+    return max(1, (minutes + 59) // 60)
+
+
+class FeeStrategy(ABC):
+    name = "?"
+
+    @abstractmethod
+    def fee(self, vtype: VehicleType, entry: datetime, exit_: datetime) -&gt; int: ...
+
+
+class HourlyFee(FeeStrategy):
+    name = "hourly"
+
+    def __init__(self, rates: dict[VehicleType, int]) -&gt; None:
+        self.rates = dict(rates)
+
+    def fee(self, vtype, entry, exit_):
+        return billable_hours(entry, exit_) * self.rates[vtype]
+
+
+class PeakHourFee(FeeStrategy):
+    """Each billed hour that starts inside [start, end) costs percent% of the base rate."""
+
+    def __init__(self, rates, start_hour: int, end_hour: int, percent: int) -&gt; None:
+        self.rates, self.start, self.end, self.percent = dict(rates), start_hour, end_hour, percent
+        self.name = f"peak {start_hour}-{end_hour}h x{percent}%"
+
+    def fee(self, vtype, entry, exit_):
+        base, total = self.rates[vtype], 0
+        for h in range(billable_hours(entry, exit_)):
+            hour = (entry + timedelta(hours=h)).hour
+            total += base * self.percent // 100 if self.start &lt;= hour &lt; self.end else base
+        return total
+
+
+class FeeStrategyFactory:
+    @staticmethod
+    def create(name: str, rates: dict[VehicleType, int]) -&gt; FeeStrategy:
+        match name.strip().lower():
+            case "hourly":
+                return HourlyFee(rates)
+            case "peak":
+                return PeakHourFee(rates, 17, 21, 150)
+        raise ValueError(f"unknown pricing: {name}")
+
+
+# ---------- Observer ----------
+class ParkingEventListener(ABC):
+    @abstractmethod
+    def on_parked(self, ticket: Ticket) -&gt; None: ...
+
+    @abstractmethod
+    def on_left(self, receipt: Receipt) -&gt; None: ...
+
+
+class ParkingLot:
+    def __init__(self, levels: list[Level], allocation: SpotAllocationStrategy, pricing: FeeStrategy) -&gt; None:
+        self._levels = list(levels)
+        self.allocation = allocation
+        self.pricing = pricing
+        self._lock = threading.Lock()          # guards the two ticket maps
+        self._active: dict[str, Ticket] = {}
+        self._ticket_by_plate: dict[str, str] = {}
+        self._seq = itertools.count(1)
+        self._listeners: list[ParkingEventListener] = []
+
+    def add_listener(self, listener: ParkingEventListener) -&gt; None:
+        self._listeners.append(listener)
+
+    def park(self, vehicle: Vehicle, at: datetime) -&gt; Ticket:
+        with self._lock:
+            if vehicle.plate in self._ticket_by_plate:
+                raise ValueError(f"{vehicle.plate} is already parked")
+            ticket_id = f"T{next(self._seq)}"
+            self._ticket_by_plate[vehicle.plate] = ticket_id   # claim the plate
+        spot = self.allocation.allocate(self._levels, vehicle)  # level locks, not the lot lock
+        if spot is None:
+            with self._lock:
+                del self._ticket_by_plate[vehicle.plate]
+            raise LotFullError(f"no free spot for {vehicle.type.name} {vehicle.plate}")
+        ticket = Ticket(ticket_id, vehicle, spot, at)
+        with self._lock:
+            self._active[ticket_id] = ticket
+        for listener in self._listeners:
+            listener.on_parked(ticket)
+        return ticket
+
+    def unpark(self, ticket_id: str, at: datetime) -&gt; Receipt:
+        with self._lock:
+            ticket = self._active.get(ticket_id)
+            if ticket is None:
+                raise InvalidTicketError(f"unknown or already used ticket {ticket_id}")
+            if at &lt; ticket.entry:
+                raise ValueError("exit time is before entry time")
+            del self._active[ticket_id]                      # only one exit can get here
+            del self._ticket_by_plate[ticket.vehicle.plate]
+        fee = self.pricing.fee(ticket.vehicle.type, ticket.entry, at)
+        self._levels[ticket.spot.level - 1].release(ticket.spot)
+        minutes = int((at - ticket.entry).total_seconds() // 60)
+        receipt = Receipt(ticket, at, minutes, fee)
+        for listener in self._listeners:
+            listener.on_left(receipt)
+        return receipt
+
+    def free_spots(self) -&gt; dict[str, int]:
+        return {s.name: sum(level.free_count(s) for level in self._levels) for s in SpotSize}
+
+
+class DisplayBoard(ParkingEventListener):
+    def __init__(self, lot: ParkingLot) -&gt; None:
+        self.lot, self.text = lot, ""
+
+    def on_parked(self, ticket):
+        self.text = f"FREE {self.lot.free_spots()}"
+
+    def on_left(self, receipt):
+        self.text = f"FREE {self.lot.free_spots()}"</code></pre>
+      <p><b>main.py</b> - demo driver.</p>
+<pre><code class="language-python">"""Demo driver: python main.py   (tests: python -m unittest test_parking_lot)"""
+from datetime import datetime
+
+from parking_lot import (BestFitAllocation, DisplayBoard, FeeStrategyFactory, InvalidTicketError, Level,
+                         LotFullError, NearestFirstAllocation, ParkingLot, VehicleFactory, VehicleType)
+
+RATES = {VehicleType.MOTORCYCLE: 10, VehicleType.CAR: 20, VehicleType.TRUCK: 50}
+
+
+def at(h: int, m: int) -&gt; datetime:
+    return datetime(2026, 11, 23, h, m)
+
+
+def main() -&gt; None:
+    lot = ParkingLot([Level(1, 1, 2, 1), Level(2, 2, 2, 1)], NearestFirstAllocation(),
+                     FeeStrategyFactory.create("hourly", RATES))
+    board = DisplayBoard(lot)
+    lot.add_listener(board)
+
+    print(f"== park with {lot.allocation.name} ==")
+    tickets = [lot.park(VehicleFactory.create(k, p), at(9, m))
+               for k, p, m in [("motorcycle", "ka01-b1", 0), ("car", "ka01-c1", 10),
+                               ("car", "ka01-c2", 15), ("car", "ka01-c3", 20)]]
+    for t in tickets:
+        print(f"  {t.id} {t.vehicle.plate} -&gt; {t.spot}")
+    assert tickets[3].spot.id == "L1-4"
+    print(f"  board: {board.text}")
+
+    lot.allocation = BestFitAllocation()
+    car4 = lot.park(VehicleFactory.create("car", "ka01-c4"), at(9, 30))
+    truck = lot.park(VehicleFactory.create("truck", "ka01-t1"), at(9, 40))
+    print(f"== best-fit: {car4.vehicle.plate} -&gt; {car4.spot}, {truck.vehicle.plate} -&gt; {truck.spot} ==")
+    assert (car4.spot.id, truck.spot.id) == ("L2-3", "L2-5")
+
+    for bad in (lambda: lot.park(VehicleFactory.create("truck", "ka01-t2"), at(9, 45)),
+                lambda: lot.park(VehicleFactory.create("car", "KA01-C1"), at(9, 50))):
+        try:
+            bad()
+            raise AssertionError("should have failed")
+        except (LotFullError, ValueError) as e:
+            print(f"  rejected as expected: {e}")
+
+    r1 = lot.unpark(tickets[1].id, at(11, 30))
+    print(f"== exit: {r1.ticket.vehicle.plate} stayed {r1.minutes} min, pays Rs {r1.fee_rupees} ==")
+    assert r1.fee_rupees == 60
+    try:
+        lot.unpark(tickets[1].id, at(11, 31))
+        raise AssertionError("ticket reused")
+    except InvalidTicketError as e:
+        print(f"  rejected as expected: {e}")
+
+    lot.pricing = FeeStrategyFactory.create("peak", RATES)
+    c5 = lot.park(VehicleFactory.create("car", "ka01-c5"), at(16, 30))
+    r3 = lot.unpark(c5.id, at(19, 10))
+    print(f"== {lot.pricing.name}: {r3.ticket.vehicle.plate} stayed {r3.minutes} min, pays Rs {r3.fee_rupees} ==")
+    assert r3.fee_rupees == 80
+    print(f"  board: {board.text}")
+    print("demo OK")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+      <p><b>test_parking_lot.py</b> - unit tests, including the concurrent park and double-exit test.</p>
+<pre><code class="language-python">import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+from parking_lot import (BestFitAllocation, FeeStrategyFactory, HourlyFee, InvalidTicketError, Level, LotFullError,
+                         NearestFirstAllocation, ParkingLot, Vehicle, VehicleFactory, VehicleType)
+
+RATES = {VehicleType.MOTORCYCLE: 10, VehicleType.CAR: 20, VehicleType.TRUCK: 50}
+T = datetime(2026, 11, 23, 10, 0)
+
+
+class ParkingLotTest(unittest.TestCase):
+    def lot(self, *levels, allocation=None):
+        return ParkingLot(list(levels), allocation or NearestFirstAllocation(), HourlyFee(RATES))
+
+    def test_car_never_takes_small_spot(self):
+        lot = self.lot(Level(1, 3, 0, 0))
+        with self.assertRaises(LotFullError):
+            lot.park(VehicleFactory.create("car", "c1"), T)
+
+    def test_best_fit_keeps_large_spot_for_truck(self):
+        lot = self.lot(Level(1, 0, 0, 1), Level(2, 0, 1, 0), allocation=BestFitAllocation())
+        self.assertEqual(lot.park(VehicleFactory.create("car", "c1"), T).spot.id, "L2-1")
+        self.assertEqual(lot.park(VehicleFactory.create("truck", "t1"), T).spot.id, "L1-1")
+
+    def test_minimum_one_hour_and_round_up(self):
+        lot = self.lot(Level(1, 0, 2, 0))
+        t1 = lot.park(VehicleFactory.create("car", "c1"), T)
+        t2 = lot.park(VehicleFactory.create("car", "c2"), T)
+        self.assertEqual(lot.unpark(t1.id, T.replace(minute=1)).fee_rupees, 20)
+        self.assertEqual(lot.unpark(t2.id, T.replace(hour=11, minute=1)).fee_rupees, 40)
+
+    def test_peak_pricing(self):
+        fee = FeeStrategyFactory.create("peak", RATES)
+        self.assertEqual(fee.fee(VehicleType.CAR, T.replace(hour=16, minute=30), T.replace(hour=19, minute=10)), 80)
+
+    def test_ticket_cannot_be_used_twice(self):
+        lot = self.lot(Level(1, 0, 1, 0))
+        t = lot.park(VehicleFactory.create("car", "c1"), T)
+        lot.unpark(t.id, T)
+        with self.assertRaises(InvalidTicketError):
+            lot.unpark(t.id, T)
+
+    def test_unknown_vehicle_type(self):
+        with self.assertRaises(ValueError):
+            VehicleFactory.create("rocket", "x")
+
+    def test_concurrent_park_never_double_allocates(self):
+        lot = self.lot(Level(1, 0, 50, 0))
+
+        def try_park(n):
+            try:
+                return lot.park(Vehicle(f"CAR-{n}", VehicleType.CAR), T)
+            except LotFullError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            tickets = [t for t in pool.map(try_park, range(200)) if t]
+        self.assertEqual(len(tickets), 50)
+        self.assertEqual(len({t.spot.id for t in tickets}), 50)
+
+        def try_exit(t):
+            try:
+                lot.unpark(t.id, T)
+                return 1
+            except InvalidTicketError:
+                return 0
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            ok = sum(pool.map(try_exit, tickets + tickets))   # each ticket presented twice
+        self.assertEqual(ok, 50)
+        self.assertEqual(lot.free_spots()["MEDIUM"], 50)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+      <p>Run: <code>python main.py</code> then <code>python -m unittest test_parking_lot</code></p>
+<pre class="terminal"><code>== park with nearest-first ==
+  T1 KA01-B1 -&gt; L1-1(SMALL)
+  T2 KA01-C1 -&gt; L1-2(MEDIUM)
+  T3 KA01-C2 -&gt; L1-3(MEDIUM)
+  T4 KA01-C3 -&gt; L1-4(LARGE)
+  board: FREE {'SMALL': 2, 'MEDIUM': 2, 'LARGE': 1}
+== best-fit: KA01-C4 -&gt; L2-3(MEDIUM), KA01-T1 -&gt; L2-5(LARGE) ==
+  rejected as expected: no free spot for TRUCK KA01-T2
+  rejected as expected: KA01-C1 is already parked
+== exit: KA01-C1 stayed 140 min, pays Rs 60 ==
+  rejected as expected: unknown or already used ticket T2
+== peak 17-21h x150%: KA01-C5 stayed 160 min, pays Rs 80 ==
+  board: FREE {'SMALL': 2, 'MEDIUM': 2, 'LARGE': 0}
+demo OK</code></pre>
+<pre class="terminal"><code>.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.009s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><b>main.cpp</b> - abstract base classes play the role of interfaces (a vtable is exactly the ops table you know from C).</p>
+<pre><code class="language-cpp">// Parking lot in C++14: same design, single-threaded demo.
+// Build: g++ -std=c++14 -Wall -O2 main.cpp -o parking &amp;&amp; ./parking
+// In a multi-threaded build, give each Level a std::mutex around takeSpot/release
+// and guard the ticket map with another one (the lock points are marked LOCK).
+#include &lt;cassert&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class SpotSize { SMALL, MEDIUM, LARGE };
+enum class VehicleType { MOTORCYCLE, CAR, TRUCK };
+
+static const char* sizeName(SpotSize s) {
+    switch (s) { case SpotSize::SMALL: return "SMALL"; case SpotSize::MEDIUM: return "MEDIUM"; default: return "LARGE"; }
+}
+
+static std::vector&lt;SpotSize&gt; fits(VehicleType t) {   // smallest first
+    switch (t) {
+        case VehicleType::MOTORCYCLE: return {SpotSize::SMALL, SpotSize::MEDIUM, SpotSize::LARGE};
+        case VehicleType::CAR: return {SpotSize::MEDIUM, SpotSize::LARGE};
+        default: return {SpotSize::LARGE};
+    }
+}
+
+struct Vehicle { std::string plate; VehicleType type; };
+
+struct ParkingSpot {
+    int level, number; SpotSize size;
+    std::string id() const { return "L" + std::to_string(level) + "-" + std::to_string(number); }
+    bool operator&lt;(const ParkingSpot&amp; o) const { return number &lt; o.number; }
+};
+
+struct Ticket { std::string id; Vehicle vehicle; ParkingSpot spot; int entryMin; };   // minutes since midnight
+
+struct LotFull : std::runtime_error { using std::runtime_error::runtime_error; };
+struct InvalidTicket : std::runtime_error { using std::runtime_error::runtime_error; };
+
+class Level {
+    int number_;
+    std::map&lt;SpotSize, std::set&lt;ParkingSpot&gt;&gt; free_;   // ordered: begin() = nearest spot
+public:
+    Level(int number, int small, int medium, int large) : number_(number) {
+        int n = 1;
+        for (int i = 0; i &lt; small; i++) free_[SpotSize::SMALL].insert({number, n++, SpotSize::SMALL});
+        for (int i = 0; i &lt; medium; i++) free_[SpotSize::MEDIUM].insert({number, n++, SpotSize::MEDIUM});
+        for (int i = 0; i &lt; large; i++) free_[SpotSize::LARGE].insert({number, n++, SpotSize::LARGE});
+    }
+    bool takeSpot(SpotSize s, ParkingSpot&amp; out) {      // LOCK: check-then-take is one critical section
+        auto&amp; set = free_[s];
+        if (set.empty()) return false;
+        out = *set.begin();
+        set.erase(set.begin());
+        return true;
+    }
+    void release(const ParkingSpot&amp; p) {               // LOCK
+        if (!free_[p.size].insert(p).second) throw std::logic_error("spot released twice: " + p.id());
+    }
+    int freeCount(SpotSize s) { return (int)free_[s].size(); }
+};
+
+// ---------- Strategy interfaces: an abstract class = a vtable, like struct file_operations ----------
+struct SpotAllocationStrategy {
+    virtual ~SpotAllocationStrategy() {}
+    virtual bool allocate(std::vector&lt;Level&gt;&amp; levels, const Vehicle&amp; v, ParkingSpot&amp; out) = 0;
+};
+
+struct NearestFirst : SpotAllocationStrategy {
+    bool allocate(std::vector&lt;Level&gt;&amp; levels, const Vehicle&amp; v, ParkingSpot&amp; out) override {
+        for (auto&amp; level : levels)
+            for (SpotSize s : fits(v.type))
+                if (level.takeSpot(s, out)) return true;
+        return false;
+    }
+};
+
+struct BestFit : SpotAllocationStrategy {
+    bool allocate(std::vector&lt;Level&gt;&amp; levels, const Vehicle&amp; v, ParkingSpot&amp; out) override {
+        for (SpotSize s : fits(v.type))
+            for (auto&amp; level : levels)
+                if (level.takeSpot(s, out)) return true;
+        return false;
+    }
+};
+
+struct FeeStrategy {
+    virtual ~FeeStrategy() {}
+    virtual long fee(VehicleType t, int entryMin, int exitMin) const = 0;
+    static long billableHours(int entryMin, int exitMin) {
+        long m = exitMin - entryMin;
+        return m &lt;= 0 ? 1 : (m + 59) / 60;
+    }
+};
+
+struct HourlyFee : FeeStrategy {
+    std::map&lt;VehicleType, long&gt; rate;
+    explicit HourlyFee(std::map&lt;VehicleType, long&gt; r) : rate(std::move(r)) {}
+    long fee(VehicleType t, int in, int out) const override { return billableHours(in, out) * rate.at(t); }
+};
+
+struct PeakHourFee : FeeStrategy {
+    std::map&lt;VehicleType, long&gt; rate; int startH, endH, pct;
+    PeakHourFee(std::map&lt;VehicleType, long&gt; r, int s, int e, int p) : rate(std::move(r)), startH(s), endH(e), pct(p) {}
+    long fee(VehicleType t, int in, int out) const override {
+        long total = 0, base = rate.at(t);
+        for (long h = 0; h &lt; billableHours(in, out); h++) {
+            int hourOfDay = (int)((in + h * 60) / 60) % 24;
+            total += (hourOfDay &gt;= startH &amp;&amp; hourOfDay &lt; endH) ? base * pct / 100 : base;
+        }
+        return total;
+    }
+};
+
+class ParkingLot {
+    std::vector&lt;Level&gt; levels_;
+    std::unique_ptr&lt;SpotAllocationStrategy&gt; alloc_;
+    std::unique_ptr&lt;FeeStrategy&gt; pricing_;
+    std::map&lt;std::string, Ticket&gt; active_;          // LOCK (lot mutex)
+    std::map&lt;std::string, std::string&gt; byPlate_;   // LOCK (lot mutex)
+    long seq_ = 0;
+public:
+    ParkingLot(std::vector&lt;Level&gt; levels, std::unique_ptr&lt;SpotAllocationStrategy&gt; a, std::unique_ptr&lt;FeeStrategy&gt; f)
+        : levels_(std::move(levels)), alloc_(std::move(a)), pricing_(std::move(f)) {}
+    void setAllocation(std::unique_ptr&lt;SpotAllocationStrategy&gt; a) { alloc_ = std::move(a); }
+    void setPricing(std::unique_ptr&lt;FeeStrategy&gt; f) { pricing_ = std::move(f); }
+
+    Ticket park(const Vehicle&amp; v, int atMin) {
+        if (byPlate_.count(v.plate)) throw std::invalid_argument(v.plate + " is already parked");
+        ParkingSpot spot{};
+        if (!alloc_-&gt;allocate(levels_, v, spot)) throw LotFull("no free spot for " + v.plate);
+        Ticket t{"T" + std::to_string(++seq_), v, spot, atMin};
+        active_[t.id] = t;
+        byPlate_[v.plate] = t.id;
+        return t;
+    }
+
+    long unpark(const std::string&amp; ticketId, int atMin) {
+        auto it = active_.find(ticketId);
+        if (it == active_.end()) throw InvalidTicket("unknown or already used ticket " + ticketId);
+        Ticket t = it-&gt;second;
+        if (atMin &lt; t.entryMin) throw std::invalid_argument("exit time is before entry time");
+        active_.erase(it);
+        byPlate_.erase(t.vehicle.plate);
+        levels_[t.spot.level - 1].release(t.spot);
+        return pricing_-&gt;fee(t.vehicle.type, t.entryMin, atMin);
+    }
+
+    std::string freeSpots() {
+        std::ostringstream os;
+        for (SpotSize s : {SpotSize::SMALL, SpotSize::MEDIUM, SpotSize::LARGE}) {
+            int n = 0;
+            for (auto&amp; l : levels_) n += l.freeCount(s);
+            os &lt;&lt; sizeName(s) &lt;&lt; "=" &lt;&lt; n &lt;&lt; " ";
+        }
+        return os.str();
+    }
+};
+
+static int hm(int h, int m) { return h * 60 + m; }
+
+int main() {
+    std::map&lt;VehicleType, long&gt; rates{{VehicleType::MOTORCYCLE, 10}, {VehicleType::CAR, 20}, {VehicleType::TRUCK, 50}};
+    std::vector&lt;Level&gt; levels{Level(1, 1, 2, 1), Level(2, 2, 2, 1)};
+    ParkingLot lot(std::move(levels), std::unique_ptr&lt;SpotAllocationStrategy&gt;(new NearestFirst()),
+                   std::unique_ptr&lt;FeeStrategy&gt;(new HourlyFee(rates)));
+
+    Ticket b = lot.park({"KA01-B1", VehicleType::MOTORCYCLE}, hm(9, 0));
+    Ticket c1 = lot.park({"KA01-C1", VehicleType::CAR}, hm(9, 10));
+    Ticket c2 = lot.park({"KA01-C2", VehicleType::CAR}, hm(9, 15));
+    Ticket c3 = lot.park({"KA01-C3", VehicleType::CAR}, hm(9, 20));
+    for (const Ticket* t : {&amp;b, &amp;c1, &amp;c2, &amp;c3})
+        std::cout &lt;&lt; t-&gt;id &lt;&lt; " " &lt;&lt; t-&gt;vehicle.plate &lt;&lt; " -&gt; " &lt;&lt; t-&gt;spot.id() &lt;&lt; "(" &lt;&lt; sizeName(t-&gt;spot.size) &lt;&lt; ")\n";
+    assert(c3.spot.id() == "L1-4");
+
+    lot.setAllocation(std::unique_ptr&lt;SpotAllocationStrategy&gt;(new BestFit()));
+    Ticket c4 = lot.park({"KA01-C4", VehicleType::CAR}, hm(9, 30));
+    Ticket tr = lot.park({"KA01-T1", VehicleType::TRUCK}, hm(9, 40));
+    std::cout &lt;&lt; "best-fit: " &lt;&lt; c4.vehicle.plate &lt;&lt; " -&gt; " &lt;&lt; c4.spot.id() &lt;&lt; ", " &lt;&lt; tr.vehicle.plate &lt;&lt; " -&gt; " &lt;&lt; tr.spot.id() &lt;&lt; "\n";
+    assert(c4.spot.id() == "L2-3" &amp;&amp; tr.spot.id() == "L2-5");
+
+    try { lot.park({"KA01-T2", VehicleType::TRUCK}, hm(9, 45)); assert(false); }
+    catch (const LotFull&amp; e) { std::cout &lt;&lt; "rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+
+    long fee = lot.unpark(c1.id, hm(11, 30));
+    std::cout &lt;&lt; "KA01-C1 pays Rs " &lt;&lt; fee &lt;&lt; "\n";
+    assert(fee == 60);
+    try { lot.unpark(c1.id, hm(11, 31)); assert(false); }
+    catch (const InvalidTicket&amp; e) { std::cout &lt;&lt; "rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+
+    lot.setPricing(std::unique_ptr&lt;FeeStrategy&gt;(new PeakHourFee(rates, 17, 21, 150)));
+    Ticket c5 = lot.park({"KA01-C5", VehicleType::CAR}, hm(16, 30));
+    long peak = lot.unpark(c5.id, hm(19, 10));
+    std::cout &lt;&lt; "KA01-C5 (peak pricing) pays Rs " &lt;&lt; peak &lt;&lt; "\n";
+    assert(peak == 80);
+    std::cout &lt;&lt; "free: " &lt;&lt; lot.freeSpots() &lt;&lt; "\nC++ demo OK\n";
+    return 0;
+}</code></pre>
+      <p>Build: <code>g++ -std=c++14 -Wall -O2 main.cpp -o parking &amp;&amp; ./parking</code></p>
+<pre class="terminal"><code>T1 KA01-B1 -&gt; L1-1(SMALL)
+T2 KA01-C1 -&gt; L1-2(MEDIUM)
+T3 KA01-C2 -&gt; L1-3(MEDIUM)
+T4 KA01-C3 -&gt; L1-4(LARGE)
+best-fit: KA01-C4 -&gt; L2-3, KA01-T1 -&gt; L2-5
+rejected as expected: no free spot for KA01-T2
+KA01-C1 pays Rs 60
+rejected as expected: unknown or already used ticket T2
+KA01-C5 (peak pricing) pays Rs 80
+free: SMALL=2 MEDIUM=2 LARGE=0 
+C++ demo OK</code></pre>
+    </div>
+  </div>
+  <p>Read the demo output against the lot picture at the top. With <b>nearest-first</b>, the third car lands in L1-4, the only large spot on level 1, because level 1 is nearer. After switching to <b>best-fit</b>, the fourth car goes up to L2-3 (a medium spot) and the large spot L2-5 is still there for the truck. That single difference is the classic follow-up "why did the truck get turned away while a car sat in the truck spot?".</p>

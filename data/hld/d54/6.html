@@ -1,0 +1,136 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. When to reserve, and what exactly to reserve</h3>
+        <p>There are three options and interviewers like to hear all three.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Option</th><th>What happens</th><th>Problem</th></tr></thead>
+            <tbody>
+              <tr><td>Pick a specific compartment at checkout</td><td>Box C_17 is held from checkout until delivery</td><td>Wastes capacity: a box sits empty for a day or more waiting for a truck</td></tr>
+              <tr><td>Reserve nothing</td><td>Hope a box is free when the driver arrives</td><td>Failed drops on busy days; the parcel goes back on the truck</td></tr>
+              <tr><td><b>Reserve capacity per (locker, size, day), assign at drop-off</b></td><td>A counter says "40 M-boxes, 31 held for Wednesday"; the exact box is chosen when the driver is standing there</td><td>Needs a forecast of how many boxes will be free that day (parcels already inside may not be picked up yet)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The third is the usual answer. Educative's write-up describes it as reserving capacity by probability rather than a fixed box, and choosing the compartment at drop-off. The forecast matters: <code>total</code> for Wednesday is not "40", it is "40 minus the parcels we expect still to be inside on Wednesday". A simple model: count parcels due to expire or likely to be picked up by then (most are collected within 48 hours) and keep a safety buffer. Their example splits a 100-compartment locker into 30% for same-day, 50% for next-day and 20% buffer. When in doubt, <b>show fewer lockers</b>: a missing option costs a little; a broken promise costs a re-delivery.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Capacity for a locker on one day split into expected occupied, held and free">
+            <text class="label" x="400" y="30">Locker L_BLR_0412, size M, Wednesday: 40 compartments</text>
+            <rect class="box db" x="40" y="60" width="200" height="60"/>
+            <text class="label" x="140" y="86">8 still occupied</text>
+            <text class="label small" x="140" y="106">forecast</text>
+            <rect class="box svc" x="240" y="60" width="300" height="60"/>
+            <text class="label" x="390" y="86">24 held by orders</text>
+            <text class="label small" x="390" y="106">capacity_day.held</text>
+            <rect class="box cache" x="540" y="60" width="100" height="60"/>
+            <text class="label" x="590" y="92">4 free</text>
+            <rect class="zone" x="640" y="60" width="100" height="60"/>
+            <text class="label small" x="690" y="92">4 buffer</text>
+            <text class="label small" x="400" y="160">total for booking = 40 - 8 forecast - 4 buffer = 28; held 24 &lt; 28, so 4 more orders may book</text>
+            <text class="label small" x="400" y="190">reservation = one conditional increment; no box is chosen yet</text>
+          </svg>
+          <figcaption>The capacity counter is what checkout books against. The buffer absorbs late pickups and broken doors.</figcaption>
+        </figure>
+
+        <h3>2. Concurrency: never one box for two parcels</h3>
+        <p>Two drivers stand at the same kiosk and both ask for an M-box at the same moment. Or one driver's kiosk retries after a timeout. Without care, both requests read "C_17 is AVAILABLE" and both get it.</p>
+        <ul>
+          <li><b>Compare-and-set in the database</b> (the main answer). Claim with <code>UPDATE ... WHERE state = 'AVAILABLE' AND version = v</code>. Exactly one request wins; the loser picks the next candidate. No lock service needed. This is optimistic concurrency, explained in <a href="{{BASE}}hld/p02">Dealing with Contention</a>.</li>
+          <li><b>Serialise at the kiosk</b>. The kiosk agent processes one door operation at a time per compartment (a single-threaded command queue), which also prevents a pickup and a drop-off on the same box at once.</li>
+          <li><b>Idempotency</b>. A unique <code>request_id</code> on the assignment row means a retry finds the existing assignment and opens the same door.</li>
+          <li><b>Distributed locks?</b> The interviewer may ask "would you use a distributed lock per locker?". You can (a lease in ZooKeeper or etcd), but be careful: Martin Kleppmann's well-known essay explains that a process can pause after its lease expires and still act as if it holds the lock, so a lock that protects correctness needs <b>fencing tokens</b> that the storage checks. A version column already is that fencing check, which is why compare-and-set is simpler and safer here. See <a href="{{BASE}}hld/d55">Distributed Lock Service</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The version-checked update is <code>cmpxchg</code>: read the value and its version, then write only if nobody changed it in between. The losing CPU retries with fresh data. A distributed lock with a lease is like a spinlock held by a thread that might get descheduled for a long time: other CPUs may decide it is dead. Fencing tokens are the generation number that makes a stale holder's write fail.</p>
+        </div>
+
+        <h3>3. Offline kiosks: edge-first design</h3>
+        <p>Kiosks live in metro stations, shops and campuses. Their network will fail. The rule: <b>pickups must keep working offline</b>, drop-offs should mostly work, and new reservations can pause.</p>
+        <ul>
+          <li><b>Push valid codes down early.</b> As soon as a code is issued, the cloud pushes its hash, compartment and deadline to the kiosk. The kiosk can validate a typed code locally (hash it and compare) without a round trip.</li>
+          <li><b>Desired vs reported state.</b> AWS IoT's Device Shadow is a good model to name: the cloud writes the <b>desired</b> state (valid codes, out-of-service compartments), the device writes its <b>reported</b> state (doors, sensors), and the difference is a <b>delta</b>. Every update carries a version, so a device that receives deltas out of order can discard older ones. When the kiosk reconnects, it fetches the current shadow and catches up.</li>
+          <li><b>Outbox with sequence numbers.</b> Every door event is written to local flash with a per-kiosk sequence number before it is sent. The cloud acknowledges by sequence. After an outage the kiosk replays from the last ack; the cloud ignores duplicates by <code>(locker_id, seq)</code>.</li>
+          <li><b>Pre-assigned drop-offs.</b> For a driver's route, the cloud can pre-assign compartments for each reservation the night before (or give the kiosk a small pool of boxes it may assign itself), so drop-offs work offline too. Reconcile when back online.</li>
+          <li><b>Degraded mode.</b> If a kiosk is offline longer than a threshold, the capacity service stops selling new reservations there; checkout simply stops showing it.</li>
+          <li><b>MQTT</b> is the usual protocol: a small publish/subscribe protocol for constrained devices, with keep-alive and persistent sessions so queued messages are delivered after reconnect.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Desired and reported state between cloud and kiosk">
+            <rect class="box svc" x="40" y="40" width="260" height="160"/>
+            <text class="label" x="170" y="68">Cloud shadow v42</text>
+            <text class="label small" x="170" y="98">desired: codes {h1, h2, h3}</text>
+            <text class="label small" x="170" y="120">desired: C_09 OUT_OF_SERVICE</text>
+            <text class="label small" x="170" y="150">reported: C_17 OCCUPIED</text>
+            <text class="label small" x="170" y="172">reported: C_09 door jammed</text>
+            <rect class="box k8s" x="500" y="40" width="260" height="160"/>
+            <text class="label" x="630" y="68">Kiosk local store v41</text>
+            <text class="label small" x="630" y="98">codes {h1, h2}</text>
+            <text class="label small" x="630" y="120">outbox: seq 9921..9925</text>
+            <text class="label small" x="630" y="150">doors, sensors</text>
+            <text class="label small" x="630" y="172">validates codes offline</text>
+            <path class="arrow" d="M300 100 L496 100"/>
+            <text class="label small" x="400" y="90">delta v42: +h3, C_09 off</text>
+            <path class="arrow" d="M496 160 L304 160"/>
+            <text class="label small" x="400" y="150">events, acked by seq</text>
+          </svg>
+          <figcaption>Intent flows down, facts flow up, and versions and sequence numbers make both directions safe to retry and reorder.</figcaption>
+        </figure>
+
+        <h3>4. The pickup code: how safe is six digits?</h3>
+        <p>From the estimation: with 40 active codes at a kiosk, one random guess opens <i>some</i> box with probability 1 in 25,000. That sounds safe, but an attacker can keep trying. Defences, in layers:</p>
+        <ol class="steps">
+          <li><strong>Lockout</strong> After about 5 wrong codes, lock the keypad for a growing period (Educative mentions lockout after about 5 failed attempts). 5 tries per lockout window gives 5 / 25,000 = 1 in 5,000 per window. With a 15-minute lockout that is still about 480 tries a day, roughly a 2% daily chance of opening some box, so lockouts must grow (15 min, 1 h, 1 day) and trigger an alert.</li>
+          <li><strong>Unguessable and single-use</strong> Generate codes from a cryptographically secure random generator (Hello Interview stresses this), never sequential or derived from the order id. Mark used on first open.</li>
+          <li><strong>Bound and short-lived</strong> A code works only at one kiosk, for one compartment, until its deadline.</li>
+          <li><strong>Stored as a keyed hash (HMAC), with the key kept elsewhere</strong> A plain or salted hash does <i>not</i> protect a 6-digit code: there are only 10<sup>6</sup> possible codes, so anyone holding the hash and its salt can try all of them offline in seconds to minutes, even with a slow hash such as Argon2. What protects the code is a <b>secret key</b>. Store <code>HMAC(key, code)</code> (a keyed hash: without the key you cannot compute it), where the key lives in the kiosk's secure element or TPM and in a cloud KMS, never next to the data. A stolen disk or a database dump then holds values nobody can check guesses against. The real hardening on top is longer codes, or app/barcode unlock for valuable parcels.</li>
+          <li><strong>Stronger factors when needed</strong> Barcode or app unlock (the phone proves the account), and camera monitoring. Amazon's own guidance says some lockers need a barcode scan or the app, not just the six-digit code.</li>
+        </ol>
+        <div class="callout interview"><p>Do the 1-in-25,000 arithmetic out loud. It turns "I would add a lockout" into an engineering argument, and shows why lockout alone is not enough.</p></div>
+
+        <h3>5. The state machine, expiry and returns</h3>
+        <p>Write the compartment state machine on the board. Every transition is one conditional update, and every transition is driven by a real event (a sensor reading or a command), not by a timer alone.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Compartment state machine">
+            <rect class="box cache" x="30" y="110" width="140" height="56"/>
+            <text class="label" x="100" y="143">AVAILABLE</text>
+            <rect class="box svc" x="230" y="40" width="140" height="56"/>
+            <text class="label" x="300" y="73">ASSIGNED</text>
+            <rect class="box db" x="430" y="40" width="140" height="56"/>
+            <text class="label" x="500" y="73">OCCUPIED</text>
+            <rect class="box queue" x="630" y="110" width="140" height="56"/>
+            <text class="label" x="700" y="143">EXPIRED</text>
+            <rect class="box client" x="330" y="200" width="160" height="56"/>
+            <text class="label" x="410" y="233">OUT_OF_SERVICE</text>
+            <path class="arrow" d="M140 110 L240 96"/>
+            <text class="label small" x="170" y="88">drop-off CAS</text>
+            <path class="arrow" d="M370 68 L426 68"/>
+            <text class="label small" x="398" y="30">door closed + sensor</text>
+            <path class="arrow" d="M570 80 L640 116"/>
+            <text class="label small" x="640" y="96">deadline passed</text>
+            <path class="arrow" d="M440 96 L160 120"/>
+            <text class="label small" x="290" y="130">picked up + sensor empty</text>
+            <path class="arrow" d="M640 156 L170 150"/>
+            <text class="label small" x="420" y="172">driver removed + sensor empty</text>
+            <path class="arrow dashed" d="M100 166 L330 228"/>
+            <path class="arrow dashed" d="M490 228 L170 140"/>
+            <text class="label small" x="160" y="230">jam / fault</text>
+          </svg>
+          <figcaption>An expired parcel is still physically there, so EXPIRED is not AVAILABLE. The box frees only when the sensor confirms it is empty.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Expiry</b>: a scheduler (a delayed queue or a time-indexed scan) finds assignments past <code>code_expires_at</code>, revokes the code (desired state to the kiosk), moves the box to EXPIRED, creates a retrieval task for the next driver visit, and emits <code>ParcelExpired</code> so the order service refunds or returns the item. Use the server's clock for the deadline, not the kiosk's. Patterns for timers are in <a href="{{BASE}}hld/d25">Distributed Job Scheduler</a> and <a href="{{BASE}}hld/p07">Long-running Tasks</a>.</li>
+          <li><b>Reminders</b>: one notification about 24 hours before the deadline cuts expiries.</li>
+          <li><b>Returns</b> run the same machine in reverse: the customer reserves a box for a return, gets a drop code, the door closes on the return parcel, and a carrier's pickup frees it.</li>
+          <li><b>Faults</b>: a jammed door or a sensor that disagrees with software goes to OUT_OF_SERVICE, the capacity counter for future days drops by one, and any parcel inside is re-routed by operations. A nightly reconciliation compares sensor state with database state.</li>
+        </ul>
+
+        <h3>6. Store pickup (the Walmart variant)</h3>
+        <p>"Buy online, pick up in store" swaps boxes for <b>items on shelves</b> and <b>pickup time slots</b>.</p>
+        <ul>
+          <li><b>Inventory reservation</b>: when the order is placed, decrement the store's available-to-promise count for each item with the same conditional-update trick, and hold it with a time limit until it is picked. See <a href="{{BASE}}hld/d11">Inventory Management</a>.</li>
+          <li><b>Slot capacity</b>: a slot is limited by people, not boxes. Walmart describes a capacity and slot management system that decides which slots are open from the size of orders and the labour available (orders and associates per store, day and time). Model it as a counter per (store, slot) in "picking minutes", not "orders".</li>
+          <li><b>Check-in and dispense</b>: the customer taps "I am here", staff bring the order out or a pickup tower dispenses it. Walmart's Store Assist product has separate picking and check-in-and-dispense components, which is a good boundary for services.</li>
+        </ul>
+      

@@ -1,0 +1,84 @@
+
+        <h2>Log compaction: keep the latest value per key</h2>
+        <p class="chips level-chips"><span class="chip ok">must know</span></p>
+        <p>Some topics are not "a history of events" but "the current state of things": a user's latest address, a product's latest price, a consumer group's latest committed offset. For those, deleting by age is wrong (the newest value of a key that has not changed in a month would vanish). Instead you set <code>cleanup.policy=compact</code>, and Kafka's <strong>log cleaner</strong> keeps <em>at least the latest value for every key</em> and throws away older values for the same key.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Before and after log compaction">
+            <text class="label left" x="20" y="24">Before (offsets 0..8)</text>
+            <g>
+              <rect class="box kafka" x="20" y="40" width="80" height="60"/><text class="label" x="60" y="62">0</text><text class="label small" x="60" y="84">K1=a</text>
+              <rect class="box svc" x="105" y="40" width="80" height="60"/><text class="label" x="145" y="62">1</text><text class="label small" x="145" y="84">K2=b</text>
+              <rect class="box kafka" x="190" y="40" width="80" height="60"/><text class="label" x="230" y="62">2</text><text class="label small" x="230" y="84">K1=c</text>
+              <rect class="box cache" x="275" y="40" width="80" height="60"/><text class="label" x="315" y="62">3</text><text class="label small" x="315" y="84">K3=d</text>
+              <rect class="box svc" x="360" y="40" width="80" height="60"/><text class="label" x="400" y="62">4</text><text class="label small" x="400" y="84">K2=e</text>
+              <rect class="box kafka" x="445" y="40" width="80" height="60"/><text class="label" x="485" y="62">5</text><text class="label small" x="485" y="84">K1=f</text>
+              <rect class="box cache ghost" x="530" y="40" width="80" height="60"/><text class="label" x="570" y="62">6</text><text class="label small" x="570" y="84">K3=null</text>
+              <rect class="box queue" x="615" y="40" width="80" height="60"/><text class="label" x="655" y="62">7</text><text class="label small" x="655" y="84">K4=g</text>
+              <rect class="box svc" x="700" y="40" width="80" height="60"/><text class="label" x="740" y="62">8</text><text class="label small" x="740" y="84">K2=h</text>
+            </g>
+            <path class="arrow" d="M400 112 L400 160"/>
+            <text class="label small" x="560" y="138">log cleaner thread copies only survivors into new segments</text>
+            <text class="label left" x="20" y="176">After (offsets keep their numbers; gaps are normal)</text>
+            <g>
+              <rect class="box kafka" x="20" y="192" width="80" height="60"/><text class="label" x="60" y="214">5</text><text class="label small" x="60" y="236">K1=f</text>
+              <rect class="box cache ghost" x="105" y="192" width="80" height="60"/><text class="label" x="145" y="214">6</text><text class="label small" x="145" y="236">K3=null</text>
+              <rect class="box queue" x="190" y="192" width="80" height="60"/><text class="label" x="230" y="214">7</text><text class="label small" x="230" y="236">K4=g</text>
+              <rect class="box svc" x="275" y="192" width="80" height="60"/><text class="label" x="315" y="214">8</text><text class="label small" x="315" y="236">K2=h</text>
+            </g>
+            <text class="label small left" x="380" y="214">K3=null is a tombstone: kept for</text>
+            <text class="label small left" x="380" y="236">delete.retention.ms (1 day), then removed</text>
+          </svg>
+          <figcaption>Compaction keeps the newest record per key. A record with a null value (a <b>tombstone</b>) means "delete this key"; it survives long enough for consumers to see it, then disappears too. Order of survivors is preserved. A consumer reading from 0 still ends with the correct final state.</figcaption>
+        </figure>
+
+        <h3>How the log cleaner works</h3>
+        <ol class="steps">
+          <li><strong>Clean head and dirty tail.</strong> The cleaner tracks a "cleaner point". Records before it were already compacted (the clean part); records after it are new (the dirty part). The active segment is never cleaned.</li>
+          <li><strong>When it runs.</strong> A partition becomes eligible when the dirty part is at least <code>min.cleanable.dirty.ratio</code> (default 0.5) of the log. <code>min.compaction.lag.ms</code> can force records to stay uncompacted for a while; <code>max.compaction.lag.ms</code> forces compaction even if the ratio is not reached.</li>
+          <li><strong>Build an offset map.</strong> The cleaner scans the dirty part and builds an in-memory map of key hash to latest offset.</li>
+          <li><strong>Recopy.</strong> It rewrites the segments, keeping a record only if it is the latest for its key (or newer than the map), then atomically swaps the new segment files in.</li>
+        </ol>
+        <p>Important properties: offsets never change (survivors keep their original offsets, so there are gaps), order is preserved, and a consumer that keeps up sees every update anyway; compaction only affects readers who come later and start from the beginning.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A compacted topic is a <b>routing table (RIB) written as a log</b>. Each record is "prefix (key) now points to next hop (value)". Only the latest route per prefix matters, and a <b>withdraw</b> is a tombstone. A new router joining can replay the compacted log and end up with the full current table, without replaying years of flaps. It is also like an ARP or MAC table: latest entry per key wins.</p>
+          <p><b>Where the analogy breaks:</b> compaction is lazy and background. Between cleaner runs, old values for a key are still in the log, so a reader may see several versions before the newest one.</p>
+        </div>
+
+        <h3>Where compaction is used for real</h3>
+        <ul>
+          <li><code>__consumer_offsets</code>: the internal topic (50 partitions by default) where consumer groups commit offsets. Key = (group, topic, partition), value = offset. Only the latest matters. See <a href="{{BASE}}devops/kafka-04">Consumers &amp; Consumer Groups</a>.</li>
+          <li><b>Kafka Streams changelogs</b> that back state stores and KTables (see <a href="{{BASE}}devops/kafka-09">Connect &amp; Streams</a>).</li>
+          <li><b>CDC topics</b>: a Debezium topic keyed by primary key can be compacted to act like a replicated copy of the table.</li>
+          <li><b>Kafka Connect</b> and Schema Registry store their own config and offsets in compacted topics.</li>
+        </ul>
+
+<pre><code class="language-bash"># Create a compacted topic for "latest price per product"
+kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic product-prices --partitions 6 --replication-factor 3 \
+  --config cleanup.policy=compact \
+  --config min.cleanable.dirty.ratio=0.1 \
+  --config segment.ms=600000 \
+  --config delete.retention.ms=86400000
+
+# Write keyed records (key:value)
+kafka-console-producer.sh --bootstrap-server localhost:9092 --topic product-prices \
+  --reader-property parse.key=true --reader-property key.separator=:
+&gt; sku-1:99
+&gt; sku-2:250
+&gt; sku-1:89
+
+# Check the topic config
+kafka-configs.sh --bootstrap-server localhost:9092 --describe \
+  --entity-type topics --entity-name product-prices</code></pre>
+<pre class="terminal"><code>Dynamic configs for topic product-prices are:
+  cleanup.policy=compact sensitive=false synonyms={DYNAMIC_TOPIC_CONFIG:cleanup.policy=compact, DEFAULT_CONFIG:log.cleanup.policy=delete}
+  delete.retention.ms=86400000 sensitive=false synonyms={...}
+  min.cleanable.dirty.ratio=0.1 sensitive=false synonyms={...}
+  segment.ms=600000 sensitive=false synonyms={...}</code></pre>
+        <p>The small <code>segment.ms</code> and low dirty ratio are only for a lab, so you can watch compaction happen within minutes. In production, very small segments mean many files and extra cleaner work.</p>
+        <div class="callout note"><p><b>Both at once:</b> <code>cleanup.policy=compact,delete</code> compacts <em>and</em> deletes segments older than retention. Useful for "latest value per key, but forget keys untouched for 30 days".</p></div>
+        <div class="callout warn"><p><b>Keys are required.</b> A compacted topic rejects records with a null key. And compaction is not a database index: you still cannot ask Kafka "what is the value of key K?" directly. You read the topic into a local table (which is exactly what a KTable does).</p></div>
+      

@@ -1,0 +1,100 @@
+
+        <h2>Probabilistic structures: huge questions, tiny memory</h2>
+        <p>Exact answers at web scale can need gigabytes per key. These three structures accept a small, <em>known</em> error in exchange for kilobytes. Hello Interview's advice applies: use them when exact structures truly do not fit, and talk about trade-offs, not internals. Using a Bloom filter where a hash set would do is a red flag.</p>
+
+        <h3>Bloom filter: "have I seen this before?"</h3>
+        <p>A Bloom filter is a bit array of <code>m</code> bits plus <code>k</code> hash functions. To <strong>add</strong> an item, set the <code>k</code> bits it hashes to. To <strong>check</strong>, look at those <code>k</code> bits: if any is 0, the item is <em>definitely not</em> in the set. If all are 1, it is <em>probably</em> in the set (other items may have set those bits). No false negatives, a tunable false-positive rate, and no deletes (a <em>counting</em> Bloom filter fixes that with small counters).</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Bloom filter: two items each set three bits; a query for a new item finds a zero bit and is definitely absent">
+            
+            <rect class="box client" x="60" y="20" width="140" height="40"/><text class="label" x="130" y="40">add "url-A"</text>
+            <rect class="box client" x="330" y="20" width="140" height="40"/><text class="label" x="400" y="40">add "url-B"</text>
+            <rect class="box svc" x="600" y="20" width="160" height="40"/><text class="label" x="680" y="40">check "url-C"?</text>
+            <g>
+              <rect class="box plain" x="40" y="120" width="50" height="50"/><text class="label" x="65" y="145">0</text>
+              <rect class="box cache solid" x="96" y="120" width="50" height="50"/><text class="label white" x="121" y="145">1</text>
+              <rect class="box plain" x="152" y="120" width="50" height="50"/><text class="label" x="177" y="145">0</text>
+              <rect class="box cache solid" x="208" y="120" width="50" height="50"/><text class="label white" x="233" y="145">1</text>
+              <rect class="box cache solid" x="264" y="120" width="50" height="50"/><text class="label white" x="289" y="145">1</text>
+              <rect class="box plain" x="320" y="120" width="50" height="50"/><text class="label" x="345" y="145">0</text>
+              <rect class="box cache solid" x="376" y="120" width="50" height="50"/><text class="label white" x="401" y="145">1</text>
+              <rect class="box plain" x="432" y="120" width="50" height="50"/><text class="label" x="457" y="145">0</text>
+              <rect class="box cache solid" x="488" y="120" width="50" height="50"/><text class="label white" x="513" y="145">1</text>
+              <rect class="box plain hot" x="544" y="120" width="50" height="50"/><text class="label bad" x="569" y="145">0</text>
+              <rect class="box cache solid" x="600" y="120" width="50" height="50"/><text class="label white" x="625" y="145">1</text>
+              <rect class="box plain" x="656" y="120" width="50" height="50"/><text class="label" x="681" y="145">0</text>
+            </g>
+            <path class="arrow" d="M110 60 L121 115"/><path class="arrow" d="M130 60 L233 115"/><path class="arrow" d="M150 60 L401 115"/>
+            <path class="arrow kafka" d="M380 60 L289 115"/><path class="arrow kafka" d="M400 60 L513 115"/><path class="arrow kafka" d="M420 60 L625 115"/>
+            <path class="arrow dashed" d="M660 60 L233 115"/><path class="arrow dashed bad" d="M680 60 L569 115"/><path class="arrow dashed" d="M700 60 L625 115"/>
+            <text class="label small" x="370" y="200">bit positions 0 .. m-1 (here m = 12, k = 3)</text>
+            <text class="label bad" x="400" y="235">"url-C" hits a 0 bit: definitely NOT seen. All 1s would mean "probably seen".</text>
+          </svg>
+          <figcaption>Each item sets k bits. One zero among an item's k bits proves it was never added. When all k bits are 1 because of other items, you get a false positive.</figcaption>
+        </figure>
+        <p><b>Sizing (worth memorising).</b> For <code>n</code> items and target false-positive rate <code>p</code>: <code>m = -n ln p / (ln 2)<sup>2</sup></code> bits and <code>k = (m/n) ln 2</code> hashes. That is about 9.6 bits per item for 1% and 14.4 for 0.1%. Example: a crawler with 1 billion seen URLs at 1% needs about 9.6 billion bits (around 1.2 GB) and 7 hashes. An exact hash set of 1 billion 100-byte URLs would be over 100 GB.</p>
+        <p><b>Where it is used.</b> Bigtable lets clients create Bloom filters per SSTable so most lookups for missing rows never touch disk. Cassandra does the same, with <code>bloom_filter_fp_chance</code> defaulting to 0.01 (0.1 for leveled compaction); its docs note that going from 0.1 to 0.01 takes about 3x the memory. Other uses: crawler URL dedup (<a href="{{BASE}}hld/d16">d16</a>), "skip profiles you have already swiped" (<a href="{{BASE}}hld/d59">d59</a>), "is this username taken?" pre-checks, and CDN "cache only on second request" (avoiding one-hit wonders).</p>
+
+        <h3>HyperLogLog: "how many different ones?"</h3>
+        <p>Counting <em>distinct</em> users exactly needs memory proportional to the number of users. <strong>HyperLogLog</strong> (Flajolet et al., 2007) estimates it in fixed memory. The intuition: hash each item to random-looking bits. Seeing a hash that starts with many zeros is rare. If the longest run of leading zeros you have seen is <code>r</code>, you have probably seen about 2<sup>r</sup> distinct items. One such guess is noisy, so HLL splits items into <code>m</code> buckets by the first hash bits, keeps the max run per bucket, and combines them with a harmonic mean. Standard error is about <code>1.04/sqrt(m)</code>.</p>
+        <ul>
+          <li><b>Redis</b>: up to 12 KB per key, standard error 0.81% (that is 16,384 registers: 1.04/sqrt(16384) = 0.81%), counts up to 2<sup>64</sup>. Commands: <code>PFADD</code>, <code>PFCOUNT</code>, <code>PFMERGE</code>.</li>
+          <li><b>The paper</b>: beyond 10<sup>9</sup> distinct items with about 2% error using only 1.5 KB.</li>
+          <li><b>Mergeable</b>: the HLL of a union is the per-register max of the HLLs. Daily unique visitors per page can be merged into weekly ones without rescanning. Intersections are not exact, though.</li>
+        </ul>
+<pre class="terminal"><code>$ redis-cli PFADD uv:page42:2026-11-23 user:17 user:99 user:17
+(integer) 1
+$ redis-cli PFCOUNT uv:page42:2026-11-23
+(integer) 2
+$ redis-cli PFMERGE uv:page42:week48 uv:page42:2026-11-23 uv:page42:2026-11-24
+OK</code></pre>
+
+        <h3>Count-min sketch: "how often?"</h3>
+        <p>A <strong>count-min sketch</strong> is <code>d</code> rows of <code>w</code> counters, with one hash function per row. To add an item, increment one counter in each row. To query, read its <code>d</code> counters and take the <strong>minimum</strong>. Collisions only ever add, so the estimate can be too high but never too low; the minimum picks the row with the fewest collisions. With <code>w = ceil(e/epsilon)</code> and <code>d = ceil(ln(1/delta))</code>, the overestimate is at most epsilon x (total count) with probability 1 - delta. Example: epsilon 0.001, delta 0.01 gives w = 2,719 and d = 5, about 13,600 counters, or roughly 54 KB at 4 bytes each, whatever the number of distinct keys.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Count-min sketch with three rows; an item increments one counter per row and the estimate is the minimum">
+            
+            <rect class="box client" x="20" y="100" width="130" height="50"/><text class="label" x="85" y="125">"#cricket"</text>
+            <text class="label small left" x="180" y="62">h1</text><text class="label small left" x="180" y="127">h2</text><text class="label small left" x="180" y="192">h3</text>
+            <g>
+              <rect class="box plain" x="220" y="40" width="70" height="44"/><text class="label" x="255" y="62">4</text>
+              <rect class="box plain" x="296" y="40" width="70" height="44"/><text class="label" x="331" y="62">0</text>
+              <rect class="box cache hot" x="372" y="40" width="70" height="44"/><text class="label" x="407" y="62">57</text>
+              <rect class="box plain" x="448" y="40" width="70" height="44"/><text class="label" x="483" y="62">9</text>
+              <rect class="box plain" x="524" y="40" width="70" height="44"/><text class="label" x="559" y="62">2</text>
+              <rect class="box plain" x="220" y="105" width="70" height="44"/><text class="label" x="255" y="127">1</text>
+              <rect class="box plain" x="296" y="105" width="70" height="44"/><text class="label" x="331" y="127">13</text>
+              <rect class="box plain" x="372" y="105" width="70" height="44"/><text class="label" x="407" y="127">0</text>
+              <rect class="box plain" x="448" y="105" width="70" height="44"/><text class="label" x="483" y="127">6</text>
+              <rect class="box cache hot" x="524" y="105" width="70" height="44"/><text class="label" x="559" y="127">51</text>
+              <rect class="box cache hot" x="220" y="170" width="70" height="44"/><text class="label" x="255" y="192">50</text>
+              <rect class="box plain" x="296" y="170" width="70" height="44"/><text class="label" x="331" y="192">3</text>
+              <rect class="box plain" x="372" y="170" width="70" height="44"/><text class="label" x="407" y="192">8</text>
+              <rect class="box plain" x="448" y="170" width="70" height="44"/><text class="label" x="483" y="192">0</text>
+              <rect class="box plain" x="524" y="170" width="70" height="44"/><text class="label" x="559" y="192">5</text>
+            </g>
+            <path class="arrow" d="M150 115 L367 62"/><path class="arrow" d="M150 125 L519 127"/><path class="arrow" d="M150 135 L215 192"/>
+            <rect class="box svc" x="630" y="95" width="155" height="60"/><text class="label" x="707" y="118">estimate</text><text class="label" x="707" y="140">min = 50</text>
+            <text class="label small" x="407" y="235">57 and 51 include other tags that collided; true count is &lt;= 50</text>
+          </svg>
+          <figcaption>Each row is an independent hash into w counters. Adding increments one counter per row. The estimate is the smallest of the item's counters, an upper bound on the true count.</figcaption>
+        </figure>
+        <p>Count-min only answers "how many times did X appear?". To get the <strong>top K</strong>, pair it with a small min-heap of size K: after each update, if the item's estimate beats the heap minimum, swap it in. That is the core of <a href="{{BASE}}hld/d35">Top-K / Heavy Hitters (d35)</a> and <a href="{{BASE}}hld/d29">Trending Topics (d29)</a>, usually with per-window sketches (they merge by adding counters) and a batch job for exact numbers later. Redis ships it as <code>CMS.INITBYDIM</code>, <code>CMS.INCRBY</code>, <code>CMS.QUERY</code>.</p>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Structure</th><th>Answers</th><th>Error type</th><th>Memory example</th><th>Merge?</th></tr></thead>
+            <tbody>
+              <tr><td>Bloom filter</td><td>Membership</td><td>False positives only</td><td>~9.6 bits/item at 1%</td><td>OR of bit arrays (same m, k)</td></tr>
+              <tr><td>HyperLogLog</td><td>Distinct count</td><td>~0.81% std error (Redis)</td><td>12 KB, any cardinality</td><td>Max per register</td></tr>
+              <tr><td>Count-min sketch</td><td>Frequency per item</td><td>Overestimates only</td><td>~54 KB for epsilon 0.001</td><td>Add counters</td></tr>
+              <tr><td>Exact hash set/map</td><td>All of the above</td><td>None</td><td>Grows with distinct keys (GBs)</td><td>Union</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>You have used these ideas in hardware. A count-min sketch is a set of hashed flow counters in a switch ASIC that accept collisions (sFlow/NetFlow-style heavy-hitter detection). A Bloom filter is a cheap pre-check before an expensive TCAM or DRAM lookup. "Mergeable sketches" are why line cards can count locally and the supervisor just sums or maxes them. Where this breaks: an ASIC usually resets its counters every polling interval, while a sketch used for "the last hour" needs one sketch per time bucket that you keep and merge.</p>
+        </div>
+      

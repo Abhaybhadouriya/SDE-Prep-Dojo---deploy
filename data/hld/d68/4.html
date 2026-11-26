@@ -1,0 +1,46 @@
+
+        <h2>Data model</h2>
+        <pre><code class="language-sql">-- Inventory: the truth, one row per store x SKU, sharded by store_id
+CREATE TABLE store_inventory (
+  store_id     TEXT,
+  sku_id       BIGINT,
+  on_hand      INT NOT NULL,        -- physically on the shelves (WMS view)
+  reserved     INT NOT NULL DEFAULT 0,
+  safety_buf   INT NOT NULL DEFAULT 0,   -- hidden units to absorb count errors
+  version      BIGINT NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMPTZ,
+  PRIMARY KEY (store_id, sku_id),
+  CHECK (reserved &gt;= 0 AND reserved &lt;= on_hand)
+);
+
+-- Every change is also a ledger row (audit + rebuild + reconciliation)
+CREATE TABLE inventory_movement (
+  movement_id  UUID PRIMARY KEY,   -- idempotency: the same event is applied once
+  store_id TEXT, sku_id BIGINT,
+  kind TEXT,          -- GRN | RESERVE | RELEASE | PICK | DAMAGE | COUNT_ADJUST | RETURN
+  qty INT, ref_id TEXT, created_at TIMESTAMPTZ
+);
+
+CREATE TABLE orders (
+  order_id UUID PRIMARY KEY, user_id BIGINT, store_id TEXT,
+  status TEXT,        -- CREATED|RESERVED|PAID|PICKING|PACKED|ASSIGNED|OUT|DELIVERED|CANCELLED
+  promised_by TIMESTAMPTZ, amount_paise INT, payment_method TEXT,
+  created_at TIMESTAMPTZ
+);
+CREATE TABLE order_line (order_id UUID, sku_id BIGINT, qty INT, picked_qty INT,
+  price_paise INT, PRIMARY KEY (order_id, sku_id));</code></pre>
+        <h3>SQL vs NoSQL per component (the Zepto question)</h3>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Component</th><th>Store</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>Store inventory, reservations</td><td><b>Postgres/MySQL</b>, sharded by store_id</td><td>Conditional updates, CHECK constraints, multi-line transactions for a cart. Per-store sharding keeps every cart inside one shard.</td></tr>
+            <tr><td>Orders, payments</td><td><b>SQL</b> (or DynamoDB with conditional writes)</td><td>State machine with strict transitions, money, audit. Zepto has published that it moved high-volume order data to DynamoDB on AWS (see Real world); either works if transitions are conditional writes.</td></tr>
+            <tr><td>Catalog (product master)</td><td><b>Document store</b> (MongoDB) + object storage for images</td><td>Flexible attributes per category (weight, flavour, expiry); read-heavy; changes slowly.</td></tr>
+            <tr><td>Search index</td><td><b>Elasticsearch/OpenSearch</b></td><td>Text, synonyms ("curd" = "dahi"), typo tolerance, ranking.</td></tr>
+            <tr><td>Hot stock and availability cache</td><td><b>Redis</b></td><td>Sub-millisecond "in stock at BLR-114?" for search filtering; short TTL plus event invalidation.</td></tr>
+            <tr><td>Rider locations</td><td><b>Redis GEO</b> + Kafka stream</td><td>4,000 writes/s of overwrite-only data; only the latest point matters for assignment.</td></tr>
+            <tr><td>Events (orders, stock changes)</td><td><b>Kafka</b>, keyed by store_id</td><td>Per-store ordering, replay to rebuild caches and analytics.</td></tr>
+            <tr><td>Analytics, demand forecasting</td><td><b>Lakehouse</b> (S3 + Spark/Trino)</td><td>Which SKUs to stock where, per hour; trained offline.</td></tr>
+          </tbody>
+        </table></div>
+      

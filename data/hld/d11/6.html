@@ -1,0 +1,136 @@
+
+        <h2>Deep dives: the hard parts</h2>
+
+        <h3>1. Ordering and "one writer per key"</h3>
+        <p>Walmart's Confluent post describes the exact bug this prevents: one consumer thread reads an item-store and writes 20, another writes 22, and the final value depends on timing. Their fix was a partitioning strategy where each item-store always goes to one partition, so only one consumer handles that combination. Kafka guarantees order <b>inside a partition</b>, and a consumer group gives each partition to <b>exactly one</b> member. Together those give us serial, lock-free updates per key, while 128 partitions still run in parallel.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Events hashed by item and location key to partitions, each owned by one processor instance">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="15" y="40" width="190" height="40"/>
+            <text class="label small" x="110" y="65">SKU123|store-42 sale</text>
+            <rect class="box client" x="15" y="95" width="190" height="40"/>
+            <text class="label small" x="110" y="120">SKU999|dc-7 receipt</text>
+            <rect class="box client" x="15" y="150" width="190" height="40"/>
+            <text class="label small" x="110" y="175">SKU123|store-42 return</text>
+            <rect class="box client" x="15" y="205" width="190" height="40"/>
+            <text class="label small" x="110" y="230">SKU555|store-9 sale</text>
+            <rect class="box queue" x="250" y="110" width="110" height="60"/>
+            <text class="label" x="305" y="137">hash(key)</text>
+            <text class="label small" x="305" y="157">% 128</text>
+            <rect class="zone kafka" x="400" y="25" width="200" height="235"/>
+            <text class="zone-label" x="412" y="45">inventory-events</text>
+            <rect class="box kafka" x="415" y="60" width="170" height="44"/>
+            <text class="label small" x="500" y="87">partition 17</text>
+            <rect class="box kafka" x="415" y="118" width="170" height="44"/>
+            <text class="label small" x="500" y="145">partition 63</text>
+            <rect class="box kafka" x="415" y="176" width="170" height="44"/>
+            <text class="label small" x="500" y="203">partition 101</text>
+            <rect class="box k8s" x="660" y="60" width="185" height="44"/>
+            <text class="label small" x="752" y="87">processor pod A</text>
+            <rect class="box k8s" x="660" y="118" width="185" height="44"/>
+            <text class="label small" x="752" y="145">processor pod B</text>
+            <rect class="box k8s" x="660" y="176" width="185" height="44"/>
+            <text class="label small" x="752" y="203">processor pod C</text>
+            <path class="arrow" d="M205 60 L244 130"/>
+            <path class="arrow" d="M205 115 L244 136"/>
+            <path class="arrow" d="M205 170 L244 146"/>
+            <path class="arrow" d="M205 225 L244 152"/>
+            <path class="arrow" d="M360 130 L409 82"/>
+            <path class="arrow" d="M360 140 L409 140"/>
+            <path class="arrow" d="M360 150 L409 198"/>
+            <path class="arrow kafka" d="M585 82 L654 82"/>
+            <path class="arrow kafka" d="M585 140 L654 140"/>
+            <path class="arrow kafka" d="M585 198 L654 198"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M205 60 L250 130 L360 130 L415 82 L585 82 L660 82"/></circle>
+            <circle class="packet" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M205 170 L250 146 L360 130 L415 82 L585 82 L660 82"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="0.7s" repeatCount="indefinite" path="M205 115 L250 136 L360 140 L415 140 L585 140 L660 140"/></circle>
+            <text class="label small" x="430" y="275">Both SKU123|store-42 events (blue) go to partition 17 and pod A, in order.</text>
+          </svg>
+          <figcaption>Same key, same partition, same pod. Different keys spread out for parallelism.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is <b>ECMP flow hashing</b>. A router hashes the 5-tuple so all packets of one flow take one path and stay in order, while different flows spread across links. Here the "flow" is item+location and the "links" are partitions. Adding partitions is like changing the ECMP group size: flows get re-hashed and you can briefly lose ordering. <b>Where it breaks:</b> ECMP with resilient hashing limits the churn; Kafka's default partitioner does not, so many keys move at once.</p>
+        </div>
+        <ul>
+          <li><b>Never change the partition count casually.</b> <code>hash(key) % N</code> changes for most keys when N changes. If you must grow, either create a new topic with more partitions and migrate with a pause per key, or accept a short window where you drain the old topic before switching.</li>
+          <li><b>Align the database partitioning</b> with the Kafka key (Walmart's post recommends this for Cassandra) so one consumer's writes land on a small set of database partitions.</li>
+          <li><b>Rebalances pause work.</b> When a pod dies, its partitions move to others after the session timeout. Use static membership and cooperative rebalancing to reduce pauses (see <a href="{{BASE}}devops/kafka-04">Consumers &amp; Consumer Groups</a>).</li>
+        </ul>
+
+        <h3>2. Never sell the last unit twice</h3>
+        <p>Two shoppers press "Reserve for pickup" on the last unit within the same second. The availability cache says 1 for both. The cache is allowed to be stale; the <b>reserve</b> step must not be. The reservation service does one atomic conditional update:</p>
+<pre><code class="language-sql">UPDATE inventory_position
+   SET reserved = reserved + 1, reserved_version = reserved_version + 1, updated_at = now()
+ WHERE item_id = 'SKU123' AND location_id = 'store-42'
+   AND on_hand - reserved - safety_stock &gt;= 1;
+-- 1 row  -&gt; reserved; insert the reservation row in the same transaction
+-- 0 rows -&gt; 409 INSUFFICIENT_STOCK; show "not available, try another store"</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="Two shoppers race for the last unit; the database conditional update lets only one win">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="160" height="56"/>
+            <text class="label" x="100" y="63">Shopper A</text>
+            <rect class="box client" x="20" y="140" width="160" height="56"/>
+            <text class="label" x="100" y="173">Shopper B</text>
+            <rect class="box svc" x="260" y="80" width="170" height="70"/>
+            <text class="label" x="345" y="108">Reservation</text>
+            <text class="label small" x="345" y="130">service</text>
+            <rect class="box db" x="510" y="70" width="170" height="90"/>
+            <text class="label" x="595" y="100">position row</text>
+            <text class="label small" x="595" y="122">available = 1</text>
+            <text class="label small" x="595" y="142">row lock, atomic</text>
+            <rect class="box db solid" x="720" y="30" width="125" height="50"/>
+            <text class="label white" x="782" y="60">A: reserved</text>
+            <rect class="box fail" x="720" y="150" width="125" height="50"/>
+            <text class="label bad" x="782" y="180">B: 409</text>
+            <path class="arrow" d="M180 58 L254 100"/>
+            <path class="arrow" d="M180 168 L254 130"/>
+            <path class="arrow" d="M430 115 L504 115"/>
+            <path class="arrow ok" d="M680 95 L714 60"/>
+            <path class="arrow bad" d="M680 135 L714 170"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M180 58 L260 100 L430 115 L510 115 L680 95 L720 55"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="2.6s" begin="0.3s" repeatCount="indefinite" path="M180 168 L260 130 L430 115 L510 115 L680 135 L720 175"/></circle>
+          </svg>
+          <figcaption>The cache can be wrong for a second; the conditional update cannot. The database serialises the two updates on one row.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Why two owners on one row is safe:</b> each column has exactly one owner, with no exceptions. The processor changes <code>on_hand</code> for every event type (sales, receipts, returns, counts and picks) and bumps only <code>onhand_version</code>. The reservation service changes <code>reserved</code> for holds, releases, commits and picks and bumps only <code>reserved_version</code>. The processor's write is an upsert guarded by <i>its own</i> version (<code>... SET on_hand = :v, onhand_version = :ver WHERE onhand_version &lt; :ver</code>), so a replayed old write is ignored. The reservation service always uses one atomic statement of the form <code>SET reserved = reserved + :delta</code>, never "read, compute in the app, write back", and the reserve check reads both columns at the moment of the update. Neither writer ever puts back a value the other one changed, so no lost update is possible.</li>
+          <li><b>TTL on holds.</b> A held reservation expires (say 15 minutes) if the order is not paid. A sweeper releases expired holds by decrementing <code>reserved</code>, idempotently (only rows still HELD).</li>
+          <li><b>When the item is picked</b>, the PICK event (with one <code>event_id</code>) flows to both owners. The <b>processor</b> applies it like a sale: <code>on_hand -= q</code> in its state store, then writes the new value with the next <code>onhand_version</code>. The <b>reservation service</b> consumes the same event idempotently (it skips an <code>event_id</code> it has already applied) and releases the hold in one transaction:
+<pre><code class="language-sql">BEGIN;
+UPDATE reservations
+   SET status = 'FULFILLED'
+ WHERE reservation_id = :r AND status = 'COMMITTED';      -- 0 rows = already applied: stop here
+UPDATE inventory_position
+   SET reserved = reserved - :q,
+       reserved_version = reserved_version + 1
+ WHERE item_id = :item AND location_id = :loc;
+COMMIT;</code></pre>
+The two writes land a moment apart. If on_hand drops first, <i>available</i> briefly falls by 2 for one unit, which can cause a false "not available" on a low-stock item for a second or so. We accept that dip: safety stock usually covers it, and a false "no" is far cheaper than an oversell. The processor's state store always includes the pick, so its next write (for a till sale, say) can never put the old on_hand back.</li>
+          <li><b>Safety stock</b> absorbs the gap between "system says 1" and "shelf has 0". For hot or theft-prone items, raise it; for slow movers, lower it.</li>
+          <li><b>Alternative:</b> route reservation requests <i>through the same Kafka partition</i> so the processor (the single writer) decides. That is consistent and lock-free but adds Kafka latency to checkout; the DB conditional update is simpler to explain.</li>
+        </ul>
+
+        <h3>3. Duplicates, late events and absolute counts</h3>
+        <ul>
+          <li><b>Duplicates:</b> producers retry, so events can arrive twice. Dedupe by <code>event_id</code>: keep recent ids in a windowed state store, or in a KeyValueStore that a punctuator (a timer callback in Kafka Streams) cleans every few minutes, with a retention you choose (for example 7 days; a plain KeyValueStore has no TTL of its own). Kafka Streams' <code>exactly_once_v2</code> makes state updates and output records commit together, but it covers only <b>Kafka-to-Kafka</b>. The write to the position DB is outside it, so that write must be idempotent too: a sink connector (Walmart's post describes a Cassandra connector) or an upsert keyed by item|location that only applies a newer <code>onhand_version</code>.</li>
+          <li><b>Delta vs absolute events.</b> SALE, RETURN and RECEIPT are <b>deltas</b> (+/- qty). COUNT is <b>absolute</b> ("there are 7 as of 14:00"). A delta is safe to apply once; an absolute event resets the number.</li>
+          <li><b>Late events after a count.</b> A till that was offline uploads a sale from 13:50 at 14:05, after the 14:00 count. The count already includes that sale (the item was gone from the shelf). Rule: when a COUNT arrives, store <code>last_count_at</code>; ignore deltas whose <code>event_time</code> is before it. This is <b>event time vs processing time</b> in a real business setting.</li>
+          <li><b>Per-source sequence numbers</b> (<code>source_seq</code>) let the transformer detect gaps ("store 42 sent 917 then 919") and ask the source to resend.</li>
+        </ul>
+
+        <h3>4. The read path at 250,000 lookups/s</h3>
+        <ul>
+          <li><b>Serve status buckets, not exact numbers.</b> Most pages only need IN_STOCK / LOW / OUT. A bucket changes far less often than the exact count, so caches stay valid longer and the update stream is smaller.</li>
+          <li><b>Precompute regional rollups.</b> For "ship to ZIP 560103 by Friday", keep a view keyed by item+region listing the best few locations with stock, updated from the positions stream.</li>
+          <li><b>Layered caches:</b> a short TTL in the app/CDN for product pages (seconds), Redis/Valkey for the availability view, the position DB only for misses.</li>
+          <li><b>Always re-check at reserve time</b> (deep dive 2). Browsing is eventually consistent; checkout is strongly consistent.</li>
+        </ul>
+
+        <h3>5. Hot SKUs on launch day</h3>
+        <p>A console launch puts thousands of reservations per second on a few keys. One key lives in one partition and one database row, so it cannot scale out. Options: pre-split online stock into buckets (10 rows of 100 units) and pick a random bucket; or put a Redis counter with atomic <code>DECR</code> in front as a gate and settle the DB asynchronously; plus a virtual waiting room. This is the same problem as <a href="{{BASE}}hld/d09">Flash Sale</a> and the <a href="{{BASE}}hld/p02">Dealing with Contention</a> pattern.</p>
+
+        <h3>6. Replenishment and multi-region</h3>
+        <p>A replenishment consumer reads positions, compares them with a reorder point (forecast demand over lead time plus safety stock) and creates purchase or transfer orders. Walmart's replenishment post describes a Kafka-based micro-batch framework for this. For disaster recovery, run Kafka per region and mirror topics with MirrorMaker 2; keep each item-location's writer in one region at a time (a home region per store) so two regions never both write the same key.</p>
+      

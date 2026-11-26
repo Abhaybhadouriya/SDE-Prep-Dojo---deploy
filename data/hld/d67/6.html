@@ -1,0 +1,120 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Never overbook: four ways to protect a counter</h3>
+        <p>The naive code reads the slot, checks <code>booked &lt; capacity</code> in Java, then writes <code>booked + 1</code>. Two requests read 9 of 10 at the same time, both pass the check, both write: 11 of 10. This is the classic <b>read-check-write race</b>. Four fixes, from simplest to most specialised:</p>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Approach</th><th>How</th><th>Good when</th><th>Breaks when</th></tr></thead>
+          <tbody>
+            <tr><td><b>Conditional (atomic) update</b></td><td><code>UPDATE slot SET held = held + :n WHERE slot_id = :id AND booked + held + :n &lt;= capacity</code>; check row count = 1</td><td>Default answer. One statement, row lock held for microseconds, no retries in code.</td><td>Thousands of writers on the <i>same</i> row: they queue on its lock (still correct, but slow).</td></tr>
+            <tr><td><b>Optimistic (version)</b></td><td>Read <code>version</code>; <code>UPDATE ... SET version = version + 1 WHERE slot_id = ? AND version = :v</code>; retry on 0 rows</td><td>Low contention, logic too complex for one WHERE clause.</td><td>High contention: most attempts fail and retry, wasting work (retry storms).</td></tr>
+            <tr><td><b>Pessimistic</b></td><td><code>SELECT ... FOR UPDATE</code>, check in code, update, commit</td><td>Multi-row decisions (a service needs 2 consecutive slots) with a fixed lock order.</td><td>Long transactions hold locks; risk of deadlock without a lock order; never hold it across a network call (payment!).</td></tr>
+            <tr><td><b>Pre-created tokens</b></td><td>Insert one row per place (10 rows for 10 places); a hold claims one with <code>FOR UPDATE SKIP LOCKED</code></td><td>Tiny capacity, very hot (8 seats per ride): writers grab different rows instead of queueing on one.</td><td>Large capacities (200 doses = 200 rows per slot); more rows to manage.</td></tr>
+          </tbody>
+        </table></div>
+        <p>Whichever you pick, add the <b>CHECK constraint</b> <code>booked + held &lt;= capacity</code>. It is a seat belt: even a buggy admin tool or a new code path cannot overbook, because the database refuses the write.</p>
+        <div class="callout interview"><p><b>Optimistic vs pessimistic, in one breath:</b> "Optimistic wins when conflicts are rare, because nobody waits. Pessimistic wins when conflicts are common and the work is short, because retries cost more than waiting. A slot counter is the special case where a single conditional UPDATE gives you the pessimistic row lock for one statement only, with no retry loop: that is my default."</p></div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Two concurrent conditional updates on the same slot row">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label" x="120" y="24">Request A</text>
+            <text class="label" x="740" y="24">Request B</text>
+            <rect class="box db" x="330" y="90" width="200" height="80"/>
+            <text class="label" x="430" y="120">slot 4711</text>
+            <text class="label small" x="430" y="145">cap 10, booked 9, held 0</text>
+            <rect class="box svc" x="20" y="50" width="200" height="50"/><text class="label small" x="120" y="80">UPDATE ... AND 9+0+1 &lt;= 10</text>
+            <rect class="box svc" x="640" y="50" width="200" height="50"/><text class="label small" x="740" y="80">UPDATE ... (waits for lock)</text>
+            <path class="arrow ok" d="M220 75 L324 110"/>
+            <path class="arrow dashed" d="M640 75 L536 110"/>
+            <rect class="box svc" x="20" y="190" width="200" height="50"/><text class="label small ok" x="120" y="220">1 row: held = 1, wins</text>
+            <rect class="box svc" x="640" y="190" width="200" height="50"/><text class="label small bad" x="740" y="220">re-checks 9+1+1 &gt; 10: 0 rows</text>
+            <path class="arrow ok" d="M330 160 L226 205"/>
+            <path class="arrow bad" d="M530 160 L634 205"/>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M220 75 L330 115 L330 160 L220 205"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="0.4s" repeatCount="indefinite" path="M640 75 L530 115 L530 160 L640 205"/></circle>
+          </svg>
+          <figcaption>In Postgres (READ COMMITTED), B's UPDATE waits on A's row lock, then re-evaluates its WHERE clause on the new row version, finds no room, and changes 0 rows. B's code turns 0 rows into "slot just filled". No double booking, no retry loop.</figcaption>
+        </figure>
+
+        <h3>2. Holds: "many users selected the slot but have not booked yet"</h3>
+        <p>This was the exact follow-up in a June 2025 Amazon SDE2 round that ended in a down-level to SDE1 (<a href="https://leetcode.com/discuss/post/6883459/" target="_blank" rel="noopener">post</a>). The problem: if selecting a slot reserves nothing, two people both reach the payment page for the last place and one is charged for nothing. If selecting reserves forever, abandoned carts make a slot look full while it is empty.</p>
+        <ol class="steps">
+          <li><strong>Count holds against capacity.</strong> The condition is <code>booked + held + n &lt;= capacity</code>, so held places are not offered to anyone else.</li>
+          <li><strong>Give every hold a deadline.</strong> <code>expires_at = now() + 5 minutes</code> (long enough for UPI on a slow phone, short enough that abandoned holds return quickly). Show a countdown timer to the user.</li>
+          <li><strong>Expire actively.</strong> A sweeper runs every few seconds: <code>UPDATE hold SET status='EXPIRED' WHERE status='ACTIVE' AND expires_at &lt; now() RETURNING slot_id, qty</code>, then <code>held -= qty</code> on each slot, in the same transaction. Use <code>FOR UPDATE SKIP LOCKED</code> with a batch limit so several sweeper pods never fight over the same holds.</li>
+          <li><strong>Limit holds per user.</strong> At most one active hold per beneficiary (a partial unique index), and a rate limit per account. Otherwise one script can "pencil in" a whole district.</li>
+          <li><strong>Optional Redis gate.</strong> For very hot slots, keep a Redis counter per slot and run a small Lua script that checks and increments it with a TTL key per hold. Requests that fail in Redis never touch Postgres. Requests that pass still do the database hold, which is the record. If Redis loses data on failover, the worst case is more requests reach the database, which still refuses overbooking.</li>
+        </ol>
+        <div class="callout warn"><p><b>Redis TTL alone is not enough.</b> Redis key expiry is lazy plus periodic sampling, and keyspace "expired" notifications are fire-and-forget (lost if no subscriber is connected). So you cannot rely on an expiry event to give a place back. Keep the hold row in the database with <code>expires_at</code>, and let the sweeper or the hold query itself treat old holds as free.</p></div>
+
+        <h3>3. Surges: the minute slots open</h3>
+        <p>The October 2026 Amazon report lists "queue buffer for surges" and "CDN vs Redis" among the discussion points (<a href="https://leetcode.com/discuss/post/8555479/" target="_blank" rel="noopener">post</a>). Three layers keep the database calm:</p>
+        <ul>
+          <li><b>Reads at the edge.</b> Publish district-level availability as a small JSON file on the CDN with a 2-5 second TTL. A million refreshes a second become a few hundred origin requests. Redis serves the per-centre detail behind it. <b>CDN vs Redis</b>: the CDN is for identical responses to many users (district lists); Redis is for keyed lookups the CDN cannot cache well (per user, per centre, with auth).</li>
+          <li><b>Admission control.</b> A waiting room hands out signed tokens at a fixed rate (say 2,000 per second per shard). Users get a queue position instead of an error. The booking tier only sees traffic it was sized for. This is the "fast, fair no" from the estimation.</li>
+          <li><b>Queue the writes (option).</b> For the adventure-park case (10K people for 80 seats), put hold requests for each ride slot onto a Kafka partition keyed by <code>slot_id</code>. One consumer per partition processes them in order, in memory, with the counter loaded from the database, and writes results in batches. No lock contention at all, and order of arrival is fair. The cost: the user waits a second or two for "you got it" via push or polling.</li>
+          <li><b>Stagger releases.</b> A product fix, not a tech fix: release slots district by district at different times, or by lottery for very popular centres. Say it; interviewers like seeing you question the requirement.</li>
+          <li><b>Captcha and bot defence</b> at the hold step. CoWIN was reported to add a captcha to scheduling in May 2021 after scripts and Telegram alert bots grabbed slots in seconds.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 220" role="img" aria-label="Surge funnel from millions of refreshes down to the database write rate">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="15" y="20" width="160" height="180"/>
+            <text class="label" x="95" y="100">5M users</text><text class="label small" x="95" y="122">refresh every 5 s</text>
+            <rect class="box cache" x="220" y="40" width="150" height="140"/>
+            <text class="label" x="295" y="100">CDN</text><text class="label small" x="295" y="122">~1M reads/s served</text>
+            <rect class="box queue" x="415" y="60" width="150" height="100"/>
+            <text class="label" x="490" y="100">Waiting room</text><text class="label small" x="490" y="122">tokens 2K/s/shard</text>
+            <rect class="box svc" x="610" y="75" width="110" height="70"/>
+            <text class="label small" x="665" y="105">Booking svc</text>
+            <rect class="box db" x="755" y="80" width="95" height="60"/>
+            <text class="label small" x="802" y="115">Postgres</text>
+            <path class="arrow" d="M175 110 L214 110"/>
+            <path class="arrow" d="M370 110 L409 110"/>
+            <path class="arrow" d="M565 110 L604 110"/>
+            <path class="arrow" d="M720 110 L749 110"/>
+            <circle class="packet" r="7"><animateMotion dur="2s" repeatCount="indefinite" path="M175 90 L214 90"/></circle>
+            <circle class="packet" r="7"><animateMotion dur="2s" begin="0.5s" repeatCount="indefinite" path="M175 130 L214 130"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M370 110 L604 110 L749 110"/></circle>
+          </svg>
+          <figcaption>Each layer removes one order of magnitude: the CDN absorbs repeated reads, the waiting room turns a stampede into a steady stream, and only that stream reaches the shard that owns the slot.</figcaption>
+        </figure>
+
+        <h3>4. Payment, webhooks and the Saga</h3>
+        <p>Payment is a step you do not control: the user may close the app, UPI may take two minutes, the PSP may send the webhook twice or never. Never hold a database lock across it. The booking is a <a href="{{BASE}}interview/glossary#saga">Saga</a>: a chain of local steps, each with a compensation.</p>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Step</th><th>Local transaction</th><th>Compensation if a later step fails</th></tr></thead>
+          <tbody>
+            <tr><td>1. Hold</td><td><code>held += n</code>, insert hold (5 min)</td><td>Release hold: <code>held -= n</code> (or let it expire)</td></tr>
+            <tr><td>2. Create payment</td><td>Booking PAYMENT_PENDING + PSP order with idempotency key = booking_id</td><td>Cancel PSP order</td></tr>
+            <tr><td>3. Payment succeeded (webhook)</td><td>Verify signature; hold to CONVERTED, <code>held -= n, booked += n</code>, booking CONFIRMED, outbox row</td><td>Refund (if confirm is impossible)</td></tr>
+            <tr><td>4. Notify / certificate slot</td><td>Kafka consumers</td><td>Retry; these never undo a booking</td></tr>
+          </tbody>
+        </table></div>
+        <ul>
+          <li><b>Duplicate webhooks:</b> the confirm UPDATE names the state it leaves (<code>WHERE status='PAYMENT_PENDING'</code>), and <code>psp_order_id</code> is UNIQUE. A second delivery changes 0 rows and returns 200.</li>
+          <li><b>Missing webhook:</b> a reconciler polls the PSP for orders PAYMENT_PENDING for more than a few minutes. Webhooks are an optimisation; polling is the safety net.</li>
+          <li><b>Payment after the hold expired:</b> try to re-take the place with the same conditional update. If the slot is now full, mark REFUNDED and refund automatically with an idempotency key. Never confirm a place you no longer own. A small grace window (hold counts as live until expires_at + 1 minute for a payment already in flight) cuts how often this happens.</li>
+          <li><b>Why not two-phase commit</b> with the PSP? You cannot make an external bank join your transaction, and 2PC blocks on failure. Saga + idempotency + reconciliation is the industry pattern.</li>
+        </ul>
+
+        <h3>5. The meeting-room and venue variant: ranges and time zones</h3>
+        <p>Rooms differ in two ways: capacity is 1, and users pick arbitrary ranges (14:15 to 15:45), not fixed windows. Asked at Amazon SDE2 (<a href="https://leetcode.com/discuss/post/7393613/" target="_blank" rel="noopener">2025-12</a>), Yellow.ai (<a href="https://leetcode.com/discuss/post/8586568/" target="_blank" rel="noopener">2026-10</a>, with time zones) and as venue rental packages at Salesforce (<a href="https://leetcode.com/discuss/post/8325797/" target="_blank" rel="noopener">2026-06</a>).</p>
+        <ul>
+          <li><b>Option A, fixed grid:</b> cut the day into 15-minute cells and book cells with the slot logic above (capacity 1 each, all cells in one transaction, locked in time order). Simple, works with any database.</li>
+          <li><b>Option B, range constraint:</b> Postgres can enforce "no overlap" itself with an exclusion constraint:
+            <pre><code class="language-sql">CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE room_booking (
+  room_id  BIGINT,
+  during   TSTZRANGE,       -- [start, end) in UTC
+  status   TEXT,
+  EXCLUDE USING gist (room_id WITH =, during WITH &amp;&amp;) WHERE (status &lt;&gt; 'CANCELLED')
+);</code></pre>
+            Two overlapping inserts for the same room: the second fails with an exclusion violation. No application-level check can race it.</li>
+          <li><b>Time zones:</b> store instants in UTC (<code>timestamptz</code>), store each room's or venue's IANA zone (<code>Asia/Kolkata</code>, <code>America/New_York</code>), and convert only at the edges. Recurring meetings ("every Monday 10:00 New York time") must be stored as a rule plus the zone, and expanded per occurrence, or daylight-saving changes move the meeting by an hour.</li>
+          <li><b>Venue packages</b> (Salesforce): a package is a bundle (ground + lights + 4 hours). Model <code>package</code> and <code>package_item</code>, and a booking that holds every resource in the bundle in one transaction.</li>
+          <li><b>Amazon's grilling</b> was on Redis, Kafka, Elasticsearch and database choices: be ready to say why each exists (Redis for free/busy cache and holds, Kafka for invites and calendar sync events, Elasticsearch for "find a free room with a projector for 8 people", Postgres for the booking itself).</li>
+        </ul>
+      

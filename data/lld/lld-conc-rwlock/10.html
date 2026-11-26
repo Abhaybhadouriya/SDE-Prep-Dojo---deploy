@@ -1,0 +1,377 @@
+
+  <h2>Code: runnable demos</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-rwlock/</code>, followed by its real output: <code>RwDemo.java</code> (RW cache, downgrade, failed upgrade, starvation test, StampedLock, snapshot), <code>seqlock.cpp</code> (a C++14 <code>shared_timed_mutex</code> route table and a seqlock) and <code>rwlock.py</code> (a writer-preferring RW lock built on a <code>Condition</code>).</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+/**
+ * Read-write locks, StampedLock and immutable snapshots, for the SDE Prep Dojo page
+ * "Read-Write Locks, StampedLock &amp; Read-Mostly Data".
+ * Run: javac RwDemo.java &amp;&amp; java RwDemo
+ */
+public class RwDemo {
+
+    // ---- 1. a read-mostly cache guarded by ReentrantReadWriteLock -------------------------
+    static final class RwCache&lt;K, V&gt; {
+        private final Map&lt;K, V&gt; map = new HashMap&lt;&gt;();
+        private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();   // nonfair by default
+        final AtomicInteger readersNow = new AtomicInteger(), maxReaders = new AtomicInteger();
+
+        V get(K k) {
+            rw.readLock().lock();
+            try {
+                int n = readersNow.incrementAndGet();
+                maxReaders.accumulateAndGet(n, Math::max);
+                sleep(2);                                  // pretend the read takes a while
+                return map.get(k);
+            } finally { readersNow.decrementAndGet(); rw.readLock().unlock(); }
+        }
+        void put(K k, V v) {
+            rw.writeLock().lock();
+            try { map.put(k, v); } finally { rw.writeLock().unlock(); }
+        }
+        /** Downgrade: write, then keep reading under a read lock with no gap. */
+        V putAndRead(K k, V v) {
+            rw.writeLock().lock();
+            try {
+                map.put(k, v);
+                rw.readLock().lock();                      // allowed while holding the write lock
+            } finally { rw.writeLock().unlock(); }         // now only the read lock is held
+            try { return map.get(k); } finally { rw.readLock().unlock(); }
+        }
+        /** Upgrade is NOT supported: with a read lock held, the write lock can never be granted. */
+        boolean tryUpgrade() throws InterruptedException {
+            rw.readLock().lock();
+            try { return rw.writeLock().tryLock(200, TimeUnit.MILLISECONDS); }   // lock() here would hang forever
+            finally { rw.readLock().unlock(); }
+        }
+    }
+
+    // ---- 2. a naive reader-preferring RW lock, to show writer starvation --------------------
+    static final class NaiveRwLock {
+        private int readers; private boolean writer;
+        synchronized void lockRead() throws InterruptedException { while (writer) wait(); readers++; }
+        synchronized void unlockRead() { if (--readers == 0) notifyAll(); }
+        synchronized void lockWrite() throws InterruptedException { while (writer || readers &gt; 0) wait(); writer = true; }
+        synchronized void unlockWrite() { writer = false; notifyAll(); }
+    }
+
+    interface RW { void r() throws InterruptedException; void ur(); void w() throws InterruptedException; void uw(); }
+
+    /** 4 readers overlap continuously for ~1 s; a writer arrives at 100 ms. How long does it wait? */
+    static long writerWaitMs(RW lock) throws Exception {
+        AtomicBoolean stop = new AtomicBoolean();
+        List&lt;Thread&gt; readers = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 4; i++) {
+            final int offset = i;
+            Thread t = new Thread(() -&gt; {
+                sleep(offset);                             // stagger so read sections always overlap
+                while (!stop.get()) {
+                    try { lock.r(); } catch (InterruptedException e) { return; }
+                    try { sleep(4); } finally { lock.ur(); }
+                }
+            });
+            readers.add(t); t.start();
+        }
+        sleep(100);
+        long t0 = System.nanoTime();
+        Thread writer = new Thread(() -&gt; {
+            try { lock.w(); lock.uw(); } catch (InterruptedException ignored) { }
+        });
+        writer.start();
+        writer.join(1200);
+        long waited = writer.isAlive() ? -1 : (System.nanoTime() - t0) / 1_000_000;
+        stop.set(true);
+        writer.join();
+        if (waited &lt; 0) waited = (System.nanoTime() - t0) / 1_000_000;  // only got in after readers stopped
+        for (Thread t : readers) t.join();
+        return waited;
+    }
+
+    // ---- 3. StampedLock with an optimistic read ---------------------------------------------
+    static final class Point {
+        private double x, y;
+        private final StampedLock sl = new StampedLock();
+        final LongAdder optimisticFails = new LongAdder();
+
+        void move(double dx, double dy) {
+            long st = sl.writeLock();
+            try { x += dx; y += dy; } finally { sl.unlockWrite(st); }
+        }
+        double distanceFromOrigin() {
+            long st = sl.tryOptimisticRead();              // no lock taken, just a version number
+            double cx = x, cy = y;                         // copy into locals FIRST
+            if (!sl.validate(st)) {                        // a writer ran in between: fall back
+                optimisticFails.increment();
+                st = sl.readLock();
+                try { cx = x; cy = y; } finally { sl.unlockRead(st); }
+            }
+            return Math.sqrt(cx * cx + cy * cy);
+        }
+    }
+
+    // ---- 4. copy-on-write snapshot: readers never lock --------------------------------------
+    record Config(Map&lt;String, String&gt; flags, long version) {
+        Config with(String k, String v) {
+            Map&lt;String, String&gt; copy = new HashMap&lt;&gt;(flags);
+            copy.put(k, v);
+            return new Config(Map.copyOf(copy), version + 1);
+        }
+    }
+    static final AtomicReference&lt;Config&gt; CONFIG = new AtomicReference&lt;&gt;(new Config(Map.of("dark-mode", "off"), 1));
+    static String flag(String k) { return CONFIG.get().flags().get(k); }               // one volatile read
+    static void setFlag(String k, String v) { CONFIG.updateAndGet(c -&gt; c.with(k, v)); } // CAS loop, may retry
+
+    static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("1) ReentrantReadWriteLock: readers share, writers exclude");
+        RwCache&lt;String, String&gt; cache = new RwCache&lt;&gt;();
+        cache.put("route", "v1");
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List&lt;Future&lt;String&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 40; i++) fs.add(pool.submit(() -&gt; cache.get("route")));
+        for (Future&lt;String&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("  max readers inside at once: " + cache.maxReaders.get());
+        System.out.println("  downgrade write -&gt; read returned: " + cache.putAndRead("route", "v2"));
+        System.out.println("  upgrade read -&gt; write granted? " + cache.tryUpgrade());
+
+        System.out.println("2) writer waiting while readers keep arriving (one run)");
+        NaiveRwLock naive = new NaiveRwLock();
+        long naiveWait = writerWaitMs(new RW() {
+            public void r() throws InterruptedException { naive.lockRead(); }   public void ur() { naive.unlockRead(); }
+            public void w() throws InterruptedException { naive.lockWrite(); }  public void uw() { naive.unlockWrite(); }
+        });
+        ReentrantReadWriteLock jdk = new ReentrantReadWriteLock();
+        long jdkWait = writerWaitMs(new RW() {
+            public void r() { jdk.readLock().lock(); }   public void ur() { jdk.readLock().unlock(); }
+            public void w() { jdk.writeLock().lock(); }  public void uw() { jdk.writeLock().unlock(); }
+        });
+        System.out.println("  naive reader-preferring lock: writer waited " + naiveWait + " ms");
+        System.out.println("  ReentrantReadWriteLock      : writer waited " + jdkWait + " ms");
+
+        System.out.println("3) StampedLock optimistic reads");
+        Point p = new Point();
+        AtomicBoolean stop = new AtomicBoolean();
+        Thread mover = new Thread(() -&gt; { while (!stop.get()) { p.move(1, 1); sleep(1); } });
+        mover.start();
+        int reads = 2_000_000;
+        for (int i = 0; i &lt; reads; i++) p.distanceFromOrigin();
+        stop.set(true); mover.join();
+        System.out.println("  " + reads + " reads, " + p.optimisticFails.sum() + " fell back to a read lock");
+        StampedLock sl = new StampedLock();
+        long w = sl.writeLock();
+        System.out.println("  tryOptimisticRead while write-locked returns " + sl.tryOptimisticRead() + " (0 = invalid)");
+        sl.unlockWrite(w);
+
+        System.out.println("4) immutable snapshot + AtomicReference (RCU-style)");
+        Config before = CONFIG.get();
+        setFlag("dark-mode", "on");
+        System.out.println("  old reader still sees " + before.flags().get("dark-mode") + " (v" + before.version() + "), new readers see "
+                + flag("dark-mode") + " (v" + CONFIG.get().version() + ")");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out RwDemo.java &amp;&amp; java -cp out RwDemo
+1) ReentrantReadWriteLock: readers share, writers exclude
+  max readers inside at once: 8
+  downgrade write -&gt; read returned: v2
+  upgrade read -&gt; write granted? false
+2) writer waiting while readers keep arriving (one run)
+  naive reader-preferring lock: writer waited 1206 ms
+  ReentrantReadWriteLock      : writer waited 5 ms
+3) StampedLock optimistic reads
+  2000000 reads, 6 fell back to a read lock
+  tryOptimisticRead while write-locked returns 0 (0 = invalid)
+4) immutable snapshot + AtomicReference (RCU-style)
+  old reader still sees off (v1), new readers see on (v2)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Reader-writer lock and a seqlock in C++14, for the SDE Prep Dojo page
+// "Read-Write Locks, StampedLock &amp; Read-Mostly Data".
+// Build: g++ -std=c++14 -O2 -Wall -Wextra -pthread seqlock.cpp -o seqlock &amp;&amp; ./seqlock
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+// C++14 has std::shared_timed_mutex (std::shared_mutex is C++17).
+#include &lt;atomic&gt;
+#include &lt;chrono&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;mutex&gt;
+#include &lt;shared_mutex&gt;
+#include &lt;string&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+// ---- 1. read-mostly map with a reader-writer lock --------------------------------
+class RouteTable {
+public:
+    std::string lookup(const std::string&amp; prefix) const {
+        std::shared_lock&lt;std::shared_timed_mutex&gt; lk(m_);     // many readers at once
+        auto it = routes_.find(prefix);
+        return it == routes_.end() ? "drop" : it-&gt;second;
+    }
+    void update(const std::string&amp; prefix, const std::string&amp; nh) {
+        std::unique_lock&lt;std::shared_timed_mutex&gt; lk(m_);     // one writer, no readers
+        routes_[prefix] = nh;
+    }
+private:
+    mutable std::shared_timed_mutex m_;
+    std::map&lt;std::string, std::string&gt; routes_;
+};
+
+// ---- 2. seqlock: writers bump a counter to odd, write, bump to even ----------------
+// Readers never block a writer; they retry if the counter was odd or changed.
+// Payload fields are relaxed atomics so concurrent reads are not a data race in C++.
+class SeqPoint {
+public:
+    void write(int x) {
+        std::lock_guard&lt;std::mutex&gt; g(writers_);              // writers still exclude each other
+        unsigned s = seq_.load(std::memory_order_relaxed);
+        seq_.store(s + 1, std::memory_order_relaxed);         // odd: write in progress
+        std::atomic_thread_fence(std::memory_order_release);
+        x_.store(x, std::memory_order_relaxed);
+        y_.store(2 * x, std::memory_order_relaxed);           // invariant: y == 2x
+        seq_.store(s + 2, std::memory_order_release);         // even: done
+    }
+    // Returns the number of retries; fills a consistent (x, y).
+    int read(int&amp; x, int&amp; y) const {
+        int retries = 0;
+        for (;;) {
+            unsigned s1 = seq_.load(std::memory_order_acquire);
+            if (s1 &amp; 1u) { ++retries; continue; }             // writer active
+            x = x_.load(std::memory_order_relaxed);
+            y = y_.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (seq_.load(std::memory_order_relaxed) == s1) return retries;
+            ++retries;                                        // a write overlapped: try again
+        }
+    }
+private:
+    std::atomic&lt;unsigned&gt; seq_{0};
+    std::atomic&lt;int&gt; x_{0}, y_{0};
+    std::mutex writers_;
+};
+
+int main() {
+    RouteTable rt;
+    rt.update("10.0.0.0/8", "eth1");
+    std::vector&lt;std::thread&gt; readers;
+    std::atomic&lt;int&gt; hits{0};
+    for (int i = 0; i &lt; 4; ++i)
+        readers.emplace_back([&amp;] { for (int k = 0; k &lt; 10000; ++k) if (rt.lookup("10.0.0.0/8") != "drop") ++hits; });
+    rt.update("10.0.0.0/8", "eth2");
+    for (auto&amp; t : readers) t.join();
+    std::cout &lt;&lt; "route lookups that found a next hop: " &lt;&lt; hits &lt;&lt; " / 40000\n";
+
+    SeqPoint p;
+    std::atomic&lt;bool&gt; stop{false};
+    std::thread writer([&amp;] { for (int i = 1; !stop; ++i) p.write(i); });
+    long torn = 0, retries = 0, reads = 0;
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    while (std::chrono::steady_clock::now() &lt; end) {
+        int x, y;
+        retries += p.read(x, y);
+        ++reads;
+        if (y != 2 * x) ++torn;
+    }
+    stop = true;
+    writer.join();
+    std::cout &lt;&lt; "seqlock: " &lt;&lt; reads &lt;&lt; " reads, " &lt;&lt; retries &lt;&lt; " retries, torn reads = " &lt;&lt; torn &lt;&lt; "\n";
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread seqlock.cpp -o seqlock &amp;&amp; ./seqlock
+route lookups that found a next hop: 40000 / 40000
+seqlock: 7346993 reads, 2946652 retries, torn reads = 0</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""A writer-preferring read-write lock in Python, for the SDE Prep Dojo page
+"Read-Write Locks, StampedLock &amp; Read-Mostly Data".  Run: python rwlock.py
+
+The standard library has no RW lock. This one blocks NEW readers while a writer waits,
+so a steady stream of readers cannot starve writers.
+"""
+import threading
+import time
+from contextlib import contextmanager
+
+
+class RWLock:
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    @contextmanager
+    def read(self):
+        with self._cond:
+            while self._writer or self._writers_waiting:   # writer preference
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self):
+        with self._cond:
+            self._writers_waiting += 1
+            while self._writer or self._readers:
+                self._cond.wait()
+            self._writers_waiting -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
+if __name__ == "__main__":
+    lock, data, stop = RWLock(), {"price": 100}, threading.Event()
+    max_inside, inside, guard = [0], [0], threading.Lock()
+
+    def reader():
+        while not stop.is_set():
+            with lock.read():
+                with guard:
+                    inside[0] += 1
+                    max_inside[0] = max(max_inside[0], inside[0])
+                time.sleep(0.004)
+                with guard:
+                    inside[0] -= 1
+
+    rs = [threading.Thread(target=reader) for _ in range(4)]
+    for t in rs:
+        t.start()
+    time.sleep(0.1)
+    t0 = time.perf_counter()
+    with lock.write():
+        data["price"] = 101
+    waited = (time.perf_counter() - t0) * 1000
+    stop.set()
+    for t in rs:
+        t.join()
+    print(f"max readers inside at once: {max_inside[0]}")
+    print(f"writer waited {waited:.1f} ms while 4 readers kept arriving; price={data['price']}")</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python rwlock.py
+max readers inside at once: 4
+writer waited 3.4 ms while 4 readers kept arriving; price=101</code></pre>
+    </div>
+  </div>

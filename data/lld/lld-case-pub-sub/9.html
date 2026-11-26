@@ -1,0 +1,75 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>This is where Uber and Flipkart spend the second half of the round. Walk through each shared thing and say who touches it.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="A worker's offset commit races with an admin seek; committing with compare-and-set keeps the seek">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">worker on p1</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">admin: seek(p1, 0)</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">group offset for p1</text><text class="label small" x="400" y="166">next = 7</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. read 7, delivers, will write 8</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. sets the offset to 0 (replay)</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">if the worker writes 8 after the seek</text><text class="label bad" x="645" y="164">the replay request is silently lost</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. seek came first: the CAS fails</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: commit with compare-and-set</text><text class="label mono" x="645" y="66">compareAndSet(7, 8)</text>
+      </g>
+      <g data-step="3">
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">worker sees the offset is now 0</text><text class="label small" x="645" y="242">it reads from 0 on its next loop</text><text class="label small" x="645" y="266">the replay happens as asked</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>The worker read offset 7 and delivered message 7. Before it commits 8, an operator seeks the group back to 0 to replay. A plain write of 8 would overwrite the seek.</li>
+      <li>The guard: the worker commits with <code>compareAndSet(7, 8)</code> on an <code>AtomicLong</code>: "move to 8 only if it is still 7". The seek changed it to 0, so the commit fails.</li>
+      <li>The worker notices the failed commit, reads the current offset (0) and continues from there. The seek wins, as it should.</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Writers</th><th>Readers</th><th>Protection</th></tr></thead>
+      <tbody>
+        <tr><td>Partition log</td><td>any producer thread</td><td>one worker per group</td><td>One <code>ReentrantLock</code> per partition, held only for append or copy-out. Different partitions never contend.</td></tr>
+        <tr><td>"New data" signal</td><td>append</td><td>sleeping workers</td><td><code>Condition grew</code>; <code>awaitNanos</code> in a <code>while</code> loop (spurious wake-ups, timeouts).</td></tr>
+        <tr><td>Group's next offset per partition</td><td>its worker; <code>seek</code></td><td><code>lag()</code></td><td><code>AtomicLong</code>; the worker commits with <code>compareAndSet(expected, expected+1)</code> so a concurrent seek is never overwritten.</td></tr>
+        <tr><td>Topic and group registries</td><td>create / group</td><td>publish / dead-letter</td><td><code>ConcurrentHashMap.computeIfAbsent</code>: create-if-missing is atomic, no double topic.</td></tr>
+        <tr><td>Counters</td><td>workers</td><td>demo</td><td><code>AtomicInteger</code>.</td></tr>
+        <tr><td>Message</td><td>nobody after creation</td><td>everyone</td><td>Immutable record; needs no lock.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3 id="why-not">Why not these simpler designs?</h3>
+  <ul>
+    <li><b>One global lock around the broker.</b> Correct but every publish waits for every read. "Publishers never block subscribers" fails.</li>
+    <li><b>Calling subscribers inside <code>publish</code>.</b> The producer now runs consumer code: a slow or throwing consumer blocks or breaks the producer. It is the same mistake as doing heavy work in an interrupt handler instead of deferring it to a softirq or workqueue.</li>
+    <li><b>A thread pool where any thread takes any message.</b> Parallel, but two messages of one key can run at the same time on two threads and finish out of order. Fix: route by partition (or by key hash) to a single-threaded lane.</li>
+    <li><b>A <code>BlockingQueue</code> per subscriber, deleting on take.</b> Fine for a work queue, but replay, late subscribers and "state of consumption per consumer" are gone. Also each publish copies to N queues.</li>
+    <li><b>Holding the partition lock while calling the subscriber.</b> Producers to that partition would wait for consumer code. <code>read</code> copies the slice out and releases the lock before delivery.</li>
+  </ul>
+  <h3 id="delivery-semantics">Delivery semantics in one picture</h3>
+  <div class="proscons">
+    <div class="pros"><h5>Commit after processing (what we do)</h5><ul><li>At-least-once: a crash between processing and commit replays the message.</li><li>Nothing is lost while the process lives.</li><li>Consumers must be <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> (dedupe by message id or offset).</li></ul></div>
+    <div class="cons"><h5>Commit before processing</h5><ul><li>At-most-once: a crash after commit loses the message.</li><li>No duplicates.</li><li>Fine for metrics, wrong for payments.</li></ul></div>
+  </div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The <code>compareAndSet</code> commit is the same idea as advancing a ring's consumer index with <code>cmpxchg</code> only if nobody reset it. The bounded <code>awaitNanos</code> wait is a <code>wait_event_timeout()</code>: the worker wakes regularly to check <code>running</code>, so <code>stop()</code> never hangs on a quiet partition. And "copy out under the lock, process outside it" is what you do in a driver when you pull descriptors off the ring under a spinlock and process the skbs after dropping it.</p>
+  </div>
+  <h3 id="shutdown">Shutdown and back-pressure</h3>
+  <p><code>stop()</code> flips a volatile flag, interrupts the workers (they may be sleeping in a backoff) and joins them with a timeout. Back-pressure is not needed for correctness in this design because producers only append, but memory grows forever. The honest answers are retention (drop segments older than T or beyond S bytes, and move slow groups' offsets forward with a warning) or a bounded log where <code>publish</code> blocks or fails when the slowest group is too far behind. Say which one the business wants: payments prefer blocking, metrics prefer dropping.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReentrantLock</code> = <code>pthread_mutex_t</code> of the recursive kind (the owning thread may lock it again), with <code>tryLock</code> like <code>mutex_trylock</code>.</li>
+      <li><code>Condition.await</code> / <code>awaitNanos</code>, <code>wait</code> / <code>notifyAll</code> = <code>pthread_cond_wait</code> / <code>pthread_cond_timedwait</code>; always recheck the predicate in a <code>while</code> loop because of spurious wake-ups, as <code>wait_event()</code> does.</li>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>BlockingQueue</code> = a bounded producer-consumer ring with a mutex and two condition variables (a <code>kfifo</code> plus wait queues).</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

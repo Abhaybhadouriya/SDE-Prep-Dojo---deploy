@@ -1,0 +1,127 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements.</strong> Problems, run/submit, verdicts, contests + leaderboard. Say "isolation is the top NFR" and "verdict in about 5 s".</li>
+          <li><strong>5-10 min: estimate.</strong> Show that storage is tiny and CPU-seconds are spiky: 10k submissions x 100 tests x 100 ms = 100k CPU-s, about 1,667 cores for a 60 s drain.</li>
+          <li><strong>10-15 min: API + data model.</strong> 202 + polling, idempotency key, server timestamps, tests in object storage.</li>
+          <li><strong>15-25 min: high-level flow.</strong> API -&gt; DB -&gt; queue -&gt; language worker pools -&gt; sandbox -&gt; verdict -&gt; Redis.</li>
+          <li><strong>25-40 min: deep dives.</strong> Sandbox layers first (your strength), then contest scaling, then leaderboard.</li>
+          <li><strong>40-45 min: failures and wrap-up.</strong> Retries, rejudge, monitoring (queue depth, <a href="{{BASE}}interview/glossary#p99">p99</a> verdict latency - p99 = 99% of submissions get a verdict faster than this; the slowest 1% are what users complain about - and XX rate).</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"The API stores the submission and returns 202, a queue feeds per-language workers that run the code in a locked-down container with CPU, memory and pid limits and no network, and the browser polls for the verdict."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"I size the contest burst in CPU-seconds (about 1,667 cores for a 60 s drain), autoscale workers on queue depth, pick gVisor or Firecracker for isolation, and make verdict writes conditional so a redelivered job cannot bump the leaderboard twice."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> running code in the web server; calling a container "secure" without naming seccomp/cgroups/network; using wall time for TLE; storing tests per language; holding an HTTP request open for the whole judge run; trusting the client's timestamp; forgetting that a retried job can double-count in the leaderboard.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart">
+          <summary>Why not just run the user's code inside the API server process?</summary>
+          <div class="answer">
+            <p>Because the code is untrusted and unbounded. One infinite loop pins a core, one memory bomb kills the process, and one <code>os.system</code> call can read secrets or attack the network. It also couples verdict latency to web latency. Move execution to separate workers behind a queue, inside sandboxes with CPU, memory, time and syscall limits and no network.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name three concrete attacks (loop, memory bomb, file/network access), then the separation: API stays thin, execution is async and isolated.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is a Docker container enough?</li><li>How does the user get the result if execution is async?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>Is a Docker container a secure sandbox? What would you add?</summary>
+          <div class="answer">
+            <p>Not on its own: containers share the host kernel, so a kernel bug or a misconfiguration (privileged mode, mounted Docker socket) breaks isolation. Harden it: no network, read-only root filesystem, non-root user, drop all capabilities, a strict seccomp allowlist (Docker's default already blocks about 44 of 300+ syscalls; a judge can allow far fewer), cgroup limits on memory, CPU and pids, file-size rlimit. Then add a second wall such as gVisor (a user-space kernel that services syscalls itself) or Firecracker microVMs (KVM-backed, under 125 ms boot).</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "defence in depth", list layers from outside in, and tie each to the attack it stops. Mention a real escape (Judge0 CVE-2024-28185) to show the setup code matters too.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does gVisor cost you?</li><li>How would you stop a fork bomb?</li><li>How do you prevent reading the hidden test files?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>How do you make the time limit fair across machines and load?</summary>
+          <div class="answer">
+            <p>Limit and report <b>CPU time</b> of the sandboxed process, not wall time, so queue waits and OS scheduling of other tasks do not count. Keep a looser wall-time limit only to kill sleeping programs. Pin each sandbox to its own core with cpuset, avoid oversubscription in contests, use one hardware type per pool, and add a small margin to limits. If a verdict is borderline, rejudging on a quiet worker should give the same answer.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "what we measure" (CPU time) from "what we protect against" (wall time). Then talk about noise sources.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Java's JIT warms up slowly - do you give Java a bigger limit?</li><li>How do you handle multithreaded submissions?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart">
+          <summary>Synchronous HTTP response, polling, or WebSockets for the verdict?</summary>
+          <div class="answer">
+            <p>Return 202 with a submission id, then poll every second. A synchronous request ties up a connection for up to several seconds and breaks on load balancer timeouts and retries. Polling is cheap when served from Redis, and LeetCode itself polls. WebSockets or SSE give instant push but add stateful connections; worth it only if you also push leaderboard updates or chat.</p>
+            <div class="approach"><h5>How to answer</h5><p>Compare the three on latency, server state and complexity; pick polling with backoff, show the read QPS (10k/s) and that it hits cache.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What polling interval and why?</li><li>How do you avoid hammering the DB?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>100,000 users submit in the first minutes of a contest. How do you scale?</summary>
+          <div class="answer">
+            <p>Estimate first: 10k concurrent submissions x 100 tests x 100 ms = 100k CPU-seconds, so about 1,667 cores to drain in a minute. A queue absorbs the burst; per-language worker pools scale horizontally on <b>queue depth</b>. Because contests are scheduled, pre-scale from registration counts and keep warm sandboxes. Put contest jobs in a higher-priority lane than practice. If still behind, show queue position rather than failing.</p>
+            <div class="approach"><h5>How to answer</h5><p>Numbers, then queue, then autoscaling signal, then pre-warming, then graceful degradation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why scale on queue depth instead of CPU?</li><li>What is the cold-start cost of a new worker node?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart">
+          <summary>Design the contest leaderboard.</summary>
+          <div class="answer">
+            <p>A Redis sorted set per contest. Encode score as <code>solved x 10^7 - penaltySeconds</code> so one <code>ZADD</code> keeps it ordered; <code>ZRANGE ... REV</code> for the top N and <code>ZREVRANK</code> for "my rank". Writes only on a first AC per problem (a few hundred per second). Reads are about 20k/s, so publish a top-1,000 snapshot every few seconds to a cache and let clients poll that. Persist the final board to the DB at contest end.</p>
+            <div class="approach"><h5>How to answer</h5><p>State the ranking rule, show the score encoding trick, separate write rate from read rate.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if Redis fails mid-contest? (Rebuild from the submissions table.)</li><li>How do you add wrong-attempt penalties?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>A worker dies while running a submission. What happens?</summary>
+          <div class="answer">
+            <p>The job's visibility timeout expires and the queue redelivers it to another worker. The verdict write is conditional (<code>WHERE status &lt;&gt; 'DONE'</code>) and the leaderboard update only fires if that write changed a row and it is the first AC, so a duplicate run cannot double count. Internal sandbox errors are retried; after three failures the job goes to a dead-letter queue and the user sees "judge error, retrying".</p>
+            <div class="approach"><h5>How to answer</h5><p><a href="{{BASE}}interview/glossary#at-least-once">At-least-once</a> delivery + idempotent side effects. Name the timeout value from your estimate.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you tell a user's RE from a judge's internal error?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart">
+          <summary>How do you store and run test cases for 10+ languages?</summary>
+          <div class="answer">
+            <p>One test set per problem in a language-neutral serialized format, stored as versioned blobs in object storage with a manifest in the DB. Each language has a harness that parses inputs into native types, calls the user's function and serializes the output. Exact compare by default; a custom checker for problems with many valid answers or floating point. Workers cache test sets on local disk keyed by <code>problemId + version</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Avoid N-languages x M-problems duplication; mention versioning and checkers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you fix a wrong test after a contest? (Rejudge.)</li><li>How do you stop users from printing the hidden input?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>Would you use Kafka for the submission queue?</summary>
+          <div class="answer">
+            <p>Not as the work queue. Kafka orders and commits per partition, so one slow job blocks the jobs behind it, and parallelism is capped by partition count. A judge wants per-message ack, redelivery on timeout and any-worker-takes-any-job, which SQS or RabbitMQ give. I would use Kafka for the <b>"submission judged"</b> event stream that the leaderboard, analytics, notifications and plagiarism detection consume.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know what Kafka is good at, and pick the right tool for each job.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the interviewer insists on Kafka? (Many partitions, pause/resume, a retry topic.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart">
+          <summary>How would you detect cheating or plagiarism during a contest?</summary>
+          <div class="answer">
+            <p>Asynchronously, off the critical path. Consume the judged-submission stream, normalize code (strip comments, rename identifiers, tokenize), fingerprint it (for example winnowing over token k-grams) and compare against other accepted submissions for the same problem. Flag clusters for human review after the contest rather than blocking verdicts live. Also enforce server timestamps and rate-limit submissions per user.</p>
+            <div class="approach"><h5>How to answer</h5><p>Keep it out of the hot path, describe a fingerprinting approach at a high level, and end with a human-in-the-loop.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you scale pairwise comparison? (Index fingerprints; compare only candidates sharing many hashes.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the same code gets AC, then TLE</h4>
+          <div class="situation"><p>During a contest, users complain that resubmitting identical code flips between Accepted and Time Limit Exceeded. Dashboards show worker CPU at 100% and the node count recently doubled.</p></div>
+          <div class="bad"><p>Weak answer: "Increase the time limit for everyone."</p></div>
+          <div class="good"><p>Strong answer: check what we measure. If TLE uses wall time, queue and scheduling delay leak in; switch to CPU time. Check oversubscription: are more sandboxes than physical cores running per node after the scale-up? Pin with cpuset, cap sandboxes per node, keep the new nodes the same instance type. Then rejudge the affected TLE submissions on quiet workers and publish a note.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you find "affected" submissions? (TLE with CPU time near the limit in the window.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: a submission tries to reach the internet</h4>
+          <div class="situation"><p>Security finds a submission that tried to open a socket to an external IP and read <code>/proc</code> of other processes.</p></div>
+          <div class="bad"><p>Weak answer: "Block that IP."</p></div>
+          <div class="good"><p>Strong answer: the sandbox should already make this impossible - a network namespace with only loopback, a PID namespace so no other processes are visible, seccomp denying socket families we do not need. Verify each layer actually applied (audit logs of seccomp denials), confirm workers hold no credentials, and add an alert on seccomp-deny spikes per user. Ban the account and review similar submissions.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where would you log sandbox violations, and who gets paged?</li></ul></div>
+        </div>
+      

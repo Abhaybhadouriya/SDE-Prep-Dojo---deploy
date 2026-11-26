@@ -1,0 +1,62 @@
+
+        <h2>Across nodes: overlay (VXLAN), routing (BGP), cloud and eBPF</h2>
+        <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+        <p>The underlay network (your data-center switches or cloud VPC) knows node IPs like 192.168.1.11, but it has no idea that 10.244.2.0/24 lives behind node-2. There are three ways to fix that:</p>
+        <ol class="steps">
+          <li><strong>Overlay (encapsulate).</strong> Wrap the pod packet inside a UDP packet addressed node-to-node. The underlay only sees node IPs. Flannel's default is <b>VXLAN</b>; Calico and Cilium can do it too.</li>
+          <li><strong>Routing (teach the network).</strong> Each node advertises "10.244.2.0/24 is behind me" with <b>BGP</b> (Calico's classic mode), or the nodes share one L2 segment and add plain routes (Flannel <code>host-gw</code>). No encapsulation, full MTU.</li>
+          <li><strong>Cloud-native (pods get real VPC IPs).</strong> The AWS VPC CNI gives pods secondary IPs from the node's network interfaces (ENIs, Elastic Network Interfaces: a cloud VM's virtual NICs), so the VPC itself routes them. Fast and simple, but you can run out of subnet IPs.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 268" role="img" aria-label="VXLAN encapsulation: outer Ethernet, outer IP between nodes, UDP 8472, VXLAN header, then the original pod packet">
+            <text class="label left" x="20" y="24">Original pod packet (inner)</text>
+            <rect class="box docker" x="390" y="40" width="140" height="66"/>
+            <text class="label" x="460" y="56">inner IP</text>
+            <text class="label small" x="460" y="76">src 10.244.1.7</text>
+            <text class="label small" x="460" y="94">dst 10.244.2.9</text>
+            <rect class="box docker" x="530" y="40" width="110" height="66"/>
+            <text class="label" x="585" y="73">TCP :8080</text>
+            <rect class="box docker" x="640" y="40" width="140" height="66"/>
+            <text class="label" x="710" y="73">HTTP data</text>
+            <text class="label left" x="20" y="134">On the wire between nodes (outer, +50 bytes)</text>
+            <rect class="box client" x="20" y="152" width="95" height="56"/>
+            <text class="label" x="67" y="172">outer Eth</text>
+            <text class="label small" x="67" y="194">14 B</text>
+            <rect class="box client" x="115" y="152" width="140" height="56"/>
+            <text class="label" x="185" y="172">outer IP 20 B</text>
+            <text class="label small" x="185" y="194">192.168.1.10 -> .11</text>
+            <rect class="box client" x="255" y="152" width="95" height="56"/>
+            <text class="label" x="302" y="172">UDP 8 B</text>
+            <text class="label small" x="302" y="194">dport 8472</text>
+            <rect class="box queue" x="350" y="152" width="80" height="56"/>
+            <text class="label" x="390" y="172">VXLAN</text>
+            <text class="label small" x="390" y="194">8 B, VNI 1</text>
+            <rect class="box docker" x="430" y="152" width="125" height="56"/>
+            <text class="label" x="492" y="180">inner Eth+IP</text>
+            <rect class="box docker" x="555" y="152" width="95" height="56"/>
+            <text class="label" x="602" y="180">TCP</text>
+            <rect class="box docker" x="650" y="152" width="130" height="56"/>
+            <text class="label" x="715" y="180">HTTP data</text>
+            <text class="label small" x="400" y="240">14 + 20 + 8 + 8 = 50 bytes of overhead, so pod MTU = 1450 on a 1500-byte network</text>
+          </svg>
+          <figcaption>VXLAN in one picture. Flannel on Linux uses UDP port 8472 (the Linux kernel's historical default), not the IANA port 4789. The underlay only ever routes node IPs.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>You already know all of this. Each node's <code>flannel.1</code> is a <b>VTEP</b>; Flannel's agent fills the forwarding database (<code>bridge fdb</code>) and ARP entries from data in the Kubernetes API instead of using multicast flood-and-learn. Calico's BGP mode is a real BGP speaker (BIRD) on each node, peering full mesh or through <b>route reflectors</b>, exactly like iBGP. Where it breaks: in Kubernetes the "<a href="{{BASE}}interview/glossary#control-plane">control plane</a>" for these tunnels and routes is the Kubernetes API itself, and when that goes wrong it goes wrong in Kubernetes-specific ways (see the Reddit story below).</p>
+        </div>
+        <h3>eBPF: Cilium</h3>
+        <p><strong>eBPF</strong> lets you load small verified programs into the kernel at hooks such as tc (traffic control) and XDP (eXpress Data Path: an eBPF hook in the NIC driver that runs before the kernel even allocates an skb). <b>Cilium</b> uses this to forward pod traffic, enforce L3-L7 policy, and even replace kube-proxy entirely: instead of NAT rules, it can translate the Service IP to a pod IP at the <b>socket level</b>, when the app calls <code>connect()</code>, so the packet leaves the pod already addressed to the real backend. Cilium is the dataplane behind GKE Dataplane V2 (Google's name for its eBPF-based cluster networking) and an option on AKS ("Azure CNI powered by Cilium").</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>CNI</th><th>Cross-node method</th><th>NetworkPolicy</th><th>Strengths</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td><b>Flannel</b></td><td>VXLAN (default), host-gw</td><td>No (needs another tool)</td><td>Simple, great for labs</td><td>No policy; overlay overhead</td></tr>
+              <tr><td><b>Calico</b></td><td>BGP (no encap), or IP-in-IP / VXLAN</td><td>Yes, strong</td><td>Full MTU with BGP; mature policy; iptables or eBPF dataplane</td><td>BGP design (route reflectors) is real network ops</td></tr>
+              <tr><td><b>Cilium</b></td><td>VXLAN/Geneve (a VXLAN-like encapsulation with extensible option headers) or native routing</td><td>Yes, up to L7</td><td>eBPF speed, kube-proxy replacement, Hubble (Cilium's flow log and network observability tool)</td><td>Newer kernels needed; more moving parts</td></tr>
+              <tr><td><b>AWS VPC CNI / Azure CNI</b></td><td>Real VPC IPs, no overlay</td><td>Via add-ons/policy engine</td><td>Native cloud routing, no encap</td><td>Subnet IP exhaustion; per-node pod limits from ENI counts</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For a production story about overlay cost: OpenAI's "Scaling Kubernetes to 7,500 nodes" post says they moved away from Flannel because the overlay could not keep up with their throughput, and used native pod networking instead.</p>
+      

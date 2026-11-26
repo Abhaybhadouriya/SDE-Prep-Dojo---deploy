@@ -1,0 +1,64 @@
+
+  <h2>Concurrency: the 10:00 tatkal rush</h2>
+  <p>At tatkal opening, thousands of requests arrive for the same train, date and class within the same second, and there are only a handful of tatkal berths. The race is the classic check-then-act (see <a href="{{BASE}}lld/lld-conc-booking">booking concurrency</a>): two threads both see "berth 5 free for NDLS-NGP", both OR their mask in, and berth 5 is sold twice. Step through the fix.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 820 300" role="img" aria-label="Tatkal rush with a fair lock per journey">
+      <rect class="box client" x="20" y="20" width="90" height="34"/><text class="label small" x="65" y="37">T1</text>
+      <rect class="box client" x="20" y="64" width="90" height="34"/><text class="label small" x="65" y="81">T2</text>
+      <rect class="box client" x="20" y="108" width="90" height="34"/><text class="label small" x="65" y="125">T3 ... T100</text>
+      <rect class="box k8s" x="330" y="20" width="200" height="122"/><text class="label" x="430" y="44">JourneyInventory</text>
+      <text class="label small" x="430" y="66">12627 / 2026-12-10 / 3A</text>
+      <text class="label small" x="430" y="90">tatkal berths: 5, 6</text>
+      <text class="label small" x="430" y="114">lock: ReentrantLock(true)</text>
+      <rect class="box k8s" x="600" y="20" width="200" height="60"/><text class="label small" x="700" y="44">12627 / 2026-12-11 / 3A</text><text class="label small" x="700" y="64">its own lock</text>
+      <g data-step-only="1">
+        <text class="label small bad" x="410" y="180">No lock: T1 and T2 both read occupied[5] = 0, both write | mask</text>
+        <text class="label small bad" x="410" y="204">berth 5 sold twice. Same bug as two CPUs doing a non-atomic read-modify-write.</text>
+        <path class="arrow" d="M110 37 L324 70"/><path class="arrow" d="M110 81 L324 80"/>
+      </g>
+      <g data-step="2">
+        <rect class="box queue" x="140" y="160" width="180" height="40"/><text class="label small" x="230" y="180">FIFO wait queue: T3..T100</text>
+        <path class="arrow" d="M110 37 L324 60"/>
+        <text class="label small" x="600" y="120">T1 holds the lock: scan, pick 5, OR mask</text>
+      </g>
+      <g data-step="3">
+        <text class="label small" x="600" y="144">T2 next: berth 6. T3..T100: REGRET</text>
+        <text class="label small" x="410" y="236">fair = served in the order they started waiting; each turn is microseconds</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="140" y="250" width="660" height="40"/>
+        <text class="label small" x="470" y="270">Other dates and trains have their own inventory and lock: no global bottleneck</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Without mutual exclusion, two threads read the same free mask and both write. The berth is sold twice; the invariant checker in our demo would throw "berth sold twice".</li>
+      <li>With one lock per JourneyInventory, T1 enters and does the whole check-and-allocate for all its passengers. Everybody else for this journey waits.</li>
+      <li>A fair lock is FIFO among the threads already queued on the lock: the thread that started waiting first gets it next. That is arrival order <i>at <code>lock()</code></i>, not request time: network delay and thread scheduling decide who reaches the lock first. Once the two tatkal berths are sold, the remaining 98 requests fail fast with REGRET.</li>
+      <li>The lock key is train + date + class, so a rush on 12627 for the 10th never slows down bookings for the 11th or for another train.</li>
+    </ol>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Option</th><th>Correct?</th><th>Fair?</th><th>Comment</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code> on the inventory</td><td>Yes</td><td>No guarantee</td><td>Simplest; Java monitors may let a newly arriving thread barge ahead of waiters.</td></tr>
+        <tr><td><code>ReentrantLock(true)</code> per journey (ours)</td><td>Yes</td><td>FIFO among waiters</td><td>Lower throughput than an unfair lock, but "fair manner" was a stated requirement at Zepto.</td></tr>
+        <tr><td>Per-berth locks or CAS on each mask</td><td>For masks only</td><td>No</td><td>RAC and WL queues still need a lock; a multi-passenger PNR would need several locks in order. More complex for no real gain on 72 berths.</td></tr>
+        <tr><td>Single-threaded actor per journey (a queue + one worker)</td><td>Yes</td><td>FIFO by queue</td><td>Same effect as the fair lock, and the natural shape when you scale out: route each journey to one partition (Kafka key = train+date), one consumer serialises its bookings.</td></tr>
+        <tr><td>Database: <code>SELECT ... FOR UPDATE</code> on the journey row</td><td>Yes</td><td>Mostly FIFO</td><td>Same idea at the DB level; keep the transaction short.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Other shared state in our code</h3>
+  <ul>
+    <li><b>Inventory map</b>: <code>ConcurrentHashMap.computeIfAbsent</code> so two first requests for a new journey create exactly one inventory (one lock), not two.</li>
+    <li><b>PNR numbers</b>: an <code>AtomicLong</code>; PNRs are unique without a lock.</li>
+    <li><b>Listeners</b>: a <code>CopyOnWriteArrayList</code>, and they are called after <code>allocate</code>/<code>cancel</code> return, outside the lock.</li>
+    <li><b>Tickets</b> are mutated only under their inventory's lock; readers of <code>describe()</code> in the demo read after the threads have joined. In production, return an immutable snapshot from the service instead of the live ticket.</li>
+    <li><b>Clock</b>: a <code>volatile</code> field in the manual test clock.</li>
+  </ul>
+  <div class="callout warn"><p><b>What "fair" can and cannot promise.</b> <code>ReentrantLock(true)</code> is FIFO among threads already queued on the lock. If the requirement is "earliest request wins", stamp a sequence number at ingress (the API gateway) and serialise per journey in that order (a single-threaded actor or one partition per journey). And never call the untimed <code>tryLock()</code> on a fair lock: it barges ahead of the queue even when fairness is on; use <code>tryLock(0, TimeUnit.SECONDS)</code> if you need a non-blocking attempt that respects fairness.</p></div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The fair lock is a <b>ticket lock</b>: the kernel replaced plain test-and-set spinlocks with ticket spinlocks so that CPUs get the lock in the order they asked, because the unfair version starved some CPUs under contention. Since Linux 4.2 mainline uses the queued spinlock (qspinlock, built on an MCS queue), which keeps FIFO order without every CPU spinning on one cache line. Partitioning by journey is like per-CPU or per-queue locks on a NIC driver: no global lock, each queue serialised on its own.</p>
+  </div>

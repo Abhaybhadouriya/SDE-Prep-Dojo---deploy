@@ -1,0 +1,220 @@
+
+        <h2>The solution ladder: naive to best</h2>
+
+        <h3>Rung 1: count at query time</h3>
+        <p>Store every like or click as a row, and compute <code>SELECT COUNT(*) FROM clicks WHERE ad_id=? AND ts BETWEEN ...</code> whenever someone asks. It is exact and always fresh, and fine for a small app.</p>
+        <p><b>When it breaks:</b> the work happens on every read and grows with the data. Hello Interview's ad-click breakdown dismisses this approach at 10,000 clicks a second with a sub-second query target: scanning millions of rows per dashboard refresh cannot meet it.</p>
+
+        <h3>Rung 2: one counter row, incremented on each event</h3>
+        <p>Keep <code>likes(post_id, count)</code> and run <code>UPDATE likes SET count = count + 1 WHERE post_id = ?</code>. Reads are now O(1).</p>
+        <p><b>When it breaks:</b> a viral post sends thousands of increments a second to <b>one row</b>. Each update takes the row lock, so they queue up one after another; it is a <b><a href="{{BASE}}interview/glossary#hot-partition">hot key</a></b>. The systemdesign.one counter article makes the same point: a single locked row gives strong consistency but falls over under very high concurrent writes.</p>
+
+        <h3>Rung 3: shard the counter, batch the writes</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Left: all increments contend for one hot row. Right: increments spread over N shard rows, and reads sum the shards">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="20" width="360" height="265"/>
+            <text class="zone-label" x="26" y="44">Before: one hot row</text>
+            <rect class="box client" x="30" y="70" width="90" height="36"/><text class="label small" x="75" y="88">+1</text>
+            <rect class="box client" x="30" y="130" width="90" height="36"/><text class="label small" x="75" y="148">+1</text>
+            <rect class="box client" x="30" y="190" width="90" height="36"/><text class="label small" x="75" y="208">+1</text>
+            <rect class="box fail" x="210" y="120" width="140" height="56"/>
+            <text class="label bad" x="280" y="140">post:42 count</text>
+            <text class="label small" x="280" y="162">row lock queue</text>
+            <path class="arrow" d="M120 88 L202 140"/>
+            <path class="arrow" d="M120 148 L202 148"/>
+            <path class="arrow" d="M120 208 L202 158"/>
+            <circle class="packet bad" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M120 88 L210 140"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite" path="M120 148 L210 148"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite" path="M120 208 L210 158"/></circle>
+            <text class="label small" x="190" y="255">writes serialise on one lock</text>
+
+            <rect class="zone" x="390" y="20" width="400" height="265"/>
+            <text class="zone-label" x="406" y="44">After: N shards, sum on read</text>
+            <rect class="box client" x="410" y="70" width="80" height="36"/><text class="label small" x="450" y="88">+1</text>
+            <rect class="box client" x="410" y="130" width="80" height="36"/><text class="label small" x="450" y="148">+1</text>
+            <rect class="box client" x="410" y="190" width="80" height="36"/><text class="label small" x="450" y="208">+1</text>
+            <rect class="box db" x="540" y="60" width="110" height="36"/><text class="label small" x="595" y="78">post:42:s0</text>
+            <rect class="box db" x="540" y="110" width="110" height="36"/><text class="label small" x="595" y="128">post:42:s1</text>
+            <rect class="box db" x="540" y="160" width="110" height="36"/><text class="label small" x="595" y="178">post:42:s2</text>
+            <rect class="box db" x="540" y="210" width="110" height="36"/><text class="label small" x="595" y="228">post:42:s3</text>
+            <rect class="box cache" x="680" y="125" width="95" height="50"/>
+            <text class="label" x="727" y="145">read</text>
+            <text class="label small" x="727" y="163">= sum</text>
+            <path class="arrow" d="M490 88 L532 78"/>
+            <path class="arrow" d="M490 148 L532 178"/>
+            <path class="arrow" d="M490 208 L532 228"/>
+            <path class="arrow" d="M650 78 L675 135"/>
+            <path class="arrow" d="M650 228 L675 165"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M490 88 L540 78"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" begin="0.8s" repeatCount="indefinite" path="M490 148 L540 178"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" begin="1.6s" repeatCount="indefinite" path="M490 208 L540 228"/></circle>
+          </svg>
+          <figcaption>Sharded counter. Each increment picks a random shard, so writes run in parallel; a read adds up the shards (or reads a cached total).</figcaption>
+        </figure>
+        <p>Three tools, usually combined:</p>
+        <ol class="steps">
+          <li><strong>Sharded counters.</strong> Split one logical counter into N rows or keys (<code>post:42:s0</code> ... <code>s99</code>). Each increment hits a random shard, so N writes can proceed in parallel. A read sums all N (a small <a href="{{BASE}}interview/glossary#scatter-gather">scatter-gather</a>) or reads a total that a background job refreshes. Use many shards only for hot keys; a post with 3 likes does not need 100.</li>
+          <li><strong>Batching (write-behind).</strong> Each app server keeps a local in-memory map <code>post_id -&gt; delta</code> and flushes it every second or two as one <code>count = count + delta</code> per key. One million likes on a viral post become a few hundred database writes. The cost: the number lags by the flush interval, and a crash loses the unflushed deltas, unless the deltas come from a durable log you can replay.</li>
+          <li><strong>An in-memory counter store.</strong> <a href="{{BASE}}interview/glossary#redis">Redis</a> <code>INCRBY</code> is atomic and very fast. The systemdesign.one article warns that a plain <code>INCR</code> is not idempotent (idempotent = safe to run twice: the second run changes nothing, like setting a register to a value rather than incrementing it). If the reply is lost and you retry, you may count twice. When accuracy matters, record the event ID too (a set of who liked, or a Lua script that checks and increments together).</li>
+        </ol>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The Linux kernel solved this exact problem with <b>per-CPU counters</b> (<code>percpu_counter</code>, and per-CPU network statistics). Each CPU increments its own copy with no shared cache line and no lock; a reader sums all CPUs' copies. A sharded counter is a per-CPU counter spread across machines, and write-behind batching is the per-CPU "batch" threshold before folding into the global count. It is also why <code>ip -s link</code> reads cheap per-queue counters and adds them up, instead of every packet taking a global lock.</p>
+        </div>
+
+        <h3>Rung 4: stream aggregation with windows</h3>
+        <p>For "clicks per ad <b>per minute</b>" at 10,000 events a second, the standard answer is a stream pipeline: events go into <b>Kafka</b> (keyed by <code>ad_id</code> so one ad's events land in one partition), a stream processor such as <b><a href="{{BASE}}interview/glossary#flink">Flink</a></b> keeps a running count per (ad, minute) in memory, and when the minute is over it writes one row per ad to an <b><a href="{{BASE}}interview/glossary#olap">OLAP</a></b> store (OLAP = online analytical processing: a database built for fast group-by and sum queries over huge tables, such as Druid, Pinot or ClickHouse; the opposite of an OLTP database that serves many small row reads and writes). Click through it.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 320" role="img" aria-label="Streaming aggregation: click service to Kafka to Flink windows to OLAP, with raw events archived to S3 for batch reconciliation">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="15" y="60" width="115" height="60"/>
+            <text class="label" x="72" y="82">Click svc</text>
+            <text class="label small" x="72" y="104">dedupe id</text>
+            <rect class="box kafka" x="175" y="60" width="130" height="60"/>
+            <text class="label" x="240" y="82">Kafka</text>
+            <text class="label small" x="240" y="104">key = ad_id</text>
+            <rect class="box svc" x="350" y="40" width="170" height="100"/>
+            <text class="label" x="435" y="62">Flink</text>
+            <rect class="box plain" x="365" y="78" width="140" height="22"/>
+            <text class="label small" x="435" y="90">ad7 [12:01) = 418</text>
+            <rect class="box plain" x="365" y="106" width="140" height="22"/>
+            <text class="label small" x="435" y="118">ad9 [12:01) = 77</text>
+            <rect class="box db" x="570" y="60" width="130" height="60"/>
+            <text class="label" x="635" y="82">OLAP store</text>
+            <text class="label small" x="635" y="104">per-minute rows</text>
+            <rect class="box client" x="720" y="160" width="70" height="56"/>
+            <text class="label small" x="755" y="185">dash</text>
+            <text class="label small" x="755" y="203">board</text>
+            <rect class="box cache" x="175" y="230" width="130" height="56"/>
+            <text class="label" x="240" y="250">S3 raw</text>
+            <text class="label small" x="240" y="272">all events</text>
+            <rect class="box k8s" x="400" y="230" width="170" height="56"/>
+            <text class="label" x="485" y="250">Nightly batch</text>
+            <text class="label small" x="485" y="272">recount + fix</text>
+            <g data-step="1"><path class="arrow" d="M130 90 L167 90"/></g>
+            <g data-step="2"><path class="arrow" d="M305 90 L342 90"/></g>
+            <g data-step="3">
+              <rect class="box highlight" x="350" y="150" width="170" height="44"/>
+              <text class="label small" x="435" y="166">watermark passes 12:02</text>
+              <text class="label small" x="435" y="184">window closes</text>
+            </g>
+            <g data-step="4"><path class="arrow" d="M520 90 L562 90"/></g>
+            <g data-step="5"><path class="arrow" d="M650 120 L715 180"/></g>
+            <g data-step="6">
+              <path class="arrow" d="M240 120 L240 222"/>
+              <path class="arrow" d="M305 258 L392 258"/>
+              <path class="arrow" d="M570 250 L640 125"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Capture.</b> The click service records the event with a unique ID (e.g. a signed impression ID) and an <b>event time</b> (when the click happened, not when we saw it).</li>
+            <li><b>Partition.</b> Kafka, keyed by <code>ad_id</code>: all events for one ad go to one partition, so one Flink task owns that ad's counter. Kafka keeps the events for days, so we can replay.</li>
+            <li><b>Window.</b> Flink adds each event to the counter for its (ad, minute) window. A <b>watermark</b> ("I have probably seen everything before 12:02") tells it when the 12:01 window can close.</li>
+            <li><b>Emit.</b> One row per ad per minute is written to the OLAP store, instead of 10,000 rows a second.</li>
+            <li><b>Query.</b> Dashboards read pre-aggregated minute rows; daily or weekly rollups are built from them for long ranges.</li>
+            <li><b>Reconcile.</b> All raw events also land in object storage. A nightly batch job recounts from raw and corrects the OLAP rows. This is the <b>Lambda</b> idea: a fast path plus a correct path.</li>
+          </ol>
+        </div>
+
+        <h4>Windows: tumbling, sliding, session</h4>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Timeline of events with tumbling, sliding and session windows drawn underneath">
+            <path class="arrow" d="M40 40 L770 40"/>
+            <text class="label small" x="400" y="20">event time -&gt;</text>
+            <circle class="box client" cx="80" cy="40" r="7"/><circle class="box client" cx="130" cy="40" r="7"/><circle class="box client" cx="160" cy="40" r="7"/>
+            <circle class="box client" cx="300" cy="40" r="7"/><circle class="box client" cx="330" cy="40" r="7"/>
+            <circle class="box client" cx="560" cy="40" r="7"/><circle class="box client" cx="600" cy="40" r="7"/><circle class="box client" cx="700" cy="40" r="7"/>
+            <text class="label small left" x="40" y="80">Tumbling 1m</text>
+            <rect class="box kafka" x="40" y="90" width="180" height="30"/><text class="label small" x="130" y="105">12:00 = 3</text>
+            <rect class="box kafka" x="220" y="90" width="180" height="30"/><text class="label small" x="310" y="105">12:01 = 2</text>
+            <rect class="box kafka" x="400" y="90" width="180" height="30"/><text class="label small" x="490" y="105">12:02 = 1</text>
+            <rect class="box kafka" x="580" y="90" width="180" height="30"/><text class="label small" x="670" y="105">12:03 = 2</text>
+            <text class="label small left" x="40" y="145">Sliding 2m / 1m</text>
+            <rect class="box svc" x="40" y="155" width="360" height="24"/><text class="label small" x="220" y="167">12:00-12:02 = 5</text>
+            <rect class="box svc" x="220" y="183" width="360" height="24"/><text class="label small" x="400" y="195">12:01-12:03 = 3</text>
+            <rect class="box svc" x="400" y="155" width="360" height="24"/><text class="label small" x="580" y="167">12:02-12:04 = 3</text>
+            <text class="label small left" x="40" y="228">Session gap 45s</text>
+            <rect class="box queue" x="70" y="238" width="100" height="26"/><text class="label small" x="120" y="251">3</text>
+            <rect class="box queue" x="290" y="238" width="50" height="26"/><text class="label small" x="315" y="251">2</text>
+            <rect class="box queue" x="550" y="238" width="160" height="26"/><text class="label small" x="630" y="251">3</text>
+          </svg>
+          <figcaption>Same eight events, three window types. <b>Tumbling 1m</b>: fixed one-minute buckets with no overlap, so each event is in exactly one window. <b>Sliding 2m / 1m</b>: windows two minutes long that start every minute, so they overlap and each event is counted in two windows. <b>Session gap 45s</b>: a window stays open while events keep coming and closes after 45 seconds of quiet, so it can be any length. Flink's docs define these plus a "global" window that never closes on time and needs a custom trigger.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Tumbling</b> - fixed size, no overlap; each event in exactly one window. Billing per minute, metrics per 10 s.</li>
+          <li><b>Sliding</b> (hopping) - fixed size, starts every slide interval; overlaps when slide &lt; size. "Requests in the last 5 minutes, updated every 30 s". Cheap trick: keep 1-minute tumbling counts and add the last 5.</li>
+          <li><b>Session</b> - per key, closes after a gap of inactivity. "Pages viewed per visit".</li>
+        </ul>
+        <p><b><a href="{{BASE}}interview/glossary#event-time">Event time</a> vs processing time.</b> A phone that was offline sends a 12:00 click at 12:07. If you bucket by when you <i>received</i> it (processing time), the 12:00 count is wrong and replays give different answers. Bucket by <b>event time</b>, and use a <b><a href="{{BASE}}interview/glossary#watermark">watermark</a></b> to decide when a window is "done enough". Flink's docs say the default <b>allowed lateness is 0</b>: elements behind the watermark are dropped, unless you allow lateness (the window state is kept a while longer and re-fires) or send late elements to a <b>side output</b> to handle separately. Always say what happens to late data.</p>
+        <p><b>Keep state small.</b> Flink's docs separate incremental aggregation (<code>ReduceFunction</code> / <code>AggregateFunction</code>, which keep only a running result) from <code>ProcessWindowFunction</code>, which buffers every element until the window fires. For counts and sums, always aggregate incrementally.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Windowed counts are what you already do with <b>interface counters</b>: SNMP or <code>sar</code> samples a monotonic counter every 60 s and reports the delta as a rate - a tumbling window. A watermark is like a <b>reassembly timeout</b>: you wait a bounded time for out-of-order fragments, then you give up and move on. Late data is the fragment that arrives after the reassembly buffer was freed.</p>
+        </div>
+
+        <h3>Rung 5: approximate when "almost exact" is enough</h3>
+        <p>Two questions are expensive to answer exactly: <b>"how many distinct?"</b> (you must remember everything you have seen) and <b>"how often did each of a billion keys appear?"</b> (one counter per key). <b>Sketches</b> answer them in fixed, tiny memory with a known error.</p>
+
+        <h4>HyperLogLog: distinct counts in 12 KB</h4>
+        <p>HyperLogLog (HLL) hashes each item and remembers, in a small set of registers, the longest run of leading zeros seen; long runs are rare, so they reveal roughly how many distinct items passed by. You never store the items. Redis's docs give the numbers: up to <b>12 KB</b> per key (much less when small), a standard error of <b>0.81%</b>, cardinalities up to 2^64, and <code>PFADD</code> / <code>PFCOUNT</code> in constant time. The killer feature is <b>merging</b>: <code>PFMERGE</code> gives the HLL of the union. Keep one HLL per page per day, then merge 30 of them for monthly uniques without touching raw data.</p>
+<pre class="terminal"><code>&gt; PFADD visitors:2026-11-23 user:17 user:42 user:17
+(integer) 1
+&gt; PFCOUNT visitors:2026-11-23
+(integer) 2
+&gt; PFMERGE visitors:2026-11 visitors:2026-11-22 visitors:2026-11-23
+OK</code></pre>
+        <p>Facebook's engineering blog on HLL in Presto shows the payoff at scale: a distinct count that would take days and terabytes of memory with plain SQL ran in about 12 hours with under 1 MB, with speedups of 7x to 1,000x depending on the query. Presto's <code>APPROX_DISTINCT</code> has about 2.3% standard error, and sketches (<code>APPROX_SET</code>) are stored per day and merged for any date range. Note what HLL cannot do: you cannot remove an item, and you cannot list who the uniques were.</p>
+
+        <h4>Count-min sketch: frequencies for a billion keys</h4>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Count-min sketch: an item is hashed by d hash functions into one counter per row; the estimate is the minimum">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="105" width="120" height="50"/>
+            <text class="label" x="80" y="125">#ipl</text>
+            <text class="label small" x="80" y="145">+1</text>
+            <text class="label small left" x="230" y="40">w counters per row</text>
+            <g>
+              <rect class="box plain" x="230" y="55" width="60" height="40"/><rect class="box plain" x="290" y="55" width="60" height="40"/><rect class="box hot" x="350" y="55" width="60" height="40"/><rect class="box plain" x="410" y="55" width="60" height="40"/><rect class="box plain" x="470" y="55" width="60" height="40"/><rect class="box plain" x="530" y="55" width="60" height="40"/>
+              <text class="label small" x="380" y="75">905</text>
+              <rect class="box plain" x="230" y="110" width="60" height="40"/><rect class="box hot" x="290" y="110" width="60" height="40"/><rect class="box plain" x="350" y="110" width="60" height="40"/><rect class="box plain" x="410" y="110" width="60" height="40"/><rect class="box plain" x="470" y="110" width="60" height="40"/><rect class="box plain" x="530" y="110" width="60" height="40"/>
+              <text class="label small" x="320" y="130">903</text>
+              <rect class="box plain" x="230" y="165" width="60" height="40"/><rect class="box plain" x="290" y="165" width="60" height="40"/><rect class="box plain" x="350" y="165" width="60" height="40"/><rect class="box plain" x="410" y="165" width="60" height="40"/><rect class="box hot" x="470" y="165" width="60" height="40"/><rect class="box plain" x="530" y="165" width="60" height="40"/>
+              <text class="label small" x="500" y="185">911</text>
+            </g>
+            <text class="label small" x="200" y="75">h1</text><text class="label small" x="200" y="130">h2</text><text class="label small" x="200" y="185">h3</text>
+            <path class="arrow" d="M140 120 L342 75"/>
+            <path class="arrow" d="M140 130 L282 130"/>
+            <path class="arrow" d="M140 140 L462 185"/>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M140 120 L350 75"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M140 130 L290 130"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M140 140 L470 185"/></circle>
+            <rect class="box cache" x="620" y="95" width="165" height="70"/>
+            <text class="label" x="702" y="118">estimate</text>
+            <text class="label small" x="702" y="140">min(905, 903, 911)</text>
+            <text class="label ok" x="702" y="158">= 903</text>
+            <text class="label small" x="410" y="235">d = 3 hash rows</text>
+          </svg>
+          <figcaption><a href="{{BASE}}interview/glossary#count-min-sketch">Count-min sketch</a> with d = 3 rows, one hash function per row. An update adds 1 to one counter in each row; a query reads those same counters and takes the minimum. Other items that collide in a counter only ever add to it, so every counter is at least the true count and the smallest one is the best guess. It can over-count, never under-count.</figcaption>
+        </figure>
+        <p>A <b>count-min sketch</b> (CMS) is a small 2-D array of counters, d rows by w columns, with one hash function per row. Every key shares the same array, so collisions inflate counts; taking the minimum across rows picks the least-polluted counter. Our research notes record the standard sizing: <b>w = ceil(e / epsilon)</b>, <b>d = ceil(ln(1 / delta))</b>, with error at most epsilon x total count, with probability 1 - delta; for epsilon 0.001 and delta 0.01 that is about 2,719 x 5 = 13.6k counters, around 54 KB. Redis's CMS docs stress the practical catch: counts below <i>error x total count</i> are noise and should be ignored, so a CMS is great for <b>heavy hitters</b> and poor for the long tail. That is exactly what top-K needs: keep a CMS for counts plus a small <b>min-heap of the current top K candidates</b>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Switch ASICs and NetFlow/sFlow probes have the same constraint: line-rate updates, tiny SRAM, millions of flows. Hashed flow counters that accept collisions and only trust the "elephant flows" are a count-min sketch in silicon. HLL is how some telemetry systems estimate distinct source IPs during a DDoS without storing every address.</p>
+        </div>
+
+        <h3>Rung 6: ranking - sorted sets and top-K merging</h3>
+        <p>For an exact ranking of up to tens of millions of members, a <b>Redis sorted set</b> is the standard tool (our research notes for the leaderboard design): <code>ZINCRBY lb:game 50 user42</code> to add points and <code>ZREVRANK lb:game user42</code> for "my rank" are O(log N); fetching the top 10 with <code>ZRANGE lb:game 0 9 REV WITHSCORES</code> (<code>ZREVRANGE</code> before Redis 6.2, now deprecated) is O(log N + M) for M returned members. That M matters: paging through ranks 0-9999 returns 10,000 members. It is a skip list plus a hash table. Treat it as a cache of truth: write scores to a durable log or database first so you can rebuild it.</p>
+        <p>For top-K over a stream too big for one machine: each partition keeps a local top-K (exact counts for its keys, or a CMS + heap), and a merger combines the partition lists into a global top-K every few seconds. Because Kafka keys by item, each item lives in one partition, so local counts are complete and the merge is a simple pick of the largest K. For trending, rank by <b>velocity versus a baseline</b>, not by raw count, or "good morning" trends every day.</p>
+
+        <h3>Rung 7: count each event exactly once</h3>
+        <p>Pipelines retry. Producers resend on timeouts, consumers reprocess after a crash, users double-click. If counting is not <b>idempotent</b>, every retry inflates the number - which in ad billing means charging advertisers for clicks that never happened. Layers of defence:</p>
+        <ol class="steps">
+          <li><strong>Give every event an ID at the source.</strong> Hello Interview's ad-click design has the ad server issue a unique <b>impression ID</b>, signed with an HMAC so clients cannot forge or replay it. The click service checks a Redis cache of seen IDs before writing to the stream; about 100M IDs x 16 bytes is only about 1.6 GB a day.</li>
+          <li><strong>Dedupe in the stream processor.</strong> Uber's ad-event pipeline drops duplicate events using Flink <b>keyed state</b> before aggregating.</li>
+          <li><strong>Make the sink idempotent.</strong> Upsert by (ad_id, minute) or by a result UUID instead of "add". Uber gives each aggregate record a UUID used to dedupe in Hive and to upsert in Pinot.</li>
+          <li><strong>Transactions end to end where it pays.</strong> Uber's Flink jobs write to Kafka transactionally; outputs become visible only when a checkpoint completes (<a href="{{BASE}}interview/glossary#two-phase-commit">two-phase commit</a>), and consumers use <code>read_committed</code>. In plain words: Flink's transactional sink runs a two-phase commit between its checkpoint and Kafka. Phase 1 (prepare): while a checkpoint is taken, the sink flushes its writes into an open Kafka transaction. Phase 2 (commit): once every operator has finished the checkpoint, the sink commits that transaction. A <code>read_committed</code> consumer only sees records of committed transactions, so a crash before the commit leaves nothing visible to count twice. The same prepare-then-commit idea is the <a href="{{BASE}}hld/p03#two-phase-commit">2PC rung of Multi-Step Processes</a>. They checkpoint every 2 minutes, which sets the latency floor. See <a href="{{BASE}}devops/kafka-06">Delivery Semantics &amp; Exactly-Once</a>.</li>
+          <li><strong>Reconcile.</strong> Recount from raw events in batch and correct the serving store.</li>
+        </ol>
+      

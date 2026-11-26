@@ -1,0 +1,99 @@
+
+  <h2>Concurrency: pessimistic vs optimistic seat locking</h2>
+  <p>The race is the same check-then-act you saw in the <a href="{{BASE}}lld/lld-case-parking-lot#concurrency">parking lot</a>, with two extra twists: a request covers <b>several seats</b> that must be taken all together, and a successful take is only <b>temporary</b> until payment. Step through both answers.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 860 340" role="img" aria-label="Pessimistic and optimistic seat holding compared">
+      <rect class="box client" x="20" y="30" width="120" height="44"/><text class="label small" x="80" y="52">Alice: A1,A2</text>
+      <rect class="box client" x="20" y="250" width="120" height="44"/><text class="label small" x="80" y="272">Bob: A2,A3</text>
+      <rect class="box plain" x="380" y="120" width="70" height="50"/><text class="label small" x="415" y="145">A1</text>
+      <rect class="box plain" x="460" y="120" width="70" height="50"/><text class="label small" x="495" y="145">A2</text>
+      <rect class="box plain" x="540" y="120" width="70" height="50"/><text class="label small" x="575" y="145">A3</text>
+      <g data-step-only="1">
+        <rect class="zone" x="360" y="100" width="270" height="90"/>
+        <text class="label small" x="495" y="94">show lock taken by Alice</text>
+        <path class="arrow" d="M140 52 L354 120"/>
+        <path class="arrow dashed bad" d="M140 272 L354 170"/><text class="label small bad" x="230" y="240">Bob waits for the lock</text>
+      </g>
+      <g data-step="2">
+        <rect class="box queue" x="380" y="120" width="70" height="50"/><text class="label small" x="415" y="145">A1 held</text>
+        <rect class="box queue" x="460" y="120" width="70" height="50"/><text class="label small" x="495" y="145">A2 held</text>
+      </g>
+      <g data-step-only="2">
+        <text class="label small" x="495" y="214">Alice checked both seats and wrote both, then unlocked</text>
+        <text class="label small bad" x="495" y="236">Bob gets the lock, sees A2 held: rejected, nothing written</text>
+      </g>
+      <g data-step-only="3">
+        <text class="label small" x="700" y="40">Optimistic, no lock:</text>
+        <text class="label mono" x="700" y="64">read A2 (version 7)</text>
+        <text class="label mono" x="700" y="86">CAS(A2, v7 -> Held)</text>
+        <path class="arrow ok" d="M140 52 L454 128"/>
+        <path class="arrow bad" d="M140 272 L454 166"/>
+        <text class="label small ok" x="280" y="80">Alice CAS wins</text>
+        <text class="label small bad" x="280" y="230">Bob CAS fails: version moved</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="640" y="230" width="210" height="90"/>
+        <text class="label small" x="745" y="252">Bob had already taken A3?</text>
+        <text class="label small" x="745" y="274">He rolls it back to Free</text>
+        <text class="label small" x="745" y="296">(seats in sorted order)</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Pessimistic: Alice takes the show's lock. Bob, who wants an overlapping seat, waits. Critical sections are tiny (check a few map entries, write a few), so the wait is microseconds.</li>
+      <li>Alice checks every seat, writes Held on every seat, unlocks. Bob then sees A2 held and is rejected without having written anything: all-or-nothing for free.</li>
+      <li>Optimistic: nobody locks. Each seat is an atomic reference; a write succeeds only if the seat still has the value you read (compare-and-set). Alice and Bob both read A2; only the first CAS succeeds.</li>
+      <li>The price of optimism: if Bob had already taken A3 before failing on A2, he must undo A3. Taking seats in sorted order keeps two users from repeatedly undoing each other.</li>
+    </ol>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th></th><th>Pessimistic (lock per show)</th><th>Optimistic (CAS / version per seat)</th></tr></thead>
+      <tbody>
+        <tr><td>Idea</td><td>Assume conflict; serialise the critical section</td><td>Assume no conflict; detect it at write time and retry or fail</td></tr>
+        <tr><td>Multi-seat atomicity</td><td>Natural: check all, then write all, under one lock</td><td>Manual: roll back seats already taken</td></tr>
+        <tr><td>Under heavy contention (a blockbuster's first show)</td><td>Threads queue on the lock, but each request finishes in one pass</td><td>Many CAS failures; users see more "seat taken" responses, more wasted work</td></tr>
+        <tr><td>Under light contention</td><td>Pays the lock cost even when nobody competes</td><td>Cheapest: one read, one CAS per seat</td></tr>
+        <tr><td>Granularity</td><td>Per show (two shows never block each other); could go per seat with sorted lock order</td><td>Per seat by construction</td></tr>
+        <tr><td>Deadlock risk</td><td>None with one lock per request; with per-seat locks, lock in sorted order</td><td>None (no locks), but livelock is possible without ordering</td></tr>
+        <tr><td>Database form</td><td><code>SELECT ... FOR UPDATE</code> on the show-seat rows</td><td><code>UPDATE ... WHERE version = ?</code>, check rows updated</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>In the database, the same two answers look like this. Note that the expiry check is part of the condition, so an expired hold is overwritten without any cleanup job:</p>
+<pre><code class="language-sql">-- Pessimistic: lock the rows, check, write, commit (all seats in one transaction)
+BEGIN;
+SELECT seat_id, status, hold_expires_at FROM show_seat
+ WHERE show_id = :show AND seat_id IN ('A1','A2')
+ ORDER BY seat_id
+ FOR UPDATE;                       -- sorted order: two transactions cannot deadlock
+-- application checks every row is FREE or HELD with hold_expires_at &lt; now(); else ROLLBACK
+UPDATE show_seat SET status = 'HELD', hold_id = :hold, hold_expires_at = now() + interval '5 minutes'
+ WHERE show_id = :show AND seat_id IN ('A1','A2');
+COMMIT;
+
+-- Optimistic: one conditional update; it either changes every requested row or you roll back
+UPDATE show_seat
+   SET status = 'HELD', hold_id = :hold, hold_expires_at = now() + interval '5 minutes', version = version + 1
+ WHERE show_id = :show AND seat_id IN ('A1','A2')
+   AND (status = 'FREE' OR (status = 'HELD' AND hold_expires_at &lt; now()));
+-- rows updated must equal 2; if it is 1, ROLLBACK the transaction: someone got the other seat first</code></pre>
+  <p><b>Across many app servers</b> the per-show lock in our Java code no longer works (each JVM has its own). Options, in the order to mention them: the database row locks above (simplest, strongly consistent); a Redis key per seat set with <code>SET seat:SH1:A2 &lt;holdId&gt; NX PX 300000</code> (atomic "set if absent" with an expiry, a perfect fit for TTL holds, but you then confirm in the database); or partitioning: route all requests for one show to one server, so an in-process lock is enough again. More in <a href="{{BASE}}lld/lld-conc-booking">Booking concurrency</a> and <a href="{{BASE}}lld/lld-conc-locks">Locks for LLD</a>.</p>
+  <h3>Other shared state in our code</h3>
+  <ul>
+    <li><b>Booking status</b> is guarded by the booking's own monitor (<code>synchronized (b)</code>), so a double "pay" click or a pay racing a cancel is serialised per booking, while different bookings run in parallel.</li>
+    <li><b>Expiry check before charging:</b> <code>pay()</code> checks the hold time first, so an expired hold never reaches the gateway. The tiny window between that check and <code>confirm()</code> is covered: confirm re-checks under the lock, and a failure there is reported as EXPIRED (the real system would refund).</li>
+    <li><b>Pricing swap:</b> <code>volatile</code> field holding an immutable strategy, same as the parking lot.</li>
+    <li><b>Lock ordering:</b> the service never holds the booking monitor while waiting for another booking; it holds booking then show lock, always in that order, so there is no cycle.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The optimistic inventory is a <code>cmpxchg</code> loop: read the old value, compute the new one, publish only if memory still holds the old value. The version number is the same defence you use against ABA problems in lock-free lists. The pessimistic one is a <code>spin_lock_irqsave</code> around a short critical section; the rule "never sleep while holding a spinlock" becomes "never call the payment gateway while holding the show lock".</p>
+  </div>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

@@ -1,0 +1,122 @@
+
+        <h2>Interview: drive the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope</strong> One time control, matchmaking, real-time play, leaderboard. Say what is out (spectate, chat, anti-cheat).</li>
+          <li><strong>5-10 min: numbers</strong> 500K games, 1M sockets, ~133K moves/s, 1,700 starts/s, 1 GB live state, 30 GB/day archive.</li>
+          <li><strong>10-25 min: high level</strong> Gateways, matchmaker, game servers (authoritative), journal, Kafka on game end, rating service, leaderboard.</li>
+          <li><strong>25-40 min: deep dives</strong> Double-match prevention, game ownership and failover, fair clocks, leaderboard. Let the interviewer pick two.</li>
+          <li><strong>40-45 min: wrap up</strong> Bottlenecks, what you would monitor (move latency p99, match wait p50/p95, reconnect rate, timer drift).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Clients send intents; one authoritative game server per game validates, applies and timestamps every move. Matchmaking is a Redis sorted set per time control and region, and a Lua script claims both players atomically so no one is matched twice. Games are placed by consistent hashing on gameId; the owner holds a lease and writes each move, with its epoch, to a journal before acking, so a crash means a new owner replays the journal. Clocks are server timers in a timing wheel with capped lag forgiveness. When a game ends, one event goes to Kafka; ratings, archive and leaderboard consume it. The hard parts are 1M sockets, single ownership and fair clocks, not storage."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: authoritative server, WebSockets through gateways, ply numbers for idempotency, atomic matchmaking claim, Redis sorted-set leaderboard, Kafka for game end. SDE-2 adds: lease + fencing on ownership, the journal durability caveat (async replication, <code>WAIT</code>), lag-compensation caps, timing wheels, reconnect storms with jittered backoff, and how to replay events after a rating bug.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a lock per move.</b> A lease gives one server ownership of a whole range of games for seconds at a time, so moves need no lock at all. A per-move database lock (the "stateless servers" option) is a different design with an extra round trip on every move. Also do not confuse the <b>matchmaking queue</b> (a sorted set by rating) with a message queue such as Kafka: nobody consumes it in order.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Why should the server, not the client, validate moves and run the clocks?</summary>
+          <div class="answer">
+            <p>Because the client is under the player's control. A modified client could send an illegal move, claim it moved faster than it did, or never report its own flag falling. The server is the referee: it holds the only true board, validates every move with the rules library, timestamps it with its own clock and broadcasts the result. The client still validates locally so a bad drag is rejected instantly, but that is just for user experience.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "authoritative server" in the first sentence, give one concrete cheat it prevents, then mention that client-side validation exists only for snappy UX.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle lag if the server owns time?</li><li>Would you ever use peer-to-peer?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Two matchmaker instances pick the same waiting player. How do you prevent a double match?</summary>
+          <div class="answer">
+            <p>Make the claim atomic. Keep the queue as a Redis sorted set per time control and region. A Lua script finds a neighbour in the rating window and <code>ZREM</code>s both players in one step; Redis runs scripts atomically, so only one caller can remove a given player. Then flip each player's status key from <code>searching</code> to <code>in_game:gameId</code> with compare-and-set as a second guard, and requeue the partner if anything fails. Partition buckets so each has a single owner and the hot path never needs cross-node coordination.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the naive race first (read, then remove), then the atomic fix, then the extra status-key guard. Naming "check-then-act race" shows you see the pattern.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a bucket outgrows one Redis node?</li><li>How do you widen the rating window fairly?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart">
+          <summary>How do you route every move of a game to the same server when you have 50 game servers?</summary>
+          <div class="answer">
+            <p>Consistent hashing on gameId. Every gateway has the same ring (from a membership service such as etcd), so any gateway can compute the owner. The owner holds a lease for its ranges. Gateways publish moves to a per-game channel or call the owner directly; the owner subscribes to its games. When servers join or leave, only about 1/N of games move. Each move carries the game's lease epoch so a stale owner cannot write.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the requirement first (single writer per game), then the mechanism (consistent hash + lease + fencing), then what happens on membership change.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to games on a server that is being drained?</li><li>Why not just make game servers stateless?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>A player on a slow mobile network keeps losing on time. How do you make the clocks fair?</summary>
+          <div class="answer">
+            <p>Server-owned clocks plus capped lag compensation. Measure each player's round-trip time (gateway pings or client-reported think time) and credit back the network part of each move's elapsed time, up to a per-move cap with a small refilling bank. Chess.com publishes its values: in blitz 300 ms per move automatically plus a 400 ms bank that refills every two moves. Lag above the cap is charged, so a client cannot invent time. Show the clocks on the client as a local countdown corrected by each server message.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain the problem with a number (300 ms lag x 40 moves = 12 s lost in a 3-minute game), then the capped credit, then why the cap matters for cheating.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does the server detect a flag fall without polling 500K clocks?</li><li>What about premoves?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>How do you detect timeouts for 500K running clocks?</summary>
+          <div class="answer">
+            <p>One timer per game, owned by the game actor, set to fire at the moment the side to move would hit zero. A move cancels it and arms the opponent's. Use a hashed timing wheel (O(1) arm and cancel); almost every timer is cancelled before it fires. When it fires, the actor re-checks the clock (to avoid races with a move that just arrived), declares the result and emits the game-finished event.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast polling (500K checks every 100 ms = 5M checks/s of waste) with event timers, and name the data structure.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to the timers when the server crashes?</li><li>How accurate must the timer be?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart">
+          <summary>A game server crashes mid-game. What does the player see and how do you recover?</summary>
+          <div class="answer">
+            <p>Every accepted move is appended to a replicated journal (a Redis stream keyed by gameId) before the ack. When the server dies its lease expires; the ring assigns its range to another server, which takes a new lease epoch, replays the journal, rebuilds board and clocks, and re-arms the timer. Clocks are frozen for the outage window. Clients reconnect with jittered backoff and send their last ply; the new owner sends what they missed. The user sees a "reconnecting" spinner for a few seconds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the timeline: journal, lease expiry, takeover with fencing, replay, client sync. Mention freezing clocks, which shows product sense.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why journal to Redis rather than Postgres?</li><li>How do you avoid two owners during a network partition?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Design the leaderboard for 10M players. Why not just SQL ORDER BY rating?</summary>
+          <div class="answer">
+            <p>Top-N with an index is fine in SQL, but "what is my rank" needs a count of everyone above you, which gets slow at 10M rows. A Redis sorted set gives <code>ZREVRANK</code> in O(log n) and <code>ZREVRANGE</code> in O(log n + M) for M returned rows; 10M members is only a few hundred MB. The rating service updates it after the rating commit; a nightly rebuild from Postgres fixes drift. For hundreds of millions of players, shard by score range for top-N and keep a player-to-score map to look up rank.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the operation complexity, the memory estimate, the write path, and one scaling step.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle ties?</li><li>Weekly leaderboard vs all-time?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Where would you use Kafka here, and where would you not?</summary>
+          <div class="answer">
+            <p>Use it for the <code>game-finished</code> event: many independent consumers (ratings, archive, anti-cheat, analytics), they can lag safely, and replay rebuilds derived data. Do not put individual moves through Kafka on the hot path: a move involves two people and must be acknowledged in milliseconds; a direct path through pub/sub to the owner is simpler and faster. You could mirror moves into Kafka asynchronously for anti-cheat models.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you choose tools by access pattern: fan-out + replay = log; two-party low-latency = direct.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you make rating updates exactly-once?</li><li>What partition key do you use?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>The interviewer says "now do it as LLD". What classes do you show?</summary>
+          <div class="answer">
+            <p><code>Game</code> (id, board, players, clocks, state machine: WAITING, ACTIVE, FINISHED), <code>Board</code> with an 8x8 array or bitboards, an abstract <code>Piece</code> with <code>legalMoves(board)</code> and subclasses, <code>Move</code> (from, to, promotion), <code>MoveValidator</code> that also checks "does this leave my king in check", <code>Clock</code>, and a <code>GameObserver</code> interface the network layer implements. Patterns: Strategy for time controls, State for game status, Observer for broadcasting. This is the same domain core the HLD game server runs.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the LLD back to the HLD: the validator and state machine are the inside of the game actor. See <a href="{{BASE}}hld/hld-16">HLD vs LLD</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect stalemate and threefold repetition?</li><li>How would you make it thread-safe?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Walmart">
+          <summary>Players in India and the US get matched. Where does the game live?</summary>
+          <div class="answer">
+            <p>Prefer matching within a region first (region is part of the queue bucket), widening to cross-region only after a wait threshold. For a cross-region game, place it in a region with similar latency to both or accept that one side has more lag and rely on lag compensation. Chess.com deploys gameplay nodes worldwide so each player connects to a nearby node. Each player's socket stays on a local gateway; only the game-server hop crosses regions.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention match quality vs wait time vs latency as a three-way trade-off.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you measure latency to pick the region?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: New Year traffic doubles overnight</h4>
+          <div class="situation"><p>A chess streamer goes viral. Daily active users jump from 5M to 10M in a week, games time out and the site shows 502 errors. (This is close to what Chess.com described in January 2023.)</p></div>
+          <div class="bad"><p>Weak answer: "Buy bigger servers and add more database replicas."</p></div>
+          <div class="good"><p>Strong answer: first find which layer is saturating (DB write latency, live-server CPU, socket count). Protect the move path: make sure it never touches the main database. Split user/gameplay tables onto separate databases, move hot reads into memory, shard live games by gameId, add admission control on matchmaking (a waiting room is better than broken games), and make reconnection use jittered backoff to avoid storms.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What would you load-test, and to what level?</li><li>What would you shed first?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: ratings drift after a bug</h4>
+          <div class="situation"><p>A deploy computed rating changes with the wrong sign for 2 hours.</p></div>
+          <div class="bad"><p>Weak answer: "Write a SQL script to guess the right values."</p></div>
+          <div class="good"><p>Strong answer: because every game end is an event in Kafka and the rating service is idempotent per gameId, reset affected players to a snapshot before the bug, fix the code, and replay the game-finished events from that offset. Then rebuild the leaderboard set from Postgres.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you retain the topic?</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <div class="callout danger"><p><b>Common mistakes:</b> letting clients decide legality or time; writing every move to the main SQL database; forgetting that the same player can be matched twice; polling all clocks; putting moves through Kafka on the hot path; no plan for a game server crash.</p></div>
+      

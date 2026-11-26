@@ -1,0 +1,48 @@
+
+        <h2>Step 3: follow the order through the pipeline</h2>
+        <p>Tail the logs of the three downstream services in one window:</p>
+<pre><code class="language-bash">docker compose logs -f enricher postgres-sink analytics</code></pre>
+<pre class="terminal"><code>enricher-1       | 2026-11-23 10:14:31,102 INFO  enricher enricher up: group=enricher catalog=postgres fail_rate=0.0
+enricher-1       | 2026-11-23 10:14:34,377 INFO  enricher assigned ['orders.created[0]', 'orders.created[1]', 'orders.created[2]', 'orders.created[3]', 'orders.created[4]', 'orders.created[5]']
+postgres-sink-1  | 2026-11-23 10:14:31,540 INFO  postgres-sink sink up, writing to postgres
+analytics-1      | 2026-11-23 10:14:31,611 INFO  analytics analytics up: window=60s lateness=10s
+postgres-sink-1  | 2026-11-23 10:15:02,733 INFO  postgres-sink upserted 1 rows (last p3@0)</code></pre>
+        <p>Read it like a story. The single enricher owns all 6 partitions (it is alone in its group). Within a second of your order, the sink logs <code>upserted 1 rows (last p3@0)</code>: it read the enriched record from partition 3 at offset 0. Press <kbd>Ctrl+C</kbd> to stop following; the containers keep running.</p>
+
+        <div class="callout warn"><p><b>"analytics printed nothing!"</b> That is correct. A one-minute window closes only when the <b><a href="{{BASE}}interview/glossary#watermark">watermark</a></b> (the newest <a href="{{BASE}}interview/glossary#event-time">event time</a> seen) passes the window end plus 10 s of allowed lateness. With a single order, no newer event ever arrives, so the window stays open. Send a few more orders over the next minute, or run the load generator in step 5, and you will see lines like <code>WINDOW 10:15:00-10:16:00 orders=3 revenue=INR 9291.00</code>. Event time and watermarks are covered on page <a href="{{BASE}}devops/pipeline-03">03</a>.</p></div>
+
+        <h3>The command-line view of consumer groups</h3>
+        <p>Every Kafka install ships admin scripts in <code>/opt/kafka/bin</code>. Run them inside a broker container, pointing at the INTERNAL listener:</p>
+<pre><code class="language-bash">docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:19092 --describe --all-groups</code></pre>
+<pre class="terminal"><code>GROUP          TOPIC            PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID       HOST         CLIENT-ID
+enricher       orders.created   0          0               0               0    3b1f9c2e41aa-...  /172.19.0.9  3b1f9c2e41aa
+enricher       orders.created   3          3               3               0    3b1f9c2e41aa-...  /172.19.0.9  3b1f9c2e41aa
+...
+postgres-sink  orders.enriched  3          6               6               0    7d02aa15c9e3-...  /172.19.0.11 7d02aa15c9e3
+...
+analytics      orders.enriched  3          6               6               0    a91c0b7e2f55-...  /172.19.0.12 a91c0b7e2f55
+retry-worker   orders.retry     0          -               0               -    51e8d3c0b7a1-...  /172.19.0.10 51e8d3c0b7a1</code></pre>
+        <p>The columns are the whole story of Kafka consumption:</p>
+        <ul>
+          <li><b>CURRENT-OFFSET</b>: the group's committed bookmark, the next offset it will read.</li>
+          <li><b>LOG-END-OFFSET</b>: where the next new record will be written.</li>
+          <li><b>LAG</b>: the difference. Zero means caught up. This is the number you alert on.</li>
+          <li><b>CLIENT-ID</b>: ShopStream sets <code>client.id</code> to the container's hostname, which Docker sets to the short container id. With 3 enrichers you will see 3 different ids.</li>
+          <li>A <code>-</code> in CURRENT-OFFSET means "nothing committed yet" (nothing has been retried so far).</li>
+        </ul>
+        <p>Notice that <code>postgres-sink</code> and <code>analytics</code> both read <code>orders.enriched</code> partition 3 with their own offsets. Two groups, two bookmarks, one log.</p>
+        <p>And notice the odd numbers: three orders went into <code>orders.created</code> partition 3 (LOG-END 3), but <code>orders.enriched</code> partition 3 shows LOG-END 6. That is not a bug. <code>orders.enriched</code> is written inside Kafka transactions, and every commit adds a COMMIT <a href="{{BASE}}interview/glossary#control-record">control record</a> (a marker) to each partition it wrote. The marker takes one offset. So offsets on that topic have gaps and LOG-END-OFFSET is larger than the number of records. If you look at the exact moment after a write, you may see CURRENT-OFFSET 5 and LAG 1 until the consumer reads past the marker; that is the marker, not a missing order. Page 03 explains the markers in <a href="{{BASE}}devops/pipeline-03#eos">the transaction loop</a>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This table is <code>ethtool -S</code> plus ring indexes for a multi-queue NIC: per queue (partition), the <a href="{{BASE}}interview/glossary#producer">producer</a> index (log-end offset), the consumer index (current offset) and their difference (lag). The difference with a NIC ring: there are several independent consumer indexes per ring, one per group, and the ring never wraps onto unread data; old data is removed only by retention time.</p>
+        </div>
+
+        <h3>Read the actual records</h3>
+<pre><code class="language-bash">docker compose exec kafka-1 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka-1:19092 \
+  --topic orders.enriched --from-beginning --max-messages 3 --property print.key=true --isolation-level read_committed</code></pre>
+<pre class="terminal"><code>C-42	{"created_at":"2026-11-23T10:15:02.481920+00:00","currency":"INR","customer_id":"C-42","enriched_at_ms":1795428902611,"items":[{"line_total_cents":249900,"name":"Headphones","product_id":"P-102","quantity":1,"unit_price_cents":249900},{"line_total_cents":59800,"name":"Coffee mug","product_id":"P-100","quantity":2,"unit_price_cents":29900}],"order_id":"3f6c2a8e-...","schema_version":1,"total_cents":309700,"type":"OrderEnriched"}
+...
+Processed a total of 3 messages</code></pre>
+        <p>The key, a tab, then the value. <code>--from-beginning</code> starts at the oldest offset; without it a console consumer starts at the end and waits. <code>--isolation-level read_committed</code> hides records from transactions that were aborted or are still open, the same setting our services use. Reading a topic this way creates a temporary <a href="{{BASE}}interview/glossary#consumer-group">consumer group</a> and does not affect the real groups' bookmarks.</p>
+        <div class="callout note"><p>Newer Kafka releases may print a deprecation notice for <code>--property</code> and suggest a newer flag name. The command still works on the pinned <code>apache/kafka:4.3.2</code> image.</p></div>
+      

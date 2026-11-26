@@ -1,0 +1,1258 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language; in a real round split into <code>model/</code>, <code>state/</code>, <code>timing/</code> and <code>Main</code>. The same files live in <code>lld-code/lld-case-traffic-signal/</code> in this repo. Each was compiled and run; the output below is the real output.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+
+// ---------- model ----------
+enum Direction { NORTH, SOUTH, EAST, WEST }
+
+enum Light { RED, YELLOW, GREEN, FLASHING }
+
+final class Phase {                           // directions that may be green together
+    final String name; final Set&lt;Direction&gt; dirs;
+    Phase(String name, Direction... dirs) { this.name = name; this.dirs = EnumSet.copyOf(Arrays.asList(dirs)); }
+    @Override public String toString() { return name; }
+}
+
+/** One signal head. It refuses unsafe changes, e.g. GREEN straight to RED. */
+final class TrafficSignal {
+    final Direction dir;
+    private Light light = Light.RED;
+    TrafficSignal(Direction dir) { this.dir = dir; }
+    Light light() { return light; }
+
+    boolean set(Light next) {                 // returns true if the light changed
+        boolean ok = next == light || next == Light.FLASHING
+                || (light == Light.GREEN &amp;&amp; next == Light.YELLOW)
+                || (light == Light.YELLOW &amp;&amp; next == Light.RED)
+                || (light == Light.RED &amp;&amp; next == Light.GREEN)
+                || (light == Light.FLASHING &amp;&amp; next == Light.RED);
+        if (!ok) throw new IllegalStateException(dir + ": " + light + " -&gt; " + next + " is not allowed");
+        boolean changed = next != light;
+        light = next;
+        return changed;
+    }
+}
+
+// ---------- Observer: anyone who wants to see light changes ----------
+interface SignalListener { void onChange(int time, Direction d, Light l); }
+
+/** Like the conflict monitor in a real signal cabinet: counts moments when two phases are not red. */
+final class ConflictMonitor implements SignalListener {
+    private final Map&lt;Direction, TrafficSignal&gt; signals; private final List&lt;Phase&gt; phases;
+    int violations;
+    ConflictMonitor(Map&lt;Direction, TrafficSignal&gt; signals, List&lt;Phase&gt; phases) { this.signals = signals; this.phases = phases; }
+    public void onChange(int time, Direction d, Light l) {
+        int live = 0;
+        for (Phase p : phases) {
+            boolean any = false;
+            for (Direction x : p.dirs) { Light s = signals.get(x).light(); any |= s == Light.GREEN || s == Light.YELLOW; }
+            if (any) live++;
+        }
+        if (live &gt; 1) violations++;
+    }
+}
+
+// ---------- Strategy: how long a phase stays green ----------
+interface TimingStrategy { int greenSeconds(Phase p, Map&lt;Direction, Integer&gt; queues); }
+
+final class FixedTiming implements TimingStrategy {
+    private final int seconds;
+    FixedTiming(int seconds) { this.seconds = seconds; }
+    public int greenSeconds(Phase p, Map&lt;Direction, Integer&gt; queues) { return seconds; }
+}
+
+/** Real-time traffic data: green long enough to clear the longest queue, within [min, max]. */
+final class AdaptiveTiming implements TimingStrategy {
+    private final int min, max, secondsPerCar;
+    AdaptiveTiming(int min, int max, int secondsPerCar) { this.min = min; this.max = max; this.secondsPerCar = secondsPerCar; }
+    public int greenSeconds(Phase p, Map&lt;Direction, Integer&gt; queues) {
+        int cars = 0;
+        for (Direction d : p.dirs) cars = Math.max(cars, queues.getOrDefault(d, 0));
+        return Math.max(min, Math.min(max, cars * secondsPerCar));
+    }
+}
+
+// ---------- State: what the controller is doing now ----------
+interface ControllerState {
+    String name();
+    default void enter(Controller c) {}
+    default void tick(Controller c) {}
+    default void emergency(Controller c, Direction d) { c.queueEmergency(d); }
+    default void emergencyCleared(Controller c) { c.note("ignored: no emergency in progress"); }
+    default void fault(Controller c) { c.setState(new FlashingState()); }
+    default void repair(Controller c) { c.note("ignored: not in fault mode"); }
+}
+
+final class GreenState implements ControllerState {
+    public String name() { return "GREEN"; }
+    public void enter(Controller c) {
+        int g = c.timing().greenSeconds(c.phase(), c.queues());
+        if (c.takeWalkRequest()) { g = Math.max(g, c.walkSeconds); c.note("WALK shown for " + c.phase()); }
+        c.setPhaseLights(Light.GREEN);
+        c.timer = g;
+        c.note(c.phase() + " GREEN for " + g + "s");
+    }
+    public void tick(Controller c) { c.discharge(); if (--c.timer == 0) c.setState(new YellowState()); }
+    public void emergency(Controller c, Direction d) {
+        if (c.phase().dirs.contains(d)) c.setState(new EmergencyState(d));   // already green: just hold it
+        else { c.queueEmergency(d); c.setState(new YellowState()); }         // end this phase safely
+    }
+}
+
+final class YellowState implements ControllerState {
+    public String name() { return "YELLOW"; }
+    public void enter(Controller c) { c.setPhaseLights(Light.YELLOW); c.timer = c.yellowSeconds; c.note(c.phase() + " YELLOW"); }
+    public void tick(Controller c) { if (--c.timer == 0) c.setState(new AllRedState()); }
+}
+
+final class AllRedState implements ControllerState {
+    public String name() { return "ALL_RED"; }
+    public void enter(Controller c) { c.setPhaseLights(Light.RED); c.timer = c.allRedSeconds; c.note("ALL RED (clearance)"); }
+    public void tick(Controller c) {
+        if (--c.timer &gt; 0) return;
+        Direction d = c.pollEmergency();
+        if (d != null) { c.selectPhaseOf(d); c.setState(new EmergencyState(d)); }
+        else { c.nextPhase(); c.setState(new GreenState()); }
+    }
+}
+
+final class EmergencyState implements ControllerState {
+    private final Direction from;
+    EmergencyState(Direction from) { this.from = from; }
+    public String name() { return "EMERGENCY"; }
+    public void enter(Controller c) {
+        c.setPhaseLights(Light.GREEN);
+        c.timer = c.maxEmergencySeconds;               // liveness: a lost "cleared" must not stall the junction
+        c.note("EMERGENCY from " + from + ": " + c.phase() + " GREEN until cleared (max " + c.maxEmergencySeconds + "s)");
+    }
+    public void tick(Controller c) {
+        c.discharge();
+        if (--c.timer == 0) {
+            c.note("FAULT LOGGED: emergency from " + from + " not cleared after " + c.maxEmergencySeconds + "s; resuming the cycle");
+            c.setState(new YellowState());
+        }
+    }
+    public void emergency(Controller c, Direction d) {
+        if (c.phase().dirs.contains(d)) c.note("emergency from " + d + " already served by " + c.phase());
+        else c.queueEmergency(d);
+    }
+    public void emergencyCleared(Controller c) { c.note("emergency cleared"); c.setState(new YellowState()); }
+}
+
+final class FlashingState implements ControllerState {
+    public String name() { return "FLASHING"; }
+    public void enter(Controller c) { c.setAllLights(Light.FLASHING); c.note("FAULT: all signals FLASHING"); }
+    public void emergency(Controller c, Direction d) { c.note("fault mode: emergency from " + d + " handled manually"); }
+    public void fault(Controller c) {}
+    public void repair(Controller c) {
+        c.setAllLights(Light.RED);
+        c.restartCycle();
+        c.setState(new AllRedState());
+    }
+}
+
+// ---------- the controller (context) ----------
+final class Controller {
+    final int yellowSeconds, allRedSeconds, walkSeconds;
+    int maxEmergencySeconds = 120;             // upper bound on a preemption, like a real controller's max-preempt timer
+    int timer;
+    private final Map&lt;Direction, TrafficSignal&gt; signals = new EnumMap&lt;&gt;(Direction.class);
+    private final List&lt;Phase&gt; phases;
+    private final Map&lt;Direction, Integer&gt; queues = new EnumMap&lt;&gt;(Direction.class);
+    private final Deque&lt;Direction&gt; pendingEmergencies = new ArrayDeque&lt;&gt;();
+    private final Set&lt;Integer&gt; walkRequests = new HashSet&lt;&gt;();
+    private final List&lt;SignalListener&gt; listeners = new ArrayList&lt;&gt;();
+    private final List&lt;String&gt; log = new ArrayList&lt;&gt;();
+    private TimingStrategy timing;
+    private ControllerState state;
+    private int phaseIndex, now;
+
+    Controller(List&lt;Phase&gt; phases, TimingStrategy timing, int yellow, int allRed, int walk) {
+        this.phases = phases; this.timing = timing;
+        this.yellowSeconds = yellow; this.allRedSeconds = allRed; this.walkSeconds = walk;
+        for (Direction d : Direction.values()) { signals.put(d, new TrafficSignal(d)); queues.put(d, 0); }
+    }
+
+    // ----- inputs: clock, sensors, buttons, radio -----
+    synchronized void start() { if (state == null) setState(new GreenState()); }
+    synchronized void tick(int seconds) { for (int i = 0; i &lt; seconds; i++) { now++; state.tick(this); } }
+    synchronized void arrive(Direction d, int cars) { queues.merge(d, cars, Integer::sum); }
+    synchronized void requestWalk(String phaseName) {
+        for (int i = 0; i &lt; phases.size(); i++) if (phases.get(i).name.equals(phaseName)) walkRequests.add(i);
+    }
+    synchronized void emergency(Direction d) { note("emergency vehicle approaching from " + d); state.emergency(this, d); }
+    synchronized void emergencyCleared() { state.emergencyCleared(this); }
+    synchronized void fault() { state.fault(this); }
+    synchronized void repair() { state.repair(this); }
+    synchronized void setTiming(TimingStrategy t) { timing = t; }         // takes effect at the next green
+    synchronized void addListener(SignalListener l) { listeners.add(l); }
+
+    // ----- used by the states -----
+    void setState(ControllerState s) { state = s; s.enter(this); }
+    Phase phase() { return phases.get(phaseIndex); }
+    TimingStrategy timing() { return timing; }
+    Map&lt;Direction, Integer&gt; queues() { return Collections.unmodifiableMap(queues); }
+    void nextPhase() { phaseIndex = (phaseIndex + 1) % phases.size(); }
+    void restartCycle() { phaseIndex = phases.size() - 1; pendingEmergencies.clear(); }   // next green = phase 0
+    void selectPhaseOf(Direction d) {
+        for (int i = 0; i &lt; phases.size(); i++) if (phases.get(i).dirs.contains(d)) { phaseIndex = i; return; }
+        throw new IllegalArgumentException("no phase for " + d);
+    }
+    void queueEmergency(Direction d) { if (!pendingEmergencies.contains(d)) pendingEmergencies.add(d); }
+    Direction pollEmergency() { return pendingEmergencies.poll(); }
+    boolean takeWalkRequest() { return walkRequests.remove(phaseIndex); }
+    void setPhaseLights(Light l) { for (Direction d : phase().dirs) change(d, l); }
+    void setAllLights(Light l) { for (Direction d : Direction.values()) change(d, l); }
+    private void change(Direction d, Light l) {
+        if (signals.get(d).set(l)) for (SignalListener x : listeners) x.onChange(now, d, l);
+    }
+    void discharge() {                         // one car per second leaves each green approach
+        for (Direction d : phase().dirs) if (signals.get(d).light() == Light.GREEN &amp;&amp; queues.get(d) &gt; 0) queues.merge(d, -1, Integer::sum);
+    }
+    void note(String msg) { log.add(String.format("t=%3d  %s", now, msg)); }
+
+    // ----- queries -----
+    synchronized String stateName() { return state == null ? "OFF" : state.name(); }
+    synchronized Light light(Direction d) { return signals.get(d).light(); }
+    synchronized int queue(Direction d) { return queues.get(d); }
+    synchronized int now() { return now; }
+    synchronized List&lt;String&gt; drainLog() { List&lt;String&gt; out = new ArrayList&lt;&gt;(log); log.clear(); return out; }
+    Map&lt;Direction, TrafficSignal&gt; signals() { return signals; }
+    List&lt;Phase&gt; phases() { return phases; }
+}
+
+public class Main {
+    private static int checks;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static void print(Controller c) { for (String s : c.drainLog()) System.out.println("  " + s); }
+
+    static Controller build(TimingStrategy t, int walk) {
+        List&lt;Phase&gt; phases = List.of(new Phase("NS", Direction.NORTH, Direction.SOUTH), new Phase("EW", Direction.EAST, Direction.WEST));
+        return new Controller(phases, t, 3, 2, walk);
+    }
+
+    public static void main(String[] args) {
+        System.out.println("1) fixed timing: 10s green, 3s yellow, 2s all-red");
+        Controller c = build(new FixedTiming(10), 15);
+        ConflictMonitor mon = new ConflictMonitor(c.signals(), c.phases());
+        c.addListener(mon);
+        c.start(); c.tick(30); print(c);
+        check(c.stateName().equals("GREEN") &amp;&amp; c.light(Direction.NORTH) == Light.GREEN &amp;&amp; c.now() == 30, "one 30s cycle");
+
+        System.out.println("2) pedestrian presses WALK for EW (needs 15s)");
+        c.requestWalk("EW"); c.tick(10); print(c);
+        c.tick(20); print(c);
+        check(c.light(Direction.EAST) == Light.YELLOW, "EW green lasted 15s, not 10s");
+
+        System.out.println("3) ambulance from EAST while NS is green, then a fire truck from NORTH");
+        Controller e = build(new FixedTiming(10), 15);
+        ConflictMonitor mon2 = new ConflictMonitor(e.signals(), e.phases());
+        e.addListener(mon2);
+        e.start(); e.tick(3);
+        e.emergency(Direction.EAST); e.tick(5); print(e);
+        check(e.stateName().equals("EMERGENCY") &amp;&amp; e.light(Direction.EAST) == Light.GREEN, "EW green within yellow + all-red");
+        e.emergency(Direction.NORTH); e.tick(4);
+        e.emergencyCleared(); e.tick(5); print(e);
+        check(e.stateName().equals("EMERGENCY") &amp;&amp; e.light(Direction.NORTH) == Light.GREEN, "queued emergency served next");
+        e.tick(3); e.emergencyCleared(); e.tick(5); print(e);
+        check(e.stateName().equals("GREEN") &amp;&amp; e.light(Direction.EAST) == Light.GREEN, "normal cycle resumes");
+
+        System.out.println("4) adaptive timing from queue sensors (min 5s, max 30s, 1s per car)");
+        Controller a = build(new AdaptiveTiming(5, 30, 1), 15);
+        a.arrive(Direction.NORTH, 12); a.arrive(Direction.SOUTH, 3); a.arrive(Direction.EAST, 2); a.arrive(Direction.WEST, 1);
+        a.start(); a.tick(12 + 3 + 2 + 5); print(a);
+        int left = 0; for (Direction d : Direction.values()) left += a.queue(d);
+        check(left == 0, "all queues cleared in one cycle");
+
+        System.out.println("5) fault: flashing, emergency handled manually, repair restarts the cycle");
+        e.fault(); e.emergency(Direction.WEST); e.tick(10); print(e);
+        check(e.light(Direction.NORTH) == Light.FLASHING &amp;&amp; e.light(Direction.EAST) == Light.FLASHING, "all flashing");
+        e.repair(); e.tick(2); print(e);
+        check(e.light(Direction.NORTH) == Light.GREEN &amp;&amp; e.light(Direction.EAST) == Light.RED, "repair: all red, then NS green");
+
+        System.out.println("5b) the 'cleared' message is lost: preemption ends after the max time");
+        Controller lostClear = build(new FixedTiming(10), 15);
+        lostClear.maxEmergencySeconds = 60;
+        ConflictMonitor mon3 = new ConflictMonitor(lostClear.signals(), lostClear.phases());
+        lostClear.addListener(mon3);
+        lostClear.start(); lostClear.emergency(Direction.NORTH); lostClear.tick(59);
+        check(lostClear.stateName().equals("EMERGENCY"), "still preempted before the bound");
+        lostClear.tick(1 + 3 + 2); print(lostClear);
+        check(lostClear.stateName().equals("GREEN") &amp;&amp; lostClear.light(Direction.EAST) == Light.GREEN &amp;&amp; mon3.violations == 0,
+              "bounded preemption hands over safely");
+
+        System.out.println("6) a signal refuses GREEN -&gt; RED");
+        TrafficSignal s = new TrafficSignal(Direction.NORTH);
+        s.set(Light.GREEN);
+        String err = "";
+        try { s.set(Light.RED); } catch (IllegalStateException ex) { err = ex.getMessage(); }
+        System.out.println("  rejected: " + err);
+        check(err.contains("GREEN -&gt; RED"), "unsafe change refused");
+
+        check(mon.violations == 0 &amp;&amp; mon2.violations == 0, "conflict monitor never saw two live phases");
+        System.out.println("conflict monitor: 0 violations");
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Traffic signal controller: State (controller modes), Strategy (timing), Observer (conflict monitor)."""
+from __future__ import annotations
+
+import threading
+from abc import ABC, abstractmethod
+from collections import deque
+from enum import Enum
+
+
+class Direction(Enum):
+    NORTH = "N"
+    SOUTH = "S"
+    EAST = "E"
+    WEST = "W"
+
+
+class Light(Enum):
+    RED = "RED"
+    YELLOW = "YELLOW"
+    GREEN = "GREEN"
+    FLASHING = "FLASHING"
+
+
+ALLOWED = {(Light.GREEN, Light.YELLOW), (Light.YELLOW, Light.RED), (Light.RED, Light.GREEN), (Light.FLASHING, Light.RED)}
+
+
+class Phase:
+    def __init__(self, name: str, *dirs: Direction) -&gt; None:
+        self.name, self.dirs = name, frozenset(dirs)
+
+    def __str__(self) -&gt; str:
+        return self.name
+
+
+class TrafficSignal:
+    def __init__(self, d: Direction) -&gt; None:
+        self.dir, self.light = d, Light.RED
+
+    def set(self, nxt: Light) -&gt; bool:
+        if not (nxt == self.light or nxt == Light.FLASHING or (self.light, nxt) in ALLOWED):
+            raise ValueError(f"{self.dir.name}: {self.light.name} -&gt; {nxt.name} is not allowed")
+        changed = nxt != self.light
+        self.light = nxt
+        return changed
+
+
+class ConflictMonitor:
+    """Observer: counts moments when more than one phase shows green or yellow."""
+
+    def __init__(self, signals: dict[Direction, TrafficSignal], phases: list[Phase]) -&gt; None:
+        self.signals, self.phases, self.violations = signals, phases, 0
+
+    def on_change(self, time: int, d: Direction, light: Light) -&gt; None:
+        live = sum(1 for p in self.phases
+                   if any(self.signals[x].light in (Light.GREEN, Light.YELLOW) for x in p.dirs))
+        if live &gt; 1:
+            self.violations += 1
+
+
+# ---------- Strategy ----------
+class TimingStrategy(ABC):
+    @abstractmethod
+    def green_seconds(self, phase: Phase, queues: dict[Direction, int]) -&gt; int: ...
+
+
+class FixedTiming(TimingStrategy):
+    def __init__(self, seconds: int) -&gt; None:
+        self.seconds = seconds
+
+    def green_seconds(self, phase: Phase, queues: dict[Direction, int]) -&gt; int:
+        return self.seconds
+
+
+class AdaptiveTiming(TimingStrategy):
+    def __init__(self, lo: int, hi: int, seconds_per_car: int) -&gt; None:
+        self.lo, self.hi, self.per_car = lo, hi, seconds_per_car
+
+    def green_seconds(self, phase: Phase, queues: dict[Direction, int]) -&gt; int:
+        cars = max(queues.get(d, 0) for d in phase.dirs)
+        return max(self.lo, min(self.hi, cars * self.per_car))
+
+
+# ---------- State ----------
+class ControllerState:
+    name = "?"
+
+    def enter(self, c: "Controller") -&gt; None:
+        pass
+
+    def tick(self, c: "Controller") -&gt; None:
+        pass
+
+    def emergency(self, c: "Controller", d: Direction) -&gt; None:
+        c.queue_emergency(d)
+
+    def emergency_cleared(self, c: "Controller") -&gt; None:
+        c.note("ignored: no emergency in progress")
+
+    def fault(self, c: "Controller") -&gt; None:
+        c.set_state(FlashingState())
+
+    def repair(self, c: "Controller") -&gt; None:
+        c.note("ignored: not in fault mode")
+
+
+class GreenState(ControllerState):
+    name = "GREEN"
+
+    def enter(self, c):
+        g = c.timing.green_seconds(c.phase, dict(c.queues))
+        if c.take_walk_request():
+            g = max(g, c.walk_seconds)
+            c.note(f"WALK shown for {c.phase}")
+        c.set_phase_lights(Light.GREEN)
+        c.timer = g
+        c.note(f"{c.phase} GREEN for {g}s")
+
+    def tick(self, c):
+        c.discharge()
+        c.timer -= 1
+        if c.timer == 0:
+            c.set_state(YellowState())
+
+    def emergency(self, c, d):
+        if d in c.phase.dirs:
+            c.set_state(EmergencyState(d))
+        else:
+            c.queue_emergency(d)
+            c.set_state(YellowState())
+
+
+class YellowState(ControllerState):
+    name = "YELLOW"
+
+    def enter(self, c):
+        c.set_phase_lights(Light.YELLOW)
+        c.timer = c.yellow_seconds
+        c.note(f"{c.phase} YELLOW")
+
+    def tick(self, c):
+        c.timer -= 1
+        if c.timer == 0:
+            c.set_state(AllRedState())
+
+
+class AllRedState(ControllerState):
+    name = "ALL_RED"
+
+    def enter(self, c):
+        c.set_phase_lights(Light.RED)
+        c.timer = c.all_red_seconds
+        c.note("ALL RED (clearance)")
+
+    def tick(self, c):
+        c.timer -= 1
+        if c.timer &gt; 0:
+            return
+        d = c.poll_emergency()
+        if d is not None:
+            c.select_phase_of(d)
+            c.set_state(EmergencyState(d))
+        else:
+            c.next_phase()
+            c.set_state(GreenState())
+
+
+class EmergencyState(ControllerState):
+    name = "EMERGENCY"
+
+    def __init__(self, src: Direction) -&gt; None:
+        self.src = src
+
+    def enter(self, c):
+        c.set_phase_lights(Light.GREEN)
+        c.timer = c.max_emergency_seconds          # liveness: a lost "cleared" must not stall the junction
+        c.note(f"EMERGENCY from {self.src.name}: {c.phase} GREEN until cleared (max {c.max_emergency_seconds}s)")
+
+    def tick(self, c):
+        c.discharge()
+        c.timer -= 1
+        if c.timer == 0:
+            c.note(f"FAULT LOGGED: emergency from {self.src.name} not cleared after {c.max_emergency_seconds}s; resuming the cycle")
+            c.set_state(YellowState())
+
+    def emergency(self, c, d):
+        if d in c.phase.dirs:
+            c.note(f"emergency from {d.name} already served by {c.phase}")
+        else:
+            c.queue_emergency(d)
+
+    def emergency_cleared(self, c):
+        c.note("emergency cleared")
+        c.set_state(YellowState())
+
+
+class FlashingState(ControllerState):
+    name = "FLASHING"
+
+    def enter(self, c):
+        c.set_all_lights(Light.FLASHING)
+        c.note("FAULT: all signals FLASHING")
+
+    def emergency(self, c, d):
+        c.note(f"fault mode: emergency from {d.name} handled manually")
+
+    def fault(self, c):
+        pass
+
+    def repair(self, c):
+        c.set_all_lights(Light.RED)
+        c.restart_cycle()
+        c.set_state(AllRedState())
+
+
+# ---------- controller (context) ----------
+class Controller:
+    def __init__(self, phases: list[Phase], timing: TimingStrategy, yellow: int = 3, all_red: int = 2,
+                 walk: int = 15) -&gt; None:
+        self.phases, self.timing = phases, timing
+        self.yellow_seconds, self.all_red_seconds, self.walk_seconds = yellow, all_red, walk
+        self.signals = {d: TrafficSignal(d) for d in Direction}
+        self.queues = {d: 0 for d in Direction}
+        self.timer, self.now, self._phase_index = 0, 0, 0
+        self.max_emergency_seconds = 120           # upper bound on one preemption
+        self._pending: deque[Direction] = deque()
+        self._walk: set[int] = set()
+        self._listeners: list = []
+        self._log: list[str] = []
+        self._state: ControllerState | None = None
+        self._lock = threading.RLock()
+
+    # ----- inputs -----
+    def start(self) -&gt; None:
+        with self._lock:
+            if self._state is None:
+                self.set_state(GreenState())
+
+    def tick(self, seconds: int = 1) -&gt; None:
+        with self._lock:
+            for _ in range(seconds):
+                self.now += 1
+                self._state.tick(self)
+
+    def arrive(self, d: Direction, cars: int) -&gt; None:
+        with self._lock:
+            self.queues[d] += cars
+
+    def request_walk(self, phase_name: str) -&gt; None:
+        with self._lock:
+            self._walk.update(i for i, p in enumerate(self.phases) if p.name == phase_name)
+
+    def emergency(self, d: Direction) -&gt; None:
+        with self._lock:
+            self.note(f"emergency vehicle approaching from {d.name}")
+            self._state.emergency(self, d)
+
+    def emergency_cleared(self) -&gt; None:
+        with self._lock:
+            self._state.emergency_cleared(self)
+
+    def fault(self) -&gt; None:
+        with self._lock:
+            self._state.fault(self)
+
+    def repair(self) -&gt; None:
+        with self._lock:
+            self._state.repair(self)
+
+    def set_timing(self, t: TimingStrategy) -&gt; None:
+        with self._lock:
+            self.timing = t
+
+    def add_listener(self, listener) -&gt; None:
+        with self._lock:
+            self._listeners.append(listener)
+
+    # ----- used by states -----
+    def set_state(self, s: ControllerState) -&gt; None:
+        self._state = s
+        s.enter(self)
+
+    @property
+    def phase(self) -&gt; Phase:
+        return self.phases[self._phase_index]
+
+    def next_phase(self) -&gt; None:
+        self._phase_index = (self._phase_index + 1) % len(self.phases)
+
+    def restart_cycle(self) -&gt; None:
+        self._phase_index = len(self.phases) - 1
+        self._pending.clear()
+
+    def select_phase_of(self, d: Direction) -&gt; None:
+        self._phase_index = next(i for i, p in enumerate(self.phases) if d in p.dirs)
+
+    def queue_emergency(self, d: Direction) -&gt; None:
+        if d not in self._pending:
+            self._pending.append(d)
+
+    def poll_emergency(self) -&gt; Direction | None:
+        return self._pending.popleft() if self._pending else None
+
+    def take_walk_request(self) -&gt; bool:
+        if self._phase_index in self._walk:
+            self._walk.discard(self._phase_index)
+            return True
+        return False
+
+    def set_phase_lights(self, light: Light) -&gt; None:
+        for d in sorted(self.phase.dirs, key=lambda x: x.name):
+            self._change(d, light)
+
+    def set_all_lights(self, light: Light) -&gt; None:
+        for d in Direction:
+            self._change(d, light)
+
+    def _change(self, d: Direction, light: Light) -&gt; None:
+        if self.signals[d].set(light):
+            for listener in self._listeners:
+                listener.on_change(self.now, d, light)
+
+    def discharge(self) -&gt; None:
+        for d in self.phase.dirs:
+            if self.signals[d].light == Light.GREEN and self.queues[d] &gt; 0:
+                self.queues[d] -= 1
+
+    def note(self, msg: str) -&gt; None:
+        self._log.append(f"t={self.now:3d}  {msg}")
+
+    # ----- queries -----
+    @property
+    def state_name(self) -&gt; str:
+        return self._state.name if self._state else "OFF"
+
+    def light(self, d: Direction) -&gt; Light:
+        return self.signals[d].light
+
+    def drain_log(self) -&gt; list[str]:
+        out, self._log = self._log, []
+        return out
+
+
+def four_way(timing: TimingStrategy, walk: int = 15) -&gt; Controller:
+    return Controller([Phase("NS", Direction.NORTH, Direction.SOUTH), Phase("EW", Direction.EAST, Direction.WEST)],
+                      timing, 3, 2, walk)
+
+
+def demo() -&gt; None:
+    c = four_way(AdaptiveTiming(5, 30, 1))
+    for d, n in [(Direction.NORTH, 12), (Direction.SOUTH, 3), (Direction.EAST, 2), (Direction.WEST, 1)]:
+        c.arrive(d, n)
+    c.start()
+    c.tick(5)
+    c.emergency(Direction.WEST)
+    c.tick(8)
+    c.emergency_cleared()
+    c.tick(20)
+    for line in c.drain_log():
+        print(line)
+    print("queues left:", {d.name: q for d, q in c.queues.items()})
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python tests">
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from main import (AdaptiveTiming, ConflictMonitor, Direction as D, FixedTiming, Light, TrafficSignal, four_way)
+
+
+def monitored(timing, walk=15):
+    c = four_way(timing, walk)
+    m = ConflictMonitor(c.signals, c.phases)
+    c.add_listener(m)
+    return c, m
+
+
+class SignalTest(unittest.TestCase):
+    def test_only_safe_transitions(self):
+        s = TrafficSignal(D.NORTH)
+        s.set(Light.GREEN)
+        with self.assertRaises(ValueError):
+            s.set(Light.RED)                       # must pass through yellow
+        s.set(Light.YELLOW)
+        with self.assertRaises(ValueError):
+            s.set(Light.GREEN)
+        s.set(Light.FLASHING)                      # fault mode is reachable from anything
+        with self.assertRaises(ValueError):
+            s.set(Light.GREEN)
+        s.set(Light.RED)
+
+
+class CycleTest(unittest.TestCase):
+    def test_fixed_cycle_timeline(self):
+        c, m = monitored(FixedTiming(10))
+        c.start()
+        seen = []
+        for _ in range(30):
+            c.tick()
+            seen.append((c.now, c.state_name, c.phase.name))
+        self.assertEqual(seen[9], (10, "YELLOW", "NS"))
+        self.assertEqual(seen[12], (13, "ALL_RED", "NS"))
+        self.assertEqual(seen[14], (15, "GREEN", "EW"))
+        self.assertEqual(seen[29], (30, "GREEN", "NS"))
+        self.assertEqual(m.violations, 0)
+
+    def test_adaptive_clamps_and_clears_queues(self):
+        t = AdaptiveTiming(5, 30, 2)
+        c, _ = monitored(t)
+        c.arrive(D.NORTH, 100)
+        c.start()
+        self.assertEqual(c.timer, 30)              # clamped to max
+        c.tick(35)
+        self.assertEqual((c.state_name, c.phase.name, c.timer), ("GREEN", "EW", 5))   # empty road gets min
+        self.assertEqual(c.queues[D.NORTH], 70)
+
+    def test_strategy_swap_takes_effect_next_green(self):
+        c, _ = monitored(FixedTiming(10))
+        c.start()
+        c.set_timing(FixedTiming(4))
+        self.assertEqual(c.timer, 10)
+        c.tick(15)
+        self.assertEqual((c.phase.name, c.timer), ("EW", 4))
+
+    def test_walk_request_extends_green_once(self):
+        c, _ = monitored(FixedTiming(10), walk=15)
+        c.request_walk("EW")
+        c.start()
+        c.tick(15)
+        self.assertEqual((c.phase.name, c.timer), ("EW", 15))
+        c.tick(15 + 5 + 10 + 5)
+        self.assertEqual((c.phase.name, c.timer), ("EW", 10))
+
+
+class EmergencyTest(unittest.TestCase):
+    def test_same_phase_emergency_holds_green(self):
+        c, m = monitored(FixedTiming(10))
+        c.start()
+        c.tick(2)
+        c.emergency(D.SOUTH)
+        self.assertEqual(c.state_name, "EMERGENCY")
+        c.tick(100)
+        self.assertEqual(c.light(D.SOUTH), Light.GREEN)
+        c.emergency_cleared()
+        self.assertEqual(c.state_name, "YELLOW")
+        self.assertEqual(m.violations, 0)
+
+    def test_lost_clear_message_ends_preemption_after_the_bound(self):
+        c, m = monitored(FixedTiming(10))
+        c.max_emergency_seconds = 60
+        c.start()
+        c.emergency(D.NORTH)
+        c.tick(59)
+        self.assertEqual(c.state_name, "EMERGENCY")
+        c.tick(1)
+        self.assertEqual(c.state_name, "YELLOW")
+        c.tick(5)
+        self.assertEqual((c.state_name, c.light(D.EAST)), ("GREEN", Light.GREEN))
+        self.assertEqual(m.violations, 0)
+
+    def test_cross_emergency_goes_through_yellow_and_all_red(self):
+        c, m = monitored(FixedTiming(10))
+        c.start()
+        c.emergency(D.WEST)
+        self.assertEqual(c.light(D.NORTH), Light.YELLOW)
+        c.tick(4)
+        self.assertNotEqual(c.light(D.WEST), Light.GREEN)
+        c.tick(1)
+        self.assertEqual((c.state_name, c.light(D.WEST)), ("EMERGENCY", Light.GREEN))
+        self.assertEqual(m.violations, 0)
+
+    def test_clear_without_emergency_and_repair_without_fault_are_ignored(self):
+        c, _ = monitored(FixedTiming(10))
+        c.start()
+        c.emergency_cleared()
+        c.repair()
+        self.assertEqual(c.state_name, "GREEN")
+        self.assertIn("ignored", " ".join(c.drain_log()))
+
+    def test_fault_then_repair(self):
+        c, _ = monitored(FixedTiming(10))
+        c.start()
+        c.emergency(D.EAST)
+        c.fault()
+        self.assertTrue(all(c.light(d) == Light.FLASHING for d in D))
+        c.tick(50)
+        c.repair()
+        c.tick(2)
+        self.assertEqual((c.state_name, c.phase.name), ("GREEN", "NS"))   # pending emergency dropped
+
+
+class SafetyPropertyTest(unittest.TestCase):
+    def test_random_events_never_conflict_and_never_starve(self):
+        rng = random.Random(2024)
+        for _ in range(40):
+            c, m = monitored(AdaptiveTiming(3, 20, 1) if rng.random() &lt; 0.5 else FixedTiming(rng.randint(3, 12)))
+            c.start()
+            last_green = {p.name: 0 for p in c.phases}
+            special = False                        # emergency or fault in the window
+            for _ in range(600):
+                r = rng.random()
+                if r &lt; 0.02:
+                    c.emergency(rng.choice(list(D)))
+                    special = True
+                elif r &lt; 0.04:
+                    c.emergency_cleared()
+                elif r &lt; 0.045:
+                    c.fault()
+                    special = True
+                elif r &lt; 0.06:
+                    c.repair()
+                elif r &lt; 0.2:
+                    c.arrive(rng.choice(list(D)), rng.randint(1, 5))
+                c.tick()
+                for p in c.phases:
+                    if c.light(next(iter(p.dirs))) == Light.GREEN:
+                        last_green[p.name] = c.now
+                if not special and c.state_name == "GREEN":
+                    for name, t in last_green.items():  # each phase green at least once per full cycle
+                        self.assertLessEqual(c.now - t, 2 * (20 + 3 + 2) + 1, name)
+                if c.state_name == "GREEN" and rng.random() &lt; 0.01:
+                    special = False                # reset the starvation window now and then
+                    last_green = {p.name: c.now for p in c.phases}
+            self.assertEqual(m.violations, 0)
+
+    def test_threads_feeding_events(self):
+        c, m = monitored(FixedTiming(5))
+        c.start()
+
+        def clock():
+            for _ in range(2000):
+                c.tick()
+
+        def sensors():
+            for i in range(2000):
+                c.arrive(list(D)[i % 4], 1)
+
+        def radio():
+            for i in range(200):
+                c.emergency(list(D)[i % 4])
+                c.emergency_cleared()
+
+        ts = [threading.Thread(target=f) for f in (clock, sensors, radio)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(c.now, 2000)
+        self.assertEqual(m.violations, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Traffic signal controller: State + Strategy + Observer. C++14.
+// Threaded build: add -DTS_THREADS -pthread (a std::mutex around every public call). Our MinGW g++ 6.3 has no
+// std::mutex, so the default build is single-threaded, driven by one clock loop. The threaded build was
+// compiled and run on WSL Ubuntu (g++ 13): same output, see run-cpp-linux.txt.
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;deque&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#ifdef TS_THREADS
+#include &lt;mutex&gt;
+#define TS_LOCK std::lock_guard&lt;std::mutex&gt; guard_(mu_)
+#define TS_MUTEX std::mutex mu_;
+#else
+#define TS_LOCK (void)0
+#define TS_MUTEX
+#endif
+
+enum class Direction { NORTH, SOUTH, EAST, WEST };
+enum class Light { RED, YELLOW, GREEN, FLASHING };
+static const Direction ALL_DIRS[] = {Direction::NORTH, Direction::SOUTH, Direction::EAST, Direction::WEST};
+static const char* name(Direction d) { static const char* n[] = {"NORTH", "SOUTH", "EAST", "WEST"}; return n[static_cast&lt;int&gt;(d)]; }
+static const char* name(Light l) { static const char* n[] = {"RED", "YELLOW", "GREEN", "FLASHING"}; return n[static_cast&lt;int&gt;(l)]; }
+
+struct Phase { std::string name; std::set&lt;Direction&gt; dirs; };
+
+class TrafficSignal {                                     // refuses unsafe changes
+    Direction dir_; Light light_ = Light::RED;
+public:
+    explicit TrafficSignal(Direction d) : dir_(d) {}
+    Light light() const { return light_; }
+    bool set(Light n) {
+        bool ok = n == light_ || n == Light::FLASHING
+            || (light_ == Light::GREEN &amp;&amp; n == Light::YELLOW) || (light_ == Light::YELLOW &amp;&amp; n == Light::RED)
+            || (light_ == Light::RED &amp;&amp; n == Light::GREEN) || (light_ == Light::FLASHING &amp;&amp; n == Light::RED);
+        if (!ok) throw std::logic_error(std::string(name(dir_)) + ": " + name(light_) + " -&gt; " + name(n) + " is not allowed");
+        bool changed = n != light_;
+        light_ = n;
+        return changed;
+    }
+};
+
+struct SignalListener { virtual ~SignalListener() = default; virtual void onChange(int t, Direction d, Light l) = 0; };
+
+struct TimingStrategy {
+    virtual ~TimingStrategy() = default;
+    virtual int greenSeconds(const Phase&amp; p, const std::map&lt;Direction, int&gt;&amp; queues) const = 0;
+};
+struct FixedTiming : TimingStrategy {
+    int s; explicit FixedTiming(int s) : s(s) {}
+    int greenSeconds(const Phase&amp;, const std::map&lt;Direction, int&gt;&amp;) const override { return s; }
+};
+struct AdaptiveTiming : TimingStrategy {
+    int lo, hi, perCar; AdaptiveTiming(int lo, int hi, int perCar) : lo(lo), hi(hi), perCar(perCar) {}
+    int greenSeconds(const Phase&amp; p, const std::map&lt;Direction, int&gt;&amp; q) const override {
+        int cars = 0;
+        for (Direction d : p.dirs) cars = std::max(cars, q.at(d));
+        return std::max(lo, std::min(hi, cars * perCar));
+    }
+};
+
+class Controller;
+struct ControllerState {                                  // one table of handlers per mode, like an ops struct
+    virtual ~ControllerState() = default;
+    virtual const char* name() const = 0;
+    virtual void enter(Controller&amp;) {}
+    virtual void tick(Controller&amp;) {}
+    virtual void emergency(Controller&amp; c, Direction d);
+    virtual void emergencyCleared(Controller&amp; c);
+    virtual void fault(Controller&amp; c);
+    virtual void repair(Controller&amp; c);
+};
+
+class Controller {
+public:
+    const int yellowSeconds, allRedSeconds, walkSeconds;
+    int timer = 0;
+    int maxEmergencySeconds = 120;   // upper bound on one preemption
+private:
+    std::vector&lt;Phase&gt; phases_;
+    std::map&lt;Direction, TrafficSignal&gt; signals_;
+    std::map&lt;Direction, int&gt; queues_;
+    std::deque&lt;Direction&gt; pending_;
+    std::set&lt;size_t&gt; walk_;
+    std::vector&lt;SignalListener*&gt; listeners_;
+    std::vector&lt;std::string&gt; log_;
+    std::shared_ptr&lt;const TimingStrategy&gt; timing_;
+    std::shared_ptr&lt;ControllerState&gt; state_;
+    size_t phaseIndex_ = 0;
+    int now_ = 0;
+    TS_MUTEX
+    void change(Direction d, Light l) {
+        if (signals_.at(d).set(l)) for (auto* x : listeners_) x-&gt;onChange(now_, d, l);
+    }
+public:
+    Controller(std::vector&lt;Phase&gt; phases, std::shared_ptr&lt;const TimingStrategy&gt; t, int yellow, int allRed, int walk)
+        : yellowSeconds(yellow), allRedSeconds(allRed), walkSeconds(walk), phases_(std::move(phases)), timing_(std::move(t)) {
+        for (Direction d : ALL_DIRS) { signals_.emplace(d, TrafficSignal(d)); queues_[d] = 0; }
+    }
+    // inputs. A local shared_ptr keeps the current state alive while it replaces itself.
+    void start();
+    void tick(int n) { TS_LOCK; for (int i = 0; i &lt; n; ++i) { ++now_; auto s = state_; s-&gt;tick(*this); } }
+    void arrive(Direction d, int cars) { TS_LOCK; queues_[d] += cars; }
+    void requestWalk(const std::string&amp; p) { TS_LOCK; for (size_t i = 0; i &lt; phases_.size(); ++i) if (phases_[i].name == p) walk_.insert(i); }
+    void emergency(Direction d) { TS_LOCK; note(std::string("emergency vehicle approaching from ") + ::name(d)); auto s = state_; s-&gt;emergency(*this, d); }
+    void emergencyCleared() { TS_LOCK; auto s = state_; s-&gt;emergencyCleared(*this); }
+    void fault() { TS_LOCK; auto s = state_; s-&gt;fault(*this); }
+    void repair() { TS_LOCK; auto s = state_; s-&gt;repair(*this); }
+    void setTiming(std::shared_ptr&lt;const TimingStrategy&gt; t) { TS_LOCK; timing_ = std::move(t); }
+    void addListener(SignalListener* l) { TS_LOCK; listeners_.push_back(l); }
+
+    // used by states
+    void setState(std::shared_ptr&lt;ControllerState&gt; s) { state_ = s; s-&gt;enter(*this); }
+    const Phase&amp; phase() const { return phases_[phaseIndex_]; }
+    const TimingStrategy&amp; timing() const { return *timing_; }
+    const std::map&lt;Direction, int&gt;&amp; queues() const { return queues_; }
+    void nextPhase() { phaseIndex_ = (phaseIndex_ + 1) % phases_.size(); }
+    void restartCycle() { phaseIndex_ = phases_.size() - 1; pending_.clear(); }
+    void selectPhaseOf(Direction d) {
+        for (size_t i = 0; i &lt; phases_.size(); ++i) if (phases_[i].dirs.count(d)) { phaseIndex_ = i; return; }
+        throw std::invalid_argument("no phase");
+    }
+    void queueEmergency(Direction d) { if (std::find(pending_.begin(), pending_.end(), d) == pending_.end()) pending_.push_back(d); }
+    bool pollEmergency(Direction&amp; out) { if (pending_.empty()) return false; out = pending_.front(); pending_.pop_front(); return true; }
+    bool takeWalkRequest() { return walk_.erase(phaseIndex_) &gt; 0; }
+    void setPhaseLights(Light l) { for (Direction d : phase().dirs) change(d, l); }
+    void setAllLights(Light l) { for (Direction d : ALL_DIRS) change(d, l); }
+    void discharge() { for (Direction d : phase().dirs) if (signals_.at(d).light() == Light::GREEN &amp;&amp; queues_[d] &gt; 0) --queues_[d]; }
+    void note(const std::string&amp; m) { char b[16]; std::snprintf(b, sizeof b, "t=%3d  ", now_); log_.push_back(b + m); }
+
+    // queries
+    const char* stateName() const { return state_ ? state_-&gt;name() : "OFF"; }
+    Light light(Direction d) const { return signals_.at(d).light(); }
+    int queue(Direction d) const { return queues_.at(d); }
+    const std::map&lt;Direction, TrafficSignal&gt;&amp; signals() const { return signals_; }
+    const std::vector&lt;Phase&gt;&amp; phases() const { return phases_; }
+    std::vector&lt;std::string&gt; drainLog() { std::vector&lt;std::string&gt; o; o.swap(log_); return o; }
+};
+
+struct YellowState; struct AllRedState; struct FlashingState;
+
+struct EmergencyState : ControllerState {
+    Direction from; explicit EmergencyState(Direction d) : from(d) {}
+    const char* name() const override { return "EMERGENCY"; }
+    void enter(Controller&amp; c) override {
+        c.setPhaseLights(Light::GREEN);
+        c.timer = c.maxEmergencySeconds;               // liveness: a lost "cleared" must not stall the junction
+        c.note(std::string("EMERGENCY from ") + ::name(from) + ": " + c.phase().name + " GREEN until cleared (max " +
+               std::to_string(c.maxEmergencySeconds) + "s)");
+    }
+    void tick(Controller&amp; c) override;
+    void emergency(Controller&amp; c, Direction d) override {
+        if (c.phase().dirs.count(d)) c.note(std::string("emergency from ") + ::name(d) + " already served"); else c.queueEmergency(d);
+    }
+    void emergencyCleared(Controller&amp; c) override;
+};
+
+struct GreenState : ControllerState {
+    const char* name() const override { return "GREEN"; }
+    void enter(Controller&amp; c) override {
+        int g = c.timing().greenSeconds(c.phase(), c.queues());
+        if (c.takeWalkRequest()) { g = std::max(g, c.walkSeconds); c.note("WALK shown for " + c.phase().name); }
+        c.setPhaseLights(Light::GREEN);
+        c.timer = g;
+        c.note(c.phase().name + " GREEN for " + std::to_string(g) + "s");
+    }
+    void tick(Controller&amp; c) override;
+    void emergency(Controller&amp; c, Direction d) override;
+};
+
+struct YellowState : ControllerState {
+    const char* name() const override { return "YELLOW"; }
+    void enter(Controller&amp; c) override { c.setPhaseLights(Light::YELLOW); c.timer = c.yellowSeconds; c.note(c.phase().name + " YELLOW"); }
+    void tick(Controller&amp; c) override;
+};
+
+struct AllRedState : ControllerState {
+    const char* name() const override { return "ALL_RED"; }
+    void enter(Controller&amp; c) override { c.setPhaseLights(Light::RED); c.timer = c.allRedSeconds; c.note("ALL RED (clearance)"); }
+    void tick(Controller&amp; c) override {
+        if (--c.timer &gt; 0) return;
+        Direction d;
+        if (c.pollEmergency(d)) { c.selectPhaseOf(d); c.setState(std::make_shared&lt;EmergencyState&gt;(d)); }
+        else { c.nextPhase(); c.setState(std::make_shared&lt;GreenState&gt;()); }
+    }
+};
+
+struct FlashingState : ControllerState {
+    const char* name() const override { return "FLASHING"; }
+    void enter(Controller&amp; c) override { c.setAllLights(Light::FLASHING); c.note("FAULT: all signals FLASHING"); }
+    void emergency(Controller&amp; c, Direction d) override { c.note(std::string("fault mode: emergency from ") + ::name(d) + " handled manually"); }
+    void fault(Controller&amp;) override {}
+    void repair(Controller&amp; c) override { c.setAllLights(Light::RED); c.restartCycle(); c.setState(std::make_shared&lt;AllRedState&gt;()); }
+};
+
+void ControllerState::emergency(Controller&amp; c, Direction d) { c.queueEmergency(d); }
+void ControllerState::emergencyCleared(Controller&amp; c) { c.note("ignored: no emergency in progress"); }
+void ControllerState::fault(Controller&amp; c) { c.setState(std::make_shared&lt;FlashingState&gt;()); }
+void ControllerState::repair(Controller&amp; c) { c.note("ignored: not in fault mode"); }
+void GreenState::tick(Controller&amp; c) { c.discharge(); if (--c.timer == 0) c.setState(std::make_shared&lt;YellowState&gt;()); }
+void GreenState::emergency(Controller&amp; c, Direction d) {
+    if (c.phase().dirs.count(d)) c.setState(std::make_shared&lt;EmergencyState&gt;(d));
+    else { c.queueEmergency(d); c.setState(std::make_shared&lt;YellowState&gt;()); }
+}
+void YellowState::tick(Controller&amp; c) { if (--c.timer == 0) c.setState(std::make_shared&lt;AllRedState&gt;()); }
+void EmergencyState::tick(Controller&amp; c) {
+    c.discharge();
+    if (--c.timer == 0) {
+        c.note(std::string("FAULT LOGGED: emergency from ") + ::name(from) + " not cleared after " +
+               std::to_string(c.maxEmergencySeconds) + "s; resuming the cycle");
+        c.setState(std::make_shared&lt;YellowState&gt;());
+    }
+}
+void EmergencyState::emergencyCleared(Controller&amp; c) { c.note("emergency cleared"); c.setState(std::make_shared&lt;YellowState&gt;()); }
+void Controller::start() { TS_LOCK; if (!state_) setState(std::make_shared&lt;GreenState&gt;()); }
+
+struct ConflictMonitor : SignalListener {                 // counts moments with two live phases
+    const Controller&amp; c; int violations = 0;
+    explicit ConflictMonitor(const Controller&amp; c) : c(c) {}
+    void onChange(int, Direction, Light) override {
+        int live = 0;
+        for (const Phase&amp; p : c.phases()) {
+            bool any = false;
+            for (Direction d : p.dirs) { Light l = c.signals().at(d).light(); any = any || l == Light::GREEN || l == Light::YELLOW; }
+            live += any;
+        }
+        if (live &gt; 1) ++violations;
+    }
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::printf("FAILED: %s\n", what); std::exit(1); } ++checks; }
+static void print(Controller&amp; c) { for (auto&amp; s : c.drainLog()) std::printf("  %s\n", s.c_str()); }
+static std::vector&lt;Phase&gt; fourWay() { return {{"NS", {Direction::NORTH, Direction::SOUTH}}, {"EW", {Direction::EAST, Direction::WEST}}}; }
+
+int main() {
+    std::printf("1) adaptive timing, ambulance from WEST at t=5\n");
+    Controller c(fourWay(), std::make_shared&lt;AdaptiveTiming&gt;(5, 30, 1), 3, 2, 15);
+    ConflictMonitor mon(c);
+    c.addListener(&amp;mon);
+    c.arrive(Direction::NORTH, 12); c.arrive(Direction::SOUTH, 3); c.arrive(Direction::EAST, 2); c.arrive(Direction::WEST, 1);
+    c.start(); c.tick(5);
+    c.emergency(Direction::WEST); c.tick(8);
+    check(std::string(c.stateName()) == "EMERGENCY" &amp;&amp; c.light(Direction::WEST) == Light::GREEN, "emergency green");
+    c.emergencyCleared(); c.tick(20); print(c);
+    int left = 0; for (Direction d : ALL_DIRS) left += c.queue(d);
+    check(left == 0, "queues cleared after the interruption");
+    std::printf("2) fault and repair\n");
+    c.fault(); c.tick(5); c.repair(); c.tick(2); print(c);
+    check(c.light(Direction::NORTH) == Light::GREEN, "cycle restarted at NS");
+    std::printf("2b) lost 'cleared' message: preemption ends after the max time\n");
+    Controller lc(fourWay(), std::make_shared&lt;AdaptiveTiming&gt;(5, 30, 1), 3, 2, 15);
+    ConflictMonitor mon2(lc);
+    lc.addListener(&amp;mon2);
+    lc.maxEmergencySeconds = 60;
+    lc.start(); lc.emergency(Direction::NORTH); lc.tick(59);
+    check(std::string(lc.stateName()) == "EMERGENCY", "still preempted before the bound");
+    lc.tick(1 + 3 + 2); print(lc);
+    check(std::string(lc.stateName()) == "GREEN" &amp;&amp; lc.light(Direction::EAST) == Light::GREEN &amp;&amp; mon2.violations == 0, "bounded preemption");
+    std::printf("3) unsafe change refused\n");
+    TrafficSignal s(Direction::EAST); s.set(Light::GREEN);
+    try { s.set(Light::RED); check(false, "should throw"); } catch (const std::logic_error&amp; e) { std::printf("  rejected: %s\n", e.what()); }
+    check(mon.violations == 0, "no conflicting greens");
+    std::printf("conflict monitor: 0 violations\nAll %d checks passed\n", checks);
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Demo output</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+1) fixed timing: 10s green, 3s yellow, 2s all-red
+  t=  0  NS GREEN for 10s
+  t= 10  NS YELLOW
+  t= 13  ALL RED (clearance)
+  t= 15  EW GREEN for 10s
+  t= 25  EW YELLOW
+  t= 28  ALL RED (clearance)
+  t= 30  NS GREEN for 10s
+2) pedestrian presses WALK for EW (needs 15s)
+  t= 40  NS YELLOW
+  t= 43  ALL RED (clearance)
+  t= 45  WALK shown for EW
+  t= 45  EW GREEN for 15s
+  t= 60  EW YELLOW
+3) ambulance from EAST while NS is green, then a fire truck from NORTH
+  t=  0  NS GREEN for 10s
+  t=  3  emergency vehicle approaching from EAST
+  t=  3  NS YELLOW
+  t=  6  ALL RED (clearance)
+  t=  8  EMERGENCY from EAST: EW GREEN until cleared (max 120s)
+  t=  8  emergency vehicle approaching from NORTH
+  t= 12  emergency cleared
+  t= 12  EW YELLOW
+  t= 15  ALL RED (clearance)
+  t= 17  EMERGENCY from NORTH: NS GREEN until cleared (max 120s)
+  t= 20  emergency cleared
+  t= 20  NS YELLOW
+  t= 23  ALL RED (clearance)
+  t= 25  EW GREEN for 10s
+4) adaptive timing from queue sensors (min 5s, max 30s, 1s per car)
+  t=  0  NS GREEN for 12s
+  t= 12  NS YELLOW
+  t= 15  ALL RED (clearance)
+  t= 17  EW GREEN for 5s
+  t= 22  EW YELLOW
+5) fault: flashing, emergency handled manually, repair restarts the cycle
+  t= 25  FAULT: all signals FLASHING
+  t= 25  emergency vehicle approaching from WEST
+  t= 25  fault mode: emergency from WEST handled manually
+  t= 35  ALL RED (clearance)
+  t= 37  NS GREEN for 10s
+5b) the 'cleared' message is lost: preemption ends after the max time
+  t=  0  NS GREEN for 10s
+  t=  0  emergency vehicle approaching from NORTH
+  t=  0  EMERGENCY from NORTH: NS GREEN until cleared (max 60s)
+  t= 60  FAULT LOGGED: emergency from NORTH not cleared after 60s; resuming the cycle
+  t= 60  NS YELLOW
+  t= 63  ALL RED (clearance)
+  t= 65  EW GREEN for 10s
+6) a signal refuses GREEN -&gt; RED
+  rejected: NORTH: GREEN -&gt; RED is not allowed
+conflict monitor: 0 violations
+All 12 checks passed
+
+$ python main.py
+t=  0  NS GREEN for 12s
+t=  5  emergency vehicle approaching from WEST
+t=  5  NS YELLOW
+t=  8  ALL RED (clearance)
+t= 10  EMERGENCY from WEST: EW GREEN until cleared (max 120s)
+t= 13  emergency cleared
+t= 13  EW YELLOW
+t= 16  ALL RED (clearance)
+t= 18  NS GREEN for 7s
+t= 25  NS YELLOW
+t= 28  ALL RED (clearance)
+t= 30  EW GREEN for 5s
+queues left: {'NORTH': 0, 'SOUTH': 0, 'EAST': 0, 'WEST': 0}
+
+$ python -m unittest test_main
+............
+----------------------------------------------------------------------
+Ran 12 tests in 0.092s
+
+OK
+
+$ g++ -std=c++14 -Wall -O2 -o main main.cpp &amp;&amp; ./main
+1) adaptive timing, ambulance from WEST at t=5
+  t=  0  NS GREEN for 12s
+  t=  5  emergency vehicle approaching from WEST
+  t=  5  NS YELLOW
+  t=  8  ALL RED (clearance)
+  t= 10  EMERGENCY from WEST: EW GREEN until cleared (max 120s)
+  t= 13  emergency cleared
+  t= 13  EW YELLOW
+  t= 16  ALL RED (clearance)
+  t= 18  NS GREEN for 7s
+  t= 25  NS YELLOW
+  t= 28  ALL RED (clearance)
+  t= 30  EW GREEN for 5s
+2) fault and repair
+  t= 33  FAULT: all signals FLASHING
+  t= 38  ALL RED (clearance)
+  t= 40  NS GREEN for 5s
+2b) lost 'cleared' message: preemption ends after the max time
+  t=  0  NS GREEN for 5s
+  t=  0  emergency vehicle approaching from NORTH
+  t=  0  EMERGENCY from NORTH: NS GREEN until cleared (max 60s)
+  t= 60  FAULT LOGGED: emergency from NORTH not cleared after 60s; resuming the cycle
+  t= 60  NS YELLOW
+  t= 63  ALL RED (clearance)
+  t= 65  EW GREEN for 5s
+3) unsafe change refused
+  rejected: EAST: GREEN -&gt; RED is not allowed
+conflict monitor: 0 violations
+All 6 checks passed</code></pre>
+  <div class="callout note"><p>Three things to read in the output. Java step 2: the WALK request stretches the EW green from 10 s to 15 s, once. Java step 3: the ambulance asked at t=3 and got green at t=8 (yellow 3 + all-red 2), and the fire truck that arrived meanwhile was served next, again through yellow and all-red. The Python and C++ runs: adaptive timing gave NS 12 s for 12 cars; the ambulance cut it short after 5 cars, and when NS came back it got exactly 7 s for the 7 cars still waiting.</p></div>

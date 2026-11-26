@@ -1,0 +1,100 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Sharding: by tenant, by entity, or by tag?</h3>
+        <p>The two lookups want different partition keys. "Tags of entity" wants the entity; "entities of tag" wants the tag. Three options:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Shard key</th><th>Tags of entity</th><th>Entities of tag</th><th>Verdict</th></tr></thead>
+            <tbody>
+              <tr><td><code>tenant_id</code> (both indexes on the same shard)</td><td>One shard</td><td>One shard</td><td>Default. Both directions local, one transaction, and natural tenant isolation. Breaks only for a giant tenant.</td></tr>
+              <tr><td><code>entity_ref</code></td><td>One shard</td><td>Scatter to all shards</td><td>Bad for the by-tag query.</td></tr>
+              <tr><td>Two tables: by entity and by tag, each sharded on its own key</td><td>One shard</td><td>One shard</td><td>For huge scale (NoSQL). Costs a cross-shard dual write: write one, propagate the other by CDC, and accept a short lag on the by-tag view.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Start with <b>tenant sharding</b>: most tenants are small, and both directions plus the tag dictionary live together. Map tenants to shards through a directory (a lookup table), not a hash formula, so a big tenant can be <b>moved to its own shard</b> and noisy neighbours can be separated. For the very largest tenants, split further by hashing <code>entity_ref</code> for the by-entity table and <code>tag_id</code> for the by-tag table (option 3) - only for them.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Tenant directory mapping tenants to shards, big tenant on its own shard">
+            <rect class="box svc" x="20" y="80" width="160" height="60"/>
+            <text class="label" x="100" y="106">Tenant directory</text>
+            <text class="label small" x="100" y="126">tenant to shard</text>
+            <rect class="box db" x="260" y="20" width="160" height="56"/>
+            <text class="label" x="340" y="52">Shard 1: 9,000 small</text>
+            <rect class="box db" x="260" y="90" width="160" height="56"/>
+            <text class="label" x="340" y="122">Shard 2: 9,000 small</text>
+            <rect class="box warn" x="260" y="160" width="160" height="56"/>
+            <text class="label" x="340" y="192">Shard 9: one giant</text>
+            <path class="arrow" d="M180 100 L256 50"/>
+            <path class="arrow" d="M180 110 L256 118"/>
+            <path class="arrow" d="M180 125 L256 185"/>
+            <rect class="box cache" x="500" y="130" width="140" height="40"/>
+            <text class="label small" x="570" y="155">by-entity, hash ref</text>
+            <rect class="box cache" x="500" y="180" width="140" height="36"/>
+            <text class="label small" x="570" y="203">by-tag, hash tag_id</text>
+            <path class="arrow dashed" d="M420 185 L496 150"/>
+            <path class="arrow dashed" d="M420 195 L496 198"/>
+            <text class="label small" x="640" y="60">directory lets you move a tenant</text>
+          </svg>
+          <figcaption>Small tenants share shards; a giant tenant gets its own, and can be split again by entity and by tag if it outgrows one machine.</figcaption>
+        </figure>
+        <div class="callout interview"><p>Multi-tenant isolation (asked as a follow-up): <b>tenant id is the first column of every key and index</b>, taken from the auth token, never the request body; row-level security policies in PostgreSQL (<code>tenant_id = current_setting('app.tenant')</code>) are a second fence if application code has a bug; caches and Redis keys are prefixed by tenant; per-tenant quotas protect everyone from one tenant's automation storm; big customers can get a dedicated shard (and, if contracts need it, data residency in their region).</p></div>
+
+        <h3>2. Heavy writes and the hot tag</h3>
+        <p>Interviewers asked "what if tag writes are very heavy?". Split the question:</p>
+        <ul>
+          <li><b>Many tenants writing a little</b>: spread across shards by tenant; each write is one small transaction (about 3 index updates). PostgreSQL handles thousands of these per second per shard; add shards as tenants grow.</li>
+          <li><b>One tenant bulk-tagging</b> ("add release-42 to 50,000 issues"): accept the request as an <b>async job</b> (202 plus job id), write in batches of about 1,000 rows per transaction with multi-row inserts, and rate-limit per tenant so the shard stays healthy for others. The UI shows progress.</li>
+          <li><b>One tag on millions of entities</b> (for example "bug"): the by-tag index has one long run of rows. Reads stay fast because pagination walks the index newest-first from a cursor. Counting it with <code>COUNT(*)</code> is the slow part, so never compute counts on read: keep <code>usage_count</code> updated from the event stream.</li>
+          <li><b>Write amplification</b>: each link updates the primary key index and the by-tag index. Do not add more indexes casually; derived views (search, trending) are built from events instead.</li>
+        </ul>
+        <div class="callout note"><p>Concurrency (Amazon Pay's variant): two users create "urgent" in the same second. The unique constraint on <code>(tenant_id, normalized_name)</code> makes one insert win; the other's <code>INSERT ... ON CONFLICT (tenant_id, normalized_name) DO UPDATE SET name = tag.name RETURNING tag_id</code> gets the same id back. No lock, no duplicate tag. Removing a tag while another user adds it is ordered by the database: last write wins on that one link, and both operations are idempotent.</p></div>
+
+        <h3>3. Tag search and multi-tag queries</h3>
+        <p><b>Autocomplete</b> is a prefix search inside one tenant's dictionary (hundreds to a few thousand names). A B-tree index on <code>(tenant_id, normalized_name)</code> answers <code>WHERE tenant_id = ? AND normalized_name LIKE 'perf%'</code> as a range scan. Order suggestions by <code>usage_count</code>. For a tenant with 100K tags, cache the dictionary in memory per tenant or move it into Elasticsearch with an edge n-gram analyser; fuzzy matching ("perfromance") comes free there.</p>
+        <p><b>Entities with tag A AND tag B</b>: fetch the two entity lists from the by-tag index and intersect. Start from the <b>rarer</b> tag (smaller list, known from <code>usage_count</code>) and probe the other via the by-entity primary key: for each entity in the small list, "does it have tag B?" is one index lookup. In SQL: <code>GROUP BY entity_ref HAVING COUNT(DISTINCT tag_id) = 2</code> over both tags. For rich queries combined with text and fields, push tags into each product's search index (deep dive 5's events) and let it do the boolean query.</p>
+        <p><b>Permissions</b>: "entities of tag" must only show what this user can see. The tag service does not own permissions, so it returns a page of candidates and the calling product filters with a batch permission check, fetching more pages if many were hidden. Say this out loud: it is a classic Atlassian follow-up.</p>
+
+        <h3>4. Popular and trending tags</h3>
+        <p><b>Popular (all time)</b> is <code>usage_count</code> on the tag row, updated by a consumer of tag events; top-10 is an index on <code>(tenant_id, usage_count DESC)</code> or a per-tenant sorted set <code>popular:{tenant}</code>.</p>
+        <p><b>Trending</b> means "used a lot recently". A candidate in a 2025-03 Atlassian report used Redis sorted sets and got positive feedback. The clean version uses <b>time buckets</b>:</p>
+        <pre><code class="language-bash"># on each TagAdded event (batched per minute by the aggregator)
+ZINCRBY trend:t42:2026112310  17 "tg_51"     # tenant 42, hour bucket 10:00, +17 uses
+EXPIRE  trend:t42:2026112310  259200         # keep 3 days
+
+# read: top-10 over the last 24 hours (cached ~60 s)
+ZUNIONSTORE tmp:t42:24h 24 trend:t42:2026112310 trend:t42:2026112309 ... WEIGHTS 1 0.97 0.94 ...
+ZREVRANGE   tmp:t42:24h 0 9 WITHSCORES</code></pre>
+        <p>Sorted set inserts and score updates are O(log N) (Redis uses a skip list plus a hash table), and reading the top 10 is O(log N + 10). Weights that shrink with age give a smooth decay, so a tag used heavily 23 hours ago does not beat one exploding right now. "Trending" can also mean "growth vs normal": score = recent count / (baseline count + k), which stops always-popular tags like "bug" from owning the list. Bucketing removes the need to ever "subtract" old events.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 210" role="img" aria-label="Hourly sorted set buckets combined into a 24 hour trending view">
+            <rect class="box cache" x="20" y="40" width="100" height="56"/>
+            <text class="label small" x="70" y="72">hour 10</text>
+            <rect class="box cache" x="130" y="40" width="100" height="56"/>
+            <text class="label small" x="180" y="72">hour 09</text>
+            <rect class="box cache" x="240" y="40" width="100" height="56"/>
+            <text class="label small" x="290" y="72">hour 08</text>
+            <text class="label" x="380" y="72">...</text>
+            <rect class="box cache" x="420" y="40" width="100" height="56"/>
+            <text class="label small" x="470" y="72">hour 11 (y'day)</text>
+            <rect class="box ok" x="600" y="40" width="180" height="56"/>
+            <text class="label" x="690" y="64">24 h union</text>
+            <text class="label small" x="690" y="84">weighted, cached 60 s</text>
+            <path class="arrow" d="M520 68 L596 68"/>
+            <rect class="box svc" x="600" y="140" width="180" height="50"/>
+            <text class="label" x="690" y="170">top-10</text>
+            <path class="arrow" d="M690 96 L690 136"/>
+            <text class="label small" x="270" y="140">old buckets expire by TTL: no subtraction needed</text>
+          </svg>
+          <figcaption>One sorted set per tenant per hour. Reads combine the last 24 with decaying weights.</figcaption>
+        </figure>
+        <p>At much bigger scale (global trending across all tenants, millions of distinct tags), use a <a href="{{BASE}}interview/glossary#count-min-sketch">Count-Min Sketch</a> plus a small heap per window, as in <a href="{{BASE}}hld/d35">Top-K Heavy Hitters</a>.</p>
+
+        <h3>5. Keeping derived views in sync, and deletes</h3>
+        <ul>
+          <li><b>Outbox</b>: write the event row in the same transaction as the link, and relay it to Kafka. Avoids the <a href="{{BASE}}interview/glossary#dual-write">dual write</a> bug where the link commits but the event is lost (or the reverse).</li>
+          <li><b>Entity deleted in Jira</b>: Jira publishes <code>EntityDeleted</code>; the tag service consumes it and deletes that entity's links in batches. Until then, product-side permission filtering hides the dead entity anyway.</li>
+          <li><b>Tag renamed or merged</b>: rename is one row. Merge "perf" into "performance" is a background job that re-points links in batches and leaves a redirect from the old name.</li>
+          <li><b>Rebuild</b>: Redis trending and caches can be rebuilt by replaying Kafka (7 days retention) or from the database.</li>
+        </ul>
+      

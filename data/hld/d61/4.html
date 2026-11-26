@@ -1,0 +1,76 @@
+
+        <h2>Data model</h2>
+        <p>Flipkart spent half the round here: "a song can be a single or part of an album; queries filter on singer". The trick is to make <b>every track belong to a release</b>, where a release is an album, an EP or a single. Spotify's public API does the same: an album object has an <code>album_type</code> of <code>album</code>, <code>single</code> or <code>compilation</code>. Then "singles by this artist" is just a filter, not a special case. Store-choice reasoning is in <a href="{{BASE}}hld/hld-08">Choosing Storage</a>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 330" role="img" aria-label="Entity diagram: artist, release, track, track_artist, playlist, playlist_item">
+            <rect class="box svc" x="20" y="30" width="170" height="70"/>
+            <text class="label" x="105" y="58">artist</text>
+            <text class="label small" x="105" y="80">artist_id, name</text>
+            <rect class="box svc" x="300" y="30" width="200" height="70"/>
+            <text class="label" x="400" y="58">release (album)</text>
+            <text class="label small" x="400" y="80">type: album | single | EP</text>
+            <rect class="box db" x="600" y="30" width="180" height="70"/>
+            <text class="label" x="690" y="58">track</text>
+            <text class="label small" x="690" y="80">release_id, disc, no.</text>
+            <rect class="box db" x="300" y="150" width="200" height="70"/>
+            <text class="label" x="400" y="178">track_artist</text>
+            <text class="label small" x="400" y="200">track, artist, role</text>
+            <rect class="box cache" x="20" y="240" width="170" height="70"/>
+            <text class="label" x="105" y="268">audio_file</text>
+            <text class="label small" x="105" y="290">track, codec, kbps, key</text>
+            <rect class="box client" x="600" y="240" width="180" height="70"/>
+            <text class="label" x="690" y="268">playlist_item</text>
+            <text class="label small" x="690" y="290">playlist, rank, track</text>
+            <path class="arrow" d="M190 65 L296 65"/>
+            <text class="label small" x="243" y="55">1..n</text>
+            <path class="arrow" d="M500 65 L596 65"/>
+            <text class="label small" x="548" y="55">1..n</text>
+            <path class="arrow" d="M105 100 L300 180"/>
+            <path class="arrow" d="M690 100 L500 180"/>
+            <path class="arrow" d="M640 100 L190 265"/>
+            <path class="arrow dashed" d="M690 240 L690 104"/>
+            <text class="label small" x="400" y="240">many-to-many: featured singers</text>
+          </svg>
+          <figcaption>Every track belongs to one release; a single is a release with one track. Singers attach through <code>track_artist</code> (role = main or featured), so "all songs sung by X" is one indexed lookup.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Key / index</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Catalogue: artist, release, track, track_artist, audio_file</td><td>PostgreSQL / Aurora, read replicas, Redis in front</td><td><code>track(release_id, disc, number)</code>; <code>track_artist(artist_id, track_id)</code></td><td>Small (about 150 GB), relational, joins and constraints matter, written only by catalogue ingestion from labels</td></tr>
+              <tr><td>Audio files</td><td>S3 (origin) behind CDNs</td><td><code>audio/{track}/{codec}_{kbps}</code></td><td>Immutable blobs, petabytes, 11 nines durability, range reads, cheap tiers</td></tr>
+              <tr><td>Search index</td><td>Elasticsearch / OpenSearch</td><td>Documents per track, artist, release</td><td>Full-text, fuzzy, ranking by popularity; a derived copy fed from the catalogue</td></tr>
+              <tr><td>Playlists and items</td><td>PostgreSQL sharded by <code>playlist_id</code> (or DynamoDB)</td><td><code>playlist_item(playlist_id, rank)</code></td><td>Per-playlist transactions and a version number for concurrent edits</td></tr>
+              <tr><td>Library (likes, saved albums)</td><td>Cassandra / DynamoDB</td><td>Partition <code>user_id</code>, cluster by <code>saved_at</code></td><td>Huge number of tiny rows, always read per user</td></tr>
+              <tr><td>Listening history</td><td>Kafka, then Cassandra (recent) and a data lake (all)</td><td>Partition <code>(user_id, month)</code>, cluster by <code>ts DESC</code></td><td>Append-only firehose, read as "my last 50"</td></tr>
+              <tr><td>Play counts, like counts</td><td>Stream aggregates into Redis / Cassandra counters</td><td><code>track_id</code></td><td>Eventual; exact totals come from the batch job over the event log</td></tr>
+              <tr><td>Users, subscriptions, payments</td><td>PostgreSQL (strong consistency)</td><td><code>user_id</code></td><td>Money and access rights must never be eventually right</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code class="language-sql">CREATE TABLE release (
+  release_id   BIGINT PRIMARY KEY,
+  title        TEXT NOT NULL,
+  release_type TEXT NOT NULL CHECK (release_type IN ('album','single','ep','compilation')),
+  release_date DATE,
+  primary_artist_id BIGINT NOT NULL
+);
+CREATE TABLE track (
+  track_id     BIGINT PRIMARY KEY,
+  release_id   BIGINT NOT NULL REFERENCES release,
+  disc_no      SMALLINT NOT NULL DEFAULT 1,
+  track_no     SMALLINT NOT NULL,
+  title        TEXT NOT NULL,
+  duration_ms  INT NOT NULL,
+  isrc         CHAR(12) UNIQUE,          -- industry id of the recording
+  UNIQUE (release_id, disc_no, track_no)
+);
+CREATE TABLE track_artist (
+  track_id  BIGINT REFERENCES track,
+  artist_id BIGINT NOT NULL,
+  role      TEXT NOT NULL DEFAULT 'main',  -- main | featured
+  PRIMARY KEY (track_id, artist_id)
+);
+CREATE INDEX track_by_artist ON track_artist (artist_id, track_id);   -- "songs by this singer"</code></pre>
+        <div class="callout interview"><p>Apple's follow-up was <b>"why a relational DB, why S3?"</b> Answer with properties, not brand names: the catalogue is small, heavily related (artist-release-track), needs uniqueness (ISRC) and multi-row updates when a label re-releases an album, and is read far more than written - a relational database with replicas and a cache is the simplest thing that fits. Audio is large, immutable and read by byte range - object storage gives cheap, durable, effectively unlimited space and is a natural CDN origin. A database row holding 5 MB blobs would bloat backups, replicas and the buffer cache for no benefit.</p></div>
+      

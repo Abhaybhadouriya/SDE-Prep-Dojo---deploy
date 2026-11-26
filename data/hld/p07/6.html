@@ -1,0 +1,68 @@
+
+        <h2>How Kafka, Kubernetes and Docker help</h2>
+
+        <h3>Kafka: a durable buffer in front of the work</h3>
+        <p>Kafka is a log, not a classic work queue: a consumer commits an <b>offset per partition</b>, not an ack per message. So a single 10-minute job blocks everything behind it in that partition, and parallelism is capped by the number of partitions. That is why many teams put Kafka <i>in front of</i> a work queue rather than using it as one.</p>
+        <p>Slack's engineering blog tells exactly this story. Their job queue was Redis. When a database problem slowed job execution, Redis filled its memory, and because dequeuing also needed free memory, the queue locked up even after the database recovered. The fix was not a rewrite: they put Kafka in front of Redis. A small Go service (Kafkagate) accepts jobs over HTTP and writes them to Kafka; another (JQRelay) moves jobs from Kafka into Redis at a controlled rate and only advances the offset after the Redis write succeeds. They report over 1.4 billion jobs on busy days and peaks of 33,000 jobs a second, on 16 brokers with 32 partitions per topic, replication factor 3 and 2-day retention.</p>
+        <p>If you do process jobs straight from Kafka, use <b>retry topics</b> (<code>jobs.retry.1m</code>, <code>jobs.retry.10m</code>) and a <b>DLQ topic</b>, so a failing message is moved aside and the partition keeps flowing. Details on <a href="{{BASE}}devops/pipeline-03">Stream Processing, Retries &amp; DLQ</a> and <a href="{{BASE}}devops/kafka-04">Consumers &amp; Consumer Groups</a>.</p>
+
+        <h3>Kubernetes: workers that scale with the queue</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="KEDA reads queue age and depth and scales the worker Deployment from 2 to 40 pods">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box queue" x="20" y="90" width="150" height="70"/>
+            <text class="label" x="95" y="115">Queue</text>
+            <text class="label small" x="95" y="138">depth 40k, age 9 min</text>
+            <rect class="box k8s" x="250" y="20" width="160" height="60"/>
+            <text class="label" x="330" y="42">KEDA scaler</text>
+            <text class="label small" x="330" y="64">reads queue metrics</text>
+            <rect class="box k8s" x="250" y="170" width="160" height="60"/>
+            <text class="label" x="330" y="192">HPA</text>
+            <text class="label small" x="330" y="214">sets replicas</text>
+            <rect class="zone k8s" x="480" y="20" width="300" height="220"/>
+            <text class="zone-label" x="496" y="44">Worker Deployment</text>
+            <rect class="box k8s solid" x="500" y="60" width="80" height="40"/><text class="label white" x="540" y="80">pod</text>
+            <rect class="box k8s solid" x="590" y="60" width="80" height="40"/><text class="label white" x="630" y="80">pod</text>
+            <rect class="box k8s solid" x="680" y="60" width="80" height="40"/><text class="label white" x="720" y="80">pod</text>
+            <rect class="box k8s ghost" x="500" y="115" width="80" height="40"/><text class="label muted" x="540" y="135">new</text>
+            <rect class="box k8s ghost" x="590" y="115" width="80" height="40"/><text class="label muted" x="630" y="135">new</text>
+            <rect class="box k8s ghost" x="680" y="115" width="80" height="40"/><text class="label muted" x="720" y="135">new</text>
+            <text class="label small" x="630" y="190">2 to 40 replicas,</text>
+            <text class="label small" x="630" y="210">scale to zero when idle</text>
+            <path class="arrow" d="M170 110 L242 55"/>
+            <path class="arrow" d="M330 80 L330 162"/>
+            <path class="arrow" d="M410 200 L472 160"/>
+            <path class="arrow" d="M480 85 L178 125"/>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M170 125 L480 85"/></circle>
+          </svg>
+          <figcaption>Workers as a Deployment scaled on queue metrics. CPU is a poor signal for queue workers; queue depth or age is the real one.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Workers as a Deployment</b> pulling from the queue, autoscaled by <b><a href="{{BASE}}interview/glossary#keda">KEDA</a></b> (it has scalers for SQS, Kafka lag, RabbitMQ, Redis and more) instead of CPU. Set <code>terminationGracePeriodSeconds</code> longer than a typical job, and on SIGTERM stop taking new jobs and finish (or release) the current one.</li>
+          <li><b>One pod per task with a Job</b> for big batch work. <code>backoffLimit</code> (default 6) caps retries, the retry delay starts at 10 s and doubles up to 6 minutes, <code>activeDeadlineSeconds</code> kills a job that runs too long, <code>ttlSecondsAfterFinished</code> cleans up, and <code>completionMode: Indexed</code> hands each pod a shard number. <b>CronJob</b> adds a schedule with <code>concurrencyPolicy: Forbid</code> to avoid overlap. See <a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>.</li>
+        </ul>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: monthly-report-backfill
+spec:
+  completions: 20            # 20 shards of the work
+  parallelism: 5             # at most 5 pods at once
+  completionMode: Indexed    # pod gets JOB_COMPLETION_INDEX 0..19
+  backoffLimit: 6
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: worker
+        image: registry.example.com/report-worker:1.4.2
+        args: ["--shard=$(JOB_COMPLETION_INDEX)", "--of=20"]
+        resources:
+          requests: { cpu: "1", memory: 2Gi }
+          limits:   { memory: 2Gi }</code></pre>
+
+        <h3>Docker: one image per worker type</h3>
+        <p>Package each worker type as its own image (the transcoder needs ffmpeg, the report worker needs a PDF library), so you can deploy, scale and roll back them separately from the API. For untrusted code (online judge, CI), the container is also the sandbox boundary: no network, read-only root filesystem, CPU and memory limits, a hard wall-clock timeout. See <a href="{{BASE}}devops/docker-09">Docker production &amp; security</a>.</p>
+      

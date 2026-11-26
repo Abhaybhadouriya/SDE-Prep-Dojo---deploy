@@ -1,0 +1,57 @@
+
+        <h2>Multi-region data: where do the writes go?</h2>
+        <p>Stateless app servers are easy to copy to a new region. Data is the hard part. Light takes tens of milliseconds to cross a continent and back, so a write that waits for a remote region is slow. The AWS DR whitepaper names three write strategies for active-active, and they are a great interview framework:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Strategy</th><th>How it works</th><th>Conflicts?</th><th>Example tech</th><th>Use for</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Read local, write global</strong></td><td>Reads served in the nearest region; all writes go to one primary region</td><td>None (one writer)</td><td>Aurora global database (secondary lag typically under 1 s, write forwarding)</td><td>Payments, bookings, inventory, anything with invariants</td></tr>
+              <tr><td><strong>Write local</strong></td><td>Every region accepts writes and replicates to the others</td><td>Yes; needs a rule such as last-writer-wins (LWW) or CRDTs</td><td>DynamoDB global tables (LWW), Cassandra multi-DC</td><td>Profiles, carts, likes, session data, presence</td></tr>
+              <tr><td><strong>Write partitioned</strong></td><td>Each user or tenant has a <em>home region</em>; their writes go there</td><td>None within a partition</td><td>Routing by user_id or tenant_id; bidirectional object replication</td><td>Chat workspaces, multi-tenant SaaS, data residency</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>How Netflix did active-active</h3>
+        <p>Netflix's 2013 post describes running its user call path in two AWS regions (us-east-1 in Virginia and us-west-2 in Oregon), with users geo-DNS routed to the closest one, roughly 50/50. Their rules are a checklist worth repeating: services are stateless; every resource is accessed in-region; no cross-region calls on the user's path; data replication is asynchronous. User data lived in Cassandra, which replicates across regions natively. To gain confidence they wrote 1 million records in one region and read them from the other region 500 ms later under production load; all were read. For the memcached layer they did not build multi-master replication; their EvCache client instead sends an invalidation message to the other region (via SQS) after a write. Their edge proxy, Zuul, could also cap traffic and shed load during a failover so cold caches did not crush the databases.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 290" role="img" aria-label="Write in one region, replicate data and send cache invalidation to the other region">
+            
+            <rect class="zone" x="20" y="20" width="330" height="250"/>
+            <text class="zone-label" x="34" y="42">us-east-1</text>
+            <rect class="box client" x="40" y="60" width="120" height="40"/><text class="label" x="100" y="80">User write</text>
+            <rect class="box svc" x="200" y="60" width="130" height="40"/><text class="label" x="265" y="80">Service</text>
+            <rect class="box cache" x="200" y="130" width="130" height="40"/><text class="label" x="265" y="150">Cache</text>
+            <rect class="box db" x="200" y="200" width="130" height="44"/><text class="label" x="265" y="222">Cassandra</text>
+            <rect class="zone" x="450" y="20" width="330" height="250"/>
+            <text class="zone-label" x="464" y="42">us-west-2</text>
+            <rect class="box svc" x="470" y="60" width="130" height="40"/><text class="label" x="535" y="80">Service</text>
+            <rect class="box cache" x="470" y="130" width="130" height="40"/><text class="label" x="535" y="150">Cache</text>
+            <rect class="box db" x="470" y="200" width="130" height="44"/><text class="label" x="535" y="222">Cassandra</text>
+            <rect class="box queue" x="640" y="130" width="120" height="40"/><text class="label" x="700" y="150">Invalidate queue</text>
+            <path class="arrow" d="M160 80 L194 80"/>
+            <path class="arrow" d="M265 100 L265 194"/>
+            <path class="arrow dashed" d="M330 222 L464 222"/>
+            <text class="label small" x="397" y="210">async replication</text>
+            <path class="arrow dashed" d="M330 120 L700 120 L700 126"/>
+            <text class="label small" x="520" y="112">"drop key X"</text>
+            <path class="arrow" d="M640 150 L606 150"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M160 80 L200 80 L265 100 L265 200 L330 222 L470 222"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" begin="0.8s" repeatCount="indefinite" path="M330 120 L700 120 L700 130 L640 150 L600 150"/></circle>
+          </svg>
+          <figcaption>Write locally, replicate the data asynchronously, and invalidate (not update) the remote cache so the next read there falls through to fresh data. Pattern described in Netflix's active-active post.</figcaption>
+        </figure>
+
+        <h3>Conflicts, consistency and residency</h3>
+        <ul>
+          <li><strong>Last-writer-wins</strong> is simple but silently drops one of two concurrent updates. Fine for "last seen" timestamps, wrong for a bank balance or a seat booking. See conflict-free replicated data types (CRDTs) and vector clocks in <a href="{{BASE}}hld/hld-09">hld-09</a>.</li>
+          <li><strong>Synchronous cross-region writes</strong> (for example a consensus group spread across 3 regions) give strong consistency at the cost of a cross-region round trip on every write. Systems like Google Spanner take this path for data that must never diverge. This is CAP/PACELC in practice: during a partition you choose consistency or availability; with no partition you still trade latency for consistency.</li>
+          <li><strong>Sticky routing</strong>: keep one user's session in one region (Netflix treated a request outside the user's geo record as "mis-routed"), so they read their own writes.</li>
+          <li><strong>Data residency</strong>: laws may say EU or Indian user data must stay in-country. That pushes you toward write partitioned with a home region per user, and away from replicating everything everywhere.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Async replication lag is just a queue between two boxes, like a transmit ring that the far end has not drained yet. Whatever sits in that ring when the link dies is your data loss. Synchronous replication is like waiting for the ACK before you tell the application "sent": safe, but every write now pays the round-trip time.</p>
+        </div>
+      

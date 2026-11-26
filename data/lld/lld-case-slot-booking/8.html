@@ -1,0 +1,594 @@
+
+  <h2>Full code</h2>
+  <p>Each version is one file plus a driver, compiled and run as shown. The Java version is primary; the Python version has the same classes and a <code>unittest</code> suite; the C++14 version takes the same locks with <code>std::lock_guard</code>. The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>).</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java">
+      <p><code>lld-code/lld-case-slot-booking/java/Main.java</code></p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.IntSupplier;
+
+// ---------- model ----------
+enum Tier {
+    PLATINUM(10), GOLD(5), SILVER(3), UNLIMITED(Integer.MAX_VALUE);
+    final int quota;
+    Tier(int quota) { this.quota = quota; }
+}
+
+enum BookingStatus { CONFIRMED, WAITLISTED, CANCELLED }
+
+enum SlotStatus { OPEN, CANCELLED }
+
+class BookingException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    BookingException(String msg) { super(msg); }
+}
+
+final class TimeRange {
+    final int start, end;                       // minutes since midnight, [start, end)
+    TimeRange(int start, int end) {
+        if (start &lt; 0 || end &gt; 24 * 60 || start &gt;= end) throw new BookingException("bad time range");
+        this.start = start; this.end = end;
+    }
+    static TimeRange of(String from, String to) { return new TimeRange(parse(from), parse(to)); }
+    static int parse(String hhmm) {
+        String[] p = hhmm.trim().split(":");
+        int h = Integer.parseInt(p[0]), m = Integer.parseInt(p[1]);
+        if (h &lt; 0 || h &gt; 24 || m &lt; 0 || m &gt; 59) throw new BookingException("bad time " + hhmm);
+        return h * 60 + m;
+    }
+    static String fmt(int min) { return String.format("%02d:%02d", min / 60, min % 60); }
+    boolean overlaps(TimeRange o) { return start &lt; o.end &amp;&amp; o.start &lt; end; }
+    int length() { return end - start; }
+    @Override public String toString() { return fmt(start) + "-" + fmt(end); }
+}
+
+final class Provider {                          // a doctor, or a gym centre / instructor
+    final String name, category;                // category = speciality or workout type
+    final double rating;
+    Provider(String name, String category, double rating) {
+        this.name = name; this.category = category; this.rating = rating;
+    }
+}
+
+final class User {
+    final String name; final Tier tier;
+    User(String name, Tier tier) { this.name = name; this.tier = tier; }
+}
+
+final class Slot {
+    final String id; final Provider provider; final TimeRange time;
+    final int capacity, waitlistLimit;
+    final LinkedHashSet&lt;String&gt; confirmed = new LinkedHashSet&lt;&gt;();   // booking ids
+    final ArrayDeque&lt;String&gt; waitlist = new ArrayDeque&lt;&gt;();          // booking ids, FIFO
+    SlotStatus status = SlotStatus.OPEN;
+    Slot(String id, Provider p, TimeRange t, int capacity, int waitlistLimit) {
+        this.id = id; this.provider = p; this.time = t;
+        this.capacity = capacity; this.waitlistLimit = waitlistLimit;
+    }
+    int free() { return capacity - confirmed.size(); }
+    String label() { return provider.name + " " + time; }
+}
+
+final class Booking {
+    final String id, user; final Slot slot;
+    BookingStatus status;                        // changed only under the service lock
+    Booking(String id, String user, Slot slot, BookingStatus status) {
+        this.id = id; this.user = user; this.slot = slot; this.status = status;
+    }
+}
+
+// ---------- rules (chain of checks), ranking (strategy), listeners (observer) ----------
+interface BookingRule {
+    /** Throws BookingException if user may not hold slot, given the user's other active bookings. */
+    void check(User u, Slot s, List&lt;Booking&gt; others);
+}
+
+class NoDuplicateRule implements BookingRule {
+    public void check(User u, Slot s, List&lt;Booking&gt; others) {
+        for (Booking b : others)
+            if (b.slot == s) throw new BookingException(u.name + " already holds or waits for " + s.label());
+    }
+}
+
+class NoOverlapRule implements BookingRule {
+    public void check(User u, Slot s, List&lt;Booking&gt; others) {
+        for (Booking b : others)
+            if (b.status == BookingStatus.CONFIRMED &amp;&amp; b.slot.time.overlaps(s.time))
+                throw new BookingException(u.name + " already has " + b.slot.label() + " at that time");
+    }
+}
+
+class TierQuotaRule implements BookingRule {
+    public void check(User u, Slot s, List&lt;Booking&gt; others) {
+        // C: for each b in others { if (b-&gt;status == CONFIRMED) used++; }
+        long used = others.stream().filter(b -&gt; b.status == BookingStatus.CONFIRMED).count();
+        if (used &gt;= u.tier.quota)
+            throw new BookingException(u.tier + " tier allows " + u.tier.quota + " bookings");
+    }
+}
+
+interface RankingStrategy { List&lt;Slot&gt; rank(List&lt;Slot&gt; slots); }
+
+class ByStartTime implements RankingStrategy {
+    public List&lt;Slot&gt; rank(List&lt;Slot&gt; slots) {
+        List&lt;Slot&gt; r = new ArrayList&lt;&gt;(slots);
+        // qsort() with a cmp that compares start time, then provider name on a tie
+        r.sort(Comparator.comparingInt((Slot s) -&gt; s.time.start).thenComparing(s -&gt; s.provider.name));
+        return r;
+    }
+}
+
+class ByRating implements RankingStrategy {
+    public List&lt;Slot&gt; rank(List&lt;Slot&gt; slots) {
+        List&lt;Slot&gt; r = new ArrayList&lt;&gt;(slots);
+        // highest rating first (note the minus), then earliest start
+        r.sort(Comparator.comparingDouble((Slot s) -&gt; -s.provider.rating).thenComparingInt(s -&gt; s.time.start));
+        return r;
+    }
+}
+
+interface BookingListener { void notify(String user, String message); }
+
+// ---------- service (facade) ----------
+final class BookingService {
+    private final int slotMinutes, cancelCutoffMinutes;
+    private final IntSupplier clock;                 // minutes since midnight; injected for tests
+    private final List&lt;BookingRule&gt; rules;
+    private final Map&lt;String, Provider&gt; providers = new HashMap&lt;&gt;();
+    private final Map&lt;String, User&gt; users = new HashMap&lt;&gt;();
+    private final Map&lt;String, Slot&gt; slots = new LinkedHashMap&lt;&gt;();
+    private final Map&lt;String, Booking&gt; bookings = new HashMap&lt;&gt;();
+    private final Map&lt;String, List&lt;Booking&gt;&gt; byUser = new HashMap&lt;&gt;();
+    private final Map&lt;String, Integer&gt; confirmedPerProvider = new HashMap&lt;&gt;();
+    private final List&lt;BookingListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final ReentrantLock lock = new ReentrantLock();
+    private int nextSlot = 1, nextBooking = 1;
+
+    BookingService(int slotMinutes, int cancelCutoffMinutes, IntSupplier clock, List&lt;BookingRule&gt; rules) {
+        this.slotMinutes = slotMinutes; this.cancelCutoffMinutes = cancelCutoffMinutes;
+        this.clock = clock; this.rules = rules;
+    }
+
+    void addListener(BookingListener l) { listeners.add(l); }
+
+    void registerProvider(String name, String category, double rating) {
+        lock.lock();
+        try {
+            if (providers.containsKey(name)) throw new BookingException(name + " already registered");
+            providers.put(name, new Provider(name, category, rating));
+        } finally { lock.unlock(); }
+    }
+
+    void registerUser(String name, Tier tier) {
+        lock.lock();
+        try {
+            if (users.containsKey(name)) throw new BookingException(name + " already registered");
+            users.put(name, new User(name, tier));
+            byUser.put(name, new ArrayList&lt;&gt;());
+        } finally { lock.unlock(); }
+    }
+
+    String addSlot(String providerName, String from, String to, int capacity, int waitlistLimit) {
+        lock.lock();
+        try {
+            Provider p = provider(providerName);
+            TimeRange t = TimeRange.of(from, to);
+            if (t.length() != slotMinutes) throw new BookingException("slots are " + slotMinutes + " mins only");
+            if (capacity &lt; 1 || waitlistLimit &lt; 0) throw new BookingException("bad capacity");
+            for (Slot s : slots.values())
+                if (s.provider == p &amp;&amp; s.status == SlotStatus.OPEN &amp;&amp; s.time.overlaps(t))
+                    throw new BookingException(p.name + " already has " + s.time);
+            String id = "S" + nextSlot++;
+            slots.put(id, new Slot(id, p, t, capacity, waitlistLimit));
+            return id;
+        } finally { lock.unlock(); }
+    }
+
+    List&lt;Slot&gt; available(String category, RankingStrategy ranking) {
+        lock.lock();
+        try {
+            List&lt;Slot&gt; r = new ArrayList&lt;&gt;();
+            int now = clock.getAsInt();
+            for (Slot s : slots.values())
+                if (s.status == SlotStatus.OPEN &amp;&amp; s.free() &gt; 0 &amp;&amp; s.time.start &gt; now
+                        &amp;&amp; s.provider.category.equals(category)) r.add(s);
+            return ranking.rank(r);
+        } finally { lock.unlock(); }
+    }
+
+    Booking book(String userName, String slotId) {
+        List&lt;String[]&gt; events = new ArrayList&lt;&gt;();
+        Booking b;
+        lock.lock();
+        try {
+            User u = user(userName);
+            Slot s = slot(slotId);
+            if (s.status != SlotStatus.OPEN) throw new BookingException(s.label() + " is cancelled");
+            if (s.time.start &lt;= clock.getAsInt()) throw new BookingException(s.label() + " has started");
+            for (BookingRule r : rules) r.check(u, s, active(userName));   // validate first
+            if (s.free() &gt; 0) {
+                b = newBooking(u, s, BookingStatus.CONFIRMED);
+                s.confirmed.add(b.id);
+                confirmedPerProvider.merge(s.provider.name, 1, Integer::sum);   // counts[name]++ (insert 1 if missing)
+            } else if (s.waitlist.size() &lt; s.waitlistLimit) {
+                b = newBooking(u, s, BookingStatus.WAITLISTED);
+                s.waitlist.addLast(b.id);
+                events.add(new String[]{u.name, "waitlisted #" + s.waitlist.size() + " for " + s.label()});
+            } else {
+                throw new BookingException(s.label() + " and its waitlist are full");
+            }
+        } finally { lock.unlock(); }
+        fire(events);                               // slow I/O outside the lock
+        return b;
+    }
+
+    void cancel(String bookingId) {
+        List&lt;String[]&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            Booking b = bookings.get(bookingId);
+            if (b == null) throw new BookingException("no booking " + bookingId);
+            if (b.status == BookingStatus.CANCELLED) throw new BookingException(bookingId + " already cancelled");
+            Slot s = b.slot;
+            if (b.status == BookingStatus.WAITLISTED) {
+                s.waitlist.remove(b.id);
+                b.status = BookingStatus.CANCELLED;
+                return;
+            }
+            if (clock.getAsInt() &gt; s.time.start - cancelCutoffMinutes)
+                throw new BookingException("too late: cancel at least " + cancelCutoffMinutes + " min before start");
+            s.confirmed.remove(b.id);
+            b.status = BookingStatus.CANCELLED;
+            confirmedPerProvider.merge(s.provider.name, -1, Integer::sum);   // counts[name]--
+            promote(s, events);
+        } finally { lock.unlock(); }
+        fire(events);
+    }
+
+    /** Admin / doctor cancels a whole slot: everyone is told, quotas come back automatically. */
+    void cancelSlot(String slotId) {
+        List&lt;String[]&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            Slot s = slot(slotId);
+            if (s.status == SlotStatus.CANCELLED) return;
+            s.status = SlotStatus.CANCELLED;
+            for (String id : s.confirmed) {
+                Booking b = bookings.get(id);
+                b.status = BookingStatus.CANCELLED;
+                confirmedPerProvider.merge(s.provider.name, -1, Integer::sum);   // counts[name]--
+                events.add(new String[]{b.user, s.label() + " was cancelled by the provider"});
+            }
+            for (String id : s.waitlist) {
+                Booking b = bookings.get(id);
+                b.status = BookingStatus.CANCELLED;
+                events.add(new String[]{b.user, s.label() + " was cancelled by the provider"});
+            }
+            s.confirmed.clear();
+            s.waitlist.clear();
+        } finally { lock.unlock(); }
+        fire(events);
+    }
+
+    List&lt;String&gt; bookingsOf(String userName) {
+        lock.lock();
+        try {
+            user(userName);
+            List&lt;String&gt; r = new ArrayList&lt;&gt;();
+            for (Booking b : active(userName)) r.add(b.id + " " + b.slot.label() + " " + b.status);
+            return r;
+        } finally { lock.unlock(); }
+    }
+
+    /** Bonus: provider with the most confirmed bookings right now (ties: name order). */
+    String trending() {
+        lock.lock();
+        try {
+            String best = null; int bestN = 0;
+            for (Map.Entry&lt;String, Integer&gt; e : new TreeMap&lt;&gt;(confirmedPerProvider).entrySet())
+                if (e.getValue() &gt; bestN) { best = e.getKey(); bestN = e.getValue(); }
+            return best == null ? "none" : best + " (" + bestN + ")";
+        } finally { lock.unlock(); }
+    }
+
+    BookingStatus statusOf(String bookingId) {
+        lock.lock();
+        try { return bookings.get(bookingId).status; } finally { lock.unlock(); }
+    }
+
+    int confirmedCount(String slotId) {
+        lock.lock();
+        try { return slot(slotId).confirmed.size(); } finally { lock.unlock(); }
+    }
+
+    int waitlistCount(String slotId) {
+        lock.lock();
+        try { return slot(slotId).waitlist.size(); } finally { lock.unlock(); }
+    }
+
+    // ----- helpers, all called with the lock held -----
+    private void promote(Slot s, List&lt;String[]&gt; events) {
+        while (s.free() &gt; 0 &amp;&amp; !s.waitlist.isEmpty()) {
+            Booking next = bookings.get(s.waitlist.pollFirst());
+            User u = users.get(next.user);
+            List&lt;Booking&gt; others = active(u.name);
+            others.remove(next);
+            try {
+                for (BookingRule r : rules) r.check(u, s, others);   // rules may have changed since joining
+            } catch (BookingException e) {
+                next.status = BookingStatus.CANCELLED;
+                events.add(new String[]{u.name, "dropped from waitlist of " + s.label() + ": " + e.getMessage()});
+                continue;
+            }
+            next.status = BookingStatus.CONFIRMED;
+            s.confirmed.add(next.id);
+            confirmedPerProvider.merge(s.provider.name, 1, Integer::sum);
+            events.add(new String[]{u.name, "promoted from waitlist: " + s.label()});
+        }
+    }
+
+    private Booking newBooking(User u, Slot s, BookingStatus st) {
+        Booking b = new Booking("B" + nextBooking++, u.name, s, st);
+        bookings.put(b.id, b);
+        byUser.get(u.name).add(b);
+        return b;
+    }
+
+    private List&lt;Booking&gt; active(String userName) {
+        List&lt;Booking&gt; r = new ArrayList&lt;&gt;();
+        for (Booking b : byUser.get(userName)) if (b.status != BookingStatus.CANCELLED) r.add(b);
+        return r;
+    }
+
+    private void fire(List&lt;String[]&gt; events) {
+        for (String[] e : events) for (BookingListener l : listeners) l.notify(e[0], e[1]);
+    }
+
+    private Provider provider(String n) {
+        Provider p = providers.get(n);
+        if (p == null) throw new BookingException("unknown provider " + n);
+        return p;
+    }
+
+    private User user(String n) {
+        User u = users.get(n);
+        if (u == null) throw new BookingException("unknown user " + n);
+        return u;
+    }
+
+    private Slot slot(String id) {
+        Slot s = slots.get(id);
+        if (s == null) throw new BookingException("unknown slot " + id);
+        return s;
+    }
+}
+
+// ---------- demo driver with checks ----------
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static String tryBook(BookingService svc, String user, String slot) {
+        try {
+            Booking b = svc.book(user, slot);
+            String r = (b.status == BookingStatus.CONFIRMED ? "Booked" : "Waitlisted") + ". Booking id: " + b.id;
+            System.out.println("book " + user + " " + slot + " -&gt; " + r);
+            return b.id;
+        } catch (BookingException e) {
+            System.out.println("book " + user + " " + slot + " -&gt; rejected: " + e.getMessage());
+            return null;
+        }
+    }
+
+    static boolean tryCancel(BookingService svc, String id) {
+        try {
+            svc.cancel(id);
+            System.out.println("cancel " + id + " -&gt; Booking cancelled");
+            return true;
+        } catch (BookingException e) {
+            System.out.println("cancel " + id + " -&gt; rejected: " + e.getMessage());
+            return false;
+        }
+    }
+
+    static void show(BookingService svc, String category, RankingStrategy r, String how) {
+        System.out.println("available " + category + " (" + how + "):");
+        for (Slot s : svc.available(category, r))
+            System.out.println("  " + s.id + " " + s.label() + "  free " + s.free());
+    }
+
+    static List&lt;BookingRule&gt; defaultRules() {
+        return Arrays.asList(new NoDuplicateRule(), new NoOverlapRule(), new TierQuotaRule());
+    }
+
+    public static void main(String[] args) throws Exception {
+        List&lt;String&gt; inbox = new CopyOnWriteArrayList&lt;&gt;();
+        // a lambda: an anonymous function implementing BookingListener (a callback plus its captured inbox)
+        BookingListener console = (u, m) -&gt; { System.out.println("  [notify " + u + "] " + m); inbox.add(u + ": " + m); };
+
+        System.out.println("== Clinic: 30-minute doctor slots ==");
+        int[] now = {8 * 60};                                   // 08:00, a manual clock
+        BookingService clinic = new BookingService(30, 0, () -&gt; now[0], defaultRules());
+        clinic.addListener(console);
+        clinic.registerProvider("Dr.Curious", "Cardiologist", 4.2);
+        clinic.registerProvider("Dr.Dreadful", "Dermatologist", 3.9);
+        clinic.registerProvider("Dr.Daring", "Dermatologist", 4.8);
+        try { clinic.addSlot("Dr.Curious", "09:30", "10:30", 1, 2); check(false, "60-min slot must fail"); }
+        catch (BookingException e) { System.out.println("markAvail Dr.Curious 09:30-10:30 -&gt; rejected: " + e.getMessage()); }
+        String c1 = clinic.addSlot("Dr.Curious", "09:30", "10:00", 1, 2);
+        String c2 = clinic.addSlot("Dr.Curious", "12:30", "13:00", 1, 2);
+        String c3 = clinic.addSlot("Dr.Curious", "16:00", "16:30", 1, 2);
+        String d1 = clinic.addSlot("Dr.Dreadful", "10:30", "11:00", 1, 2);
+        String d2 = clinic.addSlot("Dr.Dreadful", "12:30", "13:00", 1, 2);
+        String g1 = clinic.addSlot("Dr.Daring", "11:30", "12:00", 1, 2);
+        String g2 = clinic.addSlot("Dr.Daring", "14:00", "14:30", 1, 2);
+        try { clinic.addSlot("Dr.Curious", "09:45", "10:15", 1, 2); check(false, "overlap must fail"); }
+        catch (BookingException e) { System.out.println("markAvail Dr.Curious 09:45-10:15 -&gt; rejected: " + e.getMessage()); }
+        clinic.registerUser("PatientA", Tier.UNLIMITED);
+        clinic.registerUser("PatientB", Tier.UNLIMITED);
+        clinic.registerUser("PatientC", Tier.UNLIMITED);
+
+        show(clinic, "Cardiologist", new ByStartTime(), "by start time");
+        String a1 = tryBook(clinic, "PatientA", c2);
+        String b1 = tryBook(clinic, "PatientB", c2);             // full -&gt; waitlist
+        String x = tryBook(clinic, "PatientA", d2);              // same time, other doctor
+        check(x == null, "patient cannot hold two slots at the same time");
+        check(tryBook(clinic, "PatientA", c2) == null, "no duplicate booking");
+        show(clinic, "Cardiologist", new ByStartTime(), "by start time");
+        check(clinic.available("Cardiologist", new ByStartTime()).size() == 2, "booked slot hidden");
+        check(tryCancel(clinic, a1), "cancel works");
+        check(clinic.statusOf(b1) == BookingStatus.CONFIRMED, "first waitlisted patient promoted");
+        check(inbox.contains("PatientB: promoted from waitlist: Dr.Curious 12:30-13:00"), "promotion notified");
+        show(clinic, "Dermatologist", new ByRating(), "by rating");
+        List&lt;Slot&gt; derm = clinic.available("Dermatologist", new ByRating());
+        check(derm.get(0).provider.name.equals("Dr.Daring"), "rating strategy puts 4.8 first");
+        tryBook(clinic, "PatientC", g1);
+        tryBook(clinic, "PatientC", c1);
+        System.out.println("PatientC bookings: " + clinic.bookingsOf("PatientC"));
+        System.out.println("trending doctor: " + clinic.trending());
+        check(clinic.trending().startsWith("Dr.Curious"), "trending = most confirmed");
+
+        System.out.println();
+        System.out.println("== Gym: 60-minute classes, tiers, cancel &gt;= 30 min before ==");
+        now[0] = 5 * 60;                                        // 05:00
+        BookingService gym = new BookingService(60, 30, () -&gt; now[0], defaultRules());
+        gym.addListener(console);
+        gym.registerProvider("Bellandur-Yoga", "Yoga", 4.5);
+        String y6 = gym.addSlot("Bellandur-Yoga", "06:00", "07:00", 2, 1);
+        String y7 = gym.addSlot("Bellandur-Yoga", "07:00", "08:00", 2, 1);
+        String y8 = gym.addSlot("Bellandur-Yoga", "08:00", "09:00", 2, 1);
+        String y18 = gym.addSlot("Bellandur-Yoga", "18:00", "19:00", 2, 1);
+        gym.registerUser("Silvi", Tier.SILVER);
+        gym.registerUser("Goldy", Tier.GOLD);
+        gym.registerUser("Plato", Tier.PLATINUM);
+        gym.registerUser("Ravi", Tier.GOLD);
+        tryBook(gym, "Silvi", y7);
+        tryBook(gym, "Silvi", y8);
+        String s18 = tryBook(gym, "Silvi", y18);
+        check(tryBook(gym, "Silvi", y6) == null, "SILVER quota is 3");
+        String gy = tryBook(gym, "Goldy", y6);
+        String py = tryBook(gym, "Plato", y6);
+        String ry = tryBook(gym, "Ravi", y6);                    // waitlist (size 1)
+        check(gym.statusOf(ry) == BookingStatus.WAITLISTED, "full class -&gt; waitlist");
+        check(tryBook(gym, "Silvi", y6) == null, "class and waitlist full (and quota)");
+        check(tryCancel(gym, s18), "cancel 13 hours before is fine");
+        String s6 = tryBook(gym, "Silvi", y6);                   // quota restored, but waitlist full
+        check(s6 == null, "waitlist of 1 is full");
+        check(tryCancel(gym, gy), "Goldy cancels at 05:00");
+        check(gym.statusOf(ry) == BookingStatus.CONFIRMED, "Ravi promoted");
+        now[0] = 5 * 60 + 45;                                   // 05:45
+        System.out.println("clock -&gt; 05:45");
+        check(!tryCancel(gym, py), "cutoff: 15 min before start is too late");
+        gym.cancelSlot(y6);
+        check(gym.statusOf(py) == BookingStatus.CANCELLED &amp;&amp; gym.statusOf(ry) == BookingStatus.CANCELLED,
+              "slot cancel cancels everyone");
+        System.out.println("Ravi bookings after admin cancel: " + gym.bookingsOf("Ravi"));
+
+        System.out.println();
+        System.out.println("== Concurrency: 50 threads, capacity 10, waitlist 5 ==");
+        now[0] = 0;
+        BookingService rush = new BookingService(60, 30, () -&gt; now[0], defaultRules());
+        rush.registerProvider("HSR-HIIT", "HIIT", 4.0);
+        String hot = rush.addSlot("HSR-HIIT", "07:00", "08:00", 10, 5);
+        for (int i = 0; i &lt; 50; i++) rush.registerUser("u" + i, Tier.GOLD);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger rejected = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 50; i++) {
+            final String u = "u" + i;
+            fs.add(pool.submit(() -&gt; {
+                start.await();
+                try { rush.book(u, hot); } catch (BookingException e) { rejected.incrementAndGet(); }
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("confirmed=" + rush.confirmedCount(hot) + " waitlisted=" + rush.waitlistCount(hot)
+                + " rejected=" + rejected.get());
+        check(rush.confirmedCount(hot) == 10 &amp;&amp; rush.waitlistCount(hot) == 5 &amp;&amp; rejected.get() == 35,
+              "no overbooking under contention");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+      <p>Output:</p>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== Clinic: 30-minute doctor slots ==
+markAvail Dr.Curious 09:30-10:30 -&gt; rejected: slots are 30 mins only
+markAvail Dr.Curious 09:45-10:15 -&gt; rejected: Dr.Curious already has 09:30-10:00
+available Cardiologist (by start time):
+  S1 Dr.Curious 09:30-10:00  free 1
+  S2 Dr.Curious 12:30-13:00  free 1
+  S3 Dr.Curious 16:00-16:30  free 1
+book PatientA S2 -&gt; Booked. Booking id: B1
+  [notify PatientB] waitlisted #1 for Dr.Curious 12:30-13:00
+book PatientB S2 -&gt; Waitlisted. Booking id: B2
+book PatientA S5 -&gt; rejected: PatientA already has Dr.Curious 12:30-13:00 at that time
+book PatientA S2 -&gt; rejected: PatientA already holds or waits for Dr.Curious 12:30-13:00
+available Cardiologist (by start time):
+  S1 Dr.Curious 09:30-10:00  free 1
+  S3 Dr.Curious 16:00-16:30  free 1
+  [notify PatientB] promoted from waitlist: Dr.Curious 12:30-13:00
+cancel B1 -&gt; Booking cancelled
+available Dermatologist (by rating):
+  S6 Dr.Daring 11:30-12:00  free 1
+  S7 Dr.Daring 14:00-14:30  free 1
+  S4 Dr.Dreadful 10:30-11:00  free 1
+  S5 Dr.Dreadful 12:30-13:00  free 1
+book PatientC S6 -&gt; Booked. Booking id: B3
+book PatientC S1 -&gt; Booked. Booking id: B4
+PatientC bookings: [B3 Dr.Daring 11:30-12:00 CONFIRMED, B4 Dr.Curious 09:30-10:00 CONFIRMED]
+trending doctor: Dr.Curious (2)
+
+== Gym: 60-minute classes, tiers, cancel &gt;= 30 min before ==
+book Silvi S2 -&gt; Booked. Booking id: B1
+book Silvi S3 -&gt; Booked. Booking id: B2
+book Silvi S4 -&gt; Booked. Booking id: B3
+book Silvi S1 -&gt; rejected: SILVER tier allows 3 bookings
+book Goldy S1 -&gt; Booked. Booking id: B4
+book Plato S1 -&gt; Booked. Booking id: B5
+  [notify Ravi] waitlisted #1 for Bellandur-Yoga 06:00-07:00
+book Ravi S1 -&gt; Waitlisted. Booking id: B6
+book Silvi S1 -&gt; rejected: SILVER tier allows 3 bookings
+cancel B3 -&gt; Booking cancelled
+book Silvi S1 -&gt; rejected: Bellandur-Yoga 06:00-07:00 and its waitlist are full
+  [notify Ravi] promoted from waitlist: Bellandur-Yoga 06:00-07:00
+cancel B4 -&gt; Booking cancelled
+clock -&gt; 05:45
+cancel B5 -&gt; rejected: too late: cancel at least 30 min before start
+  [notify Plato] Bellandur-Yoga 06:00-07:00 was cancelled by the provider
+  [notify Ravi] Bellandur-Yoga 06:00-07:00 was cancelled by the provider
+Ravi bookings after admin cancel: []
+
+== Concurrency: 50 threads, capacity 10, waitlist 5 ==
+confirmed=10 waitlisted=5 rejected=35
+All 18 checks passed</code></pre>
+    </div>
+  </div>
+  

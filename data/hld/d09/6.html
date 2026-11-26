@@ -1,0 +1,146 @@
+
+        <h2>Deep dives</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1:</b> the waiting-room idea (deep dive 1), the Version A Lua counter (deep dive 2, first half) and async orders through Kafka (deep dive 3) are enough. Buckets, Redis failover and bot defence are SDE-2 material.</p></div>
+
+        <h3>1. The waiting room: admission control done kindly (must know)</h3>
+        <p>The best real story here is Shopify's. In February 2016 a Kylie Cosmetics flash sale overloaded a database shard, and every other store on that shard went down with it. Shopify's fix, described in a two-part engineering post, was a throttle in its <b>Nginx + OpenResty (Lua)</b> load balancers:</p>
+        <ul>
+          <li><b>Part I:</b> a <b>leaky bucket</b> at the edge lets a fixed number of checkouts through per time window. Throttled users get a cached <b>queue page</b> (not an error). Users who are let through receive a signed cookie, so they are not throttled again mid-checkout. The flaw: users polled with random timeouts, so a newcomer could get lucky before someone who had waited for minutes. It was unfair.</li>
+          <li><b>Part II:</b> each user's <b>first arrival time</b> goes into a signed cookie (so it cannot be faked). Each load balancer computes a <b>threshold</b>, like a deli's "Now Serving: 42" sign, and lets through only users who arrived before it. The threshold moves automatically based on capacity using a <b>PID controller</b> from control theory. Because each load balancer calculates it independently, there is no shared datastore to fail under load.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Waiting room: arrivals stamped with time, a now-serving threshold admits those who arrived before it">
+            <rect class="box client" x="20" y="100" width="120" height="60"/><text class="label" x="80" y="122">Arrivals</text><text class="label small" x="80" y="142">stamp t=arrival</text>
+            <rect class="zone" x="170" y="40" width="330" height="180"/>
+            <text class="zone-label" x="186" y="64">queue (signed cookies)</text>
+            <rect class="box plain" x="190" y="110" width="50" height="40"/><text class="label small" x="215" y="130">t=7</text>
+            <rect class="box plain" x="250" y="110" width="50" height="40"/><text class="label small" x="275" y="130">t=6</text>
+            <rect class="box plain" x="310" y="110" width="50" height="40"/><text class="label small" x="335" y="130">t=5</text>
+            <rect class="box highlight" x="370" y="110" width="50" height="40"/><text class="label small" x="395" y="130">t=4</text>
+            <rect class="box highlight" x="430" y="110" width="50" height="40"/><text class="label small" x="455" y="130">t=3</text>
+            <rect class="box svc" x="560" y="40" width="210" height="56"/><text class="label" x="665" y="62">Now serving: t &lt;= 4</text><text class="label small" x="665" y="82">PID adjusts to capacity</text>
+            <rect class="box db" x="560" y="150" width="210" height="60"/><text class="label" x="665" y="172">Checkout backend</text><text class="label small" x="665" y="192">gets a steady rate</text>
+            <path class="arrow" d="M140 130 L182 130"/>
+            <path class="arrow ok" d="M480 130 L552 175"/>
+            <path class="arrow dashed" d="M665 96 L665 142"/>
+            <text class="label small" x="335" y="200">older arrivals go first: fair</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M455 130 L560 178 L665 178"/></circle>
+          </svg>
+          <figcaption>A "Now Serving" threshold. Users whose signed arrival time is at or below it go through. The threshold rises as fast as the backend can absorb users.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Part I is a <b>leaky-bucket shaper</b> (the QoS shaper you configure on a WAN link). Part II adds a <b>closed control loop</b>: measure the error (current vs desired admitted rate), feed it through proportional, integral and derivative terms, and adjust the threshold. It is the same PID loop as a fan controller or a clock-recovery circuit. <b>Where it breaks:</b> the "packets" are humans who refresh the page, so the queue page must be cheap, honest about position, and stable.</p>
+        </div>
+        <p><b>Design choices for your waiting room:</b></p>
+        <ul>
+          <li><b>Pre-T0 arrivals:</b> people who arrive at 11:55 should not win just by having a faster network at 12:00:00.000. A common fair option: everyone already in the room at T0 gets a <b>random</b> position (a lottery), and later arrivals queue FIFO behind them.</li>
+          <li><b>Stateless edge:</b> keep state in signed tokens, as Shopify did, so the room scales with the CDN or load balancer fleet and has no database to fall over. Managed options exist (for example Cloudflare Waiting Room).</li>
+          <li><b>Admission rate:</b> set it from the backend's tested capacity, and adjust it live from its health (error rate, p99 latency) with a feedback loop.</li>
+          <li><b>Short-lived admission tokens</b> (a minute or two), bound to the user, so a token cannot be shared or reused by a bot farm.</li>
+        </ul>
+        <p>Ticketmaster's November 2022 Eras Tour presale shows what happens without enough of this: Ticketmaster said it saw 3.5 billion total system requests, 4x its previous peak, much of it from bots and from fans without presale codes. The lesson in its statement is to combine pre-registration (Verified Fan), a queue and bot defence. See also <a href="{{BASE}}hld/d14">ticket booking</a>.</p>
+
+        <h3>2. The stock counter: atomic, then sharded (must know; buckets are SDE-2)</h3>
+        <p><b>Why not the database row?</b> <code>UPDATE inventory SET stock = stock - 1 WHERE sku = 'X' AND stock &gt; 0</code> is correct, and it is what <a href="{{BASE}}hld/d08">normal checkout</a> does. But in a flash sale every request wants the <em>same row</em>. The database serialises them on that one row lock, every transaction waits for the one ahead, connection pools fill up, and the database (shared with the rest of the shop) slows for everyone. That is the Shopify shard story again.</p>
+        <p><b>Version A: one Redis key with a Lua script.</b> Redis runs a Lua script atomically: no other command runs in the middle. One script can check "has this user already won?", check stock, decrement and record the winner, all as one step.</p>
+<pre><code class="language-lua">-- reserve.lua   KEYS[1] = stock key   KEYS[2] = buyers set   ARGV[1] = userId   ARGV[2] = qty
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+  return -2                                    -- this user already won
+end
+local left = tonumber(redis.call('GET', KEYS[1]) or '0')
+local qty  = tonumber(ARGV[2])
+if left &lt; qty then
+  return -1                                    -- not enough stock here
+end
+redis.call('DECRBY', KEYS[1], qty)
+redis.call('SADD', KEYS[2], ARGV[1])
+return left - qty                              -- units left after this reservation</code></pre>
+        <p>Try it with <code>docker run -d -p 6379:6379 redis:7</code>. We start the bucket with 2 units:</p>
+<pre class="terminal"><code>$ redis-cli SET 'sale:{bbd26:b3}:stock' 2
+OK
+$ redis-cli --eval reserve.lua 'sale:{bbd26:b3}:stock' 'sale:{bbd26:b3}:buyers' , u101 1
+(integer) 1
+$ redis-cli --eval reserve.lua 'sale:{bbd26:b3}:stock' 'sale:{bbd26:b3}:buyers' , u101 1
+(integer) -2
+$ redis-cli --eval reserve.lua 'sale:{bbd26:b3}:stock' 'sale:{bbd26:b3}:buyers' , u202 1
+(integer) 0
+$ redis-cli --eval reserve.lua 'sale:{bbd26:b3}:stock' 'sale:{bbd26:b3}:buyers' , u303 1
+(integer) -1</code></pre>
+        <p>u101 wins (1 left), u101 tries again and is refused (-2), u202 takes the last unit (0 left), and u303 finds it empty (-1). In <code>redis-cli --eval</code>, keys come before the comma and arguments after it. The <code>{bbd26:b3}</code> part is a Redis Cluster <b>hash tag</b>: only the text inside the braces is hashed, so both keys land in the same slot and one script may touch both.</p>
+        <p><b>Version B: split the hot key into buckets.</b> One Redis key lives on one shard and is executed by one thread. A single shard handles on the order of 100,000 simple operations per second (order of magnitude; a Lua script costs more, so measure). If the waiting room admits less than that, Version A is enough, and saying so is a good senior answer. If you must go faster, split 10,000 units into, for example, 10 buckets of 1,000, each with its own hash tag (<code>{bbd26:b0}</code> ... <code>{bbd26:b9}</code>), so they spread across shards.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="One hot key on one shard versus stock split into buckets on several shards">
+            <text class="label title" x="190" y="26">One hot key</text>
+            <text class="label title" x="590" y="26">Sharded buckets</text>
+            <rect class="box client" x="40" y="60" width="90" height="40"/><text class="label small" x="85" y="80">users</text>
+            <rect class="box client" x="40" y="130" width="90" height="40"/><text class="label small" x="85" y="150">users</text>
+            <rect class="box client" x="40" y="200" width="90" height="40"/><text class="label small" x="85" y="220">users</text>
+            <rect class="box hot" x="230" y="115" width="130" height="70"/><text class="label" x="295" y="140">shard 1</text><text class="label small" x="295" y="162">stock: 10,000</text>
+            <path class="arrow bad" d="M130 80 L222 130"/><path class="arrow bad" d="M130 150 L222 150"/><path class="arrow bad" d="M130 220 L222 170"/>
+            <text class="label small bad" x="200" y="265">one thread, one queue</text>
+            <rect class="box client" x="440" y="130" width="90" height="40"/><text class="label small" x="485" y="150">users</text>
+            <rect class="box cache" x="605" y="45" width="185" height="50"/><text class="label small" x="697" y="70">shard A: b0..b3 (4,000)</text>
+            <rect class="box cache" x="605" y="125" width="185" height="50"/><text class="label small" x="697" y="150">shard B: b4..b6 (3,000)</text>
+            <rect class="box cache" x="605" y="205" width="185" height="50"/><text class="label small" x="697" y="230">shard C: b7..b9 (3,000)</text>
+            <path class="arrow ok" d="M530 145 L598 75"/><path class="arrow ok" d="M530 150 L598 150"/><path class="arrow ok" d="M530 155 L598 225"/>
+            <text class="label small" x="590" y="270">hash(userId) picks a bucket; fall back to others</text>
+            <circle class="packet bad" r="5"><animateMotion dur="1.2s" repeatCount="indefinite" path="M130 80 L230 135"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="1.2s" begin="0.3s" repeatCount="indefinite" path="M130 150 L230 150"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="1.2s" begin="0.6s" repeatCount="indefinite" path="M130 220 L230 168"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M530 145 L605 72"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="1.5s" begin="0.5s" repeatCount="indefinite" path="M530 150 L605 150"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="1.5s" begin="1s" repeatCount="indefinite" path="M530 155 L605 228"/></circle>
+          </svg>
+          <figcaption>Left: every request queues on one key on one shard. Right: stock is split into buckets placed on different shards, so the load spreads.</figcaption>
+        </figure>
+        <p>Buckets bring two new problems, and naming them is what makes this a Level 5 answer:</p>
+        <ul>
+          <li><b>The per-user limit now spans buckets.</b> Route each user to a bucket by <code>hash(userId) % N</code>, so the same user always hits the same bucket and that bucket's buyers set catches repeats. Add a global guard as a separate step, <code>SET sale:bbd26:user:&lt;userId&gt; 1 NX EX 900</code>, before decrementing, and the <code>UNIQUE (sale_id, user_id)</code> constraint in SQL as the final word. Because the claim is a separate step, <b>delete it (<code>DEL</code>) on every failure path</b>: the bucket was sold out, the Kafka write failed, or the payment hold expired; otherwise the user stays locked out of a retry or a second wave. (The user id is written without braces on purpose: in Redis Cluster, braces in a key name would make a hash tag.)</li>
+          <li><b>Uneven emptying.</b> Bucket 3 can be empty while bucket 8 still has units. When a user's bucket returns -1, try the next buckets in a fixed order before saying "sold out", and keep a small "all buckets empty" bitmap so you stop trying fast. Near the end you can also merge leftovers into one bucket.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the Linux kernel's <b>per-CPU counter</b> idea (<code>percpu_counter</code>, <code>this_cpu_*</code> operations): instead of every CPU fighting over one cache line with atomic operations, each CPU updates its own local counter and the global value is the sum. Contention disappears, and the cost is that "the exact global value" needs a fold. Here the "CPUs" are Redis shards, and the fold is "check the other buckets before sold out". <b>Where it breaks:</b> summing per-CPU counters takes nanoseconds in shared memory; summing Redis buckets costs a network round trip per bucket, which is why you keep the "all buckets empty" bitmap instead of re-reading every bucket.</p>
+        </div>
+
+        <h3>3. Asynchronous orders through Kafka, and "Redis said yes but the DB failed" (must know)</h3>
+        <p>Once Redis says "yes", the user has won. Writing the order synchronously to SQL would bring the database back into the hot path. Instead the reservation service writes a <code>reservation.created</code> event to Kafka and replies. An order-writer consumer group drains the topic into SQL at a rate the database is comfortable with.</p>
+        <ul>
+          <li><b>Order of operations:</b> Redis decrement, then a Kafka write with <code>acks=all</code>, then the reply. If the Kafka write fails, give the unit back (INCR and remove the user from the buyers set) and return an error. The user never hears "yes" for something that is not recorded.</li>
+          <li><b>Idempotent consumer:</b> the order writer inserts with <code>ON CONFLICT (reservation_id) DO NOTHING</code>, so a redelivered event cannot create a second order. A <code>UNIQUE (sale_id, user_id)</code> violation means a bug upstream: send it to a DLQ and alert.</li>
+          <li><b>DB write fails:</b> the consumer does not commit its offset and retries with backoff. The event stays in Kafka, so it is not lost while the database recovers. This is the answer to the classic follow-up.</li>
+          <li><b>Backpressure is free:</b> if the database slows down, consumer lag grows, but users already have their answer. Lag is exactly the "queue depth" you would watch on a NIC ring.</li>
+        </ul>
+        <p><b>The honest weak spot: Redis durability.</b> Redis replicates asynchronously. If the primary of a shard dies right after a decrement, the replica that takes over may not have it, and the counter "un-sells" a unit that was already promised. Kafka still has the reservation event, so you will not lose the order. But Redis may now allow one extra sale, which is an oversell. Mitigations, from cheap to strong:</p>
+        <ol class="steps">
+          <li><strong>Treat Kafka as the record.</strong> After any Redis failover, pause the sale for a moment and rebuild the counter as <code>total - (reservations in Kafka/SQL)</code> before reopening.</li>
+          <li><strong>Use <code>WAIT 1 50</code></strong> after the script, so the reply waits until at least one replica has the write (or 50 ms pass). This narrows the window but does not make Redis strongly consistent.</li>
+          <li><strong>Hold back a small buffer</strong> of units and release it only after reconciliation. The business decides whether a tiny buffer or a rare apology is cheaper.</li>
+          <li><strong>Use a strongly consistent store</strong> for the counter if the business demands it, and pay for it with lower throughput behind the waiting room.</li>
+        </ol>
+
+        <h3>4. Payment TTL: giving stock back safely (good to know)</h3>
+        <p>Many winners will not pay: the UPI app fails, they change their mind, or a bot grabbed it and cannot pay. A reservation therefore lives for, say, 10 minutes. When it expires:</p>
+<pre><code class="language-sql">-- only a HELD reservation can expire; a PAID one is untouched
+UPDATE sale_reservations SET status = 'EXPIRED'
+ WHERE reservation_id = 88121 AND status = 'HELD' AND pay_by &lt; now();</code></pre>
+        <p>If that returns <code>UPDATE 1</code>, and only then, the worker does <code>INCRBY</code> on the bucket and removes the user from the buyers set (if your rules allow a second try). <code>UPDATE 0</code> means it was paid or already expired, so nothing is returned. That conditional update is what stops a slow payment callback and an expiry from both "winning".</p>
+        <ul>
+          <li><b>Do not rely on Redis key-expiry notifications</b> to trigger this. They are fire-and-forget and can be missed. Use a sorted set of <code>(reservationId, payBy)</code> plus a worker that pops due items, with the SQL row as the truth.</li>
+          <li><b>Payment arrives after expiry:</b> the payment callback sees status EXPIRED. Either re-reserve if stock is available, or refund automatically. Never ship a unit that has been given to someone else.</li>
+          <li><b>Returned stock</b> clears the sold-out flag and admits the next users from the waiting room. That is how a "sold out" item comes back ten minutes later.</li>
+        </ul>
+
+        <h3>5. Protect everything else: blast radius, pre-scaling and bots (SDE-2)</h3>
+        <ul>
+          <li><b>Isolate the sale.</b> Run the reservation service and its Redis on their own cluster (a "cell"). If they melt, search, other products and old orders keep working. The Kylie Cosmetics incident took down every store that shared the shard.</li>
+          <li><b>Pre-scale, do not autoscale.</b> Autoscalers react in minutes, and the spike arrives in one second. Scale up hours before, warm caches, open connection pools, and pre-provision nodes. Flipkart's BBD 2015 memoir describes about four months of preparation, with infrastructure programs taking the two months before code freeze.</li>
+          <li><b>Load test and rehearse.</b> Run game days at production scale. Test the failure paths too: Redis failover, Kafka broker loss, a payment provider slowdown.</li>
+          <li><b>Shed load on purpose.</b> Turn off non-critical features (recommendations, reviews, personalisation) with feature flags during the first minutes. Keep a critical-traffic reserve, as in Amazon's load-shedding guidance.</li>
+          <li><b>Stop retry storms.</b> Clients use exponential backoff with jitter. Servers return final answers (410 sold out). Polling intervals are set by the server (<code>pollAfterMs</code>) and spread out.</li>
+          <li><b>Bots:</b> admission tokens bound to the user, limits per account, device, address and payment instrument, challenges only for suspicious sessions, pre-registration for the hottest deals, and post-sale cancellation of orders that break the rules.</li>
+        </ul>
+        <div class="callout interview"><p>Interviewers love this line: <b>"I will design so that the sold-out answer is the cheapest response in the whole system."</b> 99.8% of users get that answer, so it must come from the edge, not from your database.</p></div>
+        <div class="callout tip"><p><b>Go deeper.</b> Keeping bots and scalpers away from the sale - silent challenges, JA4, risk scores and WAF rate rules - is in <a href="{{BASE}}hld/hld-18">Edge Defense: Bot Detection</a>.</p></div>
+      

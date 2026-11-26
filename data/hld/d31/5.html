@@ -1,0 +1,92 @@
+
+        <h2>Architecture: from one counter to Snowflake</h2>
+        <p>Walk the interviewer up a ladder of options. Each step fixes the last one's problem. Click <b>Next</b> or <b>Play</b>.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 340" role="img" aria-label="Ladder from single DB counter to ticket servers to Snowflake workers">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="130" height="50"/><text class="label" x="85" y="60">Service A</text>
+            <rect class="box client" x="20" y="140" width="130" height="50"/><text class="label" x="85" y="170">Service B</text>
+            <rect class="box client" x="20" y="250" width="130" height="50"/><text class="label" x="85" y="280">Service C</text>
+
+            <g data-step-only="1">
+              <rect class="box db" x="330" y="130" width="170" height="70"/><text class="label" x="415" y="160">One DB counter</text><text class="label small" x="415" y="182">AUTO_INCREMENT</text>
+              <path class="arrow" d="M150 55 L325 150"/><path class="arrow" d="M150 165 L325 165"/><path class="arrow" d="M150 275 L325 180"/>
+              <text class="label bad" x="640" y="160">single point</text><text class="label bad" x="640" y="182">of failure</text>
+            </g>
+            <g data-step-only="2">
+              <rect class="box db" x="330" y="60" width="170" height="60"/><text class="label" x="415" y="86">Ticket server 1</text><text class="label small" x="415" y="106">odd: 1, 3, 5...</text>
+              <rect class="box db" x="330" y="210" width="170" height="60"/><text class="label" x="415" y="236">Ticket server 2</text><text class="label small" x="415" y="256">even: 2, 4, 6...</text>
+              <path class="arrow" d="M150 55 L325 85"/><path class="arrow" d="M150 165 L325 235"/><path class="arrow" d="M150 275 L325 245"/>
+              <text class="label" x="650" y="150">round-robin</text><text class="label small" x="650" y="172">network hop per ID</text><text class="label small" x="650" y="192">not time-sorted</text>
+            </g>
+            <g data-step="3">
+              <rect class="zone k8s" x="250" y="15" width="300" height="310"/>
+              <text class="zone-label" x="262" y="35">ID workers</text><text class="label small" x="400" y="125">(or in-process library)</text>
+              <rect class="box k8s" x="300" y="45" width="200" height="50"/><text class="label" x="400" y="75">worker 1</text>
+              <rect class="box k8s" x="300" y="150" width="200" height="50"/><text class="label" x="400" y="180">worker 2</text>
+              <rect class="box k8s" x="300" y="255" width="200" height="50"/><text class="label" x="400" y="285">worker 3</text>
+              <path class="arrow" d="M150 55 L295 70"/><path class="arrow" d="M150 165 L295 175"/><path class="arrow" d="M150 275 L295 280"/>
+            </g>
+            <g data-step="4">
+              <rect class="box queue" x="620" y="130" width="160" height="70"/><text class="label" x="700" y="160">ZooKeeper / etcd</text><text class="label small" x="700" y="182">worker-id leases</text>
+              <path class="arrow" d="M500 70 L615 150"/><path class="arrow" d="M500 175 L615 170"/><path class="arrow" d="M500 280 L615 185"/>
+              <text class="label small" x="700" y="230">only at startup</text><text class="label small" x="700" y="250">+ heartbeat</text>
+            </g>
+            <g data-step-only="5">
+              <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M150 55 L300 70 L150 55"/></circle>
+              <circle class="packet alt" r="6"><animateMotion dur="2s" begin="0.6s" repeatCount="indefinite" path="M150 165 L300 175 L150 165"/></circle>
+              <circle class="packet" r="6"><animateMotion dur="2s" begin="1.2s" repeatCount="indefinite" path="M150 275 L300 280 L150 275"/></circle>
+              <text class="label ok" x="400" y="125">no talk between workers</text>
+              <text class="label ok" x="400" y="230">per ID</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>One counter.</b> A single database <code>AUTO_INCREMENT</code>. Simple and sorted, but every ID is a write to one box: a throughput ceiling and a single point of failure.</li>
+            <li><b>Ticket servers (Flickr, 2006).</b> Two MySQL boxes; one hands out odd numbers, the other even (<code>auto-increment-increment = 2</code>, offsets 1 and 2). Clients round-robin. No SPOF, but still a network hop per ID, and IDs from the two servers drift apart, so they are not time-sorted.</li>
+            <li><b>Snowflake workers.</b> Each worker builds IDs locally from clock + its own worker ID + a sequence. It can be a small service or a library inside each app.</li>
+            <li><b>Coordination only at startup.</b> A worker gets its unique worker ID from ZooKeeper or etcd once (Meituan Leaf uses a persistent sequential znode), caches it on disk, and heartbeats its clock.</li>
+            <li><b>Steady state.</b> Every <code>nextId()</code> is pure local CPU work: read clock, bump sequence, shift and OR. No network call per ID, so it scales linearly with workers.</li>
+          </ol>
+        </div>
+
+        <h3>What happens inside one <code>nextId()</code></h3>
+        <p>This mirrors the logic in Twitter's open-sourced 2010 <code>IdWorker.scala</code>, rewritten in Python:</p>
+<pre><code class="language-python">import threading, time
+
+class Snowflake:
+    EPOCH = 1288834974657
+    def __init__(self, dc, worker):
+        assert 0 &lt;= dc &lt; 32 and 0 &lt;= worker &lt; 32
+        self.dc, self.worker = dc, worker
+        self.seq, self.last = 0, -1
+        self.lock = threading.Lock()
+
+    def next_id(self):
+        with self.lock:                                   # one generator, many threads
+            now = int(time.time() * 1000)
+            if now &lt; self.last:                           # clock went backwards
+                raise RuntimeError(f"clock moved back {self.last - now} ms; refusing")
+            if now == self.last:
+                self.seq = (self.seq + 1) &amp; 0xFFF         # 12-bit sequence
+                if self.seq == 0:                         # 4,096 used this ms
+                    while now &lt;= self.last:               # spin to next ms
+                        now = int(time.time() * 1000)
+            else:
+                self.seq = 0
+            self.last = now
+            return ((now - self.EPOCH) &lt;&lt; 22) | (self.dc &lt;&lt; 17) | (self.worker &lt;&lt; 12) | self.seq</code></pre>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Within one millisecond the sequence counts up; when it wraps the worker waits for the next millisecond">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M30 170 L770 170"/>
+            <text class="label small" x="760" y="200">time (ms)</text>
+            <rect class="box client" x="60" y="60" width="200" height="80"/><text class="label" x="160" y="92">ms = T</text><text class="label small" x="160" y="118">seq 0, 1, 2 ... 4095</text>
+            <rect class="box fail" x="280" y="60" width="160" height="80"/><text class="label bad" x="360" y="92">seq wraps to 0</text><text class="label small" x="360" y="118">spin until T+1</text>
+            <rect class="box client" x="460" y="60" width="200" height="80"/><text class="label" x="560" y="92">ms = T+1</text><text class="label small" x="560" y="118">seq 0, 1, 2 ...</text>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M60 160 L260 160 L440 160 L660 160"/></circle>
+          </svg>
+          <figcaption>The sequence resets every new millisecond. If one worker asks for more than 4,096 IDs in one millisecond it simply waits for the clock to tick, like a token bucket refilling every 1 ms.</figcaption>
+        </figure>
+      

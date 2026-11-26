@@ -1,0 +1,122 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope</strong> Catalog + search + reviews? Marketplace (many sellers per product) or single seller? Confirm freshness need for price/stock.</li>
+          <li><strong>5-10 min: numbers</strong> SKUs, QPS, update rate, read:write for reviews. Conclude "read-heavy search, write-heavy small updates".</li>
+          <li><strong>10-15 min: API + data model</strong> Product vs listing, JSON attributes + schema registry.</li>
+          <li><strong>15-25 min: high-level diagram</strong> Catalog DB, CDC, Kafka, indexer, search cluster, query path, review CQRS.</li>
+          <li><strong>25-40 min: deep dives</strong> Fresh price/stock in the index; ranking + facets; rating aggregation. Let the interviewer pick.</li>
+          <li><strong>40-45 min: failure + ops</strong> Lag, reindex, sale-day scaling.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "The catalog database is the source of truth, with products and seller listings separated and category attributes as validated JSON. Every change leaves through CDC into Kafka; an indexer joins the pieces into one search document and writes it to a sharded Elasticsearch or Solr cluster. Fast-changing price and stock do not go through the inverted index: they live in a separate near-real-time store, because Lucene segments are immutable and every update rewrites the document. Queries hit a result cache, then query understanding, then scatter to shards for BM25 plus boosts, then an ML re-ranker on the top few hundred, then hydration. Reviews use CQRS: writes to SQL, and a precomputed rating summary served from cache. Checkout always re-checks price and stock against the live services."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: inverted index vs SQL LIKE, CDC + Kafka instead of dual writes, shards and replicas, a result cache, precomputed rating summaries. SDE-2 adds: why immutable segments make per-field updates expensive and the separate NRT store for price and stock, two-phase ranking, facet cost on broad queries, zero-downtime reindex with aliases, and ordering per product key in Kafka.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>the catalog database.</b> The search index is a <b>derived, slightly stale copy</b> built for finding things, not the truth. If price or stock in search and on checkout disagree, checkout (the live service) wins. Also do not confuse <b>filters</b> (exact yes/no, cached as bitsets, do not affect score) with <b>queries</b> (scored by relevance).</p></div>
+        <h3>Common mistakes</h3>
+        <div class="callout warn"><p><b>Common mistakes:</b> using SQL <code>LIKE '%shoe%'</code> for search; dual writes to DB and Elasticsearch; storing price in the search doc and reindexing everything per change; computing average rating with <code>AVG()</code> on each page view; trusting the index at checkout; forgetting facets need counts across all matches.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>How do you store products when every category has different attributes?</summary>
+          <div class="answer">
+            <p>Keep common fields (id, category, brand, title) as typed columns and put category-specific attributes into a JSON attribute bag. A category schema registry, stored as data, defines each category's attributes with type, unit, whether it is required, searchable, or a facet. Writes are validated against it. Filtering and faceting happen in the search engine, which gets typed fields from the registry.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the three classic options (wide table, EAV, JSON/document), reject the first two with one reason each, then explain the registry. Mention that the registry also prevents index mapping explosions.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you add a new attribute to a live category?</li><li>What if you need to change an attribute's type?</li><li>Would you choose MongoDB instead? Why or why not?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>Prices and stock change thousands of times per second. How does search stay fresh?</summary>
+          <div class="answer">
+            <p>Split attributes by change rate. Text attributes go into the inverted index through the normal path. Price, stock and offers flow through Kafka into an in-memory near-real-time store on every search node, updated in place and read at query time for filtering, sorting and facets. This avoids Lucene's delete+add cost per change. Flipkart did this and reported ~50K updates/s and about half as many out-of-stock products shown. The final stock check happens at the product page and checkout, not in search.</p>
+            <div class="approach"><h5>How to answer</h5><p>First explain why it is hard (immutable segments, refresh, merges, replication of rewrites). Then the split, then bootstrap and ordering. End with "search is a hint, checkout is truth".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A node restarts. How does it rebuild its NRT store?</li><li>How do you handle out-of-order price events?</li><li>What lag would you alert on?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>Why not just write to the database and Elasticsearch from the same service?</summary>
+          <div class="answer">
+            <p>Dual writes are not atomic. If the DB commit succeeds and the search write fails (or the process crashes between them), the two diverge silently. Retries can also reorder writes. Use change data capture from the database's log (Debezium, Flipkart AESOP, DynamoDB Streams) or the transactional outbox pattern, so every committed change produces an event exactly in commit order.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the crash-between-writes example, then CDC or outbox, then mention idempotent consumers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>CDC vs outbox: which and when? (<a href="{{BASE}}hld/hld-10">hld-10</a>)</li><li>How do you backfill a brand-new index?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>How are facet counts computed, and why can they get slow?</summary>
+          <div class="answer">
+            <p>For each facetable field, the engine iterates over the matching documents and counts values using a columnar per-field store (doc values). Cost is proportional to matches times facets. A broad query ("shoes") can match a million documents, so ten facets means millions of lookups. Mitigations: only facet on a curated list from the schema registry, cache facets for popular queries, compute approximate counts for huge result sets, and pre-filter by detected category so the match set shrinks.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define facets, explain the per-match cost, give two mitigations.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would "in stock only" facet counts stay accurate?</li><li>Why do doc values help compared to a row store?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon,Microsoft">
+          <summary>Walk me through ranking search results at 40K QPS.</summary>
+          <div class="answer">
+            <p>Two phases. Phase 1 runs on every shard: text relevance (BM25) on title/brand/attributes plus cheap boosts (in stock, sales rank), returning the top few hundred per shard. Phase 2, at the coordinator or a ranking service, runs an ML model (for example gradient-boosted trees or a small neural model) on the merged few hundred using features like CTR, conversion, price competitiveness, rating and personalisation. Phase 1 must be cheap because it touches every match; phase 2 can be richer because it touches few.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "retrieve then re-rank" and justify with cost per document. Mention offline training on click logs and online A/B tests.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid feedback loops where top items get all clicks?</li><li>Where do fresh signals like stock come from at ranking time?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Design the ratings and reviews system. How is the average rating kept correct?</summary>
+          <div class="answer">
+            <p>CQRS. Reviews are written to a relational store (unique on user + product, verified against orders), then go through asynchronous moderation. Approved reviews emit events that update a per-product summary (count, sum, 1-5 histogram) and materialised read views (top reviews, sorted pages) in a KV store. The average is sum/count at read time. Increments are idempotent per review id, and edits emit a delta (old stars removed, new added). Ranking uses a Bayesian average so items with few reviews do not dominate.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with the read:write ratio (Flipkart: ~100 writes vs ~100,000 reads). Then CQRS, then idempotent aggregation, then Bayesian average.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A user edits 2 stars to 5. What changes?</li><li>How do you sort reviews by "most helpful" with pagination?</li><li>How do you stop fake reviews?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart">
+          <summary>Your review sort index in Redis is 500 GB and growing. What do you do?</summary>
+          <div class="answer">
+            <p>Measure what is stored first. Flipkart had exactly this: per-(product, sort order) sorted sets of string UUID review ids. They switched to a per-product integer review number (product_id + n is unique), which takes about 2 bytes with varint encoding instead of 36, removed duplicated translated text, used Avro and integer compression, and cached only the first pages. The working set fell under 100 GB and moved into an in-process LFU cache with over 95% hits at peak.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that you attack data size (encoding, ids, duplication) before buying more machines.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why LFU instead of LRU for this cache?</li><li>How do you keep in-process caches consistent across hosts?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>How many shards and replicas would you run, and how do you decide?</summary>
+          <div class="answer">
+            <p>Shards are set by data size, replicas by query throughput. With ~300 GB of index and a 10-50 GB per-shard guideline, about 10 primary shards. Then measure QPS per full copy of the index on real hardware; if one copy serves ~1,000 QPS and the engine needs ~12K QPS after caching, run about 12 copies plus headroom. More shards make each query fan out wider, so do not over-shard.</p>
+            <div class="approach"><h5>How to answer</h5><p>State the rule (size for shards, QPS for replicas), do the arithmetic, and say you will load-test.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to latency when you double the shards?</li><li>How do you reshard a live index? (new index + alias swap)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Swiggy,Flipkart">
+          <summary>How does query understanding work, and why does it matter?</summary>
+          <div class="answer">
+            <p>Before hitting the index, a query service normalises text (case, units like "8gb" to "8 GB"), corrects spelling, expands synonyms and transliterations, and classifies the query into a category and attribute filters ("red nike shoes under 2000" becomes brand=nike, color=red, price&lt;2000 in footwear). This shrinks the match set, which makes ranking and facets cheaper and results more precise. Flipkart has written about adapting search to Indian phonetic spellings.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give one example query and show how it is rewritten.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where would typeahead fit? (<a href="{{BASE}}hld/d15">d15</a>)</li><li>How do you evaluate a change to query rewriting?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>A big sale starts in 10 minutes. What breaks first, and what do you do?</summary>
+          <div class="answer">
+            <p>Likely first: the update pipeline (price and offer changes spike as sellers adjust; Flipkart saw ~30K updates/s and 4.5B updates in one sale), then the search engine if caches miss, then hot product pages. Before the sale: pre-scale search replicas and indexers, warm result caches with top queries, turn on request coalescing for hot pages, prioritise stock updates over text updates, and set degradation switches (skip ML re-rank, fewer facets). During: watch Kafka lag in seconds and p99 latency.</p>
+            <div class="approach"><h5>How to answer</h5><p>Order by likely failure, then prevention, then runtime switches. Link to <a href="{{BASE}}hld/d09">Flash Sale</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What metrics would be on your sale-day dashboard?</li><li>How do you load-test search realistically?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: customers see "in stock" in search but "sold out" on the product page</h4>
+          <div class="situation"><p>Complaints spike during a sale. The product page (which reads the inventory service live) is correct; search results are wrong for minutes.</p></div>
+          <div class="bad"><p>Weak answer: "Lower the Elasticsearch refresh interval to 100 ms."</p></div>
+          <div class="good"><p>Strong answer: measure Kafka consumer lag (in seconds) on the stock topic and indexer throughput. If lag is high, scale indexers to the partition count and give stock updates a priority lane. Long term, move stock out of the inverted index into an in-memory NRT store updated in place, and add a "last updated" check so very stale stock flags are filtered conservatively. Refresh tuning makes merges worse.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you prove the fix worked? (out-of-stock click rate)</li><li>What if one Kafka partition is hot?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the rating on a viral product is wrong after an outage</h4>
+          <div class="situation"><p>The rating consumer crashed and was restarted from an older offset; now the review count is higher than the number of reviews.</p></div>
+          <div class="bad"><p>Weak answer: "Run a SQL UPDATE to fix the number."</p></div>
+          <div class="good"><p>Strong answer: the consumer double-applied increments, so it was not idempotent. Fix now by recomputing the summary from the source of truth (COUNT and SUM over approved reviews for that product) and writing it with a version. Fix forever by making increments idempotent per review id (or recomputing summaries in small batches from the truth), and add a nightly reconciliation job that compares summaries with the database.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Exactly-once in Kafka vs idempotent consumers? (<a href="{{BASE}}devops/kafka-06">Delivery semantics</a>)</li></ul></div>
+        </div>
+      

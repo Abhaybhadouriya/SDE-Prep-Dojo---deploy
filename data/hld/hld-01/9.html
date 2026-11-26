@@ -1,0 +1,174 @@
+
+        <h2>Sharding: split the data across machines <span class="chip ok">Must know</span></h2>
+        <p>Replication copies <i>all</i> the data to every replica. That does not help when the data is too big for one machine, or when there are too many writes for one leader. <strong><a href="{{BASE}}interview/glossary#sharding">Sharding</a></strong> (also called <strong>partitioning</strong>) splits the data so each machine (a <strong>shard</strong>) holds only a part. Each shard is then usually replicated too.</p>
+        <p>The most important choice is the <strong>shard key</strong>: the field that decides which shard a row lives on.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 900 310" role="img" aria-label="Range sharding by first letter versus hash sharding by hash of user ID">
+            <rect class="zone" x="10" y="10" width="430" height="290"/>
+            <text class="zone-label" x="26" y="34">Range sharding: by name A-H, I-P, Q-Z</text>
+            <rect class="box db" x="30" y="60" width="120" height="120"/><text class="label" x="90" y="90">Shard 1</text><text class="label small" x="90" y="112">A - H</text>
+            <rect class="box db hot" x="160" y="60" width="120" height="120"/><text class="label" x="220" y="90">Shard 2</text><text class="label small" x="220" y="112">I - P</text>
+            <rect class="box db" x="290" y="60" width="120" height="120"/><text class="label" x="350" y="90">Shard 3</text><text class="label small" x="350" y="112">Q - Z</text>
+            <rect class="cell filled" x="45" y="130" width="90" height="10"/><rect class="cell filled" x="175" y="125" width="90" height="10"/><rect class="cell new" x="175" y="140" width="90" height="10"/><rect class="cell new" x="175" y="155" width="90" height="10"/><rect class="cell filled" x="305" y="135" width="90" height="10"/>
+            <text class="label small ok left" x="30" y="215">+ range scans are easy (all names I-K)</text>
+            <text class="label small bad left" x="30" y="240">- uneven: many names start with M or P</text>
+            <text class="label small bad left" x="30" y="265">- time-based keys: all new writes hit one shard</text>
+
+            <rect class="zone" x="460" y="10" width="430" height="290"/>
+            <text class="zone-label" x="476" y="34">Hash sharding: hash(user_id) mod 3</text>
+            <rect class="box db" x="480" y="60" width="120" height="120"/><text class="label" x="540" y="90">Shard 0</text><text class="label small" x="540" y="112">hash % 3 = 0</text>
+            <rect class="box db" x="610" y="60" width="120" height="120"/><text class="label" x="670" y="90">Shard 1</text><text class="label small" x="670" y="112">hash % 3 = 1</text>
+            <rect class="box db" x="740" y="60" width="120" height="120"/><text class="label" x="800" y="90">Shard 2</text><text class="label small" x="800" y="112">hash % 3 = 2</text>
+            <rect class="cell filled" x="495" y="135" width="90" height="10"/><rect class="cell filled" x="625" y="135" width="90" height="10"/><rect class="cell filled" x="755" y="135" width="90" height="10"/>
+            <text class="label small ok left" x="480" y="215">+ even spread of data and load</text>
+            <text class="label small bad left" x="480" y="240">- range queries must ask every shard</text>
+            <text class="label small bad left" x="480" y="265">- changing the shard count moves most keys</text>
+          </svg>
+          <figcaption>Range sharding keeps neighbours together but can create hot shards. Hash sharding spreads load evenly but scatters ranges. The fix for "adding a shard moves everything" is consistent hashing, next section.</figcaption>
+        </figure>
+        <h3>How to pick a shard key</h3>
+        <ol class="steps">
+          <li><strong>Follow the main query.</strong> If almost every query says "for this user", shard by <code>user_id</code>. Then one query touches one shard.</li>
+          <li><strong>High cardinality.</strong> The key needs many distinct values (millions of users, not 3 countries). AWS's DynamoDB docs make exactly this point for partition keys.</li>
+          <li><strong>Even load, not just even data.</strong> Watch for a <b>hot key</b>: a celebrity's account, one flash-sale SKU, one huge chat channel. One key cannot be split by hashing; you need special handling (split the key into sub-keys, cache it, queue its writes).</li>
+          <li><strong>Avoid cross-shard work.</strong> Joins and transactions across shards are slow and complex. Group data that is used together under the same key (all of one user's orders on that user's shard).</li>
+        </ol>
+        <div class="callout note"><p><b>Real example:</b> Discord's message store uses the partition key <code>(channel_id, bucket)</code>, where a bucket is a fixed window of time. That keeps one channel's recent messages together for fast reads, while stopping a very old, very busy channel from becoming one giant partition. (Source: Discord's "How Discord stores trillions of messages" post.)</p></div>
+        <div class="callout warn"><p><b>Careful:</b> sharding is a one-way door. It makes joins, unique constraints, transactions and schema changes harder, forever. In an interview, say <i>why</i> you need it ("writes exceed one primary" or "data is 50 TB") before you shard. YouTube built <a href="https://vitess.io/docs/overview/history/" target="_blank" rel="noopener">Vitess</a> to shard MySQL when it had no choice.</p></div>
+        <h3 id="dynamic-range">Dynamic range partitioning: let the database split hot ranges <span class="chip">Deep dive</span></h3>
+        <div class="eli5"><h4>Explain like I'm 5</h4><p>A library puts books on shelves by the first letter of the title. One day the "M" shelf is overflowing while "X" is nearly empty. Nobody planned this. So the librarian does two simple things: she cuts the "M" shelf in two ("Ma-Mm" and "Mn-Mz") and carries one half to an empty bookcase. Later, when "X" and "Y" are both tiny, she puts them back on one shelf. She never re-sorts the whole library; she only splits, merges and moves single shelves.</p></div>
+        <p>Range sharding with fixed ranges (A-H, I-P, Q-Z, chosen by a human) breaks as soon as the data does not look like your guess. <strong>Dynamic range partitioning</strong> fixes that. The database starts with one range covering every key, and from then on it manages ranges by itself:</p>
+        <ol class="steps">
+          <li><strong>Split</strong> a range in two when it grows past a size limit, or when it gets too much traffic (a <i>load-based split</i>).</li>
+          <li><strong>Move</strong> one half to a less-busy node. A <b>balancer</b> process keeps the nodes roughly even.</li>
+          <li><strong>Merge</strong> small, cold neighbouring ranges so you do not end up with millions of tiny ones.</li>
+          <li><strong>Route</strong> every request with a small <b>metadata map</b> ("keys from <code>m</code> up to <code>t</code> live on node 2") that clients cache and refresh when they are told it changed.</li>
+        </ol>
+        <p>You keep the big win of range sharding (neighbouring keys stay together, so range scans hit one or two shards) and lose most of its pain (hand-picked ranges that turn uneven). Bigtable, HBase, MongoDB, DynamoDB, Spanner, CockroachDB and TiKV all work this way under different names.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 900 340" role="img" aria-label="A range grows hot, splits at a middle key, one half moves to a new node, the router map is updated, and two cold neighbours merge">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="10" width="280" height="250"/><text class="zone-label" x="26" y="34">Node 1</text>
+            <rect class="zone" x="310" y="10" width="280" height="250"/><text class="zone-label" x="326" y="34">Node 2</text>
+            <rect class="zone" x="610" y="10" width="280" height="250"/><text class="zone-label" x="626" y="34">Router map (metadata)</text>
+            <g data-step-only="1">
+              <rect class="box db hot" x="40" y="60" width="220" height="90"/><text class="label" x="150" y="92">Range [a, z)</text><text class="label small" x="150" y="116">size 250 MB, limit 128 MB</text>
+              <text class="label small left" x="630" y="70">[a, z)  -&gt;  node 1</text>
+              <circle class="packet bad" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M150 180 L150 150"/></circle>
+            </g>
+            <g data-step-only="2">
+              <rect class="box db" x="40" y="60" width="105" height="90"/><text class="label small" x="92" y="98">[a, m)</text><text class="label small" x="92" y="122">125 MB</text>
+              <rect class="box db hot" x="155" y="60" width="105" height="90"/><text class="label small" x="207" y="98">[m, z)</text><text class="label small" x="207" y="122">125 MB</text>
+              <text class="label small left" x="630" y="70">[a, m)  -&gt;  node 1</text>
+              <text class="label small left" x="630" y="94">[m, z)  -&gt;  node 1</text>
+              <text class="label small left" x="40" y="190">split = a metadata edit, no data copied</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box db" x="40" y="60" width="105" height="90"/><text class="label small" x="92" y="98">[a, m)</text>
+              <rect class="box ghost" x="155" y="60" width="105" height="90"/><text class="label small" x="207" y="98">moving...</text>
+              <rect class="box db" x="340" y="60" width="105" height="90"/><text class="label small" x="392" y="98">[m, z)</text>
+              <path class="arrow flow" d="M262 105 L332 105"/>
+              <circle class="packet" r="6"><animateMotion dur="1.6s" repeatCount="indefinite" path="M262 120 L332 120"/></circle>
+              <text class="label small left" x="40" y="190">balancer copies the range,</text>
+              <text class="label small left" x="40" y="212">then flips ownership</text>
+              <text class="label small left" x="630" y="70">[a, m)  -&gt;  node 1</text>
+              <text class="label small left" x="630" y="94">[m, z)  -&gt;  node 1 (moving)</text>
+            </g>
+            <g data-step-only="4">
+              <rect class="box db" x="40" y="60" width="105" height="90"/><text class="label small" x="92" y="98">[a, m)</text>
+              <rect class="box db" x="340" y="60" width="105" height="90"/><text class="label small" x="392" y="98">[m, z)</text>
+              <text class="label small left" x="630" y="70">[a, m)  -&gt;  node 1</text>
+              <text class="label small left" x="630" y="94" >[m, z)  -&gt;  node 2</text>
+              <text class="label small ok left" x="630" y="130">version 2: stale clients</text>
+              <text class="label small ok left" x="630" y="152">get "moved", re-fetch map</text>
+              <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M750 190 L750 230 L392 230 L392 152"/></circle>
+              <text class="label small left" x="630" y="200">write key "q"</text>
+            </g>
+            <g data-step-only="5">
+              <rect class="box db" x="40" y="60" width="70" height="90"/><text class="label small" x="75" y="98">[a, c)</text>
+              <rect class="box db" x="115" y="60" width="70" height="90"/><text class="label small" x="150" y="98">[c, e)</text>
+              <rect class="box db" x="190" y="60" width="70" height="90"/><text class="label small" x="225" y="98">[e, m)</text>
+              <rect class="box ok" x="40" y="160" width="145" height="50"/><text class="label small" x="112" y="190">merged [a, e)</text>
+              <path class="arrow" d="M112 152 L112 158"/>
+              <rect class="box db" x="340" y="60" width="105" height="90"/><text class="label small" x="392" y="98">[m, z)</text>
+              <text class="label small left" x="630" y="70">[a, e)  -&gt;  node 1</text>
+              <text class="label small left" x="630" y="94">[e, m)  -&gt;  node 1</text>
+              <text class="label small left" x="630" y="118">[m, z)  -&gt;  node 2</text>
+            </g>
+            <text class="label small left" x="20" y="300">Every system below is this loop: watch size and load, split, move, merge, update the map.</text>
+          </svg>
+          <ol class="stepper-captions">
+            <li>One range holds every key from <code>a</code> to <code>z</code>. It has grown past the size limit and is taking most of the writes.</li>
+            <li>The database picks a middle key (<code>m</code>) and splits the range in two. On the same node this is only a metadata change.</li>
+            <li>The balancer moves <code>[m, z)</code> to the emptier node 2. In MongoDB this copies documents; in Bigtable it is nearly free because the data lives on a shared file system.</li>
+            <li>The router map gets a new version. A client with an old map sends the write to node 1, is told "moved", re-reads the map and retries on node 2.</li>
+            <li>Later, small cold neighbours are merged, so the number of ranges (and the size of the map) stays sane.</li>
+          </ol>
+        </div>
+        <h4>The same idea in four real systems</h4>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>System</th><th>Name of a range</th><th>When it splits</th><th>Who moves it</th><th>What to remember</th></tr></thead>
+            <tbody>
+              <tr><td>Google Bigtable</td><td>Tablet</td><td>Size (the 2006 paper says about 100-200 MB per tablet by default) and load spikes</td><td>The master assigns tablets to tablet servers</td><td>Tablets live as SSTables on Colossus, not on the node, so moving a tablet just changes pointers. Google's docs say it splits busy or large tablets and merges small, quiet ones automatically.</td></tr>
+              <tr><td>Apache HBase</td><td>Region</td><td>A store file passes <code>hbase.hregion.max.filesize</code> (10 GB by default); the default <code>SteppingSplitPolicy</code> splits sooner while a table has few regions</td><td>The HMaster balancer, every 5 minutes by default, evens out region counts</td><td>Data sits in HDFS, so a move is a reassignment, not a copy. Pre-split new tables or a bulk load hammers one region.</td></tr>
+              <tr><td>MongoDB (sharded)</td><td>Chunk / range</td><td>Range size defaults to 128 MB</td><td>The balancer, running on the config server primary</td><td>It balances by <b>data size</b> per shard: a migration starts when two shards differ by 3 range sizes (384 MB at the default). Migrations really copy documents between shards.</td></tr>
+              <tr><td>Amazon DynamoDB</td><td>Partition (hidden from you)</td><td>Size and throughput; AWS manages it</td><td>DynamoDB itself</td><td><b>Adaptive capacity</b> instantly gives a hot partition more of the table's throughput and can move hot items so one item sits alone on a partition, up to the 3,000 read / 1,000 write units per second partition limit.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Timestamp keys send every new write to the last range even after splits; salting or hashing the key prefix spreads writes over all ranges">
+            <rect class="zone" x="10" y="10" width="430" height="280"/>
+            <text class="zone-label" x="26" y="34">Key = timestamp</text>
+            <rect class="box db" x="30" y="60" width="90" height="110"/><text class="label small" x="75" y="100">Mon</text>
+            <rect class="box db" x="130" y="60" width="90" height="110"/><text class="label small" x="175" y="100">Tue</text>
+            <rect class="box db" x="230" y="60" width="90" height="110"/><text class="label small" x="275" y="100">Wed</text>
+            <rect class="box db hot" x="330" y="60" width="90" height="110"/><text class="label small" x="375" y="100">now</text>
+            <circle class="packet bad" r="6"><animateMotion dur="1.4s" repeatCount="indefinite" path="M375 230 L375 172"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="1.4s" begin="0.7s" repeatCount="indefinite" path="M375 230 L375 172"/></circle>
+            <text class="label small bad left" x="30" y="215">all new writes hit the last range;</text>
+            <text class="label small bad left" x="30" y="238">splitting it just makes a new "last"</text>
+            <text class="label small left" x="30" y="268">old ranges go cold and only get reads</text>
+
+            <rect class="zone" x="460" y="10" width="430" height="280"/>
+            <text class="zone-label" x="476" y="34">Key = bucket(hash % 4) + timestamp</text>
+            <rect class="box db" x="480" y="60" width="90" height="110"/><text class="label small" x="525" y="100">0|...</text>
+            <rect class="box db" x="580" y="60" width="90" height="110"/><text class="label small" x="625" y="100">1|...</text>
+            <rect class="box db" x="680" y="60" width="90" height="110"/><text class="label small" x="725" y="100">2|...</text>
+            <rect class="box db" x="780" y="60" width="90" height="110"/><text class="label small" x="825" y="100">3|...</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2.8s" repeatCount="indefinite" path="M525 230 L525 172"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.8s" begin="0.7s" repeatCount="indefinite" path="M625 230 L625 172"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.8s" begin="1.4s" repeatCount="indefinite" path="M725 230 L725 172"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.8s" begin="2.1s" repeatCount="indefinite" path="M825 230 L825 172"/></circle>
+            <text class="label small ok left" x="480" y="215">writes spread over 4 ranges</text>
+            <text class="label small bad left" x="480" y="238">a time-range read now asks 4 ranges</text>
+            <text class="label small left" x="480" y="268">and merges the results</text>
+          </svg>
+          <figcaption>Automatic splitting cannot save a monotonically increasing key: the newest range is always the hot one. Prefix the key with a small salt (or use a hashed shard key) and accept a fan-out on time-range reads.</figcaption>
+        </figure>
+        <h4>Try it: watch MongoDB balance ranges</h4>
+<pre><code class="language-javascript">// mongosh, connected to a mongos router
+sh.enableSharding("shop")
+sh.shardCollection("shop.orders", { customerId: 1 })   // ranged shard key
+
+// Is the collection balanced right now?
+sh.balancerCollectionStatus("shop.orders")
+
+// Bad idea for an insert-heavy collection: a ranged key that only grows
+// sh.shardCollection("shop.events", { createdAt: 1 })
+// Better: a hashed key spreads new inserts across shards
+sh.shardCollection("shop.events", { createdAt: "hashed" })</code></pre>
+<pre class="terminal"><code>{ balancerCompliant: false, firstComplianceViolation: 'chunksImbalance', ok: 1 }
+...a few minutes later, after the balancer has moved ranges...
+{ balancerCompliant: true, ok: 1 }</code></pre>
+<pre><code class="language-bash"># HBase shell: pre-split a new table into 5 regions so a bulk load does not
+# start life on a single region server
+create 'events', 'd', SPLITS =&gt; ['2', '4', '6', '8']</code></pre>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A range map is a routing table, and a range split is <b>prefix de-aggregation</b>. One router announces <code>10.0.0.0/16</code>; when that prefix carries too much traffic, you announce the two more-specific <code>/17</code>s and point one at a different next hop. A merge is route summarization back into the <code>/16</code>. Clients caching the map are like a FIB with a version number: a stale entry gets a "moved" redirect instead of a silent black hole.</p>
+          <p><b>Where this breaks:</b> changing a next hop is instant because packets carry no state. Moving a MongoDB range means copying gigabytes first and then flipping ownership (make-before-break), which is why balancers limit themselves to one migration per shard at a time. Bigtable and HBase cheat by keeping the bytes on a shared file system, so for them a move really is just a next-hop change.</p>
+        </div>
+        <div class="callout warn"><p><b>Gotchas:</b> (1) a single hot <i>key</i> can never be split; splitting works on ranges of keys, so a celebrity row still needs caching or key splitting. (2) A brand-new table has one range: pre-split it before a bulk load. (3) Moves cost I/O and network; MongoDB lets you set a <b>balancing window</b> so migrations run off-peak. (4) DynamoDB adaptive capacity cannot exceed the table's total provisioned throughput or the per-partition maximum.</p></div>
+      

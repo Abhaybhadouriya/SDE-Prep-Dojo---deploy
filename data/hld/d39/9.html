@@ -1,0 +1,111 @@
+
+        <h2>Interview: drive the 45 minutes</h2>
+        <p>Who asks it: it is a named case study in Grokking Advanced (YouTube likes counter), Educative (sharded counters building block) and systemdesign.one. Our interview-report research found no company report titled "design a counter", but it is the core of reported prompts such as Amazon's <b>review and rating system</b> (rating counts and averages), Walmart's <b>chess with leaderboards</b>, and every like/vote/view inside feed, Reddit and live-comment questions at Meta- and Google-style loops. Company tags below show where the sub-problem appears.</p>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> which counter (likes vs views vs money), exact vs approximate, can it decrease, read-your-writes.</li>
+          <li><strong>5-10 min:</strong> numbers - total is easy; the hot key (50K/s on one post) is the problem.</li>
+          <li><strong>10-15 min:</strong> APIs (like as idempotent set op), edge table + counter table.</li>
+          <li><strong>15-25 min:</strong> diagram - edge write, Kafka, aggregator, sharded counter, rollup, cache.</li>
+          <li><strong>25-40 min:</strong> deep dives - hot keys, idempotency end to end, HLL for unique views, read-your-writes.</li>
+          <li><strong>40-45 min:</strong> failures, reconciliation, monitoring (consumer lag, drift, cache hit rate).</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Store each like as a (post, user) row with a unique key, and keep the count in N sharded counter rows that are summed on read and cached, so a viral post spreads its writes over N rows."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"Likes flow through Kafka keyed by post_id to an aggregator that batches per time window and commits offsets with the write, so retries never double count; unique views use HyperLogLog, and the liker gets read-your-writes from their own edge row."</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Meta,Google">
+          <summary>Why not just run UPDATE posts SET likes = likes + 1?</summary>
+          <div class="answer">
+            <p>It is correct and fine at low scale. At high scale every like on one post serialises on that row's lock (or partition leader), so throughput for one key is capped by one machine no matter how many machines you add. It also mixes a hot counter into the post row, so every like rewrites the post and invalidates its cache. And a retried request adds twice, because <code>+1</code> is not idempotent.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with this naive version on purpose, then name its three problems: contention on one key, no idempotency, and cache churn. Each problem leads to one part of the real design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>At what rate does it break? (quote a measured partition limit, e.g. DynamoDB's 1,000 writes/s per partition)</li><li>Would optimistic locking help? (no - it turns waiting into retry storms)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Google,Amazon">
+          <summary>Explain a sharded counter. How do you choose the number of shards?</summary>
+          <div class="answer">
+            <p>Split one logical counter into N sub-counters; each write increments a random one; the value is the sum. N = peak writes on the key / safe writes per shard, plus headroom (50K/s over 1K/s per shard gives 50; choose 64). Keep N = 1 by default and raise it only for keys detected as hot, because read cost grows with N. Serve reads from a periodically rolled-up total rather than summing on every read.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the shards and the rollup. Say both costs: writes get N-times parallelism, reads get N-times fan-out unless you roll up.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do writers learn a key just became hot? (rate tracking in the service or a Top-K sketch; push the shard count in a small cached map)</li><li>How do you shrink shards later?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Netflix">
+          <summary>How do you make sure a like is never counted twice?</summary>
+          <div class="answer">
+            <p>Make every hop idempotent. (1) The like is an insert of the edge (post, user) with a unique key; a duplicate insert is a no-op and produces no event. (2) The event is emitted via an outbox/CDC, only when the row is new. (3) The consumer either uses Kafka exactly-once transactions or stores the last applied offset per partition with the counter. (4) Generic counters take an idempotency token (event id + time), as Netflix's <code>AddCount</code> does, and store deltas keyed by it.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the path hop by hop and name the duplicate source at each: client retry, <a href="{{BASE}}interview/glossary#dual-write">dual write</a>, consumer replay.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Redis INCR is atomic - is it idempotent? (no)</li><li>How do you detect drift anyway? (recount from edges nightly)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>A celebrity post gets 50K likes per second. Walk me through what happens.</summary>
+          <div class="answer">
+            <p>The edge writes are spread out already (the edge table key includes user_id, so they hit many rows; shard the edge table by (post_id, user_id) hash so one post does not sit on one shard). The events all carry post 42, so they land in one Kafka partition: pre-aggregate in the like service for about a second, or salt the key for posts on a hot list. The aggregator turns 50K events into one +50K per second per salt. The counter for post 42 is sharded (64 shards) and a rollup writes one cached total. The cache key never expires; the rollup overwrites it. Readers see a number at most a few seconds old, plus their own like added client-side.</p>
+            <div class="approach"><h5>How to answer</h5><p>Follow one request from tap to display and point to where the hot key would hurt at each layer: edge store, Kafka partition, counter row, cache key.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the hot post is a surprise (not on any list)? (detect by rate; split dynamically)</li><li>What about the "who liked this" list for that post?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon">
+          <summary>How would you count unique viewers of a video per day?</summary>
+          <div class="answer">
+            <p>Use a HyperLogLog per (video, day): <code>PFADD</code> each viewer id, <code>PFCOUNT</code> to read. Redis' HLL uses at most 12 KB with 0.81% standard error, versus 8 bytes per viewer for an exact set (80 MB for 10M viewers). Weekly or all-time uniques come from <code>PFMERGE</code> of daily HLLs - a union, so a viewer seen on two days is counted once. Filter bots before adding, and snapshot HLLs to durable storage.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the memory comparison with numbers; that is the whole argument for HLL.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you subtract a viewer? (no; HLL has no delete)</li><li>When would you need the exact number? (payouts to creators - then count from raw events in batch)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>The total can lag. How do you still give read-your-writes?</summary>
+          <div class="answer">
+            <p>Separate "did I like it" from "how many". <code>liked_by_me</code> is read from the edge table (from the leader, or pinned to the writing region for a short window after a write), so it is always right. The displayed count is server count plus the client's own pending delta until the server count's timestamp passes the like's time. Keep the rollup timestamp with the count so the client never shows a value older than one it already displayed (monotonic reads).</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the consistency model precisely: eventual for the total, read-your-writes and monotonic reads per user.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the user switches devices? (edge read from leader fixes the heart; the count catches up in seconds)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How would you run the counter across three regions?</summary>
+          <div class="answer">
+            <p>Count locally in each region and replicate tallies asynchronously as a CRDT: a PN-counter keeps a positive and a negative slot per region; each region only increments its own slots; merge takes the max per slot and sums. Merges are commutative and idempotent, so replication order and duplicates do not matter. During a partition each region shows its own view; after healing they converge. Edges (dedup) need a home region per user or per post so a user cannot like the same post twice in two regions.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention that a global single leader would add cross-ocean latency to every like, which the requirements do not justify.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does Cloudflare count requests across PoPs? (it does not - each PoP counts locally, relying on anycast)</li><li>What is the downside of CRDTs? (slot per replica grows; exactly-once delivery into the local slot still needed)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Design the counts for product reviews: number of ratings and average stars.</summary>
+          <div class="answer">
+            <p>Store reviews as rows (truth). Maintain per product a small aggregate: count per star value (5 counters) - the average is derived as sum(stars x count) / sum(count), so you never store a float that drifts. Updates come from review events via Kafka, idempotent by review id; an edited review emits -1 on the old star and +1 on the new. Products with flash traffic use the same batching. Recompute from reviews nightly to fix drift.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that "average" is just two counters, and that edits are a decrement plus an increment.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show a rating distribution histogram? (it is the 5 counters)</li><li>Fake reviews - filter before counting</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the World Cup goal</h4>
+          <div class="situation"><p>A goal is scored; the official post gets 80K likes/s for two minutes. Like latency jumps to 4 s, the post's count freezes, and one Kafka partition shows 2 million messages of lag.</p></div>
+          <div class="bad"><p>Weak answer: "Add more Kafka partitions and more consumers."</p></div>
+          <div class="good"><p>Strong answer: All events for this post share one key, so new partitions do not help - they still hash to one partition. Short term: turn on producer-side pre-aggregation for this post (sum for 1 s in each like-service pod and emit one delta), or salt its key into 16 sub-keys so 16 consumers share it. The counter row for the post gets its shard count raised. Like latency was high because the like request waited for the counter: move the counter update fully off the request path; the request only writes the edge. Afterwards: add hot-key detection (rate per key) that does this automatically, and alert on per-partition lag, not only total lag.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does salting break ordering? (per sub-key only; sums do not need global order)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: counts are 3% too high</h4>
+          <div class="situation"><p>A data analyst finds that like counts are about 3% higher than <code>COUNT(*)</code> on the edge table, and the gap grows after every deploy.</p></div>
+          <div class="bad"><p>Weak answer: "Run a script to fix the numbers."</p></div>
+          <div class="good"><p>Strong answer: Growth after deploys points to consumer replay: the aggregator writes to the counter store, then the pod is killed before its Kafka offset is committed, so the new pod re-applies the same events. Fix: commit offsets atomically with the counter write (Kafka transactions, or store last-applied offset per partition in the counter store and skip older events), and add graceful shutdown that drains and commits. Then repair: recount from edges for affected posts. Keep a reconciliation job and alert when drift exceeds a threshold.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is the edge table the truth and not the counter? (it is naturally deduplicated by its primary key)</li></ul></div>
+        </div>
+
+        <div class="callout danger"><p><b>Common mistakes:</b> one row per post with <code>+1</code> at viral scale; sharding every counter 100 ways and then summing on every read; calling Redis <code>INCR</code> "exactly once"; using HLL for likes (no unlike); forgetting the user must see their own like; letting a counter failure block the like request; no reconciliation path.</p></div>
+      

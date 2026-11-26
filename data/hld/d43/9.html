@@ -1,0 +1,136 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope.</strong> Events, recurrence, invites, reminders, free/busy. Park room booking. State the consistency split.</li>
+          <li><strong>5-10 min: numbers.</strong> Reads ~30x writes; highlight the reminder spike at :50 and :55.</li>
+          <li><strong>10-15 min: API and data model.</strong> Use RRULE / EXDATE / RECURRENCE-ID vocabulary. Shard by calendar_id.</li>
+          <li><strong>15-25 min: architecture.</strong> Event service + DB + outbox to Kafka; consumers for fan-out, expansion, reminders.</li>
+          <li><strong>25-40 min: deep dives.</strong> Let the interviewer pick, but be ready for recurrence edits, DST, and the reminder engine.</li>
+          <li><strong>40-45 min: failure modes and what you would build next.</strong></li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Events live in a SQL store sharded by calendar_id; a recurring event stores its RRULE plus exceptions and we materialise the next 12 months for reads; times are wall-clock plus time zone, and a scheduler puts each reminder into a minute bucket."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"An outbox feeds Kafka so fan-out, expansion and reminders are rebuildable views; reminder buckets are sharded for the :50 spike, only the next occurrence is armed, SEQUENCE is checked at fire time, and devices sync with tokens and a 410 full-resync path."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For the general method see <a href="{{BASE}}hld/hld-03">The 45-Minute Interview Framework</a>. Related designs: <a href="{{BASE}}hld/d25">Distributed Job Scheduler</a>, <a href="{{BASE}}hld/d03">Notification System</a>, <a href="{{BASE}}hld/d42">Email Service</a>, <a href="{{BASE}}hld/d40">Hotel Booking</a> (room-booking contention), and <a href="{{BASE}}hld/p07">Managing Long-running Tasks</a>.</p>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber">
+          <summary>How do you store a recurring event that repeats forever?</summary>
+          <div class="answer">
+            <p>Store the series once with its RRULE, start time and IANA time zone. Store per-occurrence changes as exception rows keyed by the occurrence's original start. For fast reads, a background job materialises the next 6-12 months of occurrences into an instance index; dates beyond that are expanded on demand. Never store infinite rows.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the three options (all rows, pure rule, hybrid), reject the first two with one reason each, then describe the hybrid and the exception table.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you edit "this and following"? (Split with UNTIL.)</li><li>What happens when the window needs to grow?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>A weekly 9 AM New York meeting shows the wrong time in Bengaluru after November. Why, and how do you prevent it?</summary>
+          <div class="answer">
+            <p>The series was stored as a fixed UTC instant (13:00 UTC). When New York leaves daylight saving, 09:00 local becomes 14:00 UTC, so the stored instant now means 08:00 in New York. The fix: store recurring events as wall-clock time plus zone ID and compute UTC per occurrence. Bengaluru then correctly sees 18:30 IST in October and 19:30 IST in December.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the arithmetic out loud. It proves you understand that UTC is right for instants but wrong for human recurrence rules.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a country changes its DST rules next month?</li><li>How do you treat all-day events?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>Design the reminder engine so 100,000+ reminders per second fire on time.</summary>
+          <div class="answer">
+            <p>A time-bucketed delay queue: rows keyed by (minute_bucket, shard). Workers lease shards, pre-load the next bucket a little early, fire at the exact second, and publish to a delivery topic. Claim with a conditional update so only one worker sends. Keep only the next occurrence per series and re-arm after firing. Delivery is at-least-once, with the key (reminder_id, instance_start) for dedupe on the client and in the notification service.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from the naive cron query, show why it fails at the :50 spike, then fix it piece by piece: shard, lease, pre-load, decouple, dedupe.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not just use SQS delay or Kafka? (SQS delays cap at 15 minutes; Kafka has no per-message delay.)</li><li>How do you recover reminders owned by a dead worker?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>The organizer moves a meeting 5 minutes before its reminder fires. What happens?</summary>
+          <div class="answer">
+            <p>The edit bumps the event's SEQUENCE and emits a change on Kafka. The reminder scheduler deletes the old reminder row and inserts one for the new time. If the old row has already been loaded by a ticker, the ticker checks the event's current sequence at fire time and drops the stale reminder. Either path gives one correct reminder.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention both the happy path (cancel and reschedule) and the race (version check at fire time). The version check is what makes it safe.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the change event is delayed in Kafka?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber">
+          <summary>How would you build "find a time for these 8 people"?</summary>
+          <div class="answer">
+            <p>Read each person's busy intervals for the window from the free/busy projection (start, end, busy flag only, respecting ACLs). Merge all intervals by sorting on start and sweeping; the gaps that are at least the meeting length, inside working hours in each person's zone, are candidates. Rank by how many people are free, prefer earlier slots. Microsoft Graph's findMeetingTimes scores free as 100%, unknown as 49% and busy as 0%, then averages.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the algorithm (interval merge), then the privacy point (no titles), then the limit (cap people per query).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do working hours across time zones change the search?</li><li>How do you include rooms?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>A company-wide all-hands has 50,000 invitees. What breaks and how do you fix it?</summary>
+          <div class="answer">
+            <p>Fan-out on write means 50,000 index rows and 50,000 notifications per edit, and RSVP updates all hit one master row. Fix: invite a group instead of individuals and merge group events on read; aggregate RSVP counts asynchronously with sharded counters instead of updating one row; rate-limit update notifications ("notify only if time or place changed").</p>
+            <div class="approach"><h5>How to answer</h5><p>Link it to the push vs pull fan-out trade-off from news feeds. That shows pattern reuse.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show "1,234 accepted" quickly? (See <a href="{{BASE}}hld/d39">Distributed Counter</a>.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber">
+          <summary>How do phone, laptop and watch stay in sync?</summary>
+          <div class="answer">
+            <p>A per-calendar change log with sequence numbers. Each device keeps a sync token (its last seen sequence) and asks for changes since then, including deletions. The server pushes a lightweight "changed" ping over WebSocket or mobile push so devices pull promptly. If the token is too old, the server returns 410 Gone and the device does a full resync.</p>
+            <div class="approach"><h5>How to answer</h5><p>Delta sync + push ping + full-resync fallback. Three parts, one sentence each.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Offline edits on two devices conflict. Who wins? (Compare SEQUENCE; last writer on the server wins per field, and the losing device refetches.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber">
+          <summary>SQL or NoSQL for events, and how do you shard?</summary>
+          <div class="answer">
+            <p>SQL, sharded by calendar_id. Edits are multi-row (event, exceptions, attendees, change log) and need transactions; the main query is a range scan on (calendar_id, start_utc). Write volume is modest. The reminder queue is the exception and fits a key-value store with a sort key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the choice to access patterns and write rate, not to fashion.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you query "all my invites" if events are sharded by organizer calendar? (Secondary index / attendee table sharded by user_id.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>How do you avoid sending the same reminder twice when a worker crashes after sending but before marking it sent?</summary>
+          <div class="answer">
+            <p>You cannot fully avoid it with at-least-once delivery, so make the duplicate harmless. Attach an idempotency key (reminder_id + instance_start). The notification service records keys it has sent in a short-TTL store and skips repeats; mobile clients also collapse notifications with the same key. The ticker marks rows with a conditional update so most duplicates never happen.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "exactly-once delivery to a phone is not possible; I make it effectively-once with dedupe".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep dedupe keys?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Uber">
+          <summary>Governments change DST rules with a few weeks' notice. What does your system do?</summary>
+          <div class="answer">
+            <p>Roll out the new tzdata to every service image. Then run a job that finds series whose zone changed, re-expands their materialised instances after the effective date, and recomputes pending reminders. Because recurring events store wall-clock time plus zone, no user data changes; only derived rows are rebuilt. One-off events stored as UTC instants need a decision: keep the instant or keep the wall time. Calendars usually keep the wall time the user chose.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that "derived views are rebuildable" pays off here.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid a thundering herd of re-expansion jobs?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: Monday 09:50, reminders are arriving 4 minutes late</h4>
+          <div class="situation"><p>Dashboards show the reminder topic lag rising every hour at :50 and :55, and users complain that reminders arrive after the meeting starts.</p></div>
+          <div class="bad"><p>Weak answer: "Add more servers to the notification service."</p></div>
+          <div class="good"><p>Strong answer: first find where the lag is. If the ticker's read of the hot bucket is slow, increase reminder shards and pre-load the next bucket earlier. If the delivery topic lags, scale consumers ahead of the spike (scheduled scaling before :45) and add partitions. Then add a staleness rule: skip reminders that are already past the event start, and alert on "fired later than 10 s" as an <a href="{{BASE}}interview/glossary#sla-slo">SLO</a>.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you load-test the :50 spike?</li><li>What SLO (service level objective: the target we alert on) would you set?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: "Just use a cron job"</h4>
+          <div class="situation"><p>The interviewer pushes back: "Why so complex? Run a cron every minute that selects due reminders."</p></div>
+          <div class="bad"><p>Weak answer: agree, or insist the complex design is always needed.</p></div>
+          <div class="good"><p>Strong answer: "For one region and under ~1,000 reminders a minute, yes, a cron plus an indexed table is the right first version. It breaks on three things: a single scanner is a single point of failure, the :50 spike needs parallel scanning, and a long scan delays the next tick. Sharded buckets with leases fix exactly those three, so I would evolve to that."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the smallest change that removes the single point of failure?</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Storing every occurrence of a recurring event, or storing recurring times in UTC only.</li>
+          <li>Treating reminders as a uniform load and missing the top-of-hour spike.</li>
+          <li>Doing slow delivery (email, push) inside the timer loop.</li>
+          <li>Copying full event data to every attendee, then fighting to keep copies consistent.</li>
+          <li>Forgetting privacy in free/busy (returning titles).</li>
+        </ul>
+      

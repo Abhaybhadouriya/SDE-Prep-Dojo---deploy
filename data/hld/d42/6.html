@@ -1,0 +1,69 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Never lose an email (and never deliver it twice)</h3>
+        <p>An SMTP "250 OK" is a promise. The sender deletes its copy after it. So the rule is: <b>ack only after the message is on more than one machine</b>. Kafka with <code>acks=all</code> and <code>min.insync.replicas=2</code> gives you that (see <a href="{{BASE}}devops/kafka-05">Kafka replication</a>). Exchange Online calls its version Shadow Redundancy. It adds a second safety layer called Safety Net: after delivery, a copy stays in a transport queue for a while. If a mailbox database fails over to a copy that is slightly behind, the missing messages are automatically resubmitted from Safety Net.</p>
+        <p>Retries everywhere mean duplicates are normal. The remote MTA may resend because our 250 got lost on the wire; a consumer may crash after writing but before committing its offset. So delivery must be <b>idempotent</b>: the mailbox writer uses <code>(user_id, Message-ID header, hash)</code> as a dedupe key. A second copy finds the key and does nothing. This is "<a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> transport + idempotent sink = effectively once", the same idea as in <a href="{{BASE}}devops/kafka-06">delivery semantics</a>.</p>
+        <div class="callout warn"><p><b>Trap:</b> saying "Kafka exactly-once" solves it. Kafka EOS covers Kafka-to-Kafka. Writing into a mailbox database is an external side effect, so you still need the dedupe key.</p></div>
+
+        <h3>2. Mailbox storage: one primary per mailbox, hot and cold</h3>
+        <p>Two facts shape storage. First, a mailbox is read only by its owner, so it is a natural <a href="{{BASE}}interview/glossary#sharding">shard</a>. Second, reads are very skewed to new mail: the ByteByteGo chapter quotes that about <b>82% of reads hit data less than 16 days old</b>. Facebook described the same split for Messages: a small, volatile set of recent data and a huge, rarely touched archive.</p>
+        <ul>
+          <li><b>Shard by user.</b> A directory service maps <code>user_id -&gt; mailbox shard</code>. Moving a heavy user is a background copy, then a flip of the directory entry (Exchange has a whole service, MRS, for online mailbox moves).</li>
+          <li><b>Replicate in software, per shard.</b> Fastmail keeps each "store" as 3 slots (one master, two replicas) spread across different machines, with a log-based sync process and failover in under ~10 seconds. Exchange Online keeps at least 3 copies of each mailbox database across datacenters, one of them a "lag" copy that can rewind up to 7 days in case of logical corruption.</li>
+          <li><b>Hot and cold tiers.</b> Recent metadata on SSD with a cache of the first inbox page; old bodies and attachments compressed on cheap disks or cold object storage. The user never sees the tier, only a slightly slower open of a 5-year-old mail.</li>
+          <li><b>Check everything.</b> Fastmail checksums every record and message file and runs weekly audits between master and replicas. Exchange scans every database page every 7 days and can patch a single corrupt page from a healthy replica. At exabyte scale, disks silently lie.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The lag copy is like keeping an older kernel in the bootloader. A bad change (here: a bug that deletes mail) replicates instantly to every live copy, so replicas do not protect you. Only a copy that is deliberately behind does.</p>
+        </div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> "Ack SMTP only after the message is replicated, then deliver idempotently with a dedupe key" and "partition everything by user_id with one primary per mailbox, hot and cold tiers" are the interview-sufficient core. Deep dives 3-6 (attachment dedupe, per-mailbox search, threading, spam and deliverability) are what an SDE-2 answer adds.</p></div>
+
+        <h3>3. Attachments and fan-out</h3>
+        <p>A company-wide email with a 10 MB PDF to 50,000 employees is 500 GB if stored naively. Instead, store the blob once under its content hash (SHA-256), and give each recipient only a metadata row pointing to it, with a reference count for deletion. The body can be shared the same way for big mailing lists. Clients upload attachments directly to the object store with pre-signed URLs, and big files become links (Gmail turns anything over 25 MB into a Drive link). Virus scanning runs on the blob once, not per recipient. See <a href="{{BASE}}hld/d36">object storage</a> and <a href="{{BASE}}hld/p06">large blobs</a>.</p>
+
+        <h3>4. Search inside one mailbox</h3>
+        <p>Search is always "my mail only", so the index is <b>partitioned by user</b>. Two choices:</p>
+        <ul>
+          <li><b>Elasticsearch / OpenSearch</b> with routing by <code>user_id</code>, so one query hits one shard. Indexing is fed by Kafka "message stored" events, so it is seconds behind. The hard part is keeping it in sync with the source of truth (deletes, label changes) and rebuilding it after a bug.</li>
+          <li><b>Custom per-user index</b> stored next to the mailbox (an LSM-tree style index, sequential writes). ByteByteGo notes this is what providers at Gmail/Outlook scale lean towards, because a billion tiny indexes do not fit a general search cluster well and disk I/O is the bottleneck.</li>
+        </ul>
+        <p>Rule of thumb from the chapter: Elasticsearch for a smaller system, a custom embedded index for a giant one with a dedicated team. The general ideas are on <a href="{{BASE}}hld/hld-15">text indexes</a> and <a href="{{BASE}}hld/d38">post search</a>.</p>
+
+        <h3>5. Threading (conversations)</h3>
+        <p>Email has no "conversation id" on the wire. Clients rebuild threads from three headers: every message carries a unique <code>Message-ID</code>; a reply carries <code>In-Reply-To</code> (the parent's id) and <code>References</code> (the whole chain of ancestor ids). The REFERENCES algorithm in RFC 5256 (based on Jamie Zawinski's "JWZ" algorithm) links messages into a tree using References first, falls back to In-Reply-To, and as a last resort groups by the base subject (with "Re:" and "Fwd:" stripped).</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Thread tree: message A, replies B and C reference A, D references A and B">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="320" y="10" width="160" height="56"/>
+            <text class="label" x="400" y="34">A: "Q3 plan"</text>
+            <text class="label small" x="400" y="54">Message-ID: &lt;a1&gt;</text>
+            <rect class="box client" x="120" y="96" width="200" height="56"/>
+            <text class="label" x="220" y="120">B: "Re: Q3 plan"</text>
+            <text class="label small" x="220" y="140">In-Reply-To: &lt;a1&gt;</text>
+            <rect class="box client" x="480" y="96" width="200" height="56"/>
+            <text class="label" x="580" y="120">C: "Re: Q3 plan"</text>
+            <text class="label small" x="580" y="140">In-Reply-To: &lt;a1&gt;</text>
+            <rect class="box client" x="120" y="178" width="200" height="56"/>
+            <text class="label" x="220" y="202">D: "Re: Re: Q3 plan"</text>
+            <text class="label small" x="220" y="222">References: &lt;a1&gt; &lt;b1&gt;</text>
+            <path class="arrow" d="M360 66 L260 92"/>
+            <path class="arrow" d="M440 66 L540 92"/>
+            <path class="arrow" d="M220 152 L220 172"/>
+            <text class="label small" x="580" y="200">Missing parent? Keep an empty</text>
+            <text class="label small" x="580" y="218">placeholder node, link later.</text>
+          </svg>
+          <figcaption>Threads come from headers. The server computes a <code>thread_id</code> at delivery time and stores it with the metadata, so listing a conversation is one partition read.</figcaption>
+        </figure>
+        <p>Do threading on the server, at write time, per user: look up the referenced Message-IDs in a small per-user index <code>(user_id, rfc_msg_id) -&gt; thread_id</code>. If a reply arrives before its parent (it happens), create a placeholder and merge later.</p>
+
+        <h3>6. Spam, phishing and deliverability</h3>
+        <p><b>Inbound</b>, filtering is layered, cheapest first: IP reputation and rate limits at connect time; SPF (is this IP allowed to send for that domain?), DKIM (is the cryptographic signature on the headers valid?) and DMARC (does the From: domain align with SPF or DKIM, and what does the domain owner want done on failure?); then content ML. Google's 2019 post says its models already blocked more than 99.9% of spam, phishing and malware, and a new TensorFlow layer caught about 100 million extra spam messages a day: image-based spam, hidden content, and new domains hiding a little spam in normal traffic. Filtering is also personalised: one person's newsletter is another person's spam, so "report spam" clicks are labels for training.</p>
+        <p><b>Outbound</b>, our own reputation is the asset. Since February 2024 Gmail requires every sender to use SPF or DKIM, TLS and valid reverse DNS, and keep the spam-complaint rate under 0.3%. Bulk senders (more than 5,000 messages a day to Gmail) must have SPF and DKIM and DMARC, and offer one-click unsubscribe. So our design needs: DKIM signing on every outbound mail, separate IP pools for transactional vs bulk mail, slow warm-up of new IPs, processing of bounces and complaint feedback loops in their own queues, and fast suspension of accounts that start spamming.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>SPF is like a source-address ACL (uRPF: is this source allowed from here?). DKIM is like an authentication header on the packet (IPsec AH): a signature that proves the content was not changed and came from the key owner. DMARC is the policy that says what to do when either check fails.</p>
+        </div>
+      

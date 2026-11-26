@@ -1,0 +1,73 @@
+
+        <h2>Lab: watch the producer work</h2>
+        <p>Use the single-broker container from the <a href="{{BASE}}devops/kafka-index#lab">track overview</a> (Docker basics are on <a href="{{BASE}}devops/docker-04">Running &amp; Managing Containers</a>). Open a shell inside the container for the Kafka tools:</p>
+<pre><code class="language-bash">docker run -d --name broker -p 9092:9092 apache/kafka:4.4.0   # skip if already running
+docker exec -it --workdir /opt/kafka/bin broker sh</code></pre>
+
+        <h3>1. Keyed records and delivery reports (Python, on your laptop)</h3>
+<pre><code class="language-bash">./kafka-topics.sh --bootstrap-server localhost:9092 --create --topic producer-lab --partitions 3
+exit
+pip install confluent-kafka</code></pre>
+        <p>Save this as <code>keyed_producer.py</code> on your laptop and run it:</p>
+<pre><code class="language-python">from confluent_kafka import Producer
+
+p = Producer({
+    "bootstrap.servers": "localhost:9092",
+    "enable.idempotence": True,
+    "acks": "all",
+    "linger.ms": 5,
+    "compression.type": "lz4",
+    "partitioner": "murmur2_random",
+})
+
+def on_delivery(err, msg):
+    if err is not None:
+        print("FAILED:", err)
+    else:
+        print(f"ok key={msg.key().decode()} partition={msg.partition()} offset={msg.offset()}")
+
+events = [("o-1", "placed"), ("o-2", "placed"), ("o-3", "placed"), ("o-1", "paid")]
+for key, status in events:
+    p.produce("producer-lab", key=key, value=status, on_delivery=on_delivery)
+    p.poll(0)                     # run any callbacks that are ready; never blocks
+
+left = p.flush(10)                # wait up to 10 s
+print("still undelivered:", left)</code></pre>
+<pre class="terminal"><code>$ python keyed_producer.py
+ok key=o-1 partition=0 offset=0
+ok key=o-2 partition=0 offset=1
+ok key=o-1 partition=0 offset=2
+ok key=o-3 partition=1 offset=0
+still undelivered: 0</code></pre>
+        <p>Three things to notice. Both <code>o-1</code> events are in partition 0, in the order sent (offset 0, then 2). The callbacks arrive grouped by batch, so the line for <code>o-3</code> can print before or after the partition 0 lines on your machine - order across partitions is not promised. And <code>flush()</code> returned 0, meaning nothing was left in the buffer. Now delete the <code>p.flush(10)</code> line and run it again: most likely nothing prints at all, because the program exits while the records are still in memory.</p>
+
+        <h3>2. Break it: acks=all versus too few replicas</h3>
+        <p>A single broker can only hold one replica. Create a topic that <i>demands</i> two in-sync replicas, then write to it with <code>acks=all</code>. Short timeouts make the failure show up in 15 seconds instead of 2 minutes.</p>
+<pre><code class="language-bash">docker exec -it --workdir /opt/kafka/bin broker sh
+./kafka-topics.sh --bootstrap-server localhost:9092 --create --topic strict \
+  --partitions 1 --config min.insync.replicas=2
+./kafka-console-producer.sh --bootstrap-server localhost:9092 --topic strict \
+  --command-property acks=all \
+  --command-property delivery.timeout.ms=15000 \
+  --command-property request.timeout.ms=5000</code></pre>
+<pre class="terminal"><code>&gt;hello
+[...] WARN [Producer clientId=console-producer] Got error produce response with correlation id 6 on topic-partition strict-0, retrying (2147483646 attempts left). Error: NOT_ENOUGH_REPLICAS (org.apache.kafka.clients.producer.internals.Sender)
+[...] WARN [Producer clientId=console-producer] Got error produce response with correlation id 8 on topic-partition strict-0, retrying (2147483645 attempts left). Error: NOT_ENOUGH_REPLICAS (org.apache.kafka.clients.producer.internals.Sender)
+... (repeats with backoff)
+[...] ERROR Error when sending message to topic strict with key: null, value: 5 bytes with error: (org.apache.kafka.clients.producer.internals.ErrorLoggingCallback)
+org.apache.kafka.common.errors.TimeoutException: Expiring 1 record(s) for strict-0:15006 ms has passed since batch creation</code></pre>
+        <p>Read it like an on-call engineer. The <b>final</b> error says only "timeout". The <b>real</b> reason is in the retry warnings above it: <code>NOT_ENOUGH_REPLICAS</code>, a retriable error, retried with backoff until the 15 s delivery deadline ran out. Many production "Kafka timeout" tickets are exactly this. Now press Ctrl+C and start the producer again with <code>--command-property acks=1</code>: the same write succeeds immediately, because <code>min.insync.replicas</code> only guards <code>acks=all</code> writes. Safe settings refuse unsafe conditions; weak settings do not even notice. (Exact log wording can vary a little between versions.)</p>
+
+        <h3>3. Measure batching with the perf tool</h3>
+<pre><code class="language-bash">./kafka-topics.sh --bootstrap-server localhost:9092 --create --topic perf --partitions 3
+# A: no waiting, small batches, no compression
+./kafka-producer-perf-test.sh --topic perf --num-records 300000 --record-size 500 --throughput -1 \
+  --bootstrap-server localhost:9092 --command-property linger.ms=0 batch.size=16384 compression.type=none
+# B: wait a little, bigger batches, lz4
+./kafka-producer-perf-test.sh --topic perf --num-records 300000 --record-size 500 --throughput -1 \
+  --bootstrap-server localhost:9092 --command-property linger.ms=20 batch.size=131072 compression.type=lz4</code></pre>
+        <p>The tool prints a progress line every few seconds and one summary line at the end, in this shape (<b>p50/p95/p99</b> are percentiles: p99 = 99 of every 100 records were acknowledged faster than this, so it shows the slow tail an average hides):</p>
+<pre class="terminal"><code>300000 records sent, &lt;R&gt; records/sec (&lt;M&gt; MB/sec), &lt;avg&gt; ms avg latency, &lt;max&gt; ms max latency, &lt;p50&gt; ms 50th, &lt;p95&gt; ms 95th, &lt;p99&gt; ms 99th, &lt;p99.9&gt; ms 99.9th.</code></pre>
+        <p>Compare the records/sec and the latency percentiles of run A and run B on your own machine; a laptop with one broker will give very different numbers from a real cluster, so do not quote them as "Kafka's speed". The perf tool's payload is random text, so compression gains here are smaller than with real JSON. Try a third run with <code>acks=1</code> to see what the replication wait costs (on one broker, almost nothing - another reason laptop numbers mislead). The flags are the Kafka 4.2+ names (KIP-1147): <code>--bootstrap-server</code> plus <code>--command-property</code> replace the old <code>--producer-props bootstrap.servers=...</code>, and <code>--command-property</code> replaces <code>--producer-property</code>. On a pre-4.2 image use the old names.</p>
+        <div class="callout tip"><p>Done? <code>exit</code>, then <code>docker rm -f broker</code>. The full ShopStream project uses these exact producer settings in its order API; see the <a href="{{BASE}}devops/pipeline-index">pipeline overview</a> and <a href="{{BASE}}devops/pipeline-02">Build It Locally</a>.</p></div>
+      

@@ -1,0 +1,881 @@
+
+  <h2>Full code</h2>
+  <h3 id="build-steps">Build it in 4 steps</h3>
+  <p>Before the full listing, here is the order to write it in. Each step is a real excerpt from the files below (cut at about 15 lines), so you can see where each idea from the patterns table actually lives.</p>
+  <div class="stepper" data-stepper>
+   <div class="step-frames">
+    <div data-step-only="1">
+<pre><code class="language-java">enum JobState {
+    WAITING,    // blocked on dependencies
+    SCHEDULED,  // in the time queue, waiting for its run time
+    RUNNING,
+    SUCCEEDED,
+    FAILED,     // all attempts used up
+    CANCELLED,  // cancelled by a caller
+    SKIPPED;    // an upstream dependency failed, was cancelled or skipped
+
+    boolean isTerminal() {
+        return this == SUCCEEDED || this == FAILED || this == CANCELLED || this == SKIPPED;
+    }
+}</code></pre>
+<pre><code class="language-java">interface Task {
+    void run() throws Exception;
+}</code></pre>
+    </div>
+    <div data-step-only="2">
+<pre><code class="language-java">interface Schedule {
+    long next(long plannedStart, long finishedAt);
+
+    default boolean isRecurring() { return true; }   // C: default method = an ops-table slot with a generic body
+
+    static Schedule once() {
+        return new Schedule() {
+            public long next(long plannedStart, long finishedAt) { return -1; }
+            public boolean isRecurring() { return false; }
+        };
+    }
+
+    /** Next start = previous planned start + period; if a run overran, start at once. */
+    static Schedule fixedRate(long periodMs) {
+        if (periodMs &lt;= 0) throw new IllegalArgumentException("period must be &gt; 0");
+        return (plannedStart, finishedAt) -&gt; Math.max(plannedStart + periodMs, finishedAt);
+    }
+
+    /** Next start = previous finish + delay (the Uber statement's definition). */
+    static Schedule fixedDelay(long delayMs) {
+        if (delayMs &lt;= 0) throw new IllegalArgumentException("delay must be &gt; 0");
+        return (plannedStart, finishedAt) -&gt; finishedAt + delayMs;
+    }
+}</code></pre>
+    </div>
+    <div data-step-only="3">
+<pre><code class="language-java">    void submit(JobSpec spec) {
+        List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            checkOpen();
+            validate(spec, Set.of());
+            admit(spec, events);
+        } finally {   // C: finally runs on every exit path: the goto out_unlock label
+            lock.unlock();
+        }
+        fire(events);
+    }</code></pre>
+<pre><code class="language-java">    private Job nextReadyJob() throws InterruptedException {
+        while (running) {
+            long now = clock.millis();
+            while (!timeQueue.isEmpty() &amp;&amp; timeQueue.peek().runAt &lt;= now) {
+                Job j = timeQueue.poll();
+                if (j.state == JobState.SCHEDULED) readyQueue.add(j);   // drop cancelled ones
+            }
+            Job j = readyQueue.poll();
+            if (j != null) {
+                if (j.state == JobState.SCHEDULED) return j;
+                continue;                                             // cancelled after it became ready
+            }
+            if (timeQueue.isEmpty()) changed.await();
+            else changed.await(timeQueue.peek().runAt - now, TimeUnit.MILLISECONDS);
+        }
+        return null;
+    }</code></pre>
+    </div>
+    <div data-step-only="4">
+<pre><code class="language-java">    public static void main(String[] args) throws Exception {
+        delayedJobs();
+        priorities();
+        periodic();
+        retries();
+        dag();
+        validation();
+        stress();
+        System.out.println("== all " + checks + " checks passed ==");
+    }</code></pre>
+    </div>
+   </div>
+    <ol class="stepper-captions">
+      <li><b>Enums and data classes.</b> <code>JobState</code> with its terminal states, and <code>Task</code>, the unit of work (a Command).</li>
+      <li><b>One interface, its implementations.</b> <code>Schedule</code> answers "when is the next run?"; once, fixed delay and fixed rate implement it.</li>
+      <li><b>The core.</b> <code>submit</code> admits a job under the lock and signals the dispatcher; <code>nextReadyJob</code> waits with a deadline until the head of the time queue is due.</li>
+      <li><b>The driver.</b> <code>main</code> runs priorities, delays, retries, a DAG, cancellation and the stress test.</li>
+    </ol>
+  </div>
+  <h3 id="reading-order">How to read the full code</h3>
+  <p><b>Reading order:</b> Read <code>Model.java</code> (Task, Schedule, JobState, JobSpec), then <code>TaskScheduler.submit</code>, <code>dispatchLoop</code>, <code>nextReadyJob</code> and <code>execute</code>. Skip <code>WorkerPool</code>'s shutdown and <code>topologicalOrder</code> on a first read.</p>
+  <details class="callout note">
+    <summary><b>Java for C readers</b>: the idioms this page's code uses (open if a line looks strange)</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>x -&gt; x.price</code> (lambda)</td><td>An anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you would hand to <code>qsort</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A pointer to a function that already exists, written without a wrapper: <code>Post::score</code> is <code>&amp;post_score</code>.</td></tr>
+        <tr><td><code>.stream().filter(..).map(..).collect(..)</code></td><td>A for-loop written as a pipeline: <code>filter</code> is <code>if (!pred(x)) continue;</code>, <code>map</code> transforms each element, <code>collect</code>/<code>toList</code> appends the survivors to a new array.</td></tr>
+        <tr><td><code>record P(int x, int y) {}</code></td><td>An immutable struct: the compiler writes the constructor, the getters <code>x()</code>/<code>y()</code>, <code>equals</code>, <code>hashCode</code> and <code>toString</code>.</td></tr>
+        <tr><td><code>map.computeIfAbsent(k, f)</code></td><td>Lookup-or-create in one call: find <code>k</code>; if it is missing, call <code>f</code>, insert the result and return it.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k] += 1</code>, inserting the first value when <code>k</code> is absent.</td></tr>
+        <tr><td><code>Comparator.comparing(f).reversed().thenComparing(g)</code></td><td>Builds the <code>cmp()</code> function field by field: compare by <code>f</code>, negate the result, break ties with <code>g</code>.</td></tr>
+        <tr><td><code>case X -&gt; ...</code> (switch arrow)</td><td>A <code>case</code> with no fall-through and an implied <code>break</code>; the whole <code>switch</code> can also return a value.</td></tr>
+        <tr><td><code>default</code> method in an interface</td><td>An ops-table slot pre-filled with a generic implementation; an implementing class overrides only the slots it cares about.</td></tr>
+        <tr><td><code>enum</code> with fields and methods</td><td>A Java enum is a fixed set of singleton objects: think of a <code>static const</code> array of structs that can carry function pointers.</td></tr>
+        <tr><td><code>lock(); try { ... } finally { unlock(); }</code></td><td>The <code>finally</code> block runs on every exit path, normal return or exception: it is the <code>goto out_unlock;</code> label of kernel C.</td></tr>
+        <tr><td><code>throw new XException(..)</code></td><td>Unwinds to the nearest <code>catch</code>: an error return that a caller cannot silently ignore.</td></tr>
+        <tr><td><code>static final class Builder</code> inside a class</td><td>A struct type declared inside another type's namespace; it gets no hidden pointer to an outer object.</td></tr>
+        <tr><td><code>List.of(..)</code>, <code>Map.of(..)</code></td><td>Immutable literal collections, like a <code>static const</code> initialiser list; writes to them throw.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The source files mark the first use of each idiom with a short <code>// C: ...</code> comment. The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <p>Complete, runnable, and the same files that sit in <code>lld-code/lld-case-task-scheduler/</code>. Java is the primary version: three files, no packages, <code>javac *.java &amp;&amp; java Main</code>. Python mirrors it with a unittest file. The C++14 version is a <b>deterministic simulation</b> with a virtual clock and simulated workers, because the MinGW g++ 6.3 used to build it has no <code>std::thread</code>; it is the best way to see the ordering rules without timing noise.</p>
+  <h3>Java (primary)</h3>
+  <ul class="file-roles"><li><code>Model.java</code>: interfaces, enum, value types</li><li><code>TaskScheduler.java</code>: the scheduler and its worker pool</li><li><code>Main.java</code>: demo driver with 31 checks</li></ul>
+  <p>These files hold several package-private top-level classes each, so <b>compile them together</b>: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>. <code>javac Main.java</code> alone fails, and <code>javac -Xlint:all</code> warns that an "auxiliary class" is used outside its own file. That packing keeps the page short; in a real round, put one top-level type per file or use a package (see <a href="{{BASE}}lld/lld-int-code-layout">code layout</a>).</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Model.java">
+<pre><code class="language-java">import java.util.*;
+
+/** What a job does. Command pattern: the scheduler only knows "run it". */
+@FunctionalInterface
+interface Task {
+    void run() throws Exception;
+}
+
+/** Monotonic milliseconds. Injected so tests can control or fake time. */
+@FunctionalInterface
+interface Clock {
+    long millis();
+    Clock SYSTEM = () -&gt; System.nanoTime() / 1_000_000;   // monotonic, never jumps back
+}
+
+enum JobState {
+    WAITING,    // blocked on dependencies
+    SCHEDULED,  // in the time queue, waiting for its run time
+    RUNNING,
+    SUCCEEDED,
+    FAILED,     // all attempts used up
+    CANCELLED,  // cancelled by a caller
+    SKIPPED;    // an upstream dependency failed, was cancelled or skipped
+
+    boolean isTerminal() {
+        return this == SUCCEEDED || this == FAILED || this == CANCELLED || this == SKIPPED;
+    }
+}
+
+/** When should the job run next? Strategy. Returns -1 for "never again". */
+@FunctionalInterface
+interface Schedule {
+    long next(long plannedStart, long finishedAt);
+
+    default boolean isRecurring() { return true; }   // C: default method = an ops-table slot with a generic body
+
+    static Schedule once() {
+        return new Schedule() {
+            public long next(long plannedStart, long finishedAt) { return -1; }
+            public boolean isRecurring() { return false; }
+        };
+    }
+
+    /** Next start = previous planned start + period; if a run overran, start at once. */
+    static Schedule fixedRate(long periodMs) {
+        if (periodMs &lt;= 0) throw new IllegalArgumentException("period must be &gt; 0");
+        return (plannedStart, finishedAt) -&gt; Math.max(plannedStart + periodMs, finishedAt);
+    }
+
+    /** Next start = previous finish + delay (the Uber statement's definition). */
+    static Schedule fixedDelay(long delayMs) {
+        if (delayMs &lt;= 0) throw new IllegalArgumentException("delay must be &gt; 0");
+        return (plannedStart, finishedAt) -&gt; finishedAt + delayMs;
+    }
+}
+
+/** How many times to try, and how long to wait between tries (exponential backoff). */
+record RetryPolicy(int maxAttempts, long baseBackoffMs) {   // C: record = an immutable struct (equals/hashCode/toString generated)
+    RetryPolicy {
+        if (maxAttempts &lt; 1 || baseBackoffMs &lt; 0) throw new IllegalArgumentException("bad retry policy");
+    }
+    static RetryPolicy none() { return new RetryPolicy(1, 0); }
+    long backoffMs(int failedAttempt) { return baseBackoffMs &lt;&lt; Math.min(failedAttempt - 1, 20); }
+}
+
+/** Immutable description of a job, built with a Builder. */
+final class JobSpec {
+    final String id;
+    final Task task;
+    final int priority;            // higher runs first among jobs that are due
+    final long delayMs;            // not before now + delay
+    final Schedule schedule;
+    final Set&lt;String&gt; dependsOn;
+    final RetryPolicy retry;
+
+    private JobSpec(Builder b) {
+        id = b.id; task = b.task; priority = b.priority; delayMs = b.delayMs;
+        schedule = b.schedule; dependsOn = Set.copyOf(b.dependsOn); retry = b.retry;
+    }
+
+    static Builder of(String id, Task task) { return new Builder(id, task); }
+
+    static final class Builder {
+        private final String id;
+        private final Task task;
+        private int priority = 5;
+        private long delayMs = 0;
+        private Schedule schedule = Schedule.once();
+        private final Set&lt;String&gt; dependsOn = new LinkedHashSet&lt;&gt;();
+        private RetryPolicy retry = RetryPolicy.none();
+
+        private Builder(String id, Task task) {
+            if (id == null || id.isBlank()) throw new IllegalArgumentException("job id is required");
+            this.id = id;
+            this.task = Objects.requireNonNull(task, "task");
+        }
+        Builder priority(int p) { priority = p; return this; }
+        Builder delay(long ms) { if (ms &lt; 0) throw new IllegalArgumentException("delay &lt; 0"); delayMs = ms; return this; }
+        Builder schedule(Schedule s) { schedule = Objects.requireNonNull(s); return this; }
+        Builder dependsOn(String... ids) { dependsOn.addAll(Arrays.asList(ids)); return this; }
+        Builder retry(int maxAttempts, long baseBackoffMs) { retry = new RetryPolicy(maxAttempts, baseBackoffMs); return this; }
+        JobSpec build() { return new JobSpec(this); }
+    }
+}
+
+/** Mutable run-time record of one job. Every field is guarded by the scheduler's lock. */
+final class Job {
+    final JobSpec spec;
+    final long seq;                 // submission order, the last tie-breaker
+    final long notBefore;           // submit time + delay
+    JobState state;
+    long runAt;                     // when it may run (valid while SCHEDULED)
+    int attempt;                    // attempts in the current run
+    int runs;                       // finished executions (success or failure)
+    int pendingDeps;
+    String lastError;
+    final List&lt;Job&gt; dependents = new ArrayList&lt;&gt;();
+
+    Job(JobSpec spec, long seq, long notBefore) {
+        this.spec = spec; this.seq = seq; this.notBefore = notBefore;
+    }
+}
+
+/** Read-only snapshot handed to callers. */
+record JobInfo(String id, JobState state, int runs, int attempt, String lastError) {}
+
+/** Observer: hears every state change. Called outside the scheduler lock. */
+@FunctionalInterface
+interface JobListener {
+    void onStateChange(String jobId, JobState from, JobState to);
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="TaskScheduler.java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
+
+/** A fixed set of worker threads fed by a queue. The scheduler never gives it more than n jobs at once. */
+final class WorkerPool {
+    private static final Runnable STOP = () -&gt; { };
+    private final BlockingQueue&lt;Runnable&gt; queue = new LinkedBlockingQueue&lt;&gt;();
+    private final List&lt;Thread&gt; threads = new ArrayList&lt;&gt;();
+
+    WorkerPool(int n, String name) {
+        for (int i = 1; i &lt;= n; i++) {
+            Thread t = new Thread(this::loop, name + "-" + i);   // C: Type::method = a pointer to an existing function
+            threads.add(t);
+            t.start();
+        }
+    }
+
+    void execute(Runnable r) { queue.add(r); }
+
+    private void loop() {
+        try {
+            while (true) {
+                Runnable r = queue.take();
+                if (r == STOP) return;
+                r.run();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** FIFO queue: work already handed over finishes before the STOP markers are seen. */
+    void shutdownAndJoin() throws InterruptedException {
+        for (int i = 0; i &lt; threads.size(); i++) queue.add(STOP);
+        for (Thread t : threads) t.join();
+    }
+}
+
+/**
+ * In-memory task scheduler: delayed, periodic and dependent (DAG) jobs, priorities, retries,
+ * cancellation, a bounded worker pool. One lock guards all job state; one dispatcher thread
+ * moves due jobs from the time queue to the ready queue and hands them to free workers.
+ */
+final class TaskScheduler implements AutoCloseable {
+    /** Not yet due: earliest run time first. */
+    private static final Comparator&lt;Job&gt; BY_TIME =
+            Comparator.comparingLong((Job j) -&gt; j.runAt).thenComparingLong(j -&gt; j.seq);   // C: builds the cmp() function you would pass to qsort
+    /** Due: highest priority first, then the one that has waited longest, then submission order. */
+    private static final Comparator&lt;Job&gt; BY_PRIORITY =
+            Comparator.comparingInt((Job j) -&gt; -j.spec.priority)
+                      .thenComparingLong(j -&gt; j.runAt)
+                      .thenComparingLong(j -&gt; j.seq);
+
+    private final Clock clock;
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition changed = lock.newCondition();   // dispatcher waits here
+    private final Condition settled = lock.newCondition();   // awaitTerminal waits here
+    private final PriorityQueue&lt;Job&gt; timeQueue = new PriorityQueue&lt;&gt;(BY_TIME);
+    private final PriorityQueue&lt;Job&gt; readyQueue = new PriorityQueue&lt;&gt;(BY_PRIORITY);
+    private final Map&lt;String, Job&gt; jobs = new HashMap&lt;&gt;();
+    private final List&lt;JobListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final Semaphore freeWorkers;
+    private final WorkerPool pool;
+    private final Thread dispatcher;
+    private boolean running = true;
+    private long nextSeq = 0;
+
+    TaskScheduler(int workers, Clock clock) {
+        if (workers &lt; 1) throw new IllegalArgumentException("need at least one worker");
+        this.clock = clock;
+        this.freeWorkers = new Semaphore(workers);
+        this.pool = new WorkerPool(workers, "worker");
+        this.dispatcher = new Thread(this::dispatchLoop, "dispatcher");
+        dispatcher.start();
+    }
+
+    TaskScheduler(int workers) { this(workers, Clock.SYSTEM); }
+
+    void addListener(JobListener l) { listeners.add(l); }
+
+    // ---------------------------------------------------------------- public API
+
+    /** Admit one job. Its dependencies must already be known to the scheduler. */
+    void submit(JobSpec spec) {
+        List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            checkOpen();
+            validate(spec, Set.of());
+            admit(spec, events);
+        } finally {   // C: finally runs on every exit path: the goto out_unlock label
+            lock.unlock();
+        }
+        fire(events);
+    }
+
+    /** Admit a whole graph, all or nothing. Rejects unknown ids, duplicates and cycles. */
+    void submitGraph(List&lt;JobSpec&gt; specs) {
+        List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            checkOpen();
+            Map&lt;String, JobSpec&gt; batch = new LinkedHashMap&lt;&gt;();
+            for (JobSpec s : specs) {
+                if (batch.put(s.id, s) != null) throw new IllegalArgumentException("duplicate job id " + s.id);
+            }
+            for (JobSpec s : specs) validate(s, batch.keySet());
+            for (JobSpec s : topologicalOrder(batch)) admit(s, events);
+        } finally {
+            lock.unlock();
+        }
+        fire(events);
+    }
+
+    /** True if the job will not run (again). A running one-shot job cannot be stopped. */
+    boolean cancel(String id) {
+        List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+        boolean done;
+        lock.lock();
+        try {
+            Job job = jobs.get(id);
+            if (job == null || job.state.isTerminal()) {
+                done = false;
+            } else if (job.state == JobState.RUNNING &amp;&amp; !job.spec.schedule.isRecurring()) {
+                done = false;
+            } else {
+                move(job, JobState.CANCELLED, events);   // lazy removal: the queues skip it later
+                skipDependents(job, events);
+                changed.signal();
+                done = true;
+            }
+        } finally {
+            lock.unlock();
+        }
+        fire(events);
+        return done;
+    }
+
+    JobInfo info(String id) {
+        lock.lock();
+        try {
+            Job j = jobs.get(id);
+            if (j == null) throw new NoSuchElementException("unknown job " + id);
+            return new JobInfo(j.spec.id, j.state, j.runs, j.attempt, j.lastError);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Wait until every listed job is in a terminal state. */
+    boolean awaitTerminal(Collection&lt;String&gt; ids, long timeoutMs) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        lock.lock();
+        try {
+            while (true) {
+                boolean all = true;
+                for (String id : ids) {
+                    Job j = jobs.get(id);
+                    if (j == null || !j.state.isTerminal()) { all = false; break; }
+                }
+                if (all) return true;
+                long left = deadline - System.nanoTime();
+                if (left &lt;= 0) return false;
+                settled.awaitNanos(left);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Stop dispatching, let running jobs finish, stop the workers. Queued jobs stay queued. */
+    void shutdown() throws InterruptedException {
+        lock.lock();
+        try {
+            running = false;
+            changed.signalAll();
+        } finally {
+            lock.unlock();
+        }
+        dispatcher.interrupt();          // it may be blocked waiting for a free worker
+        dispatcher.join();
+        pool.shutdownAndJoin();
+    }
+
+    @Override public void close() throws InterruptedException { shutdown(); }
+
+    // ---------------------------------------------------------------- admission (lock held)
+
+    private void checkOpen() {
+        if (!running) throw new IllegalStateException("scheduler is shut down");
+    }
+
+    private void validate(JobSpec s, Set&lt;String&gt; batchIds) {
+        if (jobs.containsKey(s.id)) throw new IllegalArgumentException("duplicate job id " + s.id);
+        if (s.schedule.isRecurring() &amp;&amp; !s.dependsOn.isEmpty())
+            throw new IllegalArgumentException("recurring job " + s.id + " cannot have dependencies");
+        for (String d : s.dependsOn) {
+            Job parent = jobs.get(d);
+            if (parent == null &amp;&amp; !batchIds.contains(d))
+                throw new IllegalArgumentException("unknown dependency " + d + " of " + s.id);
+            if (parent != null &amp;&amp; parent.spec.schedule.isRecurring())
+                throw new IllegalArgumentException(s.id + " cannot depend on recurring job " + d);
+        }
+    }
+
+    /** Kahn's algorithm over the batch; edges to already-admitted jobs are ignored here. */
+    private List&lt;JobSpec&gt; topologicalOrder(Map&lt;String, JobSpec&gt; batch) {
+        Map&lt;String, Integer&gt; indegree = new HashMap&lt;&gt;();
+        Map&lt;String, List&lt;String&gt;&gt; children = new HashMap&lt;&gt;();
+        for (JobSpec s : batch.values()) {
+            indegree.putIfAbsent(s.id, 0);
+            for (String d : s.dependsOn) {
+                if (!batch.containsKey(d)) continue;
+                indegree.merge(s.id, 1, Integer::sum);
+                children.computeIfAbsent(d, k -&gt; new ArrayList&lt;&gt;()).add(s.id);   // C: look up k; if missing, allocate, insert and return it
+            }
+        }
+        Deque&lt;String&gt; ready = new ArrayDeque&lt;&gt;();
+        for (JobSpec s : batch.values()) if (indegree.get(s.id) == 0) ready.add(s.id);
+        List&lt;JobSpec&gt; order = new ArrayList&lt;&gt;();
+        while (!ready.isEmpty()) {
+            String id = ready.poll();
+            order.add(batch.get(id));
+            for (String c : children.getOrDefault(id, List.of())) {
+                if (indegree.merge(c, -1, Integer::sum) == 0) ready.add(c);
+            }
+        }
+        if (order.size() != batch.size()) {
+            List&lt;String&gt; stuck = new ArrayList&lt;&gt;();
+            for (String id : batch.keySet()) if (indegree.get(id) &gt; 0) stuck.add(id);
+            throw new IllegalArgumentException("cycle among " + stuck);
+        }
+        return order;
+    }
+
+    private void admit(JobSpec spec, List&lt;Runnable&gt; events) {
+        Job job = new Job(spec, ++nextSeq, clock.millis() + spec.delayMs);
+        jobs.put(spec.id, job);
+        boolean doomed = false;
+        for (String d : spec.dependsOn) {
+            JobState ps = jobs.get(d).state;
+            if (ps == JobState.FAILED || ps == JobState.CANCELLED || ps == JobState.SKIPPED) doomed = true;
+        }
+        if (doomed) { move(job, JobState.SKIPPED, events); return; }
+        for (String d : spec.dependsOn) {
+            Job parent = jobs.get(d);
+            if (parent.state != JobState.SUCCEEDED) { parent.dependents.add(job); job.pendingDeps++; }
+        }
+        if (job.pendingDeps &gt; 0) move(job, JobState.WAITING, events);
+        else schedule(job, job.notBefore, events);
+    }
+
+    // ---------------------------------------------------------------- state changes (lock held)
+
+    private void schedule(Job job, long at, List&lt;Runnable&gt; events) {
+        job.runAt = at;
+        move(job, JobState.SCHEDULED, events);
+        timeQueue.add(job);
+        changed.signal();
+    }
+
+    private void move(Job job, JobState to, List&lt;Runnable&gt; events) {
+        JobState from = job.state;
+        job.state = to;
+        if (to.isTerminal()) settled.signalAll();
+        String id = job.spec.id;
+        events.add(() -&gt; { for (JobListener l : listeners) l.onStateChange(id, from, to); });
+    }
+
+    private void releaseDependents(Job done, long now, List&lt;Runnable&gt; events) {
+        for (Job d : done.dependents) {
+            if (d.state == JobState.WAITING &amp;&amp; --d.pendingDeps == 0) {
+                schedule(d, Math.max(now, d.notBefore), events);
+            }
+        }
+    }
+
+    private void skipDependents(Job root, List&lt;Runnable&gt; events) {
+        for (Job d : root.dependents) {
+            if (d.state == JobState.WAITING) {
+                move(d, JobState.SKIPPED, events);
+                skipDependents(d, events);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- dispatch and execution
+
+    private void dispatchLoop() {
+        try {
+            while (true) {
+                freeWorkers.acquire();             // backpressure: only pick a job when a worker is free
+                Job job;
+                List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+                lock.lock();
+                try {
+                    job = nextReadyJob();
+                    if (job == null) { freeWorkers.release(); return; }
+                    job.attempt++;
+                    move(job, JobState.RUNNING, events);
+                } finally {
+                    lock.unlock();
+                }
+                fire(events);
+                pool.execute(() -&gt; execute(job));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();    // shutdown
+        }
+    }
+
+    /** Lock held. Blocks until a job is due and ready, or returns null on shutdown. */
+    private Job nextReadyJob() throws InterruptedException {
+        while (running) {
+            long now = clock.millis();
+            while (!timeQueue.isEmpty() &amp;&amp; timeQueue.peek().runAt &lt;= now) {
+                Job j = timeQueue.poll();
+                if (j.state == JobState.SCHEDULED) readyQueue.add(j);   // drop cancelled ones
+            }
+            Job j = readyQueue.poll();
+            if (j != null) {
+                if (j.state == JobState.SCHEDULED) return j;
+                continue;                                             // cancelled after it became ready
+            }
+            if (timeQueue.isEmpty()) changed.await();
+            else changed.await(timeQueue.peek().runAt - now, TimeUnit.MILLISECONDS);
+        }
+        return null;
+    }
+
+    /** Runs on a worker thread. The task body runs without the lock. */
+    private void execute(Job job) {
+        Exception error = null;
+        try {
+            job.spec.task.run();
+        } catch (Exception e) {
+            error = e;
+        }
+        List&lt;Runnable&gt; events = new ArrayList&lt;&gt;();
+        lock.lock();
+        try {
+            long now = clock.millis();
+            job.runs++;
+            if (job.state == JobState.CANCELLED) {
+                // cancelled while running: keep CANCELLED, do not reschedule
+            } else if (error == null) {
+                long next = job.spec.schedule.next(job.runAt, now);
+                job.attempt = 0;
+                if (next &gt;= 0) {
+                    schedule(job, next, events);
+                } else {
+                    move(job, JobState.SUCCEEDED, events);
+                    releaseDependents(job, now, events);
+                }
+            } else {
+                job.lastError = error.getMessage();
+                if (job.attempt &lt; job.spec.retry.maxAttempts()) {
+                    schedule(job, now + job.spec.retry.backoffMs(job.attempt), events);
+                } else {
+                    move(job, JobState.FAILED, events);
+                    skipDependents(job, events);
+                }
+            }
+        } finally {
+            lock.unlock();
+            freeWorkers.release();
+        }
+        fire(events);
+    }
+
+    private void fire(List&lt;Runnable&gt; events) {
+        for (Runnable e : events) e.run();
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Main.java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+/** Demo driver with simple assertions. Run: javac *.java &amp;&amp; java Main */
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static Task record(List&lt;String&gt; log, String name) {
+        return () -&gt; log.add(name);
+    }
+
+    public static void main(String[] args) throws Exception {
+        delayedJobs();
+        priorities();
+        periodic();
+        retries();
+        dag();
+        validation();
+        stress();
+        System.out.println("== all " + checks + " checks passed ==");
+    }
+
+    static void delayedJobs() throws Exception {
+        System.out.println("== 1. delayed jobs run in time order ==");
+        List&lt;String&gt; ran = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        try (TaskScheduler s = new TaskScheduler(2)) {
+            s.submit(JobSpec.of("late", record(ran, "late")).delay(300).build());
+            s.submit(JobSpec.of("early", record(ran, "early")).delay(100).build());
+            s.submit(JobSpec.of("mid", record(ran, "mid")).delay(200).build());
+            check(s.info("late").state() == JobState.SCHEDULED, "late is SCHEDULED before its time");
+            check(s.awaitTerminal(List.of("late", "early", "mid"), 3000), "delayed jobs finish");
+        }
+        System.out.println("  submitted late(+300ms), early(+100ms), mid(+200ms)");
+        System.out.println("  ran: " + String.join(", ", ran));
+        check(ran.equals(List.of("early", "mid", "late")), "time order");
+    }
+
+    static void priorities() throws Exception {
+        System.out.println("== 2. priority decides among due jobs (1 worker) ==");
+        List&lt;String&gt; ran = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        CountDownLatch gate = new CountDownLatch(1);
+        try (TaskScheduler s = new TaskScheduler(1)) {
+            s.submit(JobSpec.of("gate", gate::await).build());          // keeps the only worker busy
+            s.submit(JobSpec.of("bulk", record(ran, "bulk(p1)")).priority(1).build());
+            s.submit(JobSpec.of("normal", record(ran, "normal(p5)")).priority(5).build());
+            s.submit(JobSpec.of("urgent", record(ran, "urgent(p9)")).priority(9).build());
+            gate.countDown();
+            check(s.awaitTerminal(List.of("bulk", "normal", "urgent"), 3000), "priority jobs finish");
+        }
+        System.out.println("  ran: " + String.join(", ", ran));
+        check(ran.equals(List.of("urgent(p9)", "normal(p5)", "bulk(p1)")), "priority order");
+    }
+
+    static void periodic() throws Exception {
+        System.out.println("== 3. fixed-delay periodic job, cancelled after 3 runs ==");
+        AtomicInteger beats = new AtomicInteger();
+        CountDownLatch three = new CountDownLatch(3);
+        try (TaskScheduler s = new TaskScheduler(2)) {
+            s.submit(JobSpec.of("heartbeat", () -&gt; { beats.incrementAndGet(); three.countDown(); })
+                    .schedule(Schedule.fixedDelay(150)).build());
+            check(three.await(3, TimeUnit.SECONDS), "three heartbeats");
+            check(s.cancel("heartbeat"), "cancel a periodic job");
+            Thread.sleep(400);                                        // would allow 2 more beats
+            check(beats.get() == 3, "no run after cancel");
+            check(s.info("heartbeat").state() == JobState.CANCELLED, "state CANCELLED");
+            check(!s.cancel("heartbeat"), "second cancel returns false");
+            System.out.println("  heartbeat ran " + beats.get() + " times, state " + s.info("heartbeat").state());
+        }
+    }
+
+    static void retries() throws Exception {
+        System.out.println("== 4. retry with exponential backoff, failure skips dependents ==");
+        List&lt;String&gt; flakyStates = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        AtomicInteger tries = new AtomicInteger();
+        try (TaskScheduler s = new TaskScheduler(2)) {
+            s.addListener((id, from, to) -&gt; { if (id.equals("flaky")) flakyStates.add(to.name()); });
+            s.submit(JobSpec.of("flaky", () -&gt; {
+                if (tries.incrementAndGet() &lt; 3) throw new IllegalStateException("timeout #" + tries.get());
+            }).retry(3, 20).build());
+            s.submit(JobSpec.of("broken", () -&gt; { throw new IllegalStateException("disk full"); })
+                    .retry(2, 10).build());
+            s.submit(JobSpec.of("report", () -&gt; { }).dependsOn("broken").build());
+            s.submit(JobSpec.of("email", () -&gt; { }).dependsOn("report").build());
+            check(s.awaitTerminal(List.of("flaky", "broken", "report", "email"), 3000), "retry jobs settle");
+            System.out.println("  flaky: " + String.join(" -&gt; ", flakyStates));
+            JobInfo b = s.info("broken");
+            System.out.println("  broken: " + b.state() + " after " + b.runs() + " attempts, last error '" + b.lastError() + "'");
+            System.out.println("  report: " + s.info("report").state() + ", email: " + s.info("email").state());
+            check(tries.get() == 3 &amp;&amp; s.info("flaky").state() == JobState.SUCCEEDED, "flaky succeeds on try 3");
+            check(b.state() == JobState.FAILED &amp;&amp; b.runs() == 2, "broken fails after 2 attempts");
+            check(s.info("report").state() == JobState.SKIPPED, "dependent skipped");
+            check(s.info("email").state() == JobState.SKIPPED, "skip is transitive");
+            s.submit(JobSpec.of("late-child", () -&gt; { }).dependsOn("broken").build());
+            check(s.info("late-child").state() == JobState.SKIPPED, "child of a failed job is skipped at once");
+        }
+    }
+
+    static void dag() throws Exception {
+        System.out.println("== 5. DAG pipeline (Rubrik-style) on 1 worker ==");
+        // A -&gt; B -&gt; C -&gt; G,  A -&gt; E -&gt; F -&gt; G,  K -&gt; L -&gt; M
+        String[][] edges = {{"A"}, {"B", "A"}, {"C", "B"}, {"E", "A"}, {"F", "E"}, {"G", "C", "F"},
+                            {"K"}, {"L", "K"}, {"M", "L"}};
+        List&lt;String&gt; order = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        List&lt;JobSpec&gt; specs = new ArrayList&lt;&gt;();
+        for (String[] e : edges) {
+            String id = e[0];
+            specs.add(JobSpec.of(id, () -&gt; { Thread.sleep(5); order.add(id); })
+                    .dependsOn(Arrays.copyOfRange(e, 1, e.length)).build());
+        }
+        try (TaskScheduler s = new TaskScheduler(1)) {
+            s.submitGraph(specs);
+            check(s.info("G").state() == JobState.WAITING || s.info("G").state() == JobState.SCHEDULED, "G waits");
+            List&lt;String&gt; ids = new ArrayList&lt;&gt;();
+            for (String[] e : edges) ids.add(e[0]);
+            check(s.awaitTerminal(ids, 5000), "pipeline finishes");
+        }
+        System.out.println("  order: " + String.join(" ", order));
+        boolean valid = true;
+        for (String[] e : edges)
+            for (int i = 1; i &lt; e.length; i++)
+                if (order.indexOf(e[i]) &gt; order.indexOf(e[0])) valid = false;
+        System.out.println("  every job ran after all its parents: " + valid);
+        check(valid &amp;&amp; order.size() == 9, "topological order");
+        check(order.equals(List.of("A", "K", "B", "E", "L", "C", "F", "M", "G")), "FIFO among equal priority");
+    }
+
+    static void validation() throws Exception {
+        System.out.println("== 6. validation ==");
+        try (TaskScheduler s = new TaskScheduler(1)) {
+            s.submit(JobSpec.of("x", () -&gt; { }).delay(10_000).build());
+            String[] cases = {"cycle", "duplicate", "unknown", "recurring-with-deps", "depends-on-recurring"};
+            for (String c : cases) {
+                try {
+                    switch (c) {
+                        case "cycle" -&gt; s.submitGraph(List.of(   // C: case X -&gt; ... is a switch arm with no fall-through
+                                JobSpec.of("P", () -&gt; { }).dependsOn("R").build(),
+                                JobSpec.of("Q", () -&gt; { }).dependsOn("P").build(),
+                                JobSpec.of("R", () -&gt; { }).dependsOn("Q").build()));
+                        case "duplicate" -&gt; s.submit(JobSpec.of("x", () -&gt; { }).build());
+                        case "unknown" -&gt; s.submit(JobSpec.of("y", () -&gt; { }).dependsOn("nope").build());
+                        case "recurring-with-deps" -&gt; s.submit(JobSpec.of("z", () -&gt; { })
+                                .schedule(Schedule.fixedRate(100)).dependsOn("x").build());
+                        default -&gt; {
+                            s.submit(JobSpec.of("tick", () -&gt; { }).delay(10_000).schedule(Schedule.fixedRate(100)).build());
+                            s.submit(JobSpec.of("w", () -&gt; { }).dependsOn("tick").build());
+                        }
+                    }
+                    check(false, c + " should be rejected");
+                } catch (IllegalArgumentException e) {
+                    System.out.println("  rejected " + c + ": " + e.getMessage());
+                    checks++;
+                }
+            }
+            try {
+                s.info("P");
+                check(false, "graph with a cycle must not be half-admitted");
+            } catch (NoSuchElementException e) {
+                checks++;
+            }
+            check(s.cancel("x") &amp;&amp; s.info("x").state() == JobState.CANCELLED, "cancel a scheduled job");
+        }
+    }
+
+    static void stress() throws Exception {
+        System.out.println("== 7. stress: 8 threads x 1000 jobs, 4 workers ==");
+        int producers = 8, perProducer = 1000, workers = 4;
+        ConcurrentHashMap&lt;String, Integer&gt; runs = new ConcurrentHashMap&lt;&gt;();
+        AtomicInteger inFlight = new AtomicInteger(), maxInFlight = new AtomicInteger();
+        List&lt;String&gt; ids = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        long start = System.nanoTime();
+        try (TaskScheduler s = new TaskScheduler(workers)) {
+            ExecutorService submitters = Executors.newFixedThreadPool(producers);
+            for (int p = 0; p &lt; producers; p++) {
+                int pid = p;
+                submitters.execute(() -&gt; {
+                    Random rnd = new Random(pid);
+                    for (int i = 0; i &lt; perProducer; i++) {
+                        String id = "p" + pid + "-" + i;
+                        ids.add(id);
+                        s.submit(JobSpec.of(id, () -&gt; {
+                            int now = inFlight.incrementAndGet();
+                            maxInFlight.accumulateAndGet(now, Math::max);
+                            runs.merge(id, 1, Integer::sum);   // C: counts[k] += v, inserting v if k is absent
+                            inFlight.decrementAndGet();
+                        }).priority(rnd.nextInt(10)).delay(rnd.nextInt(5)).build());
+                    }
+                });
+            }
+            submitters.shutdown();
+            check(submitters.awaitTermination(10, TimeUnit.SECONDS), "submitters finish");
+            check(s.awaitTerminal(ids, 20_000), "all stress jobs finish");
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        boolean once = runs.size() == producers * perProducer &amp;&amp; runs.values().stream().allMatch(v -&gt; v == 1);   // C: stream() = a for-loop written as filter/map/collect
+        System.out.println("  " + runs.size() + " jobs ran exactly once: " + once
+                + "; max in flight " + maxInFlight.get() + " (limit " + workers + ")");
+        System.out.println("  (took " + (ms &lt; 2000 ? "under 2 s" : ms + " ms") + ")");
+        check(once, "every job ran exactly once");
+        check(maxInFlight.get() &lt;= workers, "never more than " + workers + " jobs at once");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Output of <code>javac -d out *.java &amp;&amp; java -cp out Main</code> (Java 21; identical on 10 repeated runs):</p>
+<pre class="terminal"><code>== 1. delayed jobs run in time order ==
+  submitted late(+300ms), early(+100ms), mid(+200ms)
+  ran: early, mid, late
+== 2. priority decides among due jobs (1 worker) ==
+  ran: urgent(p9), normal(p5), bulk(p1)
+== 3. fixed-delay periodic job, cancelled after 3 runs ==
+  heartbeat ran 3 times, state CANCELLED
+== 4. retry with exponential backoff, failure skips dependents ==
+  flaky: SCHEDULED -&gt; RUNNING -&gt; SCHEDULED -&gt; RUNNING -&gt; SCHEDULED -&gt; RUNNING -&gt; SUCCEEDED
+  broken: FAILED after 2 attempts, last error 'disk full'
+  report: SKIPPED, email: SKIPPED
+== 5. DAG pipeline (Rubrik-style) on 1 worker ==
+  order: A K B E L C F M G
+  every job ran after all its parents: true
+== 6. validation ==
+  rejected cycle: cycle among [P, Q, R]
+  rejected duplicate: duplicate job id x
+  rejected unknown: unknown dependency nope of y
+  rejected recurring-with-deps: recurring job z cannot have dependencies
+  rejected depends-on-recurring: w cannot depend on recurring job tick
+== 7. stress: 8 threads x 1000 jobs, 4 workers ==
+  8000 jobs ran exactly once: true; max in flight 4 (limit 4)
+  (took under 2 s)
+== all 31 checks passed ==</code></pre>
+    </div>
+  </div>
+
+  <p>Python keeps the same classes and names (a <code>threading.Condition</code> replaces <code>ReentrantLock</code> + <code>Condition</code>); C++14 replays the rules on a virtual clock.</p>
+  

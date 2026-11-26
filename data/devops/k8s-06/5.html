@@ -1,0 +1,79 @@
+
+        <h2>TLS: terminate, pass through, or re-encrypt</h2>
+        <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Mode</th><th>What happens</th><th>When</th></tr></thead>
+            <tbody>
+              <tr><td><b>Terminate</b> (most common)</td><td>Gateway decrypts; plain HTTP inside the cluster</td><td>Normal web traffic; lets the gateway route on path and headers</td></tr>
+              <tr><td><b>Passthrough</b> (TLSRoute: a route that matches on SNI only)</td><td>Gateway routes on SNI only, never decrypts</td><td>The backend must hold its own keys (compliance), or non-HTTP TLS protocols</td></tr>
+              <tr><td><b>Re-encrypt</b> (BackendTLSPolicy: says how the gateway should verify the backend's certificate)</td><td>Decrypt at the gateway, then open a new TLS connection to the backend</td><td>"Encrypt everything in transit" rules, zero-trust networks</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Three TLS modes: terminate decrypts at the gateway, passthrough keeps encryption to the pod, re-encrypt decrypts and encrypts again">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="10" y="40">Terminate</text>
+            <rect class="box client" x="130" y="18" width="110" height="44"/><text class="label" x="185" y="40">client</text>
+            <rect class="box k8s solid" x="360" y="18" width="130" height="44"/><text class="label white" x="425" y="40">gateway</text>
+            <rect class="box docker" x="610" y="18" width="130" height="44"/><text class="label" x="675" y="40">pod</text>
+            <path class="arrow ok thick" d="M240 40 L355 40"/><text class="label small" x="298" y="76">TLS (locked)</text>
+            <path class="arrow dashed" d="M490 40 L605 40"/><text class="label small" x="548" y="76">plain HTTP</text>
+
+            <text class="label left" x="10" y="130">Passthrough</text>
+            <rect class="box client" x="130" y="108" width="110" height="44"/><text class="label" x="185" y="130">client</text>
+            <rect class="box k8s" x="360" y="108" width="130" height="44"/><text class="label" x="425" y="130">gateway (SNI)</text>
+            <rect class="box docker" x="610" y="108" width="130" height="44"/><text class="label" x="675" y="130">pod has key</text>
+            <path class="arrow ok thick" d="M240 130 L605 130"/><text class="label small" x="425" y="166">one TLS session end to end; gateway cannot read paths</text>
+
+            <text class="label left" x="10" y="220">Re-encrypt</text>
+            <rect class="box client" x="130" y="198" width="110" height="44"/><text class="label" x="185" y="220">client</text>
+            <rect class="box k8s solid" x="360" y="198" width="130" height="44"/><text class="label white" x="425" y="220">gateway</text>
+            <rect class="box docker" x="610" y="198" width="130" height="44"/><text class="label" x="675" y="220">pod</text>
+            <path class="arrow ok thick" d="M240 220 L355 220"/>
+            <path class="arrow ok thick" d="M490 220 L605 220"/><text class="label small" x="548" y="254">new TLS session</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M240 130 L610 130"/></circle>
+          </svg>
+          <figcaption>Green thick arrows are encrypted hops. Only when the gateway decrypts (terminate or re-encrypt) can it route on paths and headers.</figcaption>
+        </figure>
+        <h3>An HTTPS listener in YAML</h3>
+        <p>In the Gateway API, TLS lives on the <b>listener</b> of the Gateway (owned by the platform team). App teams only write HTTPRoutes and never touch keys.</p>
+<pre><code class="language-yaml">apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: shop-gw
+  namespace: infra
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod   # ask cert-manager to issue the cert below
+spec:
+  gatewayClassName: eg                 # which implementation (here Envoy Gateway)
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "api.shop.example.com" # SNI value this listener answers for
+      tls:
+        mode: Terminate                # decrypt here; use a TLSRoute + mode Passthrough to skip decryption
+        certificateRefs:
+          - kind: Secret
+            name: api-shop-tls         # a kubernetes.io/tls Secret: tls.crt + tls.key
+      allowedRoutes:
+        namespaces:
+          from: All                    # app namespaces may attach HTTPRoutes</code></pre>
+        <p>Several listeners with different <code>hostname</code>s can share port 443; the proxy picks the listener, and so the certificate, from the SNI field of the TLS ClientHello.</p>
+        <h3>Where the certificate comes from: cert-manager</h3>
+        <p><a href="https://cert-manager.io/docs/" target="_blank" rel="noopener">cert-manager</a> is a popular add-on controller that issues and renews certificates for you. <b>Let's Encrypt</b> is a free public certificate authority that proves you own a domain with the ACME protocol. The flow:</p>
+        <ol class="steps">
+          <li><strong>You declare an issuer.</strong> A <code>ClusterIssuer</code> object says "use Let's Encrypt with this account".</li>
+          <li><strong>cert-manager notices the Gateway.</strong> It sees the annotation and the listener's <code>certificateRefs</code>, and creates a <code>Certificate</code> request for <code>api.shop.example.com</code>.</li>
+          <li><strong>It proves you own the domain.</strong> Let's Encrypt asks for a challenge: a token served over HTTP (HTTP-01) or a DNS TXT record (DNS-01). cert-manager sets it up and cleans it up.</li>
+          <li><strong>It writes the <a href="{{BASE}}interview/glossary#secret">Secret</a>.</strong> The signed certificate and private key land in the <code>api-shop-tls</code> Secret. The gateway controller sees the Secret and loads it into Envoy.</li>
+          <li><strong>It renews.</strong> Before expiry (Let's Encrypt certificates are short-lived), cert-manager repeats the process and updates the Secret. Nobody has to remember a renewal date.</li>
+        </ol>
+        <p>See <a href="{{BASE}}devops/k8s-07">ConfigMaps &amp; Secrets</a> for how TLS Secrets are stored.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>SNI-based routing is exactly what an <b>L7 load balancer</b> or an <b>SSL offload card</b> does: terminate TLS on the box, pick the certificate by server name, and forward clear text (or re-encrypt) to the real servers. The Gateway listener is that box's virtual-server config. Where it breaks: here the "box" is a set of ordinary pods that scale out and are configured from the Kubernetes API, and keys live in Secrets, not in a hardware security module, unless you add one.</p>
+        </div>
+      

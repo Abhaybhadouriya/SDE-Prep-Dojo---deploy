@@ -1,0 +1,92 @@
+
+        <h2>The map: four topics, five workers</h2>
+        <p>Here is everything that happens after the order-api writes an <code>OrderCreated</code> event. Watch the dots: green is a good order, gold is an order taking the retry loop, red is a poison record going to the DLQ.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 900 350" role="img" aria-label="order-api writes orders.created; the enricher writes orders.enriched, orders.retry or orders.dlq; the retry-worker sends retries back; postgres-sink and analytics read orders.enriched">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="150" width="125" height="56"/>
+            <text class="label" x="72" y="171">order-api</text>
+            <text class="label small" x="72" y="192">producer</text>
+
+            <rect class="box kafka" x="170" y="150" width="150" height="56"/>
+            <text class="label" x="245" y="171">orders.created</text>
+            <text class="label small" x="245" y="192">6 partitions</text>
+
+            <rect class="box svc" x="360" y="150" width="130" height="56"/>
+            <text class="label" x="425" y="171">enricher</text>
+            <text class="label small" x="425" y="192">validate + price</text>
+
+            <rect class="box kafka" x="540" y="55" width="160" height="56"/>
+            <text class="label" x="620" y="76">orders.enriched</text>
+            <text class="label small" x="620" y="97">good orders</text>
+
+            <rect class="box fail" x="540" y="250" width="160" height="56"/>
+            <text class="label bad" x="620" y="271">orders.dlq</text>
+            <text class="label small" x="620" y="292">poison, kept 14 days</text>
+
+            <rect class="box queue" x="360" y="265" width="130" height="50"/>
+            <text class="label" x="425" y="283">orders.retry</text>
+            <text class="label small" x="425" y="302">kept 1 day</text>
+
+            <rect class="box svc" x="170" y="265" width="150" height="50"/>
+            <text class="label" x="245" y="283">retry-worker</text>
+            <text class="label small" x="245" y="302">waits, then resends</text>
+
+            <rect class="box db" x="745" y="20" width="145" height="50"/>
+            <text class="label" x="817" y="38">postgres-sink</text>
+            <text class="label small" x="817" y="57">upsert</text>
+            <rect class="box svc" x="745" y="100" width="145" height="50"/>
+            <text class="label" x="817" y="118">analytics</text>
+            <text class="label small" x="817" y="137">1-min windows</text>
+
+            <path class="arrow" d="M135 178 L165 178"/>
+            <path class="arrow" d="M320 178 L355 178"/>
+            <path class="arrow ok" d="M490 165 L536 95"/>
+            <path class="arrow bad" d="M490 195 L536 262"/>
+            <path class="arrow" d="M425 206 L425 260"/>
+            <path class="arrow" d="M360 290 L325 290"/>
+            <path class="arrow" d="M245 265 L245 211"/>
+            <path class="arrow" d="M700 75 L741 50"/>
+            <path class="arrow" d="M700 92 L741 120"/>
+
+            <circle class="packet ok" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M135 178 L320 178 L425 178 L490 165 L540 90 L700 80 L745 48"/></circle>
+            <circle class="packet gold" r="6"><animateMotion dur="5s" begin="1s" repeatCount="indefinite" path="M425 206 L425 265 L360 290 L320 290 L245 265 L245 206 L245 178 L360 178"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M425 178 L490 195 L540 265 L620 278"/></circle>
+          </svg>
+          <figcaption>ShopStream's processing half. The enricher sends each input record to exactly one of three outputs. The retry-worker is a loop back to the start; the DLQ is a dead end that a human empties.</figcaption>
+        </figure>
+
+        <p>Every worker is a small Python program that uses <code>confluent-kafka</code> (the Python wrapper around <b>librdkafka</b>, the C client library). They all share one helper file, <a href="{{BASE}}data/files/pipeline/code/services/common/shopstream_common.py"><code>shopstream_common.py</code></a>, so the safety settings are written once:</p>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Worker</th><th>Reads</th><th>Writes</th><th>Guarantee it shows</th></tr></thead>
+            <tbody>
+              <tr><td><a href="{{BASE}}data/files/pipeline/code/services/enricher/enricher.py">enricher</a></td><td>orders.created</td><td>orders.enriched / retry / dlq</td><td>Exactly-once inside Kafka (transactions)</td></tr>
+              <tr><td><a href="{{BASE}}data/files/pipeline/code/services/enricher/retry_worker.py">retry-worker</a></td><td>orders.retry</td><td>orders.created</td><td>Delayed retry without blocking, <a href="{{BASE}}interview/glossary#eos">exactly-once</a> hand-off</td></tr>
+              <tr><td><a href="{{BASE}}data/files/pipeline/code/services/postgres-sink/sink.py">postgres-sink</a></td><td>orders.enriched</td><td>Postgres <code>orders</code> table</td><td>At-least-once + <a href="{{BASE}}interview/glossary#upsert">upsert</a> = effectively-once</td></tr>
+              <tr><td><a href="{{BASE}}data/files/pipeline/code/services/analytics/analytics.py">analytics</a></td><td>orders.enriched</td><td>/metrics, /windows</td><td>At-least-once, in-memory windows</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>Two consumer settings appear in every worker, and they are the base for everything else on this page:</p>
+<pre><code class="language-python"># services/common/shopstream_common.py (excerpt)
+def consumer_config(group_id: str, *, read_committed: bool = True) -&gt; dict[str, Any]:
+    return {
+        **base_config(),
+        "group.id": group_id,
+        "enable.auto.commit": False,
+        "auto.offset.reset": os.getenv("AUTO_OFFSET_RESET", "earliest"),
+        "isolation.level": "read_committed" if read_committed else "read_uncommitted",
+        "partition.assignment.strategy": "cooperative-sticky",
+        "session.timeout.ms": 45000,
+        "max.poll.interval.ms": int(os.getenv("MAX_POLL_INTERVAL_MS", "300000")),
+    }</code></pre>
+        <ul>
+          <li><b><code>enable.auto.commit: False</code></b>: the worker, not a background timer, decides when an offset is saved. The Kafka default is <code>true</code> (every 5 seconds), which can save the offset before your work is done; crash then, and the record is lost.</li>
+          <li><b><code>isolation.level: read_committed</code></b>: skip records written by a transaction that was later aborted. Without this, a reader could see half-done output from a crashed enricher.</li>
+          <li><b><code>auto.offset.reset: earliest</code></b>: a brand new group starts from the oldest record, not the newest. The Kafka default is <code>latest</code>, a classic "my new consumer sees nothing" bug.</li>
+        </ul>
+      

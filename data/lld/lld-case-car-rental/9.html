@@ -1,0 +1,92 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>The race is check-then-act: "is it free?" and "insert my booking" must happen as one atomic step for that car. Here is the broken version almost everyone writes first:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two bookings for overlapping times on one car both pass the overlap check; a per-car lock makes check and insert one step">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">book KA-01 10:00-12:00</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">book KA-01 11:00-13:00</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">car KA-01 bookings</text><text class="label small" x="400" y="166">10:00-14:00 is free</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. no overlap found, will insert</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. no overlap found, will insert</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">two overlapping reservations:</text><text class="label bad" x="645" y="164">one car, two customers at 11:00</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A's booking is stored</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: a lock for this car only</text><text class="label mono" x="645" y="66">check overlap + insert inside</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">B checks after A: overlap</text><text class="label small" x="645" y="242">VehicleUnavailableException</text><text class="label small" x="645" y="266">bookings for other cars never wait</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Two customers book the same car for overlapping times. Each checks the car's reservations, finds no overlap, and inserts: check-then-act again.</li>
+      <li>The guard: <code>book()</code> takes the lock for that one car (<code>locks.computeIfAbsent(id, ...)</code>) and does the overlap check and the insert inside it. The intervals are half-open, so 10:00-12:00 and 12:00-14:00 do not clash.</li>
+      <li>B gets the lock after A, sees the overlap with 10:00-12:00 and fails with <code>VehicleUnavailableException</code>. Bookings for other cars use other locks and never wait.</li>
+    </ol>
+  </div>
+
+<pre><code class="language-java">// BROKEN: two threads can both pass the check before either inserts
+Reservation book(String user, String vehicleId, TimeSlot slot) {
+    if (!isFree(vehicleId, slot)) throw new VehicleUnavailableException(vehicleId);
+    Reservation r = new Reservation(...);          // thread B is here too
+    byVehicle.get(vehicleId).add(r);               // and ArrayList.add is not thread-safe either
+    return r;
+}</code></pre>
+  <h3>Options, from the round to production</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Approach</th><th>How</th><th>Good</th><th>Watch out</th></tr></thead>
+      <tbody>
+        <tr><td>One global lock</td><td><code>synchronized</code> on the service</td><td>Simplest; obviously correct</td><td>All cars in all cities wait on one lock</td></tr>
+        <tr><td><b>Per-vehicle lock</b> (our code)</td><td><code>locks.computeIfAbsent(id, ..)</code>, check + insert inside</td><td>Different cars never contend; easy to explain</td><td>Lives in one process only; the lock map grows with the fleet (fine: one object per car)</td></tr>
+        <tr><td>Optimistic (version per car)</td><td>Read version, check, insert only if version unchanged (CAS), else retry</td><td>No blocking; great when clashes are rare</td><td>Retry loop; must re-check after a failed CAS</td></tr>
+        <tr><td>Database constraint</td><td>Let the database reject overlaps (below)</td><td>Correct across many servers</td><td>Need to map the constraint error to "unavailable"</td></tr>
+        <tr><td>Hold then confirm</td><td>Insert a HELD row with an expiry, confirm after payment, expire unpaid holds</td><td>No one pays for a car they lose</td><td>Needs a sweeper or <a href="{{BASE}}interview/glossary#ttl">TTL</a>; holds count as active</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>In PostgreSQL the database can enforce "no overlap per vehicle" for you with an exclusion constraint, which is the cleanest answer to Adobe's schema follow-up:</p>
+<pre><code class="language-sql">CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE reservation (
+  id          BIGSERIAL PRIMARY KEY,
+  user_id     BIGINT NOT NULL,
+  vehicle_id  TEXT   NOT NULL REFERENCES vehicle(id),
+  period      TSRANGE NOT NULL,                 -- half-open by default: [start, end)
+  status      TEXT   NOT NULL CHECK (status IN ('CONFIRMED','PICKED_UP','RETURNED','CANCELLED')),
+  price       BIGINT NOT NULL,
+  EXCLUDE USING gist (vehicle_id WITH =, period WITH &amp;&amp;)
+    WHERE (status IN ('CONFIRMED','PICKED_UP'))
+);
+
+-- available vehicles at a branch for a slot
+SELECT v.* FROM vehicle v
+WHERE v.branch_id = 'KOR' AND v.seats &gt;= 5
+  AND NOT EXISTS (SELECT 1 FROM reservation r
+                  WHERE r.vehicle_id = v.id AND r.status IN ('CONFIRMED','PICKED_UP')
+                    AND r.period &amp;&amp; tsrange('2026-12-02 10:00', '2026-12-03 10:00'));</code></pre>
+  <p>Without a range type, use <code>SELECT ... FROM vehicle WHERE id = ? FOR UPDATE</code> to lock the car's row, run the overlap check, insert, commit. That is our per-vehicle lock, moved into the database.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Our code keeps <b>one lock per car</b>: <code>locks.computeIfAbsent(id, ...)</code> creates it on first use, so the lock table grows with the fleet. A C++ port would use a <code>std::unordered_map&lt;std::string, std::mutex&gt;</code> guarded by one small mutex for lookups, then <code>std::lock_guard&lt;std::mutex&gt; g(locks[id]);</code> around check and insert. The kernel's futex hash is a <i>different</i> design, <b>lock striping</b>: a fixed array of N buckets, each with its own spinlock, indexed by a hash of the key (here it would be <code>stripes[hash(id) % N]</code>). Striping gives bounded memory and no per-key allocation, at the price of occasional false sharing: two unrelated cars that hash to the same stripe wait for each other. Per-key locks never contend falsely but cost one object per car. Both are fine for a rental fleet; say which one you chose and why.</p>
+  </div>
+  <ul>
+    <li><b>Reads</b>: <code>search</code> takes each car's lock briefly to read its list. For a read-heavy system, use a <code>ReadWriteLock</code> per car or <a href="{{BASE}}interview/glossary#copy-on-write">copy-on-write</a> lists (see <a href="{{BASE}}lld/lld-conc-locks">locks</a>).</li>
+    <li><b>Deadlock</b>: one booking takes one lock, so there is no lock ordering problem. A "book two cars together" feature would need locks in a fixed order (sorted by id). See <a href="{{BASE}}lld/lld-conc-deadlock">deadlock</a>.</li>
+    <li><b>Idempotency</b>: a client retry after a timeout should not create a second booking. Accept an idempotency key with <code>book()</code> and return the earlier reservation for a repeated key.</li>
+  </ul>
+  <p>More on this exact race: <a href="{{BASE}}lld/lld-conc-booking">booking concurrency</a>.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReadWriteLock</code> = <code>rwlock_t</code> / <code>rw_semaphore</code>: many readers or one writer.</li>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

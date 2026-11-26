@@ -1,0 +1,161 @@
+
+        <h2>Two autoscalers, two signals</h2>
+        <p>This is the most interview-worthy idea on the page. The order-api and the enricher need different autoscalers, because they are busy in different ways.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Left: the HPA scales order-api using CPU from metrics-server. Right: KEDA reads consumer lag from Kafka and scales the enricher, capped at 6 replicas, the number of partitions.">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="410" height="280"/>
+            <text class="zone-label" x="24" y="32">order-api: HPA on CPU</text>
+            <rect class="box client" x="30" y="55" width="150" height="50"/><text class="label" x="105" y="80">HTTP requests</text>
+            <rect class="box svc" x="240" y="55" width="160" height="50"/><text class="label" x="320" y="80">order-api pods</text>
+            <rect class="box k8s" x="30" y="150" width="150" height="50"/><text class="label small" x="105" y="175">metrics-server</text>
+            <rect class="box k8s" x="240" y="150" width="160" height="50"/><text class="label" x="320" y="175">HPA</text>
+            <path class="arrow" d="M180 80 L235 80"/>
+            <path class="arrow dashed" d="M260 105 L160 148"/><text class="label small" x="215" y="120">CPU</text>
+            <path class="arrow" d="M180 175 L235 175"/>
+            <path class="arrow k8s" d="M320 150 L320 110"/>
+            <text class="label small" x="215" y="235">target: 70 % of the CPU request</text>
+            <text class="label small" x="215" y="258">min 2, max 6</text>
+
+            <rect class="zone kafka" x="440" y="10" width="410" height="280"/>
+            <text class="zone-label" x="454" y="32">enricher: KEDA on lag</text>
+            <rect class="box kafka" x="460" y="55" width="160" height="50"/><text class="label" x="540" y="73">orders.created</text><text class="label small" x="540" y="93">lag per partition</text>
+            <rect class="box svc" x="670" y="55" width="160" height="50"/><text class="label" x="750" y="80">enricher pods</text>
+            <rect class="box k8s" x="460" y="150" width="160" height="50"/><text class="label small" x="540" y="175">KEDA operator</text>
+            <rect class="box k8s" x="670" y="150" width="160" height="50"/><text class="label small" x="750" y="168">HPA owned</text><text class="label small" x="750" y="186">by KEDA</text>
+            <path class="arrow" d="M620 80 L665 80"/>
+            <path class="arrow dashed" d="M540 105 L540 145"/><text class="label small" x="575" y="128">lag</text>
+            <path class="arrow" d="M620 175 L665 175"/>
+            <path class="arrow kafka" d="M750 150 L750 110"/>
+            <text class="label small" x="645" y="235">target: 100 messages of lag per replica</text>
+            <text class="label small" x="645" y="258">min 1, max 6 (= partitions)</text>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M540 105 L540 150 L620 175 L670 175 L750 150 L750 105"/></circle>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M260 105 L180 150 L180 175 L240 175 L320 150 L320 105"/></circle>
+          </svg>
+          <figcaption>Stateless HTTP work shows up as CPU, so a normal HPA works. A consumer can be waiting on a slow database with low CPU while thousands of orders pile up, so it scales on the queue it is draining.</figcaption>
+        </figure>
+
+        <h3>Install the two autoscaler helpers first</h3>
+        <p>kind ships neither piece. Without metrics-server the HPA has no CPU numbers; without KEDA the <code>ScaledObject</code> in <code>31-enricher.yaml</code> is an unknown resource type. Run this once per cluster (the same commands are in <code>k8s/README.md</code>, steps 3 and 3b):</p>
+<pre><code class="language-bash"># metrics-server: CPU/memory numbers for the HPA and for kubectl top
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# kind's kubelets use self-signed certificates, so metrics-server must skip verifying them (lab only!)
+kubectl -n kube-system patch deploy metrics-server --type=json \
+  -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deploy/metrics-server
+kubectl top nodes            # numbers instead of an error = working
+
+# KEDA v2.21.1 (server-side apply: its CRDs are too big for client-side apply)
+kubectl apply --server-side -f https://github.com/kedacore/keda/releases/download/v2.21.1/keda-2.21.1.yaml
+kubectl -n keda rollout status deploy/keda-operator</code></pre>
+        <div class="callout note"><p><b>PowerShell:</b> the JSON patch is easiest from a file. Save <code>[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]</code> as <code>patch.json</code> and run <code>kubectl -n kube-system patch deploy metrics-server --type=json --patch-file patch.json</code>.</p></div>
+
+        <h3>The HPA for order-api</h3>
+<pre><code class="language-yaml"># k8s/30-order-api.yaml (HPA part)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-api
+  namespace: shopstream
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: order-api}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 120   # avoid flapping</code></pre>
+        <p>The HPA controller (inside kube-controller-manager) runs every 15 seconds and computes <code>desired = ceil(current replicas x current metric / target)</code>. With 2 pods at 140 % of their CPU request: <code>ceil(2 x 140 / 70) = 4</code>. It needs <b><a href="{{BASE}}interview/glossary#metrics-server">metrics-server</a></b> (installed in the block above); without it, <code>kubectl get hpa</code> shows <code>&lt;unknown&gt;/70%</code> and nothing scales.</p>
+
+        <h3>KEDA for the enricher</h3>
+<pre><code class="language-yaml"># k8s/31-enricher.yaml (ScaledObject part)
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: enricher
+  namespace: shopstream
+spec:
+  scaleTargetRef: {name: enricher}
+  minReplicaCount: 1
+  maxReplicaCount: 6           # = partitions of orders.created; more consumers would sit idle
+  pollingInterval: 15
+  cooldownPeriod: 120
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: shopstream-kafka-bootstrap.kafka.svc:9092
+        consumerGroup: enricher
+        topic: orders.created
+        lagThreshold: "100"        # target lag per replica
+        activationLagThreshold: "10"
+        offsetResetPolicy: earliest
+        version: "3.9.0"           # protocol version KEDA's Kafka client speaks</code></pre>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 280" role="img" aria-label="KEDA scaling loop: lag grows, KEDA reads it, the HPA computes replicas, new pods join the group, partitions are rebalanced, lag drains, scale-down waits">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="25">lag per partition (6 partitions)</text>
+            <rect class="cell" x="20" y="40" width="60" height="150"/><rect class="cell" x="90" y="40" width="60" height="150"/><rect class="cell" x="160" y="40" width="60" height="150"/>
+            <rect class="cell" x="230" y="40" width="60" height="150"/><rect class="cell" x="300" y="40" width="60" height="150"/><rect class="cell" x="370" y="40" width="60" height="150"/>
+            <g data-step-only="1">
+              <rect class="cell filled" x="20" y="110" width="60" height="80"/><rect class="cell filled" x="90" y="120" width="60" height="70"/><rect class="cell filled" x="160" y="100" width="60" height="90"/>
+              <rect class="cell filled" x="230" y="115" width="60" height="75"/><rect class="cell filled" x="300" y="105" width="60" height="85"/><rect class="cell filled" x="370" y="118" width="60" height="72"/>
+              <text class="label bad" x="225" y="220">total lag 480, 1 replica</text>
+            </g>
+            <g data-step="2">
+              <rect class="box k8s" x="470" y="40" width="170" height="50"/><text class="label small" x="555" y="65">KEDA: lag = 480</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M640 65 L670 65"/>
+              <rect class="box k8s" x="675" y="40" width="170" height="50"/><text class="label small" x="760" y="58">HPA: ceil(480/100)</text><text class="label small" x="760" y="76">= 5 replicas</text>
+            </g>
+            <g data-step="4">
+              <rect class="box svc" x="470" y="120" width="70" height="40"/><text class="label small" x="505" y="140">e-1</text>
+              <rect class="box svc" x="545" y="120" width="70" height="40"/><text class="label small" x="580" y="140">e-2</text>
+              <rect class="box svc" x="620" y="120" width="70" height="40"/><text class="label small" x="655" y="140">e-3</text>
+              <rect class="box svc" x="695" y="120" width="70" height="40"/><text class="label small" x="730" y="140">e-4</text>
+              <rect class="box svc" x="770" y="120" width="70" height="40"/><text class="label small" x="805" y="140">e-5</text>
+            </g>
+            <g data-step-only="4">
+              <text class="label small" x="655" y="185">new pods join group "enricher": partitions re-assigned</text>
+            </g>
+            <g data-step-only="5">
+              <rect class="cell filled" x="20" y="175" width="60" height="15"/><rect class="cell filled" x="90" y="180" width="60" height="10"/><rect class="cell filled" x="160" y="178" width="60" height="12"/>
+              <rect class="cell filled" x="230" y="182" width="60" height="8"/><rect class="cell filled" x="300" y="176" width="60" height="14"/><rect class="cell filled" x="370" y="181" width="60" height="9"/>
+              <text class="label ok" x="225" y="220">lag drains</text>
+            </g>
+            <g data-step-only="6">
+              <text class="label small" x="655" y="215">lag low: HPA scales down</text>
+              <text class="label small" x="655" y="235">after a 5-min stabilization window</text>
+              <text class="label small" x="655" y="255">(back towards minReplicaCount 1)</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Lag grows.</b> A load spike, or the <code>PROCESSING_DELAY_MS</code> knob, makes one enricher fall behind. Total lag is 480.</li>
+            <li><b>KEDA measures.</b> Every <code>pollingInterval</code> (15 s) the KEDA operator asks Kafka for the group's committed offsets and each partition's end offset, and serves the lag to Kubernetes as an <b>external metric</b>.</li>
+            <li><b>The HPA decides.</b> KEDA created an HPA for the enricher (named <code>keda-hpa-enricher</code>) with a target of 100 per replica: <code>ceil(480 / 100) = 5</code>. It is capped at <code>maxReplicaCount: 6</code>; KEDA's Kafka scaler also does not go above the partition count by default.</li>
+            <li><b>Pods start and join.</b> The Deployment adds pods. Each joins consumer group <code>enricher</code>, and the cooperative-sticky assignor moves only the partitions that must move.</li>
+            <li><b>Lag drains.</b> Five consumers drain six partitions in parallel.</li>
+            <li><b>Scale down slowly.</b> With <code>minReplicaCount: 1</code>, scaling down is done by the HPA, which by default waits a 5-minute stabilization window, so a short dip does not cause another rebalance. (KEDA's <code>cooldownPeriod</code> only applies to scaling all the way to zero.)</li>
+          </ol>
+        </div>
+        <div class="callout warn"><p><b>Do not create your own HPA for a Deployment that a ScaledObject targets.</b> KEDA owns one. Two HPAs fighting over the same replica count is a confusing failure. And remember why <code>maxReplicaCount</code> is 6: in a classic consumer group each partition goes to one member, so a seventh enricher would sit idle.</p></div>
+<pre><code class="language-bash"># Watch it react (needs KEDA and metrics-server from the install block above)
+python loadgen/loadgen.py --url http://localhost:30080/orders --rps 50 --seconds 120
+kubectl -n shopstream get hpa,scaledobject -w</code></pre>
+<pre class="terminal"><code>NAME                                                    REFERENCE              TARGETS            MINPODS   MAXPODS   REPLICAS
+horizontalpodautoscaler.autoscaling/keda-hpa-enricher   Deployment/enricher    180/100 (avg)      1         6         2
+horizontalpodautoscaler.autoscaling/order-api           Deployment/order-api   cpu: 85%/70%       2         6         3
+
+NAME                                  SCALETARGETNAME   MIN   MAX   READY   ACTIVE
+scaledobject.keda.sh/enricher         enricher          1     6     True    True</code></pre>
+        <p>Columns are trimmed and the numbers are an example; how far it scales depends on your laptop. To force it, set <code>PROCESSING_DELAY_MS: "50"</code> in the ConfigMap and restart the enricher (<code>kubectl -n shopstream rollout restart deploy/enricher</code>): each instance then handles about 20 messages a second.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Scaling on lag is scaling on queue depth, the same signal you would use to add a link to a LAG bundle or to trigger a congestion alarm. CPU is a lagging, indirect signal for a consumer; queue depth is the direct one. Where it breaks: adding a link to a bundle is instant, but adding a Kafka consumer costs a rebalance during which some partitions pause, so you scale in steps and slowly scale down.</p>
+        </div>
+      

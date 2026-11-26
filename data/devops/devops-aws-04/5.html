@@ -1,0 +1,82 @@
+
+  <h2>Spot plus On-Demand, amd64 plus arm64 (Graviton)</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>Two cost levers stack well on Kubernetes: <b>Spot</b> instances (spare EC2 capacity, priced up to 90% below On-Demand, reclaimable with a two-minute warning) and <b>Graviton</b> (AWS-designed ARM64 CPUs; AWS states up to 40% better price performance than comparable x86 instances). Both need preparation.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two NodePools: a weighted on-demand amd64 pool for critical pods and a spot pool across arm64 and amd64 for stateless pods">
+      <rect class="zone k8s" x="20" y="20" width="360" height="260" rx="12"/>
+      <text class="label title" x="200" y="46">NodePool "critical" (weight 50)</text>
+      <text class="label small" x="200" y="68">on-demand only, amd64 + arm64</text>
+      <rect class="box k8s" x="45" y="90" width="150" height="70"/>
+      <text class="label small" x="120" y="118">m7g.xlarge</text>
+      <text class="label small" x="120" y="140">on-demand</text>
+      <rect class="box k8s" x="205" y="90" width="150" height="70"/>
+      <text class="label small" x="280" y="118">m6i.xlarge</text>
+      <text class="label small" x="280" y="140">on-demand</text>
+      <text class="label small" x="200" y="195">Kafka brokers, databases,</text>
+      <text class="label small" x="200" y="217">ingress, CoreDNS, payments</text>
+      <text class="label small muted" x="200" y="255">taint: tier=critical</text>
+      <rect class="zone docker" x="420" y="20" width="360" height="260" rx="12"/>
+      <text class="label title" x="600" y="46">NodePool "flex" (weight 10)</text>
+      <text class="label small" x="600" y="68">spot + on-demand, amd64 + arm64</text>
+      <rect class="box docker" x="445" y="90" width="100" height="70"/>
+      <text class="label small" x="495" y="118">c7g.2xl</text>
+      <text class="label small" x="495" y="140">spot</text>
+      <rect class="box docker" x="555" y="90" width="100" height="70"/>
+      <text class="label small" x="605" y="118">m7a.2xl</text>
+      <text class="label small" x="605" y="140">spot</text>
+      <rect class="box docker" x="665" y="90" width="100" height="70"/>
+      <text class="label small" x="715" y="118">r7g.xl</text>
+      <text class="label small" x="715" y="140">spot</text>
+      <text class="label small" x="600" y="195">stateless web, workers,</text>
+      <text class="label small" x="600" y="217">CI runners, batch</text>
+      <text class="label small muted" x="600" y="255">many types = deep spot pools</text>
+    </svg>
+    <figcaption>Separate pools by how painful an interruption is, not by team. Keep the pools mutually exclusive (taints/labels) or weighted so the choice is predictable.</figcaption>
+  </figure>
+  <h3>Making Spot safe</h3>
+  <ol class="steps">
+    <li><strong>Diversify.</strong> Allow many instance families, sizes and all AZs. Every type+AZ is a separate Spot pool; more pools means fewer interruptions and fewer "insufficient capacity" errors.</li>
+    <li><strong>Handle the two-minute warning.</strong> Point Karpenter's <code>--interruption-queue</code> at the SQS queue that receives EC2 interruption events: it taints and drains the node and launches a replacement in parallel. Your pods must shut down cleanly on <code>SIGTERM</code> well within that window (<a href="{{BASE}}interview/glossary#graceful-shutdown">graceful shutdown</a>).</li>
+    <li><strong>Spread replicas</strong> across zones and capacity types so one reclaim wave cannot take every replica: <code>topologySpreadConstraints</code> on <code>topology.kubernetes.io/zone</code> and on <code>karpenter.sh/capacity-type</code>.</li>
+    <li><strong>PDBs</strong> on every service, so voluntary drains (consolidation) never take too many at once.</li>
+    <li><strong>Keep state off Spot.</strong> Brokers, databases and anything with long recovery go to the On-Demand pool.</li>
+  </ol>
+  <pre><code class="language-yaml"># In the Deployment: guarantee some replicas on on-demand, spread over zones
+spec:
+  template:
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector: { matchLabels: { app: web } }
+        - maxSkew: 2
+          topologyKey: karpenter.sh/capacity-type
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: web } }</code></pre>
+  <h3>Making arm64 safe: multi-arch images</h3>
+  <p>A node only runs images built for its CPU. If a NodePool allows both <code>amd64</code> and <code>arm64</code>, every image a pod might use must be a <b>multi-arch image</b>: one tag pointing to an OCI image index (manifest list) with one image per platform. The container runtime picks the right one at pull time. Build it once in CI (see <a href="{{BASE}}devops/docker-09#supply-chain">Production, Security &amp; CI</a>):</p>
+  <pre><code class="language-bash">docker buildx create --use --name multi
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t 111122223333.dkr.ecr.ap-south-1.amazonaws.com/web:1.8.2 --push .
+docker buildx imagetools inspect 111122223333.dkr.ecr.ap-south-1.amazonaws.com/web:1.8.2</code></pre>
+  <pre class="terminal"><code>Name:      111122223333.dkr.ecr.ap-south-1.amazonaws.com/web:1.8.2
+MediaType: application/vnd.oci.image.index.v1+json
+Digest:    sha256:4c1e...
+
+Manifests:
+  Name:      111122223333.dkr.ecr.ap-south-1.amazonaws.com/web:1.8.2@sha256:9a0f...
+  Platform:  linux/amd64
+
+  Name:      111122223333.dkr.ecr.ap-south-1.amazonaws.com/web:1.8.2@sha256:e27b...
+  Platform:  linux/arm64</code></pre>
+  <pre><code class="language-bash">kubectl get nodes -L kubernetes.io/arch,karpenter.sh/capacity-type,node.kubernetes.io/instance-type</code></pre>
+  <pre class="terminal"><code>NAME                                          STATUS   ROLES    AGE   VERSION   ARCH    CAPACITY-TYPE   INSTANCE-TYPE
+ip-10-0-34-17.ap-south-1.compute.internal     Ready    &lt;none&gt;   3d    v1.35.2   amd64   on-demand       m6i.xlarge
+ip-10-0-41-202.ap-south-1.compute.internal    Ready    &lt;none&gt;   2h    v1.35.2   arm64   spot            c7g.2xlarge
+ip-10-0-77-9.ap-south-1.compute.internal      Ready    &lt;none&gt;   41m   v1.35.2   arm64   spot            m7g.2xlarge</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is cross-compiling for two targets, the same problem as building a kernel or a router image for x86 line cards and ARM control cards. <code>buildx</code> either uses native builders per arch or emulates the other arch with QEMU user-mode registered through <code>binfmt_misc</code> (slow for compile-heavy builds - use native ARM runners or cross-compilation when you can). Interpreted and JIT languages (Java, Python, Node, Go with <code>GOARCH</code>) port easily; the traps are native dependencies: C extensions, JNI libraries, vendored <code>.so</code> files and agents built only for x86, which fail with <code>exec format error</code>.</p>
+  </div>

@@ -1,0 +1,91 @@
+
+        <h2>Architecture: follow one event</h2>
+        <p>Click <b>Next</b> or <b>Play</b>. We follow Asha creating a weekly "Team sync" with two attendees, then watch the reminder fire next Tuesday.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 420" role="img" aria-label="Calendar architecture: API, event service, database, change log, Kafka, fan-out, expander, reminder scheduler, notification service">
+            <rect class="box client" x="20" y="40" width="120" height="60"/>
+            <text class="label" x="80" y="62">Client</text>
+            <text class="label small" x="80" y="84">web / phone</text>
+
+            <g data-step="1">
+              <path class="arrow" d="M140 70 L188 70"/>
+              <rect class="box svc" x="195" y="40" width="130" height="60"/>
+              <text class="label" x="260" y="62">API gateway</text>
+              <text class="label small" x="260" y="84">auth, rate limit</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M325 70 L373 70"/>
+              <rect class="box svc" x="380" y="40" width="140" height="60"/>
+              <text class="label" x="450" y="62">Event service</text>
+              <text class="label small" x="450" y="84">validate, ACL</text>
+              <path class="arrow" d="M450 100 L450 148"/>
+              <rect class="box db" x="370" y="155" width="160" height="66"/>
+              <text class="label" x="450" y="178">Events DB</text>
+              <text class="label small" x="450" y="200">sharded by calendar</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M530 188 L578 188"/>
+              <rect class="box kafka" x="585" y="155" width="150" height="66"/>
+              <text class="label" x="660" y="178">Kafka</text>
+              <text class="label small" x="660" y="200">event-changes</text>
+              <text class="label small" x="555" y="236">outbox / CDC</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M735 175 L780 120"/>
+              <rect class="box svc" x="720" y="40" width="130" height="70"/>
+              <text class="label" x="785" y="64">Invite fan-out</text>
+              <text class="label small" x="785" y="88">attendee copies</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow" d="M660 221 L660 268"/>
+              <rect class="box svc" x="585" y="275" width="150" height="62"/>
+              <text class="label" x="660" y="297">Expander</text>
+              <text class="label small" x="660" y="319">instances index</text>
+              <path class="arrow" d="M585 306 L535 306"/>
+              <rect class="box cache" x="370" y="275" width="160" height="62"/>
+              <text class="label" x="450" y="297">Instance index</text>
+              <text class="label small" x="450" y="319">+ view cache</text>
+            </g>
+            <g data-step="6">
+              <path class="arrow" d="M735 200 L790 270"/>
+              <rect class="box queue" x="745" y="275" width="105" height="62"/>
+              <text class="label" x="797" y="297">Reminder</text>
+              <text class="label small" x="797" y="319">scheduler</text>
+              <path class="arrow" d="M797 337 L797 360 L700 360"/>
+              <rect class="box db" x="520" y="345" width="175" height="52"/>
+              <text class="label" x="607" y="371">reminders_due</text>
+            </g>
+            <g data-step="7">
+              <path class="arrow" d="M520 371 L340 371"/>
+              <rect class="box svc" x="170" y="345" width="165" height="52"/>
+              <text class="label" x="252" y="371">Notification svc</text>
+              <path class="arrow" d="M200 345 L100 108"/>
+              <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M607 371 L252 371 L100 108"/></circle>
+            </g>
+            <g data-step-only="8">
+              <rect class="box fail" x="20" y="150" width="320" height="120"/>
+              <text class="label bad" x="180" y="178">Edit at 09:45?</text>
+              <text class="label small" x="180" y="204">Reminder row carries event_sequence.</text>
+              <text class="label small" x="180" y="226">At fire time, if the event's sequence</text>
+              <text class="label small" x="180" y="248">changed, drop it and use the new row.</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Request in.</b> The client sends <code>POST /events</code> with an <a href="{{BASE}}interview/glossary#idempotent">idempotency</a> key. The gateway checks the auth token and the per-user rate limit.</li>
+            <li><b>Write the source of truth.</b> The event service checks Asha's ACL on the calendar, validates the RRULE and time zone, and in one transaction writes the event row, attendee rows, and a row in the change log / <a href="{{BASE}}interview/glossary#outbox">outbox</a> table.</li>
+            <li><b>Publish the change.</b> A <a href="{{BASE}}interview/glossary#cdc">CDC</a> connector (or outbox relay) reads the committed change and publishes it to the Kafka topic <code>event-changes</code>, keyed by event_id so all changes to one event stay in order.</li>
+            <li><b>Fan out invites.</b> A consumer adds the event to each attendee's calendar view (and sends invite emails for external guests). The organizer's copy stays the source of truth.</li>
+            <li><b>Expand recurrences.</b> Another consumer runs the recurrence engine and writes the next ~12 months of occurrences into the instance index, then invalidates the cached week views of every affected calendar.</li>
+            <li><b>Schedule the next reminder.</b> The reminder scheduler computes only the <i>next</i> occurrence's fire time (start minus 10 minutes, in UTC) and inserts one row per attendee into the right minute bucket of <code>reminders_due</code>.</li>
+            <li><b>Fire.</b> At 09:50 next Tuesday, ticker workers read that minute's bucket, hand each reminder to the notification service (see <a href="{{BASE}}hld/d03">Notification System</a>), and schedule the following week's reminder.</li>
+            <li><b>Edits race with timers.</b> Each reminder row carries the event's <code>SEQUENCE</code>. At fire time the worker compares it with the current value, so a reminder for an old version of the event is silently dropped.</li>
+          </ol>
+        </div>
+
+        <p><b>Steps 2-3 in plain words.</b> CDC (change data capture) tails the database's write-ahead log and publishes each committed row change to Kafka. The outbox pattern writes the event into an <code>outbox</code> table in the same DB transaction as the event row, and a small relay publishes it. Either way, the database and Kafka can never disagree about whether a change happened.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The outbox plus CDC step is the same trick as writing to a journal before applying a change in a file system. The database commit is the single point of truth, and every downstream view (instances, reminders, devices) is rebuilt from that log, like a routing table being recomputed from the link-state database.</p>
+        </div>
+      

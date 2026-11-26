@@ -1,0 +1,221 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Never miss a match (the race)</h3>
+        <p>The naive flow is "write my swipe, then read the other person's swipe". Watch what happens when both run at the same time:</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 300" role="img" aria-label="Race: both users write then read before the other write is visible, so no match is created; fix with an atomic script on a pair key">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label" x="130" y="24">Asha's request</text>
+            <text class="label" x="430" y="24">Store</text>
+            <text class="label" x="730" y="24">Ben's request</text>
+            <line class="arrow none dashed" x1="130" y1="35" x2="130" y2="280"/>
+            <line class="arrow none dashed" x1="730" y1="35" x2="730" y2="280"/>
+            <g data-step="1">
+              <path class="arrow" d="M130 60 L380 60"/><text class="label small" x="255" y="52">write A-&gt;B = yes</text>
+              <path class="arrow" d="M730 60 L480 60"/><text class="label small" x="605" y="52">write B-&gt;A = yes</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M380 100 L130 100"/><text class="label small" x="255" y="92">read B-&gt;A: not yet visible</text>
+              <path class="arrow" d="M480 100 L730 100"/><text class="label small" x="605" y="92">read A-&gt;B: not yet visible</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box fail" x="280" y="130" width="300" height="50"/><text class="label" x="430" y="160">No match created. Bug!</text>
+            </g>
+            <g data-step="4">
+              <rect class="box ok" x="250" y="200" width="360" height="70"/>
+              <text class="label" x="430" y="224">Fix: one atomic step on key "asha:ben"</text>
+              <text class="label small" x="430" y="246">HSET dir yes; return HGET other-dir</text>
+              <text class="label small" x="430" y="263">the second script always sees the first</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li>Both write their own "yes" at almost the same moment, to different rows (or different replicas).</li>
+            <li>Both read the other row before the other write is visible (different partitions, replica lag, or simply interleaving).</li>
+            <li>Each concludes "no match yet". Nobody creates the match. Two people who like each other never find out.</li>
+            <li>Fix: put both directions under one key and do write-and-check in one atomic operation. Operations on one key are serialised, so whoever runs second is guaranteed to see the first.</li>
+          </ol>
+        </div>
+        <p>Options, weakest to strongest:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Approach</th><th>How</th><th>Problem</th></tr></thead>
+            <tbody>
+              <tr><td>Polling job</td><td>A batch job scans for mutual likes every few minutes</td><td>Late notifications, heavy DB load. OK only as a safety net.</td></tr>
+              <tr><td>Distributed transaction</td><td>Lock both users' rows across partitions</td><td>Two-phase commit at 60k/s is slow and fragile. Cassandra lightweight transactions (Paxos) work only inside one partition.</td></tr>
+              <tr><td>Pair key in Cassandra</td><td>Partition key <code>min:max</code>; write my column and read the row in one partition</td><td>Works; watch out for very active users and growing partitions; LWT adds Paxos round trips.</td></tr>
+              <tr><td><b>Pair key in Redis + Lua</b></td><td>A Lua script runs atomically: set my direction, return the other; shard by key with consistent hashing; stream to Cassandra for durability</td><td>If Redis loses recent data, a match from the last moments can be missed - so a reconciliation job checks durable swipes</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-bash">-- Only RIGHT swipes call this script; a left swipe can never complete a match,
+-- so it goes only to the durable store (and the Bloom filter), never to Redis.
+-- KEYS[1] = "swipe:{min}:{max}"   ARGV[1] = my direction field ("a2b" or "b2a")
+-- ARGV[2] = other direction field
+redis.call('HSET', KEYS[1], ARGV[1], 'yes')
+redis.call('EXPIRE', KEYS[1], 1209600)        -- 14 days hot; older swipes live in Cassandra
+return redis.call('HGET', KEYS[1], ARGV[2])   -- "yes" = match; nil = not in the hot window</code></pre>
+        <p>If the script returns nil, the other person either has not swiped or swiped yes more than 14 days ago. The swipe service then does one single-partition read of the pair row in Cassandra. That read is safe from the race, because a swipe older than the hot window was written long ago and is visible; the race only exists between two swipes seconds apart, and those both go through Redis. Storing only right swipes for 14 days is what keeps Redis at about 1.5 TB instead of tens of TB (see the estimation).</p>
+        <p>Redis runs a script as one unit: no other command on that server runs in the middle of it. Because both users' swipes hash to the same key, they hit the same shard and are serialised. Creating the match itself uses the deterministic id <code>min:max</code> with "insert if not exists", so even if both requests somehow detect the match, only one match row and one notification pair is produced.</p>
+        <div class="bridge"><h4>From your world</h4><p>This is a critical section on one shared word. Two CPUs doing "store my flag, then load your flag" without a barrier can both miss each other - the classic store-buffer litmus test, and the reason Dekker/Peterson locks need memory fences. The fix is the same idea as an atomic read-modify-write on one cache line: put both flags in one location and update it atomically. The pair key is "same cache line"; the Lua script is the atomic instruction.</p></div>
+
+        <h3>2. The geo-filtered stack: geosharding</h3>
+        <p>The naive query is SQL: <code>WHERE age BETWEEN ... AND gender = ... AND lat BETWEEN ... AND lng BETWEEN ...</code>. A B-tree can use one range well, not two, so this scans. Better: a search engine (Elasticsearch / OpenSearch) with geo-point fields, or a geo index (geohash, quadtree, S2). The real question at Tinder's scale is <b>how to shard</b> that index.</p>
+        <p>Tinder's engineering series "Geosharded Recommendations" (2019), as summarised by ByteByteGo, explains their answer:</p>
+        <ul>
+          <li>Use Google's <b>S2</b> library: it divides the Earth into a hierarchy of cells along a Hilbert curve, so nearby places get nearby cell ids. S2 cells at one level have roughly equal area (S2's statistics: level 7 averages about 5,189 km<sup>2</sup>, level 8 about 1,297 km<sup>2</sup>). Tinder found levels 7 and 8 the best fit.</li>
+          <li>Do <b>not</b> use equal-size shards: an ocean cell is empty, a Manhattan cell is on fire. Give each cell a <b>load score</b> (active users and queries from it), then group neighbouring cells into a "container" until it reaches a load threshold. That container becomes one <b>geoshard</b>. Dense cities get small shards, rural areas big ones.</li>
+          <li>All geoshards are separate indexes in <b>one</b> Elasticsearch cluster (cross-cluster queries were weaker and harder to run). Busy city shards get more replicas, quiet ones fewer, and shards are spread randomly across nodes so different time zones' peaks average out.</li>
+          <li>A query fans out to the geoshards that overlap the user's distance circle - the systemdesign.one write-up says about <b>3 shards</b> on average for a 160 km radius - in parallel, then merges.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 280" role="img" aria-label="Geoshards: small shards in a dense city, a large shard in a sparse area, and a distance circle overlapping three shards">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box ghost" x="20" y="20" width="360" height="240"/>
+            <text class="label small" x="200" y="140">Sparse region = 1 big shard</text>
+            <rect class="box hot" x="400" y="20" width="110" height="115"/><text class="label small" x="455" y="80">shard A</text>
+            <rect class="box hot" x="515" y="20" width="110" height="115"/><text class="label small" x="570" y="80">shard B</text>
+            <rect class="box hot" x="400" y="140" width="110" height="120"/><text class="label small" x="455" y="200">shard C</text>
+            <rect class="box hot" x="515" y="140" width="110" height="120"/><text class="label small" x="570" y="200">shard D</text>
+            <text class="label small" x="512" y="275">Dense city: small shards, equal load</text>
+            <circle class="box highlight" cx="500" cy="120" r="70" style="fill-opacity:0.15"/>
+            <circle class="packet" cx="500" cy="120" r="7"/>
+            <text class="label left" x="650" y="60">User's distance circle</text>
+            <text class="label left" x="650" y="85">overlaps A, B, C</text>
+            <text class="label left" x="650" y="110">-&gt; query 3 shards</text>
+            <text class="label left" x="650" y="135">in parallel, merge</text>
+            <path class="arrow" d="M645 80 L575 100"/>
+          </svg>
+          <figcaption>Shards follow load, not area. A query only touches the shards its circle overlaps.</figcaption>
+        </figure>
+        <p><b>Users move.</b> When a user travels (or uses a "Passport" feature), their document must leave the old shard and enter the new one. If "delete from old" and "insert into new" are processed out of order, you get a ghost in two places or in none. Tinder's fix: put every user's updates through <b>Kafka partitioned by user id</b>, so one user's updates are applied in order, and use the Elasticsearch Get API (which reads the latest version) where a strongly consistent read is needed. A background job periodically re-syncs the search index with the source of truth, catching failed writes.</p>
+        <div class="callout note"><p><b>Did it pay off?</b> Tinder's 2025 post on migrating to Elasticsearch 8 says over 90% of their recommendations come from a single Elasticsearch cluster, that geosharding used about <b>12% CPU versus about 50%</b> for a single-index approach, and that the migration cut p99 search latency by 12% to 56%. ByteByteGo's summary of the original work says the system handled about 20 times more computation while keeping latency low.</p></div>
+        <div class="bridge"><h4>From your world</h4><p>Partitioning one user's updates to one Kafka partition is per-flow hashing. NICs use RSS and routers use ECMP flow hashes so that all packets of one TCP flow take the same queue or path - otherwise they arrive reordered. Here a "flow" is one user's location updates, and reordering would put them in the wrong shard.</p></div>
+
+        <p>A short visual primer on geohashes and quadtrees, the simpler cousins of S2 cells (Tinder itself uses S2, but the "cell id turns near-me into a lookup" idea is the same):</p>
+        <div class="video" data-yt="ENbivJwB3BY" data-title="Designing Location-Based Systems, Geohashing vs Quadtrees Explained for Engineers" data-channel="Ultimate System Design" data-mins="8"></div>
+        
+        <h3>3. A stack that feels endless and fast</h3>
+        <ul>
+          <li><b>Precompute.</b> A background job builds about 100 ranked candidates per active user into <code>stack:{userId}</code> with a TTL under an hour. The app loads from cache: well under 300 ms.</li>
+          <li><b>Refill early.</b> When the client has only about 10-20 cards left, it asks for more. The server serves the cached remainder and computes a fresh batch from the index in the background - the user never hits an empty pile.</li>
+          <li><b>Invalidate on big changes.</b> A new city or changed filters drops the cached stack.</li>
+          <li><b>Warm only active users.</b> Precomputing stacks for 75M users who will not open the app today wastes compute; do it for users active recently and compute on demand for the rest.</li>
+          <li><b>Ranking.</b> Within the candidates, order by predicted chance of a mutual like. The High Scalability "Designing Tinder" article describes a logistic regression on profile, history and photo features; Tinder's 2025 post reports two-tower model experiments that raised match rate by 6.5%. In an interview, one sentence on "candidate generation, then ranking" is enough (see <a href="{{BASE}}hld/d48">Recommendation System</a>).</li>
+        </ul>
+
+        <h3>4. Never the same card twice: Bloom filters</h3>
+        <p>Filtering out already-swiped profiles with a database "NOT IN (my 50,000 swipes)" is slow and can miss very recent swipes that have not replicated yet. Layer it:</p>
+        <ol class="steps">
+          <li><strong>Client cache.</strong> The phone remembers its last few hundred swipes and filters them out locally. That covers the replication gap.</li>
+          <li><strong>Per-user Bloom filter.</strong> On the server, <code>seen:{userId}</code> holds a Bloom filter of every profile the user swiped. Each candidate is checked with <code>BF.MEXISTS</code> before it goes into the stack.</li>
+          <li><strong>Source of truth.</strong> Swipe history in the durable store; the filter can always be rebuilt from it.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 240" role="img" aria-label="Bloom filter: an id sets k bits; a lookup with any zero bit means definitely not seen">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="24">Bit array (m bits), k = 3 hash functions</text>
+            <rect class="box" x="200" y="100" width="40" height="40"/><rect class="box highlight" x="240" y="100" width="40" height="40"/><rect class="box" x="280" y="100" width="40" height="40"/><rect class="box highlight" x="320" y="100" width="40" height="40"/><rect class="box" x="360" y="100" width="40" height="40"/><rect class="box" x="400" y="100" width="40" height="40"/><rect class="box highlight" x="440" y="100" width="40" height="40"/><rect class="box" x="480" y="100" width="40" height="40"/><rect class="box highlight" x="520" y="100" width="40" height="40"/><rect class="box" x="560" y="100" width="40" height="40"/><rect class="box" x="600" y="100" width="40" height="40"/><rect class="box" x="640" y="100" width="40" height="40"/>
+            <rect class="box client" x="20" y="40" width="130" height="40"/><text class="label small" x="85" y="65">add "ben"</text>
+            <path class="arrow" d="M150 60 L255 97"/><path class="arrow" d="M150 60 L335 97"/><path class="arrow" d="M150 60 L455 97"/>
+            <rect class="box client" x="20" y="170" width="130" height="40"/><text class="label small" x="85" y="195">check "chris"</text>
+            <path class="arrow" d="M150 190 L335 143"/><path class="arrow" d="M150 190 L535 143"/><path class="arrow bad" d="M150 190 L615 143"/>
+            <text class="label small left" x="660" y="185">one bit is 0</text>
+            <text class="label small left" x="660" y="208">= definitely not seen</text>
+            <text class="label small left" x="620" y="60">all bits 1 = "probably seen"</text>
+            <text class="label small left" x="620" y="83">(rarely wrong)</text>
+          </svg>
+          <figcaption>A Bloom filter never says "not seen" for something you did see. It sometimes says "seen" for something you did not - here, that only hides one extra card.</figcaption>
+        </figure>
+        <p>Why this error direction is perfect here: a <b>false positive</b> means we hide a profile the user never saw - a tiny loss nobody notices. A <b>false negative</b> (showing a repeat) is impossible. Sizing from the Redis docs: <b>1% error = 7 hash functions and 9.585 bits per item; 0.1% = 10 hashes and 14.378 bits</b>. Bloom filters cannot delete items, which is fine (a swipe is forever; for "undo last swipe" keep the last swipe in a small exact list). Redis can stack sub-filters when a filter outgrows its capacity, at some cost in lookup latency.</p>
+        <div class="callout warn"><p><b>Operational catch:</b> if the Redis node holding the filters is lost, rebuilding millions of filters from swipe history is a big batch job. Persist the filters (RDB/AOF snapshots or <code>BF.SCANDUMP</code>), replicate them, and rebuild lazily: on a missing filter, rebuild that one user's filter on first use while the client cache covers the gap.</p></div>
+
+        <h3>5. Hot users and spikes</h3>
+        <ul>
+          <li><b>Very popular profiles</b> receive many right swipes. With the pair key, each (fan, star) pair is a different key, so the load spreads across shards. The star's "who liked me" list is the hotspot: write it asynchronously and cap it.</li>
+          <li><b>Evening peaks</b> are predictable by time zone: scale the swipe service on schedule and on request rate.</li>
+          <li><b>Hot geoshards</b> (a festival, New Year's Eve in one city) get extra replicas; the abstraction layer can re-balance shards because they are logical indexes, not machines.</li>
+        </ul>
+        <h3 id="location-privacy">6. Location privacy: do not let "3 km away" become a GPS fix</h3>
+        <div class="eli5"><h4>Explain like I'm 5</h4><p>You hide a toy and your friend walks around asking "how far is it?". If you answer exactly ("4 steps", "7 steps", "2 steps"), three questions are enough to find it. If you only say "it is in this room", walking around the room tells your friend nothing new.</p></div>
+        <p>Showing "3 km away" on a card feels harmless. It is not. An attacker can fake their own GPS position (the app trusts whatever latitude and longitude the phone sends), ask for the distance to one victim from three different places, and draw three circles. The circles cross at the victim's home. This is <b>trilateration</b> (distances, not angles, so not triangulation), and it has hit real dating apps more than once:</p>
+        <ul>
+          <li><b>Tinder (reported by Include Security, 2014):</b> the API returned distances to other users with about 15 decimal places, enough to place someone within about 100 feet.</li>
+          <li><b>Bumble (reported by Robert Heaton, 2021):</b> distances were rounded to whole miles, but rounded <i>down</i>. By moving the fake position step by step and watching when "3 miles" flipped to "4 miles", the attacker learned the exact 4.0-mile points, and three of those were enough again. Bumble fixed it within days of the report.</li>
+        </ul>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 380" role="img" aria-label="Trilateration: three spoofed attacker positions each learn a distance, the circles meet at the victim; with grid snapping all positions in a cell get the same answer and the circles meet only at the cell centre">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="20" y="20" width="400" height="345"/><text class="zone-label" x="36" y="44">Exact distances</text>
+            <circle class="box client" cx="220" cy="200" r="9"/><text class="label small" x="220" y="230">victim</text>
+            <g data-step="1"><circle class="box ring" cx="130" cy="150" r="103"/><circle class="box svc" cx="130" cy="150" r="7"/><text class="label small" x="130" y="134">fake P1</text></g>
+            <g data-step="2"><circle class="box ring" cx="310" cy="140" r="108"/><circle class="box svc" cx="310" cy="140" r="7"/><text class="label small" x="310" y="124">fake P2</text></g>
+            <g data-step="3"><circle class="box ring" cx="170" cy="270" r="86"/><circle class="box svc" cx="170" cy="270" r="7"/><text class="label small" x="170" y="296">fake P3</text>
+              <circle class="box ring fail" cx="220" cy="200" r="18"/><text class="label small bad" x="220" y="172">found</text></g>
+            <rect class="zone" x="440" y="20" width="400" height="345"/><text class="zone-label" x="456" y="44">Snapped to a grid cell</text>
+            <g data-step="4">
+              <path class="arrow none dashed" d="M540 60 L540 300"/><path class="arrow none dashed" d="M640 60 L640 300"/><path class="arrow none dashed" d="M740 60 L740 300"/>
+              <path class="arrow none dashed" d="M440 100 L840 100"/><path class="arrow none dashed" d="M440 200 L840 200"/><path class="arrow none dashed" d="M440 300 L840 300"/>
+              <circle class="box client" cx="670" cy="170" r="9"/><text class="label small" x="700" y="174">victim</text>
+              <circle class="box ok" cx="590" cy="150" r="7"/><text class="label small ok" x="590" y="132">cell centre</text>
+              <path class="arrow ok" d="M662 166 L598 152"/>
+              <text class="label small left" x="456" y="326">server stores and compares only cell centres</text>
+            </g>
+            <g data-step="5">
+              <circle class="box svc" cx="770" cy="240" r="7"/><circle class="box svc" cx="800" cy="280" r="7"/>
+              <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M770 240 L800 280 L760 290 L770 240"/></circle>
+              <text class="label small left" x="456" y="350">attacker moves inside a cell: same answer</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li>The attacker fakes position P1 and asks for the victim's distance. One circle: the victim is somewhere on it.</li>
+            <li>A second fake position, a second circle. Now there are only two candidate points.</li>
+            <li>A third circle picks one point. With exact (or cleverly probed rounded) distances, that point is the victim's home.</li>
+            <li>The fix: on the server, snap every user's location to the centre of a coarse grid cell before computing any distance.</li>
+            <li>Now every fake position inside one cell gets the same answer, and the best any attacker can recover is the cell centre, not the person.</li>
+          </ol>
+        </div>
+        <h4>The layered fix</h4>
+        <ol class="steps">
+          <li><strong>Never send other users' coordinates to the phone.</strong> Compute distance on the server. (Tinder's first fix; necessary but not enough.)</li>
+          <li><strong>Snap before you compute.</strong> Round each stored location to a grid cell (Heaton suggests about 0.1 degree of latitude and longitude; a coarse S2 or geohash cell works the same way) and compute the distance between cell centres. 0.1 degree of latitude is about 11 km; 0.1 degree of longitude is about 11 km at the equator, 10.8 km in Bengaluru and 6.9 km in London (it shrinks with the cosine of latitude).</li>
+          <li><strong>Show bands, not numbers.</strong> "Less than 2 km", "2-5 km", "5-10 km" after snapping. Rounding alone leaks the flip points; snapping first means the flip points are cell edges, not the victim.</li>
+          <li><strong>No fresh random noise per request.</strong> If each query adds new random jitter, the attacker asks 100 times and averages it away. Noise must be fixed per pair (or per cell and time window), or skipped in favour of snapping.</li>
+          <li><strong>Make spoofing expensive.</strong> Rate-limit location updates and distance lookups per account; flag "impossible travel" (three positions 5 km apart in one minute); limit how many distances to one profile a viewer can request.</li>
+          <li><strong>Collect less.</strong> If the product only needs the cell, store only the cell. Data you never keep cannot leak in a breach either.</li>
+        </ol>
+<pre><code class="language-python">import math
+
+CELL = 0.1  # degrees, about 11 km north-south
+
+def snap(lat, lng, cell=CELL):
+    """Move a point to the centre of its grid cell."""
+    return ((math.floor(lat / cell) + 0.5) * cell,
+            (math.floor(lng / cell) + 0.5) * cell)
+
+def haversine_km(a, b):
+    lat1, lng1, lat2, lng2 = map(math.radians, (*a, *b))
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2)
+    return 2 * 6371 * math.asin(math.sqrt(h))
+
+def band(km):
+    for limit in (2, 5, 10, 25, 50):
+        if km &lt; limit:
+            return f"less than {limit} km"
+    return "more than 50 km"
+
+victim = (12.9352, 77.6245)            # true location, never leaves the server
+for attacker in [(12.9300, 77.6200), (12.9500, 77.6300), (12.9100, 77.6400), (13.0500, 77.7000)]:
+    exact = haversine_km(attacker, victim)
+    shown = haversine_km(snap(*attacker), snap(*victim))
+    print(f"attacker {attacker}: exact {exact:.3f} km -&gt; shown '{band(shown)}' (snapped {shown:.1f} km)")</code></pre>
+<pre class="terminal"><code>$ python snap.py
+attacker (12.93, 77.62): exact 0.756 km -&gt; shown 'less than 2 km' (snapped 0.0 km)
+attacker (12.95, 77.63): exact 1.750 km -&gt; shown 'less than 2 km' (snapped 0.0 km)
+attacker (12.91, 77.64): exact 3.267 km -&gt; shown 'less than 2 km' (snapped 0.0 km)
+attacker (13.05, 77.7): exact 15.161 km -&gt; shown 'less than 25 km' (snapped 15.5 km)</code></pre>
+        <p>Three spoofed positions that are 0.8, 1.8 and 3.3 km from the victim all get the same answer, so they carry no information. Only a position in another cell gets a different band, and that tells you about cells, not people.</p>
+        <div class="bridge"><h4>From your world</h4><p>Snapping to a cell is route summarization for privacy: you advertise the <code>/16</code>, never the <code>/32</code>, so an outsider learns which network a host is in but not which host. The averaging attack on random noise is the same trick you use to measure latency through jitter: one ping is noisy, the mean of 1,000 pings is precise. Rounding down and probing for the flip point is a classic side channel too, like timing a non-constant-time compare one byte at a time.</p></div>
+        <div class="callout warn"><p><b>Gotchas:</b> two people 200 m apart on opposite sides of a cell edge will show as about one cell apart; that is the price, and bands hide most of it. Snap the <b>stored</b> value too, not only the displayed one, or a later feature (or a log line) leaks the precise point. "Recently active" and "last seen" timestamps combined with location can identify routines, so coarsen time as well. Geosharding (deep dive 2) can keep using precise cells internally; only what crosses the API boundary needs to be coarse.</p></div>
+      

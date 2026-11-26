@@ -1,0 +1,58 @@
+
+        <h2>Data model</h2>
+        <p><b>Pick SQL</b> (PostgreSQL or MySQL, sharded; or a distributed SQL database like Spanner, CockroachDB or Aurora). One sentence to justify it: <em>"Payments need ACID transactions across the payment row, its history, the ledger postings and the outbox, plus unique constraints for idempotency, and SQL gives me all of that in one commit."</em> NoSQL appears around the edges: Elasticsearch for merchant search dashboards, a data lake for analytics. PhonePe's TStore is an interesting real counter-example (a Kafka write-ahead log in front of HBase), covered in <a href="#real-world">real world</a>.</p>
+<pre><code class="language-sql">-- The current state of each payment (one row, updated with optimistic locking)
+CREATE TABLE payments (
+  payment_id      VARCHAR(32) PRIMARY KEY,      -- e.g. pay_01HZX3 (time-sortable id)
+  merchant_id     BIGINT      NOT NULL,
+  order_id        VARCHAR(64) NOT NULL,
+  amount_minor    BIGINT      NOT NULL CHECK (amount_minor &gt; 0),
+  currency        CHAR(3)     NOT NULL,
+  status          VARCHAR(20) NOT NULL,         -- created|processing|requires_action|authorized|succeeded|failed|canceled|unknown|refunded
+  psp             VARCHAR(20),                  -- which provider we routed to
+  psp_reference   VARCHAR(64),                  -- the provider's id for this charge
+  version         INT         NOT NULL DEFAULT 0,
+  created_at      TIMESTAMPTZ NOT NULL,
+  updated_at      TIMESTAMPTZ NOT NULL,
+  attempt_no      INT         NOT NULL DEFAULT 1 -- 2nd try after a decline (card -> UPI) is a new attempt
+);
+-- At most one LIVE payment per order; failed or canceled attempts do not block a retry.
+CREATE UNIQUE INDEX one_live_payment ON payments (merchant_id, order_id)
+  WHERE status NOT IN ('failed', 'canceled');
+
+-- Append-only history: every transition, never updated
+CREATE TABLE payment_events (
+  payment_id  VARCHAR(32), seq INT, from_status VARCHAR(20), to_status VARCHAR(20),
+  source      VARCHAR(20),  -- api|psp_sync|psp_webhook|reconciliation
+  payload     JSONB, created_at TIMESTAMPTZ,
+  PRIMARY KEY (payment_id, seq)
+);
+
+-- Idempotency: the "notebook" from the story
+CREATE TABLE idempotency_keys (
+  merchant_id    BIGINT, idem_key VARCHAR(64),
+  order_id       VARCHAR(64) NOT NULL,    -- part of the shard key (see Sharding below)
+  request_hash   CHAR(64)  NOT NULL,      -- sha256 of the request body
+  locked_at      TIMESTAMPTZ,             -- set while a request is in flight
+  recovery_point VARCHAR(30) NOT NULL,    -- started|payment_created|psp_called|finished
+  response_code  INT, response_body JSONB,
+  created_at     TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (merchant_id, idem_key)
+);
+
+-- Transactional outbox: rows to publish to Kafka
+CREATE TABLE outbox (
+  id BIGSERIAL PRIMARY KEY, aggregate_id VARCHAR(32), event_type VARCHAR(40),
+  payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL
+);
+
+-- Inbound webhook dedupe
+CREATE TABLE psp_events_seen (psp VARCHAR(20), event_id VARCHAR(64), PRIMARY KEY (psp, event_id));</code></pre>
+        <p>The <b>ledger</b> (accounts, journal entries and postings that sum to zero) deserves its own page: see <a href="{{BASE}}hld/d41">Digital Wallet, UPI &amp; Double-Entry Ledger</a>. Here we only need to know that a successful payment writes postings such as <i>debit "PSP receivable" 49900, credit "merchant payable" 49900</i>, in the same transaction as the status change.</p>
+        <p><b>Sharding.</b> Shard <b>all four</b> tables (<code>payments</code>, <code>payment_events</code>, <code>outbox</code> and <code>idempotency_keys</code>) by the <b>same key</b>, <code>hash(merchant_id, order_id)</code>. Every create request carries both values, so the service can compute the shard before it touches anything. Two reasons this matters:</p>
+        <ul>
+          <li><b>A unique constraint only holds within one shard.</b> The database cannot check <code>one_live_payment</code> across shards. Because every attempt for one order lands on the same shard, the partial unique index above really does mean "one live payment per order".</li>
+          <li><b>Deep dive 1 needs one local transaction</b> that claims the idempotency key, inserts the payment and writes the outbox row together. That is only possible if those rows sit on the same shard.</li>
+        </ul>
+        <p>To make lookups by id direct, <b>embed the shard number in <code>payment_id</code></b> (for example <code>pay_s0417_01HZX3...</code>): a webhook or a <code>GET /payments/{id}</code> reads the shard from the id with no directory lookup. Do not shard by merchant alone: one giant merchant would make one hot shard; adding <code>order_id</code> to the hash spreads it. Merchant queries ("show my payments today") go to a read replica or a search index fed from Kafka.</p>
+      

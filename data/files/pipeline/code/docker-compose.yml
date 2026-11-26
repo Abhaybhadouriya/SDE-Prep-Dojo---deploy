@@ -1,0 +1,236 @@
+# ShopStream - local end-to-end Kafka pipeline (3-broker KRaft cluster).
+#
+#   docker compose up -d --build           # everything
+#   docker compose ps                      # see health
+#   docker compose down -v                 # stop and delete data
+#
+# Low RAM laptop? Use the single-broker file instead:
+#   docker compose -f compose.single-broker.yml up -d --build
+#
+# Ports on your machine:
+#   8000 order-api   8001 analytics   8080 kafka-ui   9090 prometheus   3000 grafana
+#   9092 / 9192 / 9292 Kafka brokers 1/2/3 (for tools on the host)   5432 postgres
+
+name: shopstream
+
+# ---- Shared settings for the three Kafka nodes (YAML anchor, reused below) ----
+x-kafka-common: &kafka-common
+  image: ${KAFKA_IMAGE:-apache/kafka:4.3.2}
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 > /dev/null 2>&1"]
+    interval: 10s
+    timeout: 10s
+    retries: 12
+    start_period: 20s
+
+x-kafka-env: &kafka-env
+  # KRaft "combined" mode: every node is a broker AND a controller (no ZooKeeper).
+  KAFKA_PROCESS_ROLES: broker,controller
+  CLUSTER_ID: ${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka-1:29093,2@kafka-2:29093,3@kafka-3:29093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  # Durability defaults (topics-init also sets min.insync.replicas per topic).
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+  KAFKA_MIN_INSYNC_REPLICAS: 2
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # typos must fail loudly, not create topics
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_HEAP_OPTS: -Xms512m -Xmx512m
+
+x-app-env: &app-env
+  KAFKA_BOOTSTRAP: kafka-1:19092,kafka-2:19092,kafka-3:19092
+  LOG_LEVEL: INFO
+
+x-app-depends: &app-depends
+  topics-init:
+    condition: service_completed_successfully
+
+services:
+  # ---------------------------------------------------------------- Kafka
+  kafka-1:
+    <<: *kafka-common
+    hostname: kafka-1
+    ports: ["9092:9092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-1:19092,EXTERNAL://localhost:9092
+    volumes: ["kafka1-data:/var/lib/kafka/data"]
+
+  kafka-2:
+    <<: *kafka-common
+    hostname: kafka-2
+    ports: ["9192:9092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-2:19092,EXTERNAL://localhost:9192
+    volumes: ["kafka2-data:/var/lib/kafka/data"]
+
+  kafka-3:
+    <<: *kafka-common
+    hostname: kafka-3
+    ports: ["9292:9092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:29093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka-3:19092,EXTERNAL://localhost:9292
+    volumes: ["kafka3-data:/var/lib/kafka/data"]
+
+  # One-shot container: creates topics (6 partitions, RF 3, min.insync.replicas 2), then exits 0.
+  topics-init:
+    image: ${KAFKA_IMAGE:-apache/kafka:4.3.2}
+    depends_on:
+      kafka-1: {condition: service_healthy}
+      kafka-2: {condition: service_healthy}
+      kafka-3: {condition: service_healthy}
+    volumes: ["./scripts/create-topics.sh:/create-topics.sh:ro"]
+    entrypoint: ["bash", "/create-topics.sh", "kafka-1:19092,kafka-2:19092,kafka-3:19092", "3", "2"]
+    restart: "no"
+
+  # ---------------------------------------------------------------- Storage
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-shopstream}
+      POSTGRES_USER: ${POSTGRES_USER:-shopstream}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shopstream}
+    ports: ["5432:5432"]
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shopstream} -d ${POSTGRES_DB:-shopstream}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------- ShopStream services
+  order-api:
+    build: {context: ./services, dockerfile: order-api/Dockerfile}
+    image: shopstream/order-api:dev
+    restart: unless-stopped
+    stop_grace_period: 30s   # default is 10 s; match k8s terminationGracePeriodSeconds
+    ports: ["8000:8000"]
+    environment:
+      <<: *app-env
+    depends_on: *app-depends
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/readyz',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  enricher:
+    build: {context: ./services, dockerfile: enricher/Dockerfile}
+    image: shopstream/enricher:dev
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *app-env
+      CATALOG_SOURCE: ${CATALOG_SOURCE:-postgres}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-shopstream}:${POSTGRES_PASSWORD:-shopstream}@postgres:5432/${POSTGRES_DB:-shopstream}
+      TRANSIENT_FAIL_RATE: ${TRANSIENT_FAIL_RATE:-0.0}
+      PROCESSING_DELAY_MS: ${PROCESSING_DELAY_MS:-0}
+    depends_on:
+      <<: *app-depends
+      postgres: {condition: service_healthy}
+    # Scale to see a rebalance:  docker compose up -d --scale enricher=3
+    # (each replica gets its own HOSTNAME => its own transactional.id)
+
+  retry-worker:
+    build: {context: ./services, dockerfile: enricher/Dockerfile}
+    image: shopstream/enricher:dev      # same image as enricher, different program
+    restart: unless-stopped
+    stop_grace_period: 30s
+    command: ["python", "retry_worker.py"]
+    environment:
+      <<: *app-env
+    depends_on:
+      <<: *app-depends
+      enricher: {condition: service_started}
+
+  postgres-sink:
+    build: {context: ./services, dockerfile: postgres-sink/Dockerfile}
+    image: shopstream/postgres-sink:dev
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *app-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-shopstream}:${POSTGRES_PASSWORD:-shopstream}@postgres:5432/${POSTGRES_DB:-shopstream}
+    depends_on:
+      <<: *app-depends
+      postgres: {condition: service_healthy}
+
+  analytics:
+    build: {context: ./services, dockerfile: analytics/Dockerfile}
+    image: shopstream/analytics:dev
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports: ["8001:8000"]
+    environment:
+      <<: *app-env
+    depends_on: *app-depends
+
+  # ---------------------------------------------------------------- Tooling / observability
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    # (provectus is no longer updated; the maintained fork is ghcr.io/kafbat/kafka-ui)
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: shopstream
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka-1:19092,kafka-2:19092,kafka-3:19092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    depends_on: *app-depends
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.11.0
+    restart: unless-stopped
+    command:
+      - --kafka.server=kafka-1:19092
+      - --kafka.server=kafka-2:19092
+      - --kafka.server=kafka-3:19092
+      - --kafka.version=3.9.0       # protocol version the exporter speaks; works with Kafka 4.x brokers
+      - --topic.filter=orders\..*
+      - --group.filter=.*
+    ports: ["9308:9308"]
+    depends_on: *app-depends
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  grafana:
+    image: grafana/grafana:13.2.6
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      # Local learning only: anonymous viewer so you can open dashboards without a login.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shopstream-lag.json
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  pg-data:

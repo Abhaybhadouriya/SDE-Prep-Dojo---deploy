@@ -1,0 +1,81 @@
+
+        <h2>A full worked mini-example: "Design a notification service"</h2>
+        <p>Read this as a script. <b>I</b> = interviewer, <b>C</b> = candidate (you, at SDE-2 level). Notice the order, the numbers, the trade-off sentences, and how the candidate checks in. The full design lives on <a href="{{BASE}}hld/d03">Notification System</a>.</p>
+
+        <h3>Minutes 0-8: hello and requirements</h3>
+        <blockquote>
+          <p><b>I:</b> Design a notification system for an e-commerce app.</p>
+          <p><b>C:</b> Before I design, a few questions. Which channels - push, SMS, email? Who sends - other internal services, or marketing too?</p>
+          <p><b>I:</b> All three channels. Internal services send order updates and OTPs; marketing sends campaigns.</p>
+          <p><b>C:</b> So functionally: one, services call an API to send a notification to a user on one or more channels. Two, users can opt out per channel and per category. Three, we track whether each notification was delivered. I'll leave the template editor UI and A/B testing out of scope. Non-functionally: OTPs must arrive within seconds, marketing can be slow. We must not send duplicates, especially OTPs and payment messages. Availability matters more than strict consistency. How many users?</p>
+          <p><b>I:</b> Around 50 million daily active users.</p>
+        </blockquote>
+
+        <h3>Minutes 8-11: estimates</h3>
+        <blockquote>
+          <p><b>C:</b> Let me size it. Say 50M users get about 10 notifications a day on average: 500 million a day. A day is about 10^5 seconds, so about 5,000 per second on average. Marketing campaigns are bursty - if a campaign goes to all 50M users in 10 minutes, that's about 80,000 per second for a while. So the key point: <em>the peak is driven by campaigns, and it is much bigger than the average</em>. That tells me we need a queue to absorb bursts, and OTPs must not wait behind a campaign.</p>
+        </blockquote>
+<pre class="terminal" data-title="quick maths"><code>$ python -c "print(50e6*10/1e5, 'avg/s'); print(round(50e6/600), 'campaign peak/s')"
+5000.0 avg/s
+83333 campaign peak/s</code></pre>
+
+        <h3>Minutes 11-15: API and data model</h3>
+<pre><code class="language-json">POST /v1/notifications
+Idempotency-Key: 4f1c...            // caller-generated, one per logical message
+{
+  "userId": 42,
+  "category": "ORDER_UPDATE",       // or OTP, MARKETING
+  "channels": ["PUSH", "SMS"],
+  "templateId": "order_shipped_v3",
+  "params": { "orderId": "ord_81f2" }
+}
+-&gt; 202 Accepted { "notificationId": "ntf_9a1..." }
+
+GET /v1/notifications/ntf_9a1...    -&gt; status per channel: QUEUED | SENT | DELIVERED | FAILED</code></pre>
+        <blockquote>
+          <p><b>C:</b> The API returns 202 because sending is asynchronous. The idempotency key lets callers retry safely. For data: user preferences and device tokens are small and read on every send, so a key-value store with a cache in front. The notification log is write-heavy and queried by user and time, so a wide-column store like Cassandra partitioned by user ID.</p>
+        </blockquote>
+
+        <h3>Minutes 15-25: high-level design</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Notification system: API, priority queues, workers, providers">
+            <rect class="box client" x="10" y="120" width="110" height="56"/><text class="label" x="65" y="140">Order svc,</text><text class="label small" x="65" y="160">Auth, Mktg</text>
+            <rect class="box k8s" x="150" y="120" width="130" height="56"/><text class="label" x="215" y="140">Notification</text><text class="label small" x="215" y="160">API</text>
+            <rect class="box cache" x="150" y="230" width="130" height="50"/><text class="label small" x="215" y="255">prefs + dedupe</text>
+            <rect class="box kafka" x="320" y="30" width="150" height="46"/><text class="label" x="395" y="53">otp (high)</text>
+            <rect class="box kafka" x="320" y="125" width="150" height="46"/><text class="label" x="395" y="148">transactional</text>
+            <rect class="box kafka" x="320" y="220" width="150" height="46"/><text class="label" x="395" y="243">marketing (low)</text>
+            <rect class="box svc" x="510" y="30" width="120" height="46"/><text class="label" x="570" y="53">SMS workers</text>
+            <rect class="box svc" x="510" y="125" width="120" height="46"/><text class="label" x="570" y="148">Push workers</text>
+            <rect class="box svc" x="510" y="220" width="120" height="46"/><text class="label" x="570" y="243">Email workers</text>
+            <rect class="box queue" x="670" y="30" width="120" height="46"/><text class="label small" x="730" y="53">SMS vendors</text>
+            <rect class="box queue" x="670" y="125" width="120" height="46"/><text class="label small" x="730" y="148">APNs / FCM</text>
+            <rect class="box queue" x="670" y="220" width="120" height="46"/><text class="label small" x="730" y="243">Email vendor</text>
+            <path class="arrow" d="M120 148 L142 148"/><path class="arrow dashed" d="M215 176 L215 222"/>
+            <path class="arrow kafka" d="M280 135 L312 60"/><path class="arrow kafka" d="M280 148 L312 148"/><path class="arrow kafka" d="M280 160 L312 238"/>
+            <path class="arrow" d="M470 53 L502 53"/><path class="arrow" d="M470 148 L502 148"/><path class="arrow" d="M470 243 L502 243"/>
+            <path class="arrow" d="M630 53 L662 53"/><path class="arrow" d="M630 148 L662 148"/><path class="arrow" d="M630 243 L662 243"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M120 148 L215 148 L395 53 L570 53 L730 53"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="5s" begin="1s" repeatCount="indefinite" path="M120 148 L215 148 L395 243 L570 243 L730 243"/></circle>
+          </svg>
+          <figcaption>The board at minute 25. APNs and FCM are Apple's and Google's push notification services. Separate topics by priority so an OTP (fast blue dot) never waits behind a marketing campaign (slow orange dot).</figcaption>
+        </figure>
+        <blockquote>
+          <p><b>C:</b> Walking an OTP through: the Auth service calls the API with an idempotency key. The API checks the dedupe store, loads preferences from the cache, renders the template and writes one message per channel to Kafka. OTPs go to a separate high-priority topic with its own workers, so a 50-million-user campaign can't delay them. SMS workers call the vendor and record the result in the log. Does this cover what you had in mind before I go deeper?</p>
+          <p><b>I:</b> Yes. What happens when the SMS vendor is slow or down?</p>
+        </blockquote>
+
+        <h3>Minutes 25-37: deep dives</h3>
+        <blockquote>
+          <p><b>C:</b> Two parts: vendor failure, and duplicates. For vendor failure, I'd put a <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a> (a switch that stops calling a failing dependency for a while) per vendor: after a run of timeouts, stop calling it for a short time and fail over to a second SMS vendor. Retries use exponential backoff with jitter. After N attempts the message goes to a dead-letter topic (a <a href="{{BASE}}interview/glossary#dlq">DLQ</a>) and we alert. For OTPs I'd rather fail over quickly than retry slowly, because an OTP is useless after a minute - so OTP messages carry a TTL and workers drop expired ones. The trade-off: two vendors cost more and need two integrations, but SMS for login is critical enough.</p>
+          <p><b>C:</b> For duplicates: Kafka consumers are <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a>, so after a worker crash a message can be redelivered. Each message carries the notification ID, and the worker uses a two-state claim in Redis. Before calling the vendor it runs <code>SET ntf:{id} SENDING NX EX 60</code> - set only if absent, expire in 60 seconds. If the key already says SENT, skip: it was delivered. If it says SENDING, another worker owns it right now, so skip too; if that worker died, the short TTL expires and a redelivery can take over. After the vendor returns OK, the worker sets the key to SENT with a long TTL, say 24 hours. That gives effectively-once sending. The remaining window is a crash after the vendor call but before writing SENT: once the 60-second claim expires, a redelivery sends again. For an OTP a rare duplicate is acceptable, and much better than a lost one. For a "payment received" message I'd also pass the notification ID to the vendor as its own dedupe or reference key, so the vendor drops the repeat.</p>
+          <p><b>I:</b> How do you scale the campaign path?</p>
+          <p><b>C:</b> Marketing goes through a separate topic with many partitions, keyed by user ID so one user's messages stay ordered. Email workers scale horizontally up to the partition count; on Kubernetes I'd autoscale them on consumer lag. We also rate-limit per vendor, because vendors throttle us - so for campaigns the vendor quota, not our servers, is the real ceiling. I'd spread a big campaign over time instead of blasting it.</p>
+        </blockquote>
+
+        <h3>Minutes 37-41: wrap-up</h3>
+        <blockquote>
+          <p><b>C:</b> To wrap up: the first bottleneck at 10x is vendor quota, then the preferences cache. I'd monitor per-topic consumer lag, end-to-end OTP latency at p99, vendor error rate per vendor, and the DLQ size, with an alert on OTP p99 above a few seconds. Next I'd add per-user frequency caps so marketing doesn't spam, and a delivery-receipt webhook from vendors to fill in DELIVERED.</p>
+        </blockquote>
+        <div class="callout tip"><p><b>Notice what the candidate never did:</b> name a technology without a reason, go silent, or spend ten minutes on one box before the whole flow worked. Also notice the check-ins at the end of each phase - they let the interviewer steer you to what they want to grade.</p></div>
+      

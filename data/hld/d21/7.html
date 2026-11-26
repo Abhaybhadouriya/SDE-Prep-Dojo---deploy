@@ -1,0 +1,65 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <h3>Kafka: the source of truth for clicks</h3>
+<pre class="terminal"><code>$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic ad-clicks \
+    --partitions 64 --replication-factor 3 \
+    --config min.insync.replicas=2 \
+    --config retention.ms=604800000
+Created topic ad-clicks.
+
+$ echo 'ad-42:{"click_id":"imp-991","ad_id":"ad-42","event_time":"2026-11-23T10:02:13.481Z"}' | \
+  kafka-console-producer.sh --bootstrap-server localhost:9092 --topic ad-clicks \
+    --reader-property parse.key=true --reader-property key.separator=:
+
+$ kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic ad-clicks \
+    --from-beginning --formatter-property print.key=true --formatter-property print.partition=true --max-messages 1
+Partition:17	ad-42	{"click_id":"imp-991","ad_id":"ad-42","event_time":"2026-11-23T10:02:13.481Z"}
+Processed a total of 1 messages</code></pre>
+        <p>(Kafka &lt; 4.2: use <code>--property</code> instead of <code>--reader-property</code> / <code>--formatter-property</code>; the old flag is deprecated since 4.2.) (The partition number depends on the murmur2 hash of the key and your partition count; the point is that every <code>ad-42</code> click lands on the same one.) Producer settings for the click service:</p>
+<pre><code class="language-java">Properties p = new Properties();
+p.put("bootstrap.servers", "kafka-0:9092,kafka-1:9092,kafka-2:9092");
+p.put("acks", "all");                    // default since Kafka 3.0, set it explicitly anyway
+p.put("enable.idempotence", "true");     // no duplicates from producer retries
+p.put("linger.ms", "10");                // small batching window: throughput vs latency
+p.put("compression.type", "lz4");
+p.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+p.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(p);
+// fire-and-forget with a callback: the HTTP handler returns the 302 without waiting
+producer.send(new ProducerRecord&lt;&gt;("ad-clicks", adId, clickJson), (md, err) -&gt; {
+    if (err != null) spillQueue.offer(clickJson);  // never block: callbacks run on the producer I/O thread; a separate thread writes the spill file
+});</code></pre>
+        <p>Kafka is also the <b>replay button</b>: 7 days of retention means a bug fix can recompute a week. Background reading: <a href="{{BASE}}devops/kafka-05">replication &amp; ISR</a>, <a href="{{BASE}}devops/kafka-07">storage internals</a>, <a href="{{BASE}}devops/kafka-11">operations</a>, and the hands-on <a href="{{BASE}}devops/pipeline-02">pipeline lab</a>, which runs Kafka and a stream processor locally with Docker Compose.</p>
+
+        <h3>Kubernetes: stateless click service, stateful Flink</h3>
+        <ul>
+          <li><b>Click service:</b> a stateless Deployment behind an Ingress/load balancer, scaled by the HPA on CPU or request rate, spread across zones. Readiness probes pull a pod out of rotation if it cannot reach Kafka.</li>
+          <li><b>Flink:</b> run with the Apache Flink Kubernetes Operator, which adds a <code>FlinkDeployment</code> custom resource. Checkpoints go to object storage so a restarted JobManager or TaskManager pod recovers state. Parallelism should not exceed the partition count usefully. (<a href="{{BASE}}devops/k8s-10">Operators &amp; CRDs</a>.)</li>
+          <li><b>Kafka:</b> either a managed service or <a href="{{BASE}}interview/glossary#strimzi">Strimzi</a> on Kubernetes (<a href="{{BASE}}devops/kafka-11">Kafka on K8s</a>).</li>
+        </ul>
+<pre><code class="language-yaml">apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: click-aggregator
+  namespace: ads
+spec:
+  image: registry.example.internal/ads/click-agg:1.4.2   # your job jar baked into a Flink image
+  flinkVersion: v1_20                                     # match what your operator version supports
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    execution.checkpointing.interval: "60s"
+    execution.checkpointing.mode: EXACTLY_ONCE
+    state.backend.type: rocksdb
+    state.checkpoints.dir: s3://ads-flink/checkpoints/click-aggregator
+  jobManager:
+    resource: { memory: "2048m", cpu: 1 }
+  taskManager:
+    replicas: 8
+    resource: { memory: "8192m", cpu: 4 }
+  job:
+    jarURI: local:///opt/flink/usrlib/click-agg.jar
+    parallelism: 32
+    upgradeMode: savepoint          # take a savepoint before upgrades, resume from it</code></pre>
+        <h3>Docker</h3>
+        <p>Every component ships as a container image: the click service, the Flink job (job JAR layered on the official Flink image), and the reconciliation Spark job. Locally, one <code>docker compose up</code> with a single Kafka broker in KRaft mode plus a Flink JobManager and TaskManager is enough to test windows, dedup and late events - replay a file of clicks with shuffled timestamps and check the counts. See <a href="{{BASE}}devops/pipeline-02">Build it locally</a>.</p>
+      

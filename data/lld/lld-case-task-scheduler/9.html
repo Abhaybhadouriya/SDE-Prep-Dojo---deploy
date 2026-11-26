@@ -1,0 +1,69 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Start the answer with a list of shared state and who touches it. Then pick one protection per row. Here a <b>single lock</b> is the right call: every operation is a few heap and map steps (microseconds), and the slow part, the task body, runs outside it.</p>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Touched by</th><th>Protection</th></tr></thead>
+      <tbody>
+        <tr><td><code>jobs</code>, <code>timeQueue</code>, <code>readyQueue</code>, every <code>Job</code> field</td><td>submitters, cancellers, dispatcher, workers</td><td>One <code>ReentrantLock</code></td></tr>
+        <tr><td>"something changed, re-check the head"</td><td>submit, cancel, completion wake the dispatcher</td><td>Condition <code>changed</code> (await with timeout = time until head is due)</td></tr>
+        <tr><td>"a job became terminal"</td><td><code>awaitTerminal</code> callers</td><td>Condition <code>settled</code>, signalAll</td></tr>
+        <tr><td>Free worker count</td><td>dispatcher takes, worker gives back</td><td><code>Semaphore(workers)</code></td></tr>
+        <tr><td><code>JobSpec</code>, <code>Task</code>, <code>Schedule</code></td><td>everyone</td><td>Immutable: no lock needed</td></tr>
+        <tr><td>Listener list</td><td>add rarely, iterate often</td><td><code>CopyOnWriteArrayList</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Five decisions that interviewers probe</h3>
+  <ol class="steps">
+    <li><strong>The dispatcher waits for a free worker before it picks a job.</strong> If it pushed every due job into the pool's FIFO queue at once, a priority-9 job arriving a moment later would queue behind 500 priority-1 jobs: the priority heap would be useless. Acquiring a semaphore permit first means the choice is made at the last possible moment, when a worker can actually start. It also gives backpressure: the pool queue never holds more than N items.</li>
+    <li><strong>Wait with a deadline, re-check after every wake-up.</strong> <code>changed.await(head.runAt - now)</code> sleeps exactly until the earliest job is due. A new, earlier job calls <code>signal()</code> so the dispatcher recomputes. Every wait sits in a <code>while</code> loop because wake-ups can be spurious and the head may have changed. This is the classic <i>lost wake-up</i> trap: if you check the queue, release the lock and then sleep, a signal in between is lost.</li>
+    <li><strong>Run the task and the listeners without the lock.</strong> A task that sleeps for a minute while holding the lock freezes every submitter. A listener that calls <code>scheduler.info()</code> while the lock is held by another thread is fine with a reentrant lock, but a listener that blocks on something a worker needs would deadlock. We collect events under the lock and fire them after <code>unlock()</code>.</li>
+    <li><strong>Lazy cancellation.</strong> Removing an arbitrary element from a binary heap is O(n). We flip the state to CANCELLED (O(1)) and the dispatcher drops the job when it reaches the top: a tombstone. The kernel's timer wheel avoids the problem differently: timers sit on doubly linked bucket lists, so <code>del_timer()</code> is an O(1) unlink, and <code>hrtimer_cancel()</code> removes the node from an rbtree in O(log n). A binary heap cannot unlink in place, so we tombstone; an indexed heap that tracks each job's position would give O(log n) removal.</li>
+    <li><strong>A monotonic clock.</strong> <code>System.nanoTime()</code>, not <code>currentTimeMillis()</code>. If NTP steps the wall clock back an hour, a wall-clock scheduler goes silent for an hour. This is <code>CLOCK_MONOTONIC</code> versus <code>CLOCK_REALTIME</code>.</li>
+  </ol>
+  <h3>The races, and why each one cannot happen</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Race</th><th>What could go wrong</th><th>Why it is safe</th></tr></thead>
+      <tbody>
+        <tr><td>Two submits with the same id</td><td>Both admitted</td><td>Check and insert under one lock</td></tr>
+        <tr><td>Cancel while the dispatcher is picking</td><td>A cancelled job runs</td><td>The dispatcher re-checks <code>state == SCHEDULED</code> under the lock before RUNNING</td></tr>
+        <tr><td>Cancel a periodic job while it runs</td><td>It reschedules itself</td><td>Completion checks <code>state == CANCELLED</code> before scheduling the next run</td></tr>
+        <tr><td>Two parents finish at once</td><td>Child released twice, or never</td><td><code>--pendingDeps</code> under the lock; release only on the transition to 0</td></tr>
+        <tr><td>Child submitted just as its parent fails</td><td>Child waits forever</td><td>Admission reads the parent's state under the same lock; a failed parent means SKIPPED at once</td></tr>
+        <tr><td>A periodic job overlapping itself</td><td>Two copies run</td><td>The next run is scheduled only on completion of the current one</td></tr>
+        <tr><td>Shutdown while the dispatcher waits for a permit</td><td>Dispatcher hangs</td><td>Shutdown sets the flag, signals, and interrupts the dispatcher</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The stress test is the proof: 8 submitter threads, 8,000 jobs with random priorities and delays, 4 workers. Every job ran exactly once, and the in-flight counter never went above 4.</p>
+  <div class="callout warn"><p><b>Python note.</b> The Python version is correct under threads, but the GIL means the task bodies do not run Python bytecode in parallel. For CPU-heavy jobs use a process pool for the workers; the scheduler logic does not change.</p></div>
+  <details class="qa" data-level="4" data-topic="lld" data-company="Flipkart,Salesforce">
+    <summary>Why not one lock per job instead of one global lock?</summary>
+    <div class="answer">
+      <p>Because the operations that matter span many jobs at once: picking the top of a heap, decrementing several children's counters, skipping a whole subtree. Per-job locks would force a lock ordering across the DAG and still need a lock for the heaps. The global lock is held for microseconds, so contention is low. If profiling ever showed it hot, the first step would be sharding: N independent schedulers by hash of job id, each with its own lock and pool (DAG edges must then stay inside one shard).</p>
+      <div class="approach"><h5>How to answer</h5><p>Name the multi-object operations, state the hold time, and offer sharding as the measured next step.</p></div>
+      <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could the time queue be a <code>DelayQueue</code> or <code>ConcurrentSkipListSet</code> instead?</li><li>How would you measure lock contention? (JFR lock events; time waiting in <code>lock()</code>.)</li></ul></div>
+    </div>
+  </details>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>Condition.await()</code> / <code>signal()</code></td><td><code>wait_event()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: test the condition under the lock and re-test in a <code>while</code> loop after every wake.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td><code>Semaphore</code></td><td><code>struct semaphore</code>: <code>acquire()</code> is <code>down()</code>, <code>release()</code> is <code>up()</code>.</td></tr>
+        <tr><td><code>Collections.synchronizedList</code></td><td>A list with one mutex taken around every call (but not around a loop over it).</td></tr>
+        <tr><td><code>BlockingQueue</code></td><td>A <code>kfifo</code> with two wait queues: <code>take()</code> sleeps while empty, <code>put()</code> sleeps while full.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+        <tr><td><code>CountDownLatch</code></td><td><code>struct completion</code> with a count: <code>countDown()</code> is <code>complete()</code>, <code>await()</code> is <code>wait_for_completion()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>On this page: the time queue (a <code>PriorityQueue</code> ordered by run time) plus the dispatcher thread is a timer wheel or hrtimer firing into a workqueue: the timer decides <i>when</i>, the worker pool decides <i>who runs it</i>. <code>changed.await(timeout)</code> / <code>signal()</code> is <code>wait_event_timeout()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: check the condition under the lock, and re-check after every wake. <code>shutdown()</code> is <code>flush_workqueue()</code> then <code>destroy_workqueue()</code>: stop admitting, let running work finish, then join the workers.</p>
+  </div>

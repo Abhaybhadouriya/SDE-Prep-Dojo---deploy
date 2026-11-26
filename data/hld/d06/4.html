@@ -1,0 +1,84 @@
+
+        <h2>Data model: two very different kinds of data</h2>
+        <p>Split the data by how it behaves. <b>Hot, disposable, high-rate</b>: the latest driver positions and statuses, which change every few seconds and can be rebuilt from the next pings. That lives in memory. <b>Cold, precious, low-rate</b>: trips, fares, payments, which must never be lost or duplicated. That lives in a transactional, strongly consistent store. See <a href="{{BASE}}hld/hld-08">Choosing Storage</a> and <a href="{{BASE}}hld/hld-15">Geospatial Indexes</a>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 330" role="img" aria-label="Hot path: geo index and driver status in memory, location stream in Kafka. Cold path: trips, riders and drivers in SQL, traces in wide-column storage">
+            <rect class="zone" x="10" y="10" width="410" height="300"/>
+            <text class="zone-label" x="26" y="32">Hot (in memory, rebuildable)</text>
+            <rect class="box cache" x="28" y="48" width="375" height="70"/>
+            <text class="label" x="215" y="74">Geo index per city shard</text>
+            <text class="label small" x="215" y="98">cell_id -&gt; {driver_id: lat, lng, ts}</text>
+            <rect class="box cache" x="28" y="132" width="375" height="70"/>
+            <text class="label" x="215" y="158">driver_state:{driver_id}</text>
+            <text class="label small" x="215" y="182">status, version, current_ride, TTL 30 s</text>
+            <rect class="box kafka" x="28" y="216" width="375" height="76"/>
+            <text class="label" x="215" y="244">Kafka: driver-locations</text>
+            <text class="label small" x="215" y="268">key = driver_id, short retention</text>
+            <rect class="zone db" x="440" y="10" width="410" height="300"/>
+            <text class="zone-label" x="456" y="32">Cold (durable, strongly consistent)</text>
+            <rect class="box db" x="458" y="48" width="375" height="90"/>
+            <text class="label" x="645" y="74">trips (SQL, sharded by city)</text>
+            <text class="label small" x="645" y="98">trip_id, rider_id, driver_id, state,</text>
+            <text class="label small" x="645" y="118">fare, pickup, drop, version, timestamps</text>
+            <rect class="box db" x="458" y="152" width="180" height="60"/>
+            <text class="label small" x="548" y="178">riders, drivers</text>
+            <text class="label small" x="548" y="198">vehicles (SQL)</text>
+            <rect class="box db" x="652" y="152" width="181" height="60"/>
+            <text class="label small" x="742" y="178">trip_events</text>
+            <text class="label small" x="742" y="198">append-only log</text>
+            <rect class="box queue" x="458" y="226" width="375" height="66"/>
+            <text class="label" x="645" y="252">GPS traces</text>
+            <text class="label small" x="645" y="274">wide-column / object storage</text>
+          </svg>
+          <figcaption>Left side: losing it costs a few seconds until the next pings. Right side: losing it costs money and trust.</figcaption>
+        </figure>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Trips (SQL)">
+<pre><code class="language-sql">CREATE TABLE trips (
+  trip_id        BIGINT PRIMARY KEY,          -- Snowflake-style id
+  city_id        INT NOT NULL,                -- shard key
+  rider_id       BIGINT NOT NULL,
+  driver_id      BIGINT,                      -- NULL until matched
+  state          VARCHAR(16) NOT NULL,        -- REQUESTED, MATCHED, ARRIVING, IN_TRIP, COMPLETED, CANCELLED
+  fare_paise     BIGINT,
+  pickup_lat     DOUBLE PRECISION, pickup_lng DOUBLE PRECISION,
+  drop_lat       DOUBLE PRECISION, drop_lng   DOUBLE PRECISION,
+  idempotency_key UUID UNIQUE,                -- the rider's request key
+  version        INT NOT NULL DEFAULT 0,      -- optimistic locking
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Only one active trip per driver, enforced by the database itself
+CREATE UNIQUE INDEX one_active_trip_per_driver
+  ON trips (driver_id)
+  WHERE state IN ('MATCHED','ARRIVING','IN_TRIP');
+
+-- Move a trip forward only from the state we expect (no lost updates)
+UPDATE trips SET state = 'IN_TRIP', version = version + 1, updated_at = now()
+ WHERE trip_id = 5521 AND state = 'ARRIVING' AND version = 3;   -- 1 row = success, 0 rows = someone else won</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Redis GEO">
+<pre><code class="language-bash"># location service: store the latest point (geohash inside a sorted set)
+GEOADD drivers:blr:mini 77.59410 12.97231 d42
+GEOADD drivers:blr:mini 77.60102 12.96810 d77
+# matching: free drivers within 2 km, nearest first
+GEOSEARCH drivers:blr:mini FROMLONLAT 77.5946 12.9716 BYRADIUS 2 km ASC COUNT 10 WITHDIST
+# driver state with a TTL: no ping for 30 s means the key expires (driver gone)
+SET driver_state:d42 AVAILABLE EX 30</code></pre>
+          </div>
+        </div>
+<pre class="terminal"><code>$ redis-cli GEOADD drivers:blr:mini 77.59410 12.97231 d42 77.60102 12.96810 d77
+(integer) 2
+$ redis-cli GEOSEARCH drivers:blr:mini FROMLONLAT 77.5946 12.9716 BYRADIUS 2 km ASC COUNT 10 WITHDIST
+1) 1) "d42"
+   2) "0.0958"
+2) 1) "d77"
+   2) "0.7973"</code></pre>
+        <p class="muted">Output shape from <code>redis-cli</code> (Redis 6.2+ or Valkey); distances are in km and approximate. Try it with <code>docker run --rm -p 6379:6379 redis:7</code>. Note: GEOADD takes <b>longitude first</b>, then latitude, a classic bug.</p>
+        <ul>
+          <li><b>Why SQL for trips?</b> We need transactions, unique constraints ("one active trip per driver") and conditional updates. 700 writes/s per region is tiny for sharded Postgres/MySQL. Uber itself built a MySQL-based store called Schemaless for trip data.</li>
+          <li><b>Why shard by city?</b> Almost every query is local: a rider in Bengaluru never needs a driver in Delhi. City sharding keeps matching in one shard and limits the blast radius of a failure. Big cities can be split further by region.</li>
+          <li><b>Why a TTL on driver state?</b> Phones die, tunnels happen. Instead of a cleanup job, the key simply expires if pings stop, and the driver drops out of matching.</li>
+        </ul>
+      

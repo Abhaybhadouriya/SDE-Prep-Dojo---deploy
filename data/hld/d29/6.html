@@ -1,0 +1,109 @@
+
+        <h2>Deep dives</h2>
+
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the architecture above (Kafka keyed by location|term, windowed counters, scorer, cached top list) + deep dive 1 (velocity vs volume) + deep dive 2 (sliding windows from buckets) is a passing SDE-1 answer. The two-tier sketch, <a href="{{BASE}}interview/glossary#hot-partition">hot keys</a> and anti-manipulation (deep dives 3-5) are expected at SDE-2.</p></div>
+        <h3>1. Velocity, not volume: the trend score</h3>
+        <p>If we rank by raw count, "good morning", "happy birthday" and the name of the most famous footballer trend every day. We want <b>surprise</b>. A simple, explainable score: treat the expected count in this window as <code>b</code> (from the baseline for this term, location and hour of the week) and the observed count as <code>c</code>. Counts of independent events behave roughly like a <b>Poisson process</b> (random, independent arrivals at a steady average rate - think packet arrivals on a quiet link), whose standard deviation is about the square root of the mean. A <b>z-score</b> = how many standard deviations the observed value sits above normal. So:</p>
+<pre><code class="language-python">import math
+
+def trend_score(c, b, distinct_users, k=10):
+    """c = mentions in the last 10 min, b = expected mentions for this
+    term/location/hour-of-week, k = smoothing so brand-new terms with b=0
+    need a real crowd before they score highly."""
+    if distinct_users &lt; 50:          # minimum crowd: one loud account is not a trend
+        return 0.0
+    return (c - b) / math.sqrt(b + k)
+
+print(round(trend_score(c=12000, b=11500, distinct_users=9000), 1))   # "good morning"
+print(round(trend_score(c=2400,  b=40,    distinct_users=1900), 1))   # "power cut"</code></pre>
+<pre class="terminal"><code>$ python trend_score.py
+4.7
+333.8</code></pre>
+        <p>"Good morning" is huge but expected, so it scores about 4.7; "power cut" is small but 60x its baseline, so it scores about 334. Production systems add more: <b>seasonality</b> (baseline by hour-of-week, because Sunday-night cricket chatter is normal), <b>exponential decay</b> so a trend fades smoothly after the spike, and a <b>minimum distinct users</b> threshold.</p>
+        <div class="callout interview"><p>"Trending is anomaly detection: observed rate vs expected rate for that term, place and hour. I would start with a Poisson-style z-score because it is explainable and cheap, and tune it offline against labelled past events."</p></div>
+
+        <h3>2. Sliding windows without recounting everything</h3>
+        <p>"Last 10 minutes, updated every minute" is a <b>hopping (sliding) window</b>. Naively recounting 10 minutes of events every minute wastes work. Instead keep <b>1-minute buckets</b> in a ring: the 10-minute count is the sum of the last 10 buckets; every minute add the new bucket and subtract the oldest. Count-min sketches can be added and subtracted cell by cell too, as long as they share the same width, depth and hash functions.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Ring of one-minute buckets; the window adds the newest bucket and drops the oldest">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box fail" x="20" y="60" width="60" height="50"/><text class="label small" x="50" y="90">10:31</text>
+            <rect class="box kafka" x="90" y="60" width="60" height="50"/><text class="label small" x="120" y="90">10:32</text>
+            <rect class="box kafka" x="160" y="60" width="60" height="50"/><text class="label small" x="190" y="90">10:33</text>
+            <rect class="box kafka" x="230" y="60" width="60" height="50"/><text class="label small" x="260" y="90">10:34</text>
+            <rect class="box kafka" x="300" y="60" width="60" height="50"/><text class="label small" x="330" y="90">10:35</text>
+            <rect class="box kafka" x="370" y="60" width="60" height="50"/><text class="label small" x="400" y="90">10:36</text>
+            <rect class="box kafka" x="440" y="60" width="60" height="50"/><text class="label small" x="470" y="90">10:37</text>
+            <rect class="box kafka" x="510" y="60" width="60" height="50"/><text class="label small" x="540" y="90">10:38</text>
+            <rect class="box kafka" x="580" y="60" width="60" height="50"/><text class="label small" x="610" y="90">10:39</text>
+            <rect class="box kafka" x="650" y="60" width="60" height="50"/><text class="label small" x="680" y="90">10:40</text>
+            <rect class="box svc" x="720" y="60" width="60" height="50"/><text class="label small" x="750" y="90">10:41</text>
+            <rect class="zone kafka" x="85" y="50" width="700" height="70"/>
+            <text class="label small" x="50" y="140">subtract</text>
+            <text class="label small" x="750" y="140">add</text>
+            <text class="label small" x="430" y="170">window(10:32..10:41) = previous window - bucket 10:31 + bucket 10:41</text>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M790 30 L750 55"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M50 115 L20 160"/></circle>
+          </svg>
+          <figcaption>Hopping window over a ring of 1-minute buckets. Each minute costs one add and one subtract, not a full recount.</figcaption>
+        </figure>
+        <p>Use <b><a href="{{BASE}}interview/glossary#event-time">event time</a></b> (when the post was made), not processing time, with a <a href="{{BASE}}interview/glossary#watermark">watermark</a> that waits a few seconds for late events; otherwise a consumer that falls behind would create fake spikes when it catches up. In Flink SQL:</p>
+<pre><code class="language-sql">SELECT window_start, window_end, location, term,
+       COUNT(*)                AS mentions,
+       COUNT(DISTINCT user_id) AS authors
+FROM TABLE(
+  HOP(TABLE term_events, DESCRIPTOR(event_time), INTERVAL '1' MINUTES, INTERVAL '10' MINUTES))
+GROUP BY window_start, window_end, location, term;</code></pre>
+
+        <h3>3. Counting the long tail: sketch + candidates</h3>
+        <p>Use two tiers. The <b>count-min sketch</b> sees every term and answers "roughly how often?" with fixed memory. When a term's sketch estimate crosses a small threshold, promote it into a <b>candidate set</b> (a min-heap or <b>Space-Saving</b> structure of a few thousand entries - Space-Saving keeps k counters, and when a new term arrives and all k are full it evicts the smallest counter and gives the newcomer that count + 1, so heavy terms can never be pushed out) that keeps <b>exact</b> counts from then on. Scoring and display use exact candidate counts. Redis ships both structures, which is handy for a prototype (its Top-K uses <b>HeavyKeeper</b>, a newer sketch that decays the counters of small items so heavy ones stay):</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Every term updates the count-min sketch; terms whose estimate crosses a threshold are promoted into a small exact candidate heap, which feeds scoring">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="90" width="150" height="70"/><text class="label" x="95" y="118">term events</text><text class="label small" x="95" y="140">every mention</text>
+            <rect class="box cache" x="230" y="60" width="200" height="130"/><text class="label" x="330" y="86">Tier 1: count-min</text><text class="label small" x="330" y="108">sees EVERY term</text><text class="label small" x="330" y="128">fixed memory</text><text class="label small" x="330" y="148">approximate (may over-count)</text><text class="label small" x="330" y="168">no keys stored</text>
+            <rect class="box hot" x="480" y="40" width="160" height="56"/><text class="label small" x="560" y="63">estimate &gt; threshold?</text><text class="label small" x="560" y="82">promote</text>
+            <rect class="box svc" x="480" y="140" width="160" height="90"/><text class="label" x="560" y="165">Tier 2: candidates</text><text class="label small" x="560" y="186">few thousand terms</text><text class="label small" x="560" y="204">EXACT counts + HLL</text><text class="label small" x="560" y="222">from promotion on</text>
+            <rect class="box db" x="690" y="140" width="150" height="90"/><text class="label" x="765" y="170">Scorer</text><text class="label small" x="765" y="192">z-score vs</text><text class="label small" x="765" y="210">baseline</text>
+            <path class="arrow" d="M170 125 L222 125"/><path class="arrow" d="M430 90 L472 70"/><path class="arrow ok" d="M560 96 L560 132"/><path class="arrow" d="M640 185 L682 185"/>
+            <path class="arrow dashed" d="M170 150 Q320 245 472 205"/><text class="label small left" x="200" y="245">once promoted, its mentions also update the exact count</text>
+            <text class="label small muted" x="330" y="30">"good morning", "power cut", typos, one-off tags...</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M170 125 L230 125 L430 90 L480 70 L560 96 L560 140 L640 185 L690 185"/></circle>
+          </svg>
+          <figcaption>Two tiers. The sketch is cheap and sees everything but cannot list terms; it only nominates. Promoted terms get exact counts and distinct-author counts in a small heap, and only those are scored. A term counted approximately before promotion loses a few early minutes of exact history - fine for trends.</figcaption>
+        </figure>
+<pre class="terminal"><code>127.0.0.1:6379&gt; CMS.INITBYDIM cms:IN:1041 2719 5
+OK
+127.0.0.1:6379&gt; CMS.INCRBY cms:IN:1041 "power cut" 1 "good morning" 1 "power cut" 1
+1) (integer) 1
+2) (integer) 1
+3) (integer) 2
+127.0.0.1:6379&gt; CMS.QUERY cms:IN:1041 "power cut" "never seen"
+1) (integer) 2
+2) (integer) 0
+127.0.0.1:6379&gt; TOPK.RESERVE topk:IN 30
+OK
+127.0.0.1:6379&gt; TOPK.ADD topk:IN "power cut" "#INDvAUS" "#INDvAUS"
+1) (nil)
+2) (nil)
+3) (nil)
+127.0.0.1:6379&gt; TOPK.LIST topk:IN WITHCOUNT
+1) "#INDvAUS"
+2) (integer) 2
+3) "power cut"
+4) (integer) 1</code></pre>
+        <p>In the real pipeline these structures live inside the stream job's state (checkpointed), not as network calls per event - 54k Redis round trips per second is possible, but in-process state is cheaper and survives failures through checkpoints. The detailed maths of merging local top-Ks is on <a href="{{BASE}}hld/d35">Top-K / Heavy Hitters</a>.</p>
+
+        <h3>4. Hot keys: when the whole country says one word</h3>
+        <p>During a cricket final, "#INDvAUS" in location "IN" may be 30% of all events, and all of them hash to <b>one</b> partition and one worker. Fixes: (a) <b>pre-aggregate</b> before the shuffle - the extractor keeps a tiny in-memory map per second and sends "#INDvAUS +412" instead of 412 events (a <b>combiner</b>, as in MapReduce: pre-sum on the sender so fewer, bigger messages cross the network); (b) <b>salt</b> known-hot keys into N sub-keys (<code>IN|#INDvAUS|3</code>) and sum them in the merger. Pre-aggregation alone usually cuts traffic by orders of magnitude for the hottest terms.</p>
+
+        <h3>5. Spam, manipulation and safety</h3>
+        <p>Trends are valuable, so people attack them. Defences, cheapest first:</p>
+        <ul>
+          <li><b>Count people, not posts.</b> Score on distinct authors (HyperLogLog, ~12 KB per counter, about 0.81% standard error; held in the stream job's state in production) so one account posting 10,000 times counts once.</li>
+          <li><b>Weight by trust.</b> New accounts, accounts flagged by the spam system, or accounts that all post the same text get low weight.</li>
+          <li><b>Diversity checks.</b> A real trend has many unrelated users in many places; a campaign has a tight cluster created last week. Twitter's research on event detection uses clustering of related terms for this kind of grouping.</li>
+          <li><b>Policy layer.</b> Blocklists, a human review queue for high-visibility locations, and a "pause trends" switch.</li>
+        </ul>
+        <div class="callout warn"><p><b>Careful:</b> do not let the blocklist live only in code. It must be updatable in seconds (a broadcast stream or a config watched by the job), because the moment you need it is during an incident.</p></div>
+      

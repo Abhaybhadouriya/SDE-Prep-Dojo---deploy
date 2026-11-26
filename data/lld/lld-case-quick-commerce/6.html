@@ -1,0 +1,59 @@
+
+  <h2>Key relationships and patterns (and why each)</h2>
+  <div class="table-wrap"><table class="table">
+    <thead><tr><th>Pattern / technique</th><th>Where</th><th>Requirement that forces it</th></tr></thead>
+    <tbody>
+      <tr><td><a href="{{BASE}}lld/lld-pat-state">State</a> (transition table)</td><td><code>OrderStatus</code></td><td>Payment, cancel and expiry are only legal from some states, and each leaves a different inventory effect</td></tr>
+      <tr><td><a href="{{BASE}}lld/lld-pat-strategy">Strategy</a></td><td><code>StoreSelector</code></td><td>"Nearest store" today; "least busy store" or "cheapest delivery" tomorrow (the peak-time prioritisation follow-up)</td></tr>
+      <tr><td>Dependency injection of time</td><td><code>Clock</code>, <code>ManualClock</code></td><td>"Release after 5 minutes" must be testable without sleeping 5 minutes</td></tr>
+      <tr><td><a href="{{BASE}}lld/lld-pat-facade">Facade</a></td><td><code>QuickCommerce</code></td><td>One API for driver, tests and the payment webhook</td></tr>
+      <tr><td>Reservation (two-phase: reserve, then commit or release)</td><td><code>StockItem</code> counters</td><td>Payment happens after the promise; the promise must be revocable</td></tr>
+      <tr><td>Ordered locking</td><td><code>DarkStore.lockSorted</code></td><td>Multi-SKU baskets must be all-or-nothing without deadlock</td></tr>
+    </tbody>
+  </table></div>
+  <p>Observer fits the "notify customer on status change" bonus exactly as in <a href="{{BASE}}lld/lld-case-food-delivery#patterns">Food Delivery</a>; a <code>LowStockListener</code> on commit is the natural trigger for restock alerts.</p>
+  <h3>Why the pattern earns its place: the if-ladder it replaces</h3>
+  <p>Without the transition table, every handler re-implements "is this move legal?" with its own <code>if</code>s, and they drift apart:</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Before: if / switch">
+<pre><code class="language-java">OrderStatus onPayment(Order o, boolean ok) {
+    if (o.status == CREATED &amp;&amp; ok) { o.status = CONFIRMED; commit(o); }
+    else if (o.status == CREATED) { o.status = CANCELLED; release(o); }
+    else if (!ok &amp;&amp; o.status == CONFIRMED) {     // late failure webhook...
+        o.status = CANCELLED; release(o);         // ...releases committed stock: the real bug
+    }
+    return o.status;
+}
+void cancel(Order o) {
+    if (o.status == CREATED) { o.status = CANCELLED; release(o); }
+    else if (o.status == CONFIRMED || o.status == PACKED) { o.status = CANCELLED; restock(o); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="After: an interface">
+<pre><code class="language-java">enum OrderStatus {
+    CREATED, CONFIRMED, PACKED, DISPATCHED, CANCELLED, EXPIRED;
+    boolean canMoveTo(OrderStatus n) { ... one table, read by every caller ... }
+}
+OrderStatus onPayment(String id, boolean ok) {
+    synchronized (o) {
+        if (o.status() != CREATED) return o.status();   // duplicate or late: ignored
+        o.moveTo(ok ? CONFIRMED : CANCELLED);            // the only way status changes
+        ...side effect for the winning transition only...
+    }
+}</code></pre>
+    </div>
+  </div>
+  <p>With scattered <code>if</code>s, the follow-up "add a RETURNED state" edits <code>onPayment</code>, <code>cancel</code>, the sweeper and every test. With the table it edits one enum row; the handlers keep calling <code>moveTo</code>.</p>
+  <div class="bridge">
+    <h4>From your world: the same move in C</h4>
+<pre><code class="language-c">enum order_state { CREATED, CONFIRMED, PACKED, DISPATCHED, CANCELLED, EXPIRED, NSTATE };
+static const bool legal[NSTATE][NSTATE] = {
+    [CREATED]   = { [CONFIRMED] = 1, [CANCELLED] = 1, [EXPIRED] = 1 },
+    [CONFIRMED] = { [PACKED] = 1, [CANCELLED] = 1 },
+    [PACKED]    = { [DISPATCHED] = 1, [CANCELLED] = 1 },
+};
+static int move_to(struct order *o, enum order_state n)
+{ if (!legal[o-&gt;state][n]) return -EINVAL; o-&gt;state = n; return 0; }</code></pre>
+    <p>The "after" version is an ops table: the caller holds a pointer to a struct of function pointers and never asks which implementation it has, exactly as the VFS calls <code>file-&gt;f_op-&gt;read()</code> without a switch on the file system type.</p>
+    <p>The order table is a protocol state table, the same shape as TCP's: one array says which moves are legal, and every event handler consults it instead of carrying its own copy of the rules.</p>
+  </div>

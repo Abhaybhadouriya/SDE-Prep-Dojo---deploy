@@ -1,0 +1,1054 @@
+<h3>Python</h3>
+  <ul class="file-roles"><li><code>main.py</code>: demo driver</li></ul>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="locker.py">
+<pre><code class="language-python">"""Amazon Locker - in-memory, thread-safe. Mirrors the Java version class for class."""
+from __future__ import annotations
+
+import random
+import threading
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+from typing import Callable, Dict, List, Optional, Protocol
+
+
+class Size(IntEnum):
+    SMALL = 0
+    MEDIUM = 1
+    LARGE = 2
+
+    def fits_in(self, slot: "Size") -&gt; bool:
+        return slot &gt;= self
+
+    @staticmethod
+    def for_box(l_cm: int, w_cm: int, h_cm: int) -&gt; "Size":
+        longest = max(l_cm, w_cm, h_cm)
+        for limit, size in ((30, Size.SMALL), (50, Size.MEDIUM), (80, Size.LARGE)):
+            if longest &lt;= limit:
+                return size
+        raise LockerError(Reason.TOO_BIG, f"{longest} cm does not fit any slot")
+
+
+class SlotState(Enum):
+    FREE = "FREE"
+    OCCUPIED = "OCCUPIED"
+    OUT_OF_SERVICE = "OUT_OF_SERVICE"
+
+
+class DeliveryState(Enum):
+    DEPOSITED = "DEPOSITED"
+    PICKED_UP = "PICKED_UP"
+    EXPIRED = "EXPIRED"
+    RETURNED = "RETURNED"
+
+
+class Reason(Enum):
+    UNKNOWN_STATION = "UNKNOWN_STATION"
+    UNKNOWN_SLOT = "UNKNOWN_SLOT"
+    NO_SLOT = "NO_SLOT"
+    TOO_BIG = "TOO_BIG"
+    DUPLICATE_PARCEL = "DUPLICATE_PARCEL"
+    INVALID_CODE = "INVALID_CODE"
+    CODE_EXPIRED = "CODE_EXPIRED"
+    KEYPAD_LOCKED = "KEYPAD_LOCKED"
+    SLOT_BUSY = "SLOT_BUSY"
+
+
+class LockerError(Exception):
+    def __init__(self, reason: Reason, message: str):
+        super().__init__(f"{reason.value}: {message}")
+        self.reason = reason
+
+
+@dataclass
+class Slot:
+    id: str
+    size: Size
+    state: SlotState = SlotState.FREE
+
+
+@dataclass(frozen=True)
+class Parcel:
+    id: str
+    customer_id: str
+    size: Size
+
+
+@dataclass
+class Delivery:
+    parcel: Parcel
+    slot: Slot
+    code: str
+    deposited_at: int
+    expires_at: int
+    state: DeliveryState = DeliveryState.DEPOSITED
+
+
+@dataclass(frozen=True)
+class DepositReceipt:
+    station_id: str
+    slot_id: str
+    slot_size: Size
+    parcel_id: str
+    expires_at: int
+
+
+@dataclass(frozen=True)
+class PickupResult:
+    slot_id: str
+    parcel: Parcel
+
+
+# ---------- strategies ----------
+class FreeSlots(Protocol):
+    def count(self, size: Size) -&gt; int: ...
+
+
+class SlotAllocationStrategy(Protocol):
+    def choose(self, parcel: Size, free: FreeSlots) -&gt; Optional[Size]: ...
+
+
+class BestFitStrategy:
+    def choose(self, parcel: Size, free: FreeSlots) -&gt; Optional[Size]:
+        return next((s for s in Size if parcel.fits_in(s) and free.count(s) &gt; 0), None)
+
+
+class ExactFitStrategy:
+    def choose(self, parcel: Size, free: FreeSlots) -&gt; Optional[Size]:
+        return parcel if free.count(parcel) &gt; 0 else None
+
+
+class ReservingBestFitStrategy:
+    """Upgrade into a bigger size only while more than reserve[size] slots of it stay free."""
+
+    def __init__(self, reserve: Dict[Size, int]):
+        self._reserve = dict(reserve)
+
+    def choose(self, parcel: Size, free: FreeSlots) -&gt; Optional[Size]:
+        for s in Size:
+            if not parcel.fits_in(s):
+                continue
+            keep = 0 if s == parcel else self._reserve.get(s, 0)
+            if free.count(s) &gt; keep:
+                return s
+        return None
+
+
+class RandomCodeGenerator:
+    """Use random.SystemRandom() (or the secrets module) in production; a seeded Random in tests."""
+
+    def __init__(self, rng: random.Random, digits: int = 6):
+        self._rng, self._digits, self._lock = rng, digits, threading.Lock()
+
+    def next(self) -&gt; str:
+        with self._lock:
+            return "".join(str(self._rng.randrange(10)) for _ in range(self._digits))
+
+
+class LockerListener:
+    """Observer. Called outside every lock."""
+
+    def on_deposited(self, station_id: str, d: Delivery) -&gt; None: ...
+    def on_picked_up(self, station_id: str, d: Delivery) -&gt; None: ...
+    def on_expired(self, station_id: str, d: Delivery) -&gt; None: ...
+
+
+# ---------- station ----------
+class LockerStation:
+    MAX_BAD_ATTEMPTS = 5
+    KEYPAD_LOCK_MS = 60_000
+
+    def __init__(self, station_id: str, counts: Dict[Size, int], max_bad_attempts: int = MAX_BAD_ATTEMPTS):
+        self.id = station_id
+        self._max_bad = max_bad_attempts
+        self._lock = threading.Lock()                 # one lock per station
+        self._slots: Dict[str, Slot] = {}
+        self._free: Dict[Size, deque] = {s: deque() for s in Size}
+        self._by_code: Dict[str, Delivery] = {}
+        self._by_parcel: Dict[str, Delivery] = {}
+        self._bad_attempts = 0
+        self._locked_until = 0
+        for s in Size:
+            for i in range(1, counts.get(s, 0) + 1):
+                slot = Slot(f"{s.name[0]}{i:02d}", s)
+                self._slots[slot.id] = slot
+                self._free[s].append(slot)
+
+    def count(self, size: Size) -&gt; int:               # FreeSlots view; caller holds the lock
+        return len(self._free[size])
+
+    def deposit(self, parcel: Parcel, strategy: SlotAllocationStrategy, codes: RandomCodeGenerator,
+                now: int, hold_ms: int) -&gt; Delivery:
+        with self._lock:
+            if parcel.id in self._by_parcel:
+                raise LockerError(Reason.DUPLICATE_PARCEL, f"{parcel.id} is already here")
+            size = strategy.choose(parcel.size, self)
+            if size is None:
+                raise LockerError(Reason.NO_SLOT, f"no free slot for {parcel.size.name} at {self.id}")
+            slot = self._free[size].popleft()
+            code = self._unique_code(codes)
+            slot.state = SlotState.OCCUPIED
+            d = Delivery(parcel, slot, code, now, now + hold_ms)
+            self._by_code[code] = d
+            self._by_parcel[parcel.id] = d
+            return d
+
+    def pickup(self, code: str, now: int) -&gt; Delivery:
+        with self._lock:
+            if now &lt; self._locked_until:
+                raise LockerError(Reason.KEYPAD_LOCKED, f"try again in {self._locked_until - now} ms")
+            d = self._by_code.get(code)
+            if d is None:
+                self._bad_attempts += 1
+                if self._max_bad &gt; 0 and self._bad_attempts &gt;= self._max_bad:
+                    self._locked_until, self._bad_attempts = now + self.KEYPAD_LOCK_MS, 0
+                raise LockerError(Reason.INVALID_CODE, "wrong code")
+            if d.state == DeliveryState.DEPOSITED and now &gt;= d.expires_at:
+                d.state = DeliveryState.EXPIRED                       # lazy expiry
+            if d.state == DeliveryState.EXPIRED:
+                raise LockerError(Reason.CODE_EXPIRED, f"parcel {d.parcel.id} went back to the courier queue")
+            self._bad_attempts = 0
+            d.state = DeliveryState.PICKED_UP
+            del self._by_code[code]                                   # single use
+            del self._by_parcel[d.parcel.id]
+            self._release(d.slot)
+            return d
+
+    def expire_due(self, now: int) -&gt; List[Delivery]:
+        with self._lock:
+            out = [d for d in self._by_parcel.values()
+                   if d.state == DeliveryState.DEPOSITED and now &gt;= d.expires_at]
+            for d in out:
+                d.state = DeliveryState.EXPIRED
+            return out
+
+    def collect_expired(self) -&gt; List[Delivery]:
+        with self._lock:
+            out = [d for d in self._by_parcel.values() if d.state == DeliveryState.EXPIRED]
+            for d in out:
+                del self._by_parcel[d.parcel.id]
+                del self._by_code[d.code]
+                d.state = DeliveryState.RETURNED
+                self._release(d.slot)
+            return out
+
+    def set_out_of_service(self, slot_id: str, broken: bool) -&gt; None:
+        with self._lock:
+            slot = self._slots.get(slot_id)
+            if slot is None:
+                raise LockerError(Reason.UNKNOWN_SLOT, slot_id)
+            if broken:
+                if slot.state == SlotState.OCCUPIED:
+                    raise LockerError(Reason.SLOT_BUSY, f"{slot_id} holds a parcel")
+                if slot.state == SlotState.FREE:
+                    self._free[slot.size].remove(slot)
+                slot.state = SlotState.OUT_OF_SERVICE
+            elif slot.state == SlotState.OUT_OF_SERVICE:
+                self._release(slot)
+
+    def availability(self) -&gt; Dict[str, int]:
+        with self._lock:
+            return {s.name: len(self._free[s]) for s in Size}
+
+    def state_of(self, parcel_id: str) -&gt; Optional[DeliveryState]:
+        with self._lock:
+            d = self._by_parcel.get(parcel_id)
+            return d.state if d else None
+
+    def occupied(self) -&gt; int:
+        with self._lock:
+            return sum(1 for s in self._slots.values() if s.state == SlotState.OCCUPIED)
+
+    def _release(self, slot: Slot) -&gt; None:
+        slot.state = SlotState.FREE
+        self._free[slot.size].append(slot)
+
+    def _unique_code(self, codes: RandomCodeGenerator) -&gt; str:
+        for _ in range(20):
+            c = codes.next()
+            if c not in self._by_code:
+                return c
+        raise RuntimeError(f"code space exhausted at {self.id}")
+
+
+# ---------- facade ----------
+class LockerService:
+    def __init__(self, strategy: SlotAllocationStrategy, codes: RandomCodeGenerator,
+                 clock: Callable[[], int], hold_ms: int):
+        self._strategy, self._codes, self._clock, self._hold_ms = strategy, codes, clock, hold_ms
+        self._stations: Dict[str, LockerStation] = {}
+        self._stations_lock = threading.Lock()
+        self._listeners: List[LockerListener] = []
+
+    def add_listener(self, listener: LockerListener) -&gt; None:
+        self._listeners = self._listeners + [listener]     # copy-on-write
+
+    def add_station(self, station_id: str, small: int, medium: int, large: int,
+                    max_bad_attempts: int = LockerStation.MAX_BAD_ATTEMPTS) -&gt; None:
+        with self._stations_lock:
+            if station_id in self._stations:
+                raise ValueError(f"station exists: {station_id}")
+            counts = {Size.SMALL: small, Size.MEDIUM: medium, Size.LARGE: large}
+            self._stations[station_id] = LockerStation(station_id, counts, max_bad_attempts)
+
+    def deposit(self, station_id: str, parcel: Parcel) -&gt; DepositReceipt:
+        d = self._station(station_id).deposit(parcel, self._strategy, self._codes, self._clock(), self._hold_ms)
+        for l in self._listeners:
+            l.on_deposited(station_id, d)
+        return DepositReceipt(station_id, d.slot.id, d.slot.size, parcel.id, d.expires_at)
+
+    def pickup(self, station_id: str, code: str) -&gt; PickupResult:
+        d = self._station(station_id).pickup(code, self._clock())
+        for l in self._listeners:
+            l.on_picked_up(station_id, d)
+        return PickupResult(d.slot.id, d.parcel)
+
+    def expire_overdue(self) -&gt; int:
+        now, n = self._clock(), 0
+        for st in list(self._stations.values()):
+            expired = st.expire_due(now)
+            for d in expired:
+                for l in self._listeners:
+                    l.on_expired(st.id, d)
+            n += len(expired)
+        return n
+
+    def collect_expired(self, station_id: str) -&gt; List[Parcel]:
+        return [d.parcel for d in self._station(station_id).collect_expired()]
+
+    def set_out_of_service(self, station_id: str, slot_id: str, broken: bool) -&gt; None:
+        self._station(station_id).set_out_of_service(slot_id, broken)
+
+    def availability(self, station_id: str) -&gt; Dict[str, int]:
+        return self._station(station_id).availability()
+
+    def state_of(self, station_id: str, parcel_id: str) -&gt; Optional[DeliveryState]:
+        return self._station(station_id).state_of(parcel_id)
+
+    def occupied(self, station_id: str) -&gt; int:
+        return self._station(station_id).occupied()
+
+    def _station(self, station_id: str) -&gt; LockerStation:
+        st = self._stations.get(station_id)
+        if st is None:
+            raise LockerError(Reason.UNKNOWN_STATION, station_id)
+        return st</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver for locker.py. Run: python main.py"""
+import random
+import threading
+
+from locker import (BestFitStrategy, ExactFitStrategy, LockerError, LockerListener, LockerService,
+                    LockerStation, Parcel, RandomCodeGenerator, Reason, ReservingBestFitStrategy, Size)
+
+DAY = 24 * 3600 * 1000
+checks = 0
+
+
+def check(ok: bool, what: str) -&gt; None:
+    global checks
+    if not ok:
+        raise AssertionError("FAILED: " + what)
+    checks += 1
+
+
+def failure(fn):
+    try:
+        fn()
+    except LockerError as e:
+        return e.reason
+    return None
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 0
+
+    def __call__(self) -&gt; int:
+        return self.t
+
+
+class Inbox(LockerListener):
+    """Plays the SMS service: remembers the code each customer was sent."""
+
+    def __init__(self):
+        self.code_for = {}
+
+    def on_deposited(self, station_id, d):
+        self.code_for[d.parcel.id] = d.code
+
+
+def main() -&gt; None:
+    clock, inbox = FakeClock(), Inbox()
+    svc = LockerService(BestFitStrategy(), RandomCodeGenerator(random.Random(42)), clock, 3 * DAY)
+    svc.add_listener(inbox)
+    svc.add_station("BLR-01", 2, 2, 1)
+
+    print("== 1. best-fit allocation (2 small, 2 medium, 1 large) ==")
+    got = []
+    for pid, size in [("p1", Size.SMALL), ("p2", Size.SMALL), ("p3", Size.SMALL),
+                      ("p4", Size.MEDIUM), ("p5", Size.MEDIUM)]:
+        r = svc.deposit("BLR-01", Parcel(pid, "c-" + pid, size))
+        got.append(r.slot_id)
+        print(f"  {pid} {size.name:&lt;6} -&gt; slot {r.slot_id}")
+    check(got == ["S01", "S02", "M01", "M02", "L01"], "upgrade only when the exact size is full")
+    r6 = failure(lambda: svc.deposit("BLR-01", Parcel("p6", "c6", Size.SMALL)))
+    print("  p6 SMALL  -&gt;", r6.value)
+    check(r6 == Reason.NO_SLOT, "full station rejects")
+
+    print("== 2. pickup with a one-time code ==")
+    code1 = inbox.code_for["p1"]
+    wrong = "111111" if code1 == "000000" else "000000"
+    print("  wrong code -&gt;", failure(lambda: svc.pickup("BLR-01", wrong)).value)
+    pr = svc.pickup("BLR-01", code1)
+    print(f"  right code -&gt; door {pr.slot_id} opens, parcel {pr.parcel.id}")
+    check(pr.slot_id == "S01", "right door")
+    again = failure(lambda: svc.pickup("BLR-01", code1))
+    print("  same code again -&gt;", again.value)
+    check(again == Reason.INVALID_CODE, "code is single use")
+
+    print("== 3. keypad lockout after 5 wrong codes ==")
+    code2 = inbox.code_for["p2"]
+    bad = "888888" if code2 == "999999" else "999999"
+    for _ in range(5):
+        failure(lambda: svc.pickup("BLR-01", bad))
+    locked = failure(lambda: svc.pickup("BLR-01", code2))
+    print("  6th try, even with the right code -&gt;", locked.value)
+    check(locked == Reason.KEYPAD_LOCKED, "keypad locked")
+    clock.t += LockerStation.KEYPAD_LOCK_MS
+    print("  60 s later -&gt; door", svc.pickup("BLR-01", code2).slot_id)
+
+    print("== 4. expiry after 3 days, courier collects ==")
+    clock.t += 3 * DAY
+    n = svc.expire_overdue()
+    print(f"  expire_overdue() -&gt; {n} deliveries expired")
+    check(n == 3, "p3 p4 p5 expired")
+    late = failure(lambda: svc.pickup("BLR-01", inbox.code_for["p3"]))
+    print("  customer tries p3 -&gt;", late.value)
+    check(late == Reason.CODE_EXPIRED, "expired code refused")
+    back = svc.collect_expired("BLR-01")
+    print("  courier collects", [p.id for p in back], "; free now", svc.availability("BLR-01"))
+    check(svc.occupied("BLR-01") == 0, "all slots free after collection")
+
+    print("== 5. swapping the strategy ==")
+    reserving = LockerService(ReservingBestFitStrategy({Size.LARGE: 1}),
+                              RandomCodeGenerator(random.Random(7)), clock, DAY)
+    reserving.add_station("HYD-02", 1, 0, 2)
+    res = []
+    for i in range(1, 4):
+        try:
+            res.append(reserving.deposit("HYD-02", Parcel(f"s{i}", "c", Size.SMALL)).slot_id)
+        except LockerError as e:
+            res.append(e.reason.value)
+    big = reserving.deposit("HYD-02", Parcel("big", "c", Size.LARGE))
+    print(f"  reserve 1 large: smalls -&gt; {res} ; LARGE -&gt; {big.slot_id}")
+    check(res == ["S01", "L01", "NO_SLOT"] and big.slot_id == "L02", "last large slot kept")
+    exact = LockerService(ExactFitStrategy(), RandomCodeGenerator(random.Random(1)), clock, DAY)
+    exact.add_station("X", 0, 0, 3)
+    check(failure(lambda: exact.deposit("X", Parcel("e1", "c", Size.SMALL))) == Reason.NO_SLOT,
+          "exact fit never upgrades")
+
+    print("== 6. stress: 8 couriers x 100 parcels into 600 slots, then 2 racing pickers ==")
+    sms = Inbox()
+    svc600 = LockerService(BestFitStrategy(), RandomCodeGenerator(random.Random(99)), clock, DAY)
+    svc600.add_listener(sms)
+    svc600.add_station("DEL-03", 200, 200, 200, max_bad_attempts=0)   # app API race, no keypad lockout
+    used, ok, full = [], [0], [0]
+    count_lock, start = threading.Lock(), threading.Barrier(8)
+
+    def courier(c: int) -&gt; None:
+        start.wait()
+        for i in range(100):
+            try:
+                r = svc600.deposit("DEL-03", Parcel(f"c{c}-{i}", "cust", Size.SMALL))
+                with count_lock:
+                    used.append(r.slot_id)
+                    ok[0] += 1
+            except LockerError:
+                with count_lock:
+                    full[0] += 1
+
+    threads = [threading.Thread(target=courier, args=(c,)) for c in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"  deposited {ok[0]}, rejected {full[0]}, slot given twice {len(used) - len(set(used))}")
+    check(ok[0] == 600 and full[0] == 200 and len(set(used)) == 600, "no slot handed out twice")
+    codes = list(sms.code_for.values())
+    opened, refused, go = [0], [0], threading.Barrier(2)
+
+    def picker() -&gt; None:
+        go.wait()
+        for c in codes:
+            try:
+                svc600.pickup("DEL-03", c)
+                with count_lock:
+                    opened[0] += 1
+            except LockerError:
+                with count_lock:
+                    refused[0] += 1
+
+    pickers = [threading.Thread(target=picker) for _ in range(2)]
+    for t in pickers:
+        t.start()
+    for t in pickers:
+        t.join()
+    print(f"  two pickers typed all 600 codes: opened {opened[0]}, refused {refused[0]}")
+    check(opened[0] == 600 and svc600.occupied("DEL-03") == 0, "every code opened exactly one door, once")
+    print(f"== all {checks} checks passed ==")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_locker.py">
+<pre><code class="language-python">"""Run: python -m unittest -v test_locker"""
+import random
+import threading
+import unittest
+
+from locker import (BestFitStrategy, DeliveryState, ExactFitStrategy, LockerError, LockerListener,
+                    LockerService, Parcel, RandomCodeGenerator, Reason, ReservingBestFitStrategy, Size)
+
+
+class Clock:
+    def __init__(self):
+        self.t = 0
+
+    def __call__(self):
+        return self.t
+
+
+class Inbox(LockerListener):
+    def __init__(self):
+        self.code_for, self.events = {}, []
+
+    def on_deposited(self, st, d):
+        self.code_for[d.parcel.id] = d.code
+        self.events.append(("deposited", d.parcel.id))
+
+    def on_picked_up(self, st, d):
+        self.events.append(("picked", d.parcel.id))
+
+    def on_expired(self, st, d):
+        self.events.append(("expired", d.parcel.id))
+
+
+def service(strategy=None, small=2, medium=2, large=1, hold=1000, **kw):
+    clock, inbox = Clock(), Inbox()
+    svc = LockerService(strategy or BestFitStrategy(), RandomCodeGenerator(random.Random(5)), clock, hold)
+    svc.add_listener(inbox)
+    svc.add_station("S", small, medium, large, **kw)
+    return svc, clock, inbox
+
+
+class AllocationTest(unittest.TestCase):
+    def test_best_fit_prefers_exact_size(self):
+        svc, _, _ = service()
+        self.assertEqual(svc.deposit("S", Parcel("a", "c", Size.MEDIUM)).slot_id, "M01")
+
+    def test_best_fit_upgrades_when_full(self):
+        svc, _, _ = service(small=1)
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        self.assertEqual(svc.deposit("S", Parcel("b", "c", Size.SMALL)).slot_size, Size.MEDIUM)
+
+    def test_large_parcel_never_goes_small(self):
+        svc, _, _ = service(large=0)
+        with self.assertRaises(LockerError) as e:
+            svc.deposit("S", Parcel("a", "c", Size.LARGE))
+        self.assertEqual(e.exception.reason, Reason.NO_SLOT)
+
+    def test_exact_fit_rejects_instead_of_upgrading(self):
+        svc, _, _ = service(ExactFitStrategy(), small=0)
+        with self.assertRaises(LockerError):
+            svc.deposit("S", Parcel("a", "c", Size.SMALL))
+
+    def test_reserve_keeps_last_large(self):
+        svc, _, _ = service(ReservingBestFitStrategy({Size.LARGE: 1}), small=0, medium=0, large=1)
+        with self.assertRaises(LockerError):
+            svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        self.assertEqual(svc.deposit("S", Parcel("b", "c", Size.LARGE)).slot_id, "L01")
+
+    def test_duplicate_parcel(self):
+        svc, _, _ = service()
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        with self.assertRaises(LockerError) as e:
+            svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        self.assertEqual(e.exception.reason, Reason.DUPLICATE_PARCEL)
+
+    def test_size_for_box(self):
+        self.assertEqual(Size.for_box(30, 5, 5), Size.SMALL)
+        self.assertEqual(Size.for_box(31, 5, 5), Size.MEDIUM)
+        with self.assertRaises(LockerError):
+            Size.for_box(81, 1, 1)
+
+
+class PickupTest(unittest.TestCase):
+    def test_code_is_single_use_and_frees_slot(self):
+        svc, _, inbox = service()
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        code = inbox.code_for["a"]
+        self.assertEqual(svc.pickup("S", code).slot_id, "S01")
+        self.assertEqual(svc.availability("S")["SMALL"], 2)
+        with self.assertRaises(LockerError):
+            svc.pickup("S", code)
+
+    def test_lockout_and_recovery(self):
+        svc, clock, inbox = service(hold=10 ** 9)
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        bad = "000000" if inbox.code_for["a"] != "000000" else "111111"
+        for _ in range(5):
+            with self.assertRaises(LockerError):
+                svc.pickup("S", bad)
+        with self.assertRaises(LockerError) as e:
+            svc.pickup("S", inbox.code_for["a"])
+        self.assertEqual(e.exception.reason, Reason.KEYPAD_LOCKED)
+        clock.t += 60_000
+        self.assertEqual(svc.pickup("S", inbox.code_for["a"]).parcel.id, "a")
+
+    def test_expiry_is_lazy_too(self):
+        svc, clock, inbox = service(hold=1000)
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        clock.t = 1000
+        with self.assertRaises(LockerError) as e:          # no sweep ran; pickup still refuses
+            svc.pickup("S", inbox.code_for["a"])
+        self.assertEqual(e.exception.reason, Reason.CODE_EXPIRED)
+        self.assertEqual(svc.state_of("S", "a"), DeliveryState.EXPIRED)
+
+    def test_sweep_then_collect(self):
+        svc, clock, inbox = service(hold=1000)
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        svc.deposit("S", Parcel("b", "c", Size.SMALL))
+        clock.t = 999
+        self.assertEqual(svc.expire_overdue(), 0)
+        clock.t = 1000
+        self.assertEqual(svc.expire_overdue(), 2)
+        self.assertIn(("expired", "a"), inbox.events)
+        self.assertEqual([p.id for p in svc.collect_expired("S")], ["a", "b"])
+        self.assertEqual(svc.occupied("S"), 0)
+
+    def test_out_of_service(self):
+        svc, _, _ = service(small=1, medium=0, large=0)
+        svc.set_out_of_service("S", "S01", True)
+        with self.assertRaises(LockerError):
+            svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        svc.set_out_of_service("S", "S01", False)
+        svc.deposit("S", Parcel("a", "c", Size.SMALL))
+        with self.assertRaises(LockerError) as e:
+            svc.set_out_of_service("S", "S01", True)
+        self.assertEqual(e.exception.reason, Reason.SLOT_BUSY)
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_parallel_deposits_never_share_a_slot(self):
+        svc, _, _ = service(small=50, medium=50, large=50)
+        slots, lock = [], threading.Lock()
+
+        def run(t):
+            for i in range(30):
+                try:
+                    s = svc.deposit("S", Parcel(f"{t}-{i}", "c", Size.SMALL)).slot_id
+                    with lock:
+                        slots.append(s)
+                except LockerError:
+                    pass
+
+        ts = [threading.Thread(target=run, args=(t,)) for t in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(len(slots), 150)
+        self.assertEqual(len(set(slots)), 150)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p><b>locker.py</b></p>
+      <p><b>test_locker.py</b></p>
+      <p>Output of <code>python main.py</code> (Python 3.11):</p>
+<pre class="terminal"><code>== 1. best-fit allocation (2 small, 2 medium, 1 large) ==
+  p1 SMALL  -&gt; slot S01
+  p2 SMALL  -&gt; slot S02
+  p3 SMALL  -&gt; slot M01
+  p4 MEDIUM -&gt; slot M02
+  p5 MEDIUM -&gt; slot L01
+  p6 SMALL  -&gt; NO_SLOT
+== 2. pickup with a one-time code ==
+  wrong code -&gt; INVALID_CODE
+  right code -&gt; door S01 opens, parcel p1
+  same code again -&gt; INVALID_CODE
+== 3. keypad lockout after 5 wrong codes ==
+  6th try, even with the right code -&gt; KEYPAD_LOCKED
+  60 s later -&gt; door S02
+== 4. expiry after 3 days, courier collects ==
+  expire_overdue() -&gt; 3 deliveries expired
+  customer tries p3 -&gt; CODE_EXPIRED
+  courier collects ['p3', 'p4', 'p5'] ; free now {'SMALL': 2, 'MEDIUM': 2, 'LARGE': 1}
+== 5. swapping the strategy ==
+  reserve 1 large: smalls -&gt; ['S01', 'L01', 'NO_SLOT'] ; LARGE -&gt; L02
+== 6. stress: 8 couriers x 100 parcels into 600 slots, then 2 racing pickers ==
+  deposited 600, rejected 200, slot given twice 0
+  two pickers typed all 600 codes: opened 600, refused 600
+== all 12 checks passed ==</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output: tests">
+      <p>Output of <code>python -m unittest -v test_locker</code>:</p>
+<pre class="terminal"><code>test_best_fit_prefers_exact_size (test_locker.AllocationTest.test_best_fit_prefers_exact_size) ... ok
+test_best_fit_upgrades_when_full (test_locker.AllocationTest.test_best_fit_upgrades_when_full) ... ok
+test_duplicate_parcel (test_locker.AllocationTest.test_duplicate_parcel) ... ok
+test_exact_fit_rejects_instead_of_upgrading (test_locker.AllocationTest.test_exact_fit_rejects_instead_of_upgrading) ... ok
+test_large_parcel_never_goes_small (test_locker.AllocationTest.test_large_parcel_never_goes_small) ... ok
+test_reserve_keeps_last_large (test_locker.AllocationTest.test_reserve_keeps_last_large) ... ok
+test_size_for_box (test_locker.AllocationTest.test_size_for_box) ... ok
+test_parallel_deposits_never_share_a_slot (test_locker.ConcurrencyTest.test_parallel_deposits_never_share_a_slot) ... ok
+test_code_is_single_use_and_frees_slot (test_locker.PickupTest.test_code_is_single_use_and_frees_slot) ... ok
+test_expiry_is_lazy_too (test_locker.PickupTest.test_expiry_is_lazy_too) ... ok
+test_lockout_and_recovery (test_locker.PickupTest.test_lockout_and_recovery) ... ok
+test_out_of_service (test_locker.PickupTest.test_out_of_service) ... ok
+test_sweep_then_collect (test_locker.PickupTest.test_sweep_then_collect) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.116s
+
+OK</code></pre>
+    </div>
+  </div>
+  <h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: single-threaded core with asserts</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>C++ demo OK</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Amazon Locker - C++14. Each LockerStation has its own mutex (one keypad, one set of slots); the service
+// lock guards the station map and the shared random generator. Lock order: service -&gt; station.
+// Windows (MinGW g++ 6.3): g++ -std=c++14 -O2 -Wall -o locker main.cpp &amp;&amp; ./locker
+// Linux (real locks):      g++ -std=c++14 -O2 -Wall -pthread -DHAVE_STD_MUTEX -o locker main.cpp &amp;&amp; ./locker
+#include &lt;array&gt;
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;deque&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;random&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: a real std::mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). MinGW.org g++ 6.3 (win32 thread model) has no
+// std::mutex and -pthread fails to link there, so the default build uses a no-op Mutex with the same
+// lock()/unlock(): the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+enum class Size { SMALL = 0, MEDIUM = 1, LARGE = 2 };
+static const Size ALL_SIZES[] = {Size::SMALL, Size::MEDIUM, Size::LARGE};
+static const char* name(Size s) { static const char* n[] = {"SMALL", "MEDIUM", "LARGE"}; return n[(int)s]; }
+static bool fitsIn(Size parcel, Size slot) { return (int)slot &gt;= (int)parcel; }
+
+enum class SlotState { FREE, OCCUPIED, OUT_OF_SERVICE };
+enum class DeliveryState { DEPOSITED, PICKED_UP, EXPIRED, RETURNED };
+enum class Reason { NO_SLOT, DUPLICATE_PARCEL, INVALID_CODE, CODE_EXPIRED, KEYPAD_LOCKED, UNKNOWN_STATION };
+static const char* name(Reason r) {
+    static const char* n[] = {"NO_SLOT", "DUPLICATE_PARCEL", "INVALID_CODE", "CODE_EXPIRED", "KEYPAD_LOCKED", "UNKNOWN_STATION"};
+    return n[(int)r];
+}
+
+struct LockerError : std::runtime_error {
+    Reason reason;
+    LockerError(Reason r, const std::string&amp; m) : std::runtime_error(m), reason(r) {}
+};
+
+struct Slot { std::string id; Size size; SlotState state = SlotState::FREE; };
+struct Parcel { std::string id; Size size; };
+struct Delivery {
+    Parcel parcel; Slot* slot; std::string code; long long expiresAt;
+    DeliveryState state = DeliveryState::DEPOSITED;
+};
+
+// ---- Strategy: an abstract class is a C struct of function pointers with a vtable the compiler builds.
+struct FreeSlots { virtual int count(Size s) const = 0; virtual ~FreeSlots() {} };
+struct SlotAllocationStrategy {
+    virtual bool choose(Size parcel, const FreeSlots&amp; free, Size&amp; out) const = 0;   // false = nothing fits
+    virtual ~SlotAllocationStrategy() {}
+};
+struct BestFit : SlotAllocationStrategy {
+    bool choose(Size parcel, const FreeSlots&amp; free, Size&amp; out) const override {
+        for (Size s : ALL_SIZES) if (fitsIn(parcel, s) &amp;&amp; free.count(s) &gt; 0) { out = s; return true; }
+        return false;
+    }
+};
+struct ExactFit : SlotAllocationStrategy {
+    bool choose(Size parcel, const FreeSlots&amp; free, Size&amp; out) const override {
+        if (free.count(parcel) == 0) return false;
+        out = parcel; return true;
+    }
+};
+
+// ---- Observer
+struct LockerListener {
+    virtual void onDeposited(const Delivery&amp;) {}
+    virtual void onExpired(const Delivery&amp;) {}
+    virtual ~LockerListener() {}
+};
+
+class LockerStation : public FreeSlots {
+public:
+    static const int MAX_BAD = 5;
+    static const long long LOCK_MS = 60000;
+
+    LockerStation(const std::string&amp; id, int small, int medium, int large) : id_(id) {
+        int counts[] = {small, medium, large};
+        for (Size s : ALL_SIZES)
+            for (int i = 1; i &lt;= counts[(int)s]; i++) {
+                char buf[16];
+                std::snprintf(buf, sizeof buf, "%c%02d", name(s)[0], i);
+                slots_.push_back(std::unique_ptr&lt;Slot&gt;(new Slot{buf, s}));   // stable addresses
+                free_[(int)s].push_back(slots_.back().get());
+            }
+    }
+
+    // Called by the strategy from inside deposit(), so the caller already holds mu_ (no re-lock here).
+    int count(Size s) const override { return (int)free_[(int)s].size(); }
+
+    Delivery deposit(const Parcel&amp; p, const SlotAllocationStrategy&amp; strategy, std::mt19937&amp; rng,
+                     long long now, long long holdMs) {
+        LockGuard g(mu_);                       // check a free slot and claim it under one lock
+        if (byParcel_.count(p.id)) throw LockerError(Reason::DUPLICATE_PARCEL, p.id);
+        Size chosen;
+        if (!strategy.choose(p.size, *this, chosen)) throw LockerError(Reason::NO_SLOT, p.id);
+        Slot* slot = free_[(int)chosen].front();
+        free_[(int)chosen].pop_front();
+        slot-&gt;state = SlotState::OCCUPIED;
+        std::string code = uniqueCode(rng);
+        auto&amp; d = byCode_[code];
+        d = std::unique_ptr&lt;Delivery&gt;(new Delivery{p, slot, code, now + holdMs});
+        byParcel_[p.id] = d.get();
+        return *d;                              // a copy: the caller reads it after the lock is gone
+    }
+
+    Delivery pickup(const std::string&amp; code, long long now) {
+        LockGuard g(mu_);                       // one keypad: attempts counted and codes used one at a time
+        if (now &lt; lockedUntil_) throw LockerError(Reason::KEYPAD_LOCKED, "locked");
+        auto it = byCode_.find(code);
+        if (it == byCode_.end()) {
+            if (++bad_ &gt;= MAX_BAD) { lockedUntil_ = now + LOCK_MS; bad_ = 0; }
+            throw LockerError(Reason::INVALID_CODE, "wrong code");
+        }
+        Delivery&amp; d = *it-&gt;second;
+        if (d.state == DeliveryState::DEPOSITED &amp;&amp; now &gt;= d.expiresAt) d.state = DeliveryState::EXPIRED;
+        if (d.state == DeliveryState::EXPIRED) throw LockerError(Reason::CODE_EXPIRED, d.parcel.id);
+        bad_ = 0;
+        d.state = DeliveryState::PICKED_UP;
+        Delivery copy = d;
+        release(d.slot);
+        byParcel_.erase(d.parcel.id);
+        byCode_.erase(it);                      // single use; destroys the Delivery
+        return copy;
+    }
+
+    std::vector&lt;Delivery&gt; expireDue(long long now) {
+        LockGuard g(mu_);
+        std::vector&lt;Delivery&gt; out;
+        for (auto&amp; kv : byParcel_)
+            if (kv.second-&gt;state == DeliveryState::DEPOSITED &amp;&amp; now &gt;= kv.second-&gt;expiresAt) {
+                kv.second-&gt;state = DeliveryState::EXPIRED;
+                out.push_back(*kv.second);
+            }
+        return out;
+    }
+
+    std::vector&lt;std::string&gt; collectExpired() {
+        LockGuard g(mu_);
+        std::vector&lt;std::string&gt; out;
+        for (auto it = byParcel_.begin(); it != byParcel_.end();) {
+            Delivery* d = it-&gt;second;
+            if (d-&gt;state != DeliveryState::EXPIRED) { ++it; continue; }
+            out.push_back(d-&gt;parcel.id);
+            release(d-&gt;slot);
+            std::string code = d-&gt;code;
+            it = byParcel_.erase(it);
+            byCode_.erase(code);
+        }
+        return out;
+    }
+
+    int occupied() const {
+        LockGuard g(mu_);
+        int n = 0;
+        for (auto&amp; s : slots_) if (s-&gt;state == SlotState::OCCUPIED) n++;
+        return n;
+    }
+
+    const std::string&amp; id() const { return id_; }
+
+private:
+    void release(Slot* s) { s-&gt;state = SlotState::FREE; free_[(int)s-&gt;size].push_back(s); }
+
+    std::string uniqueCode(std::mt19937&amp; rng) {
+        std::uniform_int_distribution&lt;int&gt; digit(0, 9);
+        for (int tries = 0; tries &lt; 20; tries++) {
+            std::string c;
+            for (int i = 0; i &lt; 6; i++) c += char('0' + digit(rng));
+            if (!byCode_.count(c)) return c;
+        }
+        throw std::runtime_error("code space exhausted");
+    }
+
+    mutable Mutex mu_;                          // guards everything below
+    std::string id_;
+    std::vector&lt;std::unique_ptr&lt;Slot&gt;&gt; slots_;
+    std::array&lt;std::deque&lt;Slot*&gt;, 3&gt; free_;
+    std::map&lt;std::string, std::unique_ptr&lt;Delivery&gt;&gt; byCode_;   // owns deliveries
+    std::map&lt;std::string, Delivery*&gt; byParcel_;
+    int bad_ = 0;
+    long long lockedUntil_ = 0;
+};
+
+class LockerService {
+public:
+    LockerService(std::unique_ptr&lt;SlotAllocationStrategy&gt; s, unsigned seed, long long holdMs)
+        : strategy_(std::move(s)), rng_(seed), holdMs_(holdMs) {}
+    void addListener(LockerListener* l) { LockGuard g(mu_); listeners_.push_back(l); }
+    void addStation(const std::string&amp; id, int s, int m, int l) {
+        LockGuard g(mu_);
+        stations_[id] = std::unique_ptr&lt;LockerStation&gt;(new LockerStation(id, s, m, l));
+    }
+    std::string deposit(const std::string&amp; st, const Parcel&amp; p) {
+        Delivery d;
+        std::vector&lt;LockerListener*&gt; ls;
+        {
+            LockGuard g(mu_);                   // rng_ is shared by all stations
+            d = station(st).deposit(p, *strategy_, rng_, now, holdMs_);
+            ls = listeners_;
+        }
+        for (auto* l : ls) l-&gt;onDeposited(d);   // notify with no lock held
+        return d.slot-&gt;id;
+    }
+    std::string pickup(const std::string&amp; st, const std::string&amp; code) {
+        LockerStation* s;
+        long long t;
+        { LockGuard g(mu_); s = &amp;station(st); t = now; }
+        return s-&gt;pickup(code, t).slot-&gt;id;     // only this station's lock: other stations run in parallel
+    }
+    int expireOverdue() {
+        std::vector&lt;Delivery&gt; due;
+        std::vector&lt;LockerListener*&gt; ls;
+        {
+            LockGuard g(mu_);
+            for (auto&amp; kv : stations_) for (const Delivery&amp; d : kv.second-&gt;expireDue(now)) due.push_back(d);
+            ls = listeners_;
+        }
+        for (const Delivery&amp; d : due) for (auto* l : ls) l-&gt;onExpired(d);
+        return (int)due.size();
+    }
+    std::vector&lt;std::string&gt; collectExpired(const std::string&amp; st) { LockGuard g(mu_); return station(st).collectExpired(); }
+    int occupied(const std::string&amp; st) { LockGuard g(mu_); return station(st).occupied(); }
+    long long now = 0;                                    // fake clock for the demo
+
+private:
+    LockerStation&amp; station(const std::string&amp; id) {
+        auto it = stations_.find(id);
+        if (it == stations_.end()) throw LockerError(Reason::UNKNOWN_STATION, id);
+        return *it-&gt;second;
+    }
+    Mutex mu_;                                            // stations_, listeners_, rng_
+    std::unique_ptr&lt;SlotAllocationStrategy&gt; strategy_;
+    std::mt19937 rng_;
+    long long holdMs_;
+    std::map&lt;std::string, std::unique_ptr&lt;LockerStation&gt;&gt; stations_;
+    std::vector&lt;LockerListener*&gt; listeners_;
+};
+
+struct Inbox : LockerListener {
+    std::map&lt;std::string, std::string&gt; codeFor;
+    int expired = 0;
+    void onDeposited(const Delivery&amp; d) override { codeFor[d.parcel.id] = d.code; }
+    void onExpired(const Delivery&amp;) override { expired++; }
+};
+
+template &lt;class F&gt; static std::string failure(F f) {
+    try { f(); } catch (const LockerError&amp; e) { return name(e.reason); }
+    return "ok";
+}
+
+int main() {
+    const long long DAY = 24LL * 3600 * 1000;
+    LockerService svc(std::unique_ptr&lt;SlotAllocationStrategy&gt;(new BestFit), 42, 3 * DAY);
+    Inbox inbox;
+    svc.addListener(&amp;inbox);
+    svc.addStation("BLR-01", 2, 2, 1);
+
+    std::printf("== best fit ==\n");
+    const char* ids[] = {"p1", "p2", "p3", "p4", "p5"};
+    Size sizes[] = {Size::SMALL, Size::SMALL, Size::SMALL, Size::MEDIUM, Size::MEDIUM};
+    std::string expect[] = {"S01", "S02", "M01", "M02", "L01"};
+    for (int i = 0; i &lt; 5; i++) {
+        std::string slot = svc.deposit("BLR-01", Parcel{ids[i], sizes[i]});
+        std::printf("  %s %-6s -&gt; %s\n", ids[i], name(sizes[i]), slot.c_str());
+        assert(slot == expect[i]);
+    }
+    std::string full = failure([&amp;] { svc.deposit("BLR-01", Parcel{"p6", Size::SMALL}); });
+    std::printf("  p6 SMALL  -&gt; %s\n", full.c_str());
+    assert(full == "NO_SLOT");
+
+    std::printf("== pickup ==\n");
+    std::string c1 = inbox.codeFor["p1"];
+    std::printf("  right code -&gt; door %s\n", svc.pickup("BLR-01", c1).c_str());
+    std::string again = failure([&amp;] { svc.pickup("BLR-01", c1); });
+    std::printf("  same code again -&gt; %s\n", again.c_str());
+    assert(again == "INVALID_CODE");
+
+    std::printf("== expiry ==\n");
+    svc.now += 3 * DAY;
+    int n = svc.expireOverdue();
+    std::string late = failure([&amp;] { svc.pickup("BLR-01", inbox.codeFor["p2"]); });
+    auto back = svc.collectExpired("BLR-01");
+    std::printf("  expired %d, pickup of p2 -&gt; %s, courier collected %d, occupied now %d\n",
+                n, late.c_str(), (int)back.size(), svc.occupied("BLR-01"));
+    assert(n == 4 &amp;&amp; late == "CODE_EXPIRED" &amp;&amp; back.size() == 4 &amp;&amp; svc.occupied("BLR-01") == 0);
+
+    std::printf("== exact fit ==\n");
+    LockerService exact(std::unique_ptr&lt;SlotAllocationStrategy&gt;(new ExactFit), 1, DAY);
+    exact.addStation("X", 0, 0, 2);
+    std::string ex = failure([&amp;] { exact.deposit("X", Parcel{"e1", Size::SMALL}); });
+    std::printf("  small parcel, only large slots -&gt; %s\n", ex.c_str());
+    assert(ex == "NO_SLOT");
+    std::printf("C++ demo OK\n");
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Output of <code>g++ -std=c++14 -O2 -Wall -Wextra -o locker main.cpp &amp;&amp; ./locker</code>:</p>
+<pre class="terminal"><code>== best fit ==
+  p1 SMALL  -&gt; S01
+  p2 SMALL  -&gt; S02
+  p3 SMALL  -&gt; M01
+  p4 MEDIUM -&gt; M02
+  p5 MEDIUM -&gt; L01
+  p6 SMALL  -&gt; NO_SLOT
+== pickup ==
+  right code -&gt; door S01
+  same code again -&gt; INVALID_CODE
+== expiry ==
+  expired 4, pickup of p2 -&gt; CODE_EXPIRED, courier collected 4, occupied now 0
+== exact fit ==
+  small parcel, only large slots -&gt; NO_SLOT
+C++ demo OK</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it is the single-threaded core with asserts: no 8-thread stress test, no 2-picker race, no listener inbox, and no named check count (15 lines ending in "C++ demo OK" against Java's 23 checks). Allocation, codes, expiry, return and keypad lockout are all there.</p></div>
+
+  <p>Read the Java output for three rules. In section 1, <code>p3</code> lands in <code>M01</code> only because both small slots are taken: <b>upgrade only when the exact size is full</b>. In section 4, the expired parcels still hold their slots until <code>collectExpired</code>: <b>expiry is a state change, not a free</b>. In section 7, two threads typed every one of 600 codes and exactly 600 doors opened: <b>remove the code in the same critical section that frees the slot</b>.</p>

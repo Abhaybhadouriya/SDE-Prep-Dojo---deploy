@@ -1,0 +1,68 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>A logger is called from every thread in the process, so this is where SDE-2 rounds dig. Go through the shared state one item at a time:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="A writer passes the closed check just before close queues the stop marker; a read-write gate closes the gap">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">writer thread</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">close() thread</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">async queue</text><text class="label small" x="400" y="166">lines ... then POISON?</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. checks closed: false, will offer</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. sets closed, queues POISON</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">A's line lands after POISON:</text><text class="label bad" x="645" y="164">never written, never counted</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A's offer finishes first</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: a read-write gate</text><text class="label mono" x="645" y="66">write(): read side, close(): write</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">close() waits for A, then flips</text><text class="label small" x="645" y="242">closed and queues POISON last</text><text class="label small" x="645" y="266">written + dropped == attempted</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>A writer checked <code>closed</code> (false) and is about to call <code>offer()</code>. In that gap, <code>close()</code> sets <code>closed</code> and queues the POISON pill. The writer's line then lands behind POISON: the worker stops before it, so the line is neither written nor counted as dropped.</li>
+      <li>The guard: <code>write()</code> holds the read side of a <code>ReentrantReadWriteLock</code> (writers never block each other), and <code>close()</code> takes the write side just to flip <code>closed</code>. So the check and the offer can no longer be split by a close.</li>
+      <li><code>close()</code> waits for the writers already inside <code>write()</code>, then flips the flag and queues POISON last. Every later write sees <code>closed</code> and is counted as dropped. The demo checks written + dropped == attempted.</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared thing</th><th>Risk</th><th>What the code does</th></tr></thead>
+      <tbody>
+        <tr><td>Logger registry</td><td>Two threads create two "payments" loggers</td><td><code>ConcurrentHashMap.computeIfAbsent</code>: atomic per key</td></tr>
+        <tr><td>Current config</td><td>A thread sees half of a new config</td><td>Config is immutable; the field is <code>volatile</code>; swap is one reference write. Readers take no lock.</td></tr>
+        <tr><td>Each sink</td><td>Two lines interleave inside one file line</td><td><code>write</code> is <code>synchronized</code> per sink (one lock per destination, not one global lock)</td></tr>
+        <tr><td>LogMessage</td><td>Message changed while another thread formats it</td><td>Immutable (final fields / frozen dataclass), safe to publish to the writer thread</td></tr>
+        <tr><td>Async queue</td><td>Burst fills memory, or callers block on disk</td><td>Bounded <code>ArrayBlockingQueue</code>; <code>offer()</code> never blocks; drops are counted</td></tr>
+        <tr><td>Shutdown</td><td>Lines lost at exit</td><td>Poison pill queued after all lines, then <code>join()</code> the writer; <code>close()</code> is <a href="{{BASE}}interview/glossary#idempotent">idempotent</a></td></tr>
+        <tr><td>Close racing a writer</td><td>A writer passes the <code>closed</code> check, then <code>close()</code> queues the pill, then the writer's line lands <i>behind</i> the pill: never written, never counted</td><td>A read-write lock: <code>write()</code> holds the read side (writers never wait for each other), <code>close()</code> takes the write side just to flip <code>closed</code>. Demo step 4b and <code>test_close_racing_writers_loses_nothing</code> check written + dropped == attempted</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Full queue: drop, block or overwrite?</h3>
+  <p>There is no free answer; pick per sink and say why.</p>
+  <ul>
+    <li><b>Drop newest and count</b> (our <code>AsyncSink</code>): the app never stalls; you lose lines under a burst but you know how many. Good for DEBUG/INFO.</li>
+    <li><b>Block the caller</b> (<code>put()</code>): nothing lost, but a slow disk now slows checkout. Only for audit logs that must never be lost, and then it should be its own sink.</li>
+    <li><b>Overwrite oldest</b> (ring buffer, our C++ version): keeps the most recent history, the right choice for "what happened just before the crash". This is what the kernel log buffer does.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>printk can be called from interrupt context, so it must never sleep. The kernel's answer is a lock-free ring buffer (since 5.10) that writers append to, and printing to slow consoles can be deferred instead of done by the caller. Same lesson as <code>AsyncSink</code>: the producer side must be cheap and non-blocking, and the slow device is drained by someone else. Log4j 2's async loggers make the same trade with the LMAX Disruptor ring buffer.</p>
+  </div>
+  <div class="callout warn"><p><b>Do not hold the sink lock while formatting.</b> Format first (no shared state), then lock only for the write. In the C++ <code>AsyncSink</code> sketch the writer even unlocks the queue before doing I/O. Holding a lock across I/O is the classic way a logger turns into a global bottleneck.</p></div>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>BlockingQueue</code> = a bounded producer-consumer ring with a mutex and two condition variables (a <code>kfifo</code> plus wait queues).</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

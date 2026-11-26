@@ -1,0 +1,645 @@
+
+  <h2>Code: a ThreadPoolExecutor look-alike</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-thread-pool/</code>, followed by its real output. <code>MiniThreadPool.java</code> has core/max, keep-alive, four rejection policies, Futures, <code>shutdown</code>, <code>shutdownNow</code>, <code>awaitTermination</code>, and replays the scenarios on the real JDK classes. Scenario 3b is a regression test for a shutdown bug a reviewer found in an earlier version (see the callout below).</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.*;
+
+/**
+ * A small ThreadPoolExecutor look-alike, written for the SDE Prep Dojo page
+ * "Thread Pools, Executors &amp; Futures". It follows the same submit algorithm as
+ * java.util.concurrent.ThreadPoolExecutor: core threads first, then the queue,
+ * then extra threads up to max, then the rejection policy.
+ *
+ * Run: javac MiniThreadPool.java &amp;&amp; java MiniThreadPool
+ */
+public class MiniThreadPool implements Executor {
+
+    // ---- Strategy: what to do when the pool is saturated -------------------
+    public interface RejectionPolicy { void reject(Runnable task, MiniThreadPool pool); }
+
+    public static final RejectionPolicy ABORT = (t, p) -&gt; {
+        throw new RejectedExecutionException("pool saturated: " + t);
+    };
+    public static final RejectionPolicy CALLER_RUNS = (t, p) -&gt; {
+        if (!p.isShutdown()) t.run();          // the submitting thread does the work = backpressure
+    };
+    public static final RejectionPolicy DISCARD = (t, p) -&gt; { /* silently drop */ };
+    public static final RejectionPolicy DISCARD_OLDEST = (t, p) -&gt; {
+        if (!p.isShutdown()) { p.queue.poll(); p.execute(t); }
+    };
+
+    // ---- state ---------------------------------------------------------------
+    private static final int RUNNING = 0, SHUTDOWN = 1, STOP = 2, TERMINATED = 3;
+    private volatile int state = RUNNING;
+
+    private final int core, max;
+    private final long keepAliveNanos;
+    private final BlockingQueue&lt;Runnable&gt; queue;
+    private final RejectionPolicy policy;
+    private final String name;
+    private final AtomicInteger threadSeq = new AtomicInteger();
+
+    private final ReentrantLock mainLock = new ReentrantLock();   // guards workers + state changes
+    private final Condition terminated = mainLock.newCondition();
+    private final Set&lt;Worker&gt; workers = new HashSet&lt;&gt;();
+    private int largest;
+
+    public MiniThreadPool(String name, int core, int max, long keepAlive, TimeUnit unit,
+                          BlockingQueue&lt;Runnable&gt; queue, RejectionPolicy policy) {
+        if (core &lt; 0 || max &lt;= 0 || max &lt; core) throw new IllegalArgumentException("bad sizes");
+        this.name = name; this.core = core; this.max = max;
+        this.keepAliveNanos = unit.toNanos(keepAlive);
+        this.queue = Objects.requireNonNull(queue);
+        this.policy = Objects.requireNonNull(policy);
+    }
+
+    // ---- the submit algorithm (same order as ThreadPoolExecutor.execute) -----
+    @Override public void execute(Runnable task) {
+        Objects.requireNonNull(task);
+        if (state != RUNNING) { policy.reject(task, this); return; }
+        if (addWorker(task, true)) return;                  // 1. fewer than core threads: new thread
+        if (queue.offer(task)) {                             // 2. else try to queue it
+            if (state != RUNNING &amp;&amp; queue.remove(task)) policy.reject(task, this);
+            else if (workerCount() == 0) addWorker(null, false);   // core may be 0
+            return;
+        }
+        if (addWorker(task, false)) return;                 // 3. queue full: extra thread up to max
+        policy.reject(task, this);                           // 4. saturated
+    }
+
+    public &lt;T&gt; Future&lt;T&gt; submit(Callable&lt;T&gt; c) {
+        FutureTask&lt;T&gt; f = new FutureTask&lt;&gt;(c);   // the future captures the result OR the exception
+        execute(f);
+        return f;
+    }
+
+    private boolean addWorker(Runnable first, boolean asCore) {
+        Worker w;
+        mainLock.lock();
+        try {
+            if (state != RUNNING &amp;&amp; !(state == SHUTDOWN &amp;&amp; first == null &amp;&amp; !queue.isEmpty())) return false;
+            if (workers.size() &gt;= (asCore ? core : max)) return false;   // check + add under one lock
+            w = new Worker(first);
+            workers.add(w);
+            largest = Math.max(largest, workers.size());
+        } finally { mainLock.unlock(); }
+        w.thread.start();
+        return true;
+    }
+
+    // ---- a worker: one thread that keeps pulling tasks -----------------------
+    private final class Worker implements Runnable {
+        final Thread thread;
+        final ReentrantLock runLock = new ReentrantLock();   // held while a task runs
+        Runnable first;
+        Worker(Runnable first) {
+            this.first = first;
+            this.thread = new Thread(this, name + "-" + threadSeq.incrementAndGet());
+        }
+        @Override public void run() {
+            Runnable task = first; first = null;
+            try {
+                while (task != null || (task = getTask(this)) != null) {
+                    runLock.lock();
+                    try {
+                        if (state &gt;= STOP) thread.interrupt();
+                        else Thread.interrupted();          // clear a stray idle-interrupt
+                        try { task.run(); }
+                        catch (Throwable t) {              // real TPE: thread dies, a new one replaces it
+                            System.out.println("  [" + thread.getName() + "] task threw " + t);
+                        }
+                    } finally { runLock.unlock(); task = null; }
+                }
+            } finally { workerExit(this); }
+        }
+    }
+
+    /** Blocks for the next task; returns null when this worker should exit. */
+    private Runnable getTask(Worker self) {
+        while (true) {
+            int s = state;
+            if (s &gt;= STOP || (s == SHUTDOWN &amp;&amp; queue.isEmpty())) return null;
+            boolean timed = workerCount() &gt; core;          // extra threads may time out
+            try {
+                Runnable r = timed ? queue.poll(keepAliveNanos, TimeUnit.NANOSECONDS) : queue.take();
+                if (r != null) return r;
+                if (tryRetire(self)) return null;                // idle for keepAlive: shrink back to core
+            } catch (InterruptedException e) {
+                // woken by shutdown(): loop and re-check state
+            }
+        }
+    }
+
+    private boolean tryRetire(Worker self) {
+        mainLock.lock();   // check and remove together, so two idle threads cannot both retire below core
+        try {
+            if (workers.size() &lt;= core) return false;
+            workers.remove(self);
+            return true;
+        } finally { mainLock.unlock(); }
+    }
+
+    private void workerExit(Worker w) {
+        mainLock.lock();
+        try {
+            workers.remove(w);
+            if (state == SHUTDOWN &amp;&amp; !queue.isEmpty() &amp;&amp; workers.isEmpty()) {
+                // keep draining: start one more worker outside the lock
+            } else if (state &gt;= SHUTDOWN &amp;&amp; workers.isEmpty()) {
+                state = TERMINATED;
+                terminated.signalAll();
+                return;
+            } else {
+                // Pass the shutdown on. A worker that was busy when shutdown() ran was never
+                // interrupted; if it then lost the race for the last queued task it sleeps in
+                // take() forever. Each exiting worker wakes one idle worker, so the chain
+                // reaches everybody (the real TPE does this in tryTerminate()).
+                if (state &gt;= SHUTDOWN) interruptIdleWorkers(true);
+                return;
+            }
+        } finally { mainLock.unlock(); }
+        addWorker(null, false);
+    }
+
+    /** Caller holds mainLock. A worker whose runLock is free is idle (blocked in getTask). */
+    private void interruptIdleWorkers(boolean onlyOne) {
+        for (Worker w : workers) {
+            if (w.runLock.tryLock()) {
+                try { w.thread.interrupt(); } finally { w.runLock.unlock(); }
+            }
+            if (onlyOne) return;
+        }
+    }
+
+    private int workerCount() {
+        mainLock.lock();
+        try { return workers.size(); } finally { mainLock.unlock(); }
+    }
+
+    // ---- lifecycle -----------------------------------------------------------
+    /** Stop accepting, finish queued work, wake idle workers so they can exit. */
+    public void shutdown() {
+        mainLock.lock();
+        try {
+            if (state == RUNNING) state = SHUTDOWN;
+            interruptIdleWorkers(false);                     // idle = not running a task
+            if (workers.isEmpty()) { state = TERMINATED; terminated.signalAll(); }
+        } finally { mainLock.unlock(); }
+    }
+
+    /** Stop now: interrupt everybody and hand back the tasks that never ran. */
+    public List&lt;Runnable&gt; shutdownNow() {
+        List&lt;Runnable&gt; left = new ArrayList&lt;&gt;();
+        mainLock.lock();
+        try {
+            if (state &lt; STOP) state = STOP;
+            for (Worker w : workers) w.thread.interrupt();
+            queue.drainTo(left);
+            if (workers.isEmpty()) { state = TERMINATED; terminated.signalAll(); }
+        } finally { mainLock.unlock(); }
+        return left;
+    }
+
+    public boolean awaitTermination(long t, TimeUnit unit) throws InterruptedException {
+        long nanos = unit.toNanos(t);
+        mainLock.lock();
+        try {
+            while (state != TERMINATED) {
+                if (nanos &lt;= 0) return false;
+                nanos = terminated.awaitNanos(nanos);
+            }
+            return true;
+        } finally { mainLock.unlock(); }
+    }
+
+    public boolean isShutdown() { return state != RUNNING; }
+    public int poolSize() { return workerCount(); }
+    public int largestPoolSize() { mainLock.lock(); try { return largest; } finally { mainLock.unlock(); } }
+
+    // ======================================================================
+    static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); } }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("1) core=2 max=4 queue=2, AbortPolicy, 8 slow tasks");
+        MiniThreadPool p = new MiniThreadPool("mini", 2, 4, 200, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue&lt;&gt;(2), ABORT);
+        for (int i = 1; i &lt;= 8; i++) {
+            final int id = i;
+            try {
+                p.execute(() -&gt; { sleep(300); System.out.println("  task " + id + " ran on " + Thread.currentThread().getName()); });
+                System.out.println("  submit " + id + " accepted, poolSize=" + p.poolSize());
+            } catch (RejectedExecutionException e) {
+                System.out.println("  submit " + id + " REJECTED");
+            }
+        }
+        sleep(900);
+        System.out.println("  largest=" + p.largestPoolSize() + ", after keep-alive poolSize=" + p.poolSize());
+
+        System.out.println("2) Future: result and exception");
+        Future&lt;Integer&gt; ok = p.submit(() -&gt; 6 * 7);
+        Future&lt;Integer&gt; bad = p.submit(() -&gt; { throw new IllegalStateException("boom"); });
+        System.out.println("  ok.get() = " + ok.get());
+        try { bad.get(); } catch (ExecutionException e) { System.out.println("  bad.get() threw ExecutionException caused by " + e.getCause()); }
+
+        System.out.println("3) shutdown then submit");
+        p.shutdown();
+        System.out.println("  terminated in time: " + p.awaitTermination(2, TimeUnit.SECONDS));
+        try { p.execute(() -&gt; {}); } catch (RejectedExecutionException e) { System.out.println("  after shutdown: rejected"); }
+
+        System.out.println("3b) regression: shutdown while both workers are busy and 1 task is queued");
+        // Both running tasks finish together, then both workers race for the last queued task.
+        // The loser used to block in take() forever (nobody interrupted it), so awaitTermination hung.
+        int ok3 = 0, rounds = 300;
+        for (int r = 0; r &lt; rounds; r++) {
+            MiniThreadPool t = new MiniThreadPool("t", 2, 2, 0, TimeUnit.SECONDS, new LinkedBlockingQueue&lt;&gt;(), ABORT);
+            CountDownLatch started = new CountDownLatch(2), release = new CountDownLatch(1);
+            for (int i = 0; i &lt; 2; i++)
+                t.execute(() -&gt; { started.countDown(); try { release.await(); } catch (InterruptedException e) { } });
+            t.execute(() -&gt; {});                            // the one queued task
+            started.await();                                // both workers busy: shutdown interrupts nobody
+            t.shutdown();
+            release.countDown();                            // both finish at once and race for the queued task
+            if (t.awaitTermination(1, TimeUnit.SECONDS)) ok3++;
+            else { t.shutdownNow(); }
+        }
+        System.out.println("  terminated within 1 s: " + ok3 + "/" + rounds);
+
+        System.out.println("4) CallerRunsPolicy = backpressure");
+        MiniThreadPool cr = new MiniThreadPool("cr", 1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue&lt;&gt;(1), CALLER_RUNS);
+        for (int i = 1; i &lt;= 3; i++) {
+            final int id = i;
+            cr.execute(() -&gt; { sleep(100); System.out.println("  task " + id + " ran on " + Thread.currentThread().getName()); });
+        }
+        cr.shutdown(); cr.awaitTermination(2, TimeUnit.SECONDS);
+
+        System.out.println("5) shutdownNow returns tasks that never started");
+        MiniThreadPool sn = new MiniThreadPool("sn", 1, 1, 0, TimeUnit.SECONDS, new LinkedBlockingQueue&lt;&gt;(), ABORT);
+        sn.execute(() -&gt; { try { Thread.sleep(5000); } catch (InterruptedException e) { System.out.println("  long task interrupted"); } });
+        for (int i = 0; i &lt; 4; i++) sn.execute(() -&gt; {});
+        sleep(50);
+        System.out.println("  never ran: " + sn.shutdownNow().size());
+        System.out.println("  terminated: " + sn.awaitTermination(2, TimeUnit.SECONDS));
+
+        JdkDemo.run();
+    }
+}
+
+/** The same ideas with the real JDK classes. */
+class JdkDemo {
+    static void run() throws Exception {
+        System.out.println("6) real ThreadPoolExecutor, same shape");
+        AtomicInteger n = new AtomicInteger();
+        ThreadFactory named = r -&gt; new Thread(r, "pay-io-" + n.incrementAndGet());
+        ThreadPoolExecutor tpe = new ThreadPoolExecutor(2, 4, 30, TimeUnit.SECONDS,
+                new ArrayBlockingQueue&lt;&gt;(2), named, new ThreadPoolExecutor.AbortPolicy());
+        int rejected = 0;
+        for (int i = 0; i &lt; 8; i++) {
+            try { tpe.execute(() -&gt; MiniThreadPool.sleep(200)); } catch (RejectedExecutionException e) { rejected++; }
+        }
+        System.out.println("  poolSize=" + tpe.getPoolSize() + " queued=" + tpe.getQueue().size() + " rejected=" + rejected);
+
+        System.out.println("7) CompletableFuture pipeline on our own executor");
+        ExecutorService io = Executors.newFixedThreadPool(4, r -&gt; new Thread(r, "io"));
+        CompletableFuture&lt;String&gt; user  = CompletableFuture.supplyAsync(() -&gt; { MiniThreadPool.sleep(100); return "asha"; }, io);
+        CompletableFuture&lt;Integer&gt; bal  = CompletableFuture.supplyAsync(() -&gt; { MiniThreadPool.sleep(150); return 500; }, io);
+        CompletableFuture&lt;String&gt; page = user.thenCombine(bal, (u, b) -&gt; u + " has Rs " + b)
+                .thenApply(String::toUpperCase);
+        System.out.println("  " + page.get(1, TimeUnit.SECONDS));
+
+        CompletableFuture&lt;Integer&gt; slow = CompletableFuture.supplyAsync(() -&gt; { MiniThreadPool.sleep(2000); return 1; }, io)
+                .orTimeout(200, TimeUnit.MILLISECONDS)
+                .exceptionally(ex -&gt; { System.out.println("  fallback after " + ex.getClass().getSimpleName()); return -1; });
+        System.out.println("  slow -&gt; " + slow.join());
+
+        List&lt;CompletableFuture&lt;Integer&gt;&gt; parts = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 5; i++) { final int x = i; parts.add(CompletableFuture.supplyAsync(() -&gt; x * x, io)); }
+        int sum = CompletableFuture.allOf(parts.toArray(new CompletableFuture[0]))
+                .thenApply(v -&gt; parts.stream().mapToInt(CompletableFuture::join).sum()).join();
+        System.out.println("  allOf sum of squares 1..5 = " + sum);
+
+        System.out.println("8) scheduleAtFixedRate stops after an exception");
+        ScheduledExecutorService ses = Executors.newSingleThreadScheduledExecutor();
+        AtomicInteger ticks = new AtomicInteger();
+        ScheduledFuture&lt;?&gt; f = ses.scheduleAtFixedRate(() -&gt; {
+            int t = ticks.incrementAndGet();
+            if (t == 3) throw new RuntimeException("tick 3 failed");
+        }, 0, 50, TimeUnit.MILLISECONDS);
+        MiniThreadPool.sleep(400);
+        System.out.println("  ticks=" + ticks.get() + " (no more after the throw), done=" + f.isDone());
+
+        System.out.println("9) Java 21 virtual threads: one per task, no pool");
+        long t0 = System.nanoTime();
+        try (ExecutorService v = Executors.newVirtualThreadPerTaskExecutor()) {
+            for (int i = 0; i &lt; 10_000; i++) v.submit(() -&gt; { MiniThreadPool.sleep(100); return null; });
+        }   // close() waits for all tasks
+        System.out.println("  10000 sleeping tasks finished in " + (System.nanoTime() - t0) / 1_000_000 + " ms");
+
+        for (ExecutorService e : List.of(tpe, io, ses)) { e.shutdown(); e.awaitTermination(2, TimeUnit.SECONDS); }
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out FixedPool.java FixedPoolTest.java MiniThreadPool.java &amp;&amp; java -cp out MiniThreadPool
+1) core=2 max=4 queue=2, AbortPolicy, 8 slow tasks
+  submit 1 accepted, poolSize=1
+  submit 2 accepted, poolSize=2
+  submit 3 accepted, poolSize=2
+  submit 4 accepted, poolSize=2
+  submit 5 accepted, poolSize=3
+  submit 6 accepted, poolSize=4
+  submit 7 REJECTED
+  submit 8 REJECTED
+  task 2 ran on mini-2
+  task 1 ran on mini-1
+  task 6 ran on mini-4
+  task 5 ran on mini-3
+  task 4 ran on mini-1
+  task 3 ran on mini-2
+  largest=4, after keep-alive poolSize=2
+2) Future: result and exception
+  ok.get() = 42
+  bad.get() threw ExecutionException caused by java.lang.IllegalStateException: boom
+3) shutdown then submit
+  terminated in time: true
+  after shutdown: rejected
+3b) regression: shutdown while both workers are busy and 1 task is queued
+  terminated within 1 s: 300/300
+4) CallerRunsPolicy = backpressure
+  task 1 ran on cr-1
+  task 3 ran on main
+  task 2 ran on cr-1
+5) shutdownNow returns tasks that never started
+  long task interrupted
+  never ran: 4
+  terminated: true
+6) real ThreadPoolExecutor, same shape
+  poolSize=4 queued=2 rejected=2
+7) CompletableFuture pipeline on our own executor
+  ASHA HAS RS 500
+  fallback after TimeoutException
+  slow -&gt; -1
+  allOf sum of squares 1..5 = 55
+8) scheduleAtFixedRate stops after an exception
+  ticks=3 (no more after the throw), done=true
+9) Java 21 virtual threads: one per task, no pool
+  10000 sleeping tasks finished in 145 ms</code></pre>
+    </div>
+    <div class="tab-panel" data-title="FixedPoolTest">
+<pre><code class="language-java">import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Races submit() against shutdown() many times: every ACCEPTED task must run.
+ *  Run: javac FixedPool.java FixedPoolTest.java &amp;&amp; java FixedPoolTest */
+public class FixedPoolTest {
+    public static void main(String[] args) throws Exception {
+        int rounds = 500, lost = 0;
+        for (int r = 0; r &lt; rounds; r++) {
+            FixedPool pool = new FixedPool(2, 1000);
+            AtomicInteger accepted = new AtomicInteger(), ran = new AtomicInteger();
+            CountDownLatch go = new CountDownLatch(1);
+            Thread submitter = new Thread(() -&gt; {
+                try { go.await(); } catch (InterruptedException e) { return; }
+                for (int i = 0; i &lt; 200; i++) {
+                    try { pool.submit(ran::incrementAndGet); accepted.incrementAndGet(); }
+                    catch (RejectedExecutionException e) { break; }   // after shutdown: rejected, fine
+                }
+            });
+            submitter.start();
+            go.countDown();
+            pool.shutdown();                       // races with the submitter
+            submitter.join();
+            pool.awaitTermination();
+            if (ran.get() != accepted.get()) lost++;
+        }
+        System.out.println("rounds=" + rounds + ", rounds where an accepted task never ran: " + lost
+                + (lost == 0 ? "  PASS" : "  FAIL"));
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="FixedPoolTest output">
+<pre class="terminal"><code>$ java -cp out FixedPoolTest
+rounds=500, rounds where an accepted task never ran: 0  PASS</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Fixed thread pool with futures in C++14, for the SDE Prep Dojo page
+// "Thread Pools, Executors &amp; Futures".
+// Build: g++ -std=c++14 -O2 -pthread thread_pool.cpp -o thread_pool &amp;&amp; ./thread_pool
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+#include &lt;condition_variable&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;future&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+class ThreadPool {
+public:
+    ThreadPool(size_t workers, size_t capacity) : capacity_(capacity) {
+        for (size_t i = 0; i &lt; workers; ++i)
+            threads_.emplace_back([this] { loop(); });
+    }
+    ~ThreadPool() { shutdown(); }   // RAII: never leak running threads
+
+    // Returns a future for the callable's result. Throws if the queue is full (AbortPolicy).
+    template &lt;class F&gt;
+    auto submit(F f) -&gt; std::future&lt;decltype(f())&gt; {
+        using R = decltype(f());
+        auto task = std::make_shared&lt;std::packaged_task&lt;R()&gt;&gt;(std::move(f));
+        std::future&lt;R&gt; fut = task-&gt;get_future();
+        {
+            std::lock_guard&lt;std::mutex&gt; g(m_);
+            if (closed_) throw std::runtime_error("pool is shut down");
+            if (q_.size() &gt;= capacity_) throw std::runtime_error("rejected: queue full");
+            q_.emplace_back([task] { (*task)(); });   // exceptions are stored in the future
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+    void shutdown() {   // finish queued work, then join
+        {
+            std::lock_guard&lt;std::mutex&gt; g(m_);
+            if (closed_) return;
+            closed_ = true;
+        }
+        cv_.notify_all();
+        for (auto&amp; t : threads_) t.join();
+    }
+
+private:
+    void loop() {
+        for (;;) {
+            std::function&lt;void()&gt; job;
+            {
+                std::unique_lock&lt;std::mutex&gt; lk(m_);
+                cv_.wait(lk, [this] { return closed_ || !q_.empty(); });   // handles spurious wakeups
+                if (q_.empty()) return;                                      // closed and drained
+                job = std::move(q_.front());
+                q_.pop_front();
+            }
+            job();   // run outside the lock
+        }
+    }
+
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque&lt;std::function&lt;void()&gt;&gt; q_;
+    std::vector&lt;std::thread&gt; threads_;
+    size_t capacity_;
+    bool closed_ = false;
+};
+
+int main() {
+    ThreadPool pool(2, 4);
+    std::vector&lt;std::future&lt;int&gt;&gt; results;
+    for (int i = 1; i &lt;= 7; ++i) {
+        try {
+            results.push_back(pool.submit([i] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                return i * i;
+            }));
+            std::cout &lt;&lt; "submit " &lt;&lt; i &lt;&lt; " accepted\n";
+        } catch (const std::exception&amp; e) {
+            std::cout &lt;&lt; "submit " &lt;&lt; i &lt;&lt; " " &lt;&lt; e.what() &lt;&lt; "\n";
+        }
+    }
+    int sum = 0;
+    for (auto&amp; f : results) sum += f.get();
+    std::cout &lt;&lt; "sum of accepted squares = " &lt;&lt; sum &lt;&lt; "\n";
+
+    auto bad = pool.submit([]() -&gt; int { throw std::logic_error("boom"); });
+    try { bad.get(); } catch (const std::exception&amp; e) { std::cout &lt;&lt; "future rethrew: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+
+    pool.shutdown();
+    try { pool.submit([] { return 0; }); } catch (const std::exception&amp; e) { std::cout &lt;&lt; "after shutdown: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread thread_pool.cpp -o thread_pool &amp;&amp; ./thread_pool
+submit 1 accepted
+submit 2 accepted
+submit 3 accepted
+submit 4 accepted
+submit 5 rejected: queue full
+submit 6 rejected: queue full
+submit 7 rejected: queue full
+sum of accepted squares = 30
+future rethrew: boom
+after shutdown: pool is shut down</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Thread pool from scratch + concurrent.futures, for the SDE Prep Dojo page
+"Thread Pools, Executors &amp; Futures".  Run: python thread_pool.py
+"""
+import queue
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+
+_STOP = object()          # poison pill: one per worker on shutdown
+
+
+class SimplePool:
+    """Fixed workers + bounded queue. submit() returns a Future."""
+
+    def __init__(self, workers: int, capacity: int):
+        self._q: "queue.Queue" = queue.Queue(maxsize=capacity)
+        self._closed = False
+        self._lock = threading.Lock()
+        self._threads = [threading.Thread(target=self._loop, name=f"py-{i + 1}") for i in range(workers)]
+        for t in self._threads:
+            t.start()
+
+    def _loop(self) -&gt; None:
+        while True:
+            item = self._q.get()
+            if item is _STOP:
+                return
+            fut, fn, args = item
+            if not fut.set_running_or_notify_cancel():   # cancelled while queued
+                continue
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as e:                   # the future carries the error
+                fut.set_exception(e)
+
+    def submit(self, fn, *args) -&gt; Future:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("pool is shut down")
+        fut: Future = Future()
+        try:
+            self._q.put((fut, fn, args), block=False)    # reject instead of blocking the caller
+        except queue.Full:
+            raise RuntimeError("rejected: queue full") from None
+        return fut
+
+    def shutdown(self) -&gt; None:
+        with self._lock:
+            self._closed = True
+        for _ in self._threads:
+            self._q.put(_STOP)                           # queued work finishes first (FIFO)
+        for t in self._threads:
+            t.join()
+
+
+def slow_square(x: int) -&gt; int:
+    time.sleep(0.1)
+    return x * x
+
+
+if __name__ == "__main__":
+    print("1) SimplePool: 2 workers, queue of 3")
+    pool = SimplePool(workers=2, capacity=3)
+    futs = []
+    for i in range(1, 8):
+        try:
+            futs.append(pool.submit(slow_square, i))
+            print(f"  submit {i} accepted")
+        except RuntimeError as e:
+            print(f"  submit {i} {e}")
+    print("  results:", [f.result() for f in futs])
+    bad = pool.submit(lambda: 1 / 0)
+    try:
+        bad.result()
+    except ZeroDivisionError as e:
+        print("  error came back through the future:", repr(e))
+    pool.shutdown()
+
+    print("2) concurrent.futures.ThreadPoolExecutor + as_completed")
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="io") as ex:
+        jobs = {ex.submit(time.sleep, d): d for d in (0.3, 0.1, 0.2)}
+        for f in as_completed(jobs):
+            print(f"  finished sleep({jobs[f]})")
+        print("  map keeps input order:", list(ex.map(slow_square, [3, 1, 2])))</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python thread_pool.py
+1) SimplePool: 2 workers, queue of 3
+  submit 1 accepted
+  submit 2 accepted
+  submit 3 accepted
+  submit 4 rejected: queue full
+  submit 5 rejected: queue full
+  submit 6 rejected: queue full
+  submit 7 rejected: queue full
+  results: [1, 4, 9]
+  error came back through the future: ZeroDivisionError('division by zero')
+2) concurrent.futures.ThreadPoolExecutor + as_completed
+  finished sleep(0.1)
+  finished sleep(0.2)
+  finished sleep(0.3)
+  map keeps input order: [9, 1, 4]</code></pre>
+    </div>
+  </div>
+  <div class="callout warn"><p><b>A bug we shipped, and the fix.</b> An earlier <code>MiniThreadPool</code> could hang in <code>awaitTermination</code>. <code>shutdown()</code> interrupts only workers that are idle at that moment. Picture two workers busy and one task queued: both finish together, both see "queue not empty" and go for it, one wins, and the loser blocks in <code>take()</code>. Nobody ever interrupts it, so the pool never terminates. Scenario 3b reproduces it (273 of 300 rounds terminated on the old code). The fix is what the real <code>ThreadPoolExecutor</code> does in <code>tryTerminate()</code>: every worker that exits after shutdown interrupts one idle worker, so the wake-up passes down the chain until the last worker leaves (300 of 300). In an interview, "how does an idle worker learn about shutdown?" is exactly this follow-up.</p></div>

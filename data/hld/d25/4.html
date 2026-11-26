@@ -1,0 +1,79 @@
+
+        <h2>Data model</h2>
+        <p>Two tables: the <b>definition</b> (what and when) and the <b>run</b> (one attempt to execute at one scheduled time).</p>
+<pre><code class="language-sql">CREATE TABLE jobs (
+  job_id        TEXT PRIMARY KEY,
+  tenant_id     TEXT NOT NULL,
+  schedule      JSONB NOT NULL,          -- cron / once / delay + tz
+  target        JSONB NOT NULL,
+  retry_policy  JSONB NOT NULL,
+  priority      SMALLINT NOT NULL,
+  state         TEXT NOT NULL,           -- ACTIVE | PAUSED | DELETED
+  next_run_at   TIMESTAMPTZ,             -- the one column the scheduler cares about
+  shard_id      SMALLINT NOT NULL,       -- hash(job_id) % 64
+  version       BIGINT NOT NULL          -- optimistic locking
+);
+CREATE INDEX jobs_due ON jobs (shard_id, next_run_at) WHERE state = 'ACTIVE';
+
+CREATE TABLE job_runs (
+  run_id           TEXT PRIMARY KEY,     -- = job_id || ':' || scheduled_at  (natural idempotency key)
+  job_id           TEXT NOT NULL,
+  scheduled_at     TIMESTAMPTZ NOT NULL,
+  attempt          INT NOT NULL,
+  status           TEXT NOT NULL,        -- PENDING|QUEUED|RUNNING|SUCCEEDED|FAILED|DEAD
+  worker_id        TEXT,
+  fencing_token    BIGINT,
+  lease_expires_at TIMESTAMPTZ,
+  started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ, error TEXT
+);</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Run state machine: pending, queued, running, succeeded, failed retry, dead">
+            <rect class="box plain" x="20" y="100" width="110" height="50"/>
+            <text class="label" x="75" y="130">PENDING</text>
+            <rect class="box queue" x="170" y="100" width="110" height="50"/>
+            <text class="label" x="225" y="130">QUEUED</text>
+            <rect class="box svc" x="320" y="100" width="120" height="50"/>
+            <text class="label" x="380" y="130">RUNNING</text>
+            <rect class="box db" x="500" y="30" width="140" height="50"/>
+            <text class="label ok" x="570" y="60">SUCCEEDED</text>
+            <rect class="box cache" x="500" y="170" width="140" height="50"/>
+            <text class="label" x="570" y="200">FAILED (retry)</text>
+            <rect class="box fail" x="670" y="100" width="110" height="50"/>
+            <text class="label bad" x="725" y="130">DEAD (DLQ)</text>
+            <path class="arrow" d="M130 125 L162 125"/>
+            <path class="arrow" d="M280 125 L312 125"/>
+            <path class="arrow ok" d="M440 115 L492 60"/>
+            <path class="arrow" d="M440 135 L492 190"/>
+            <path class="arrow dashed" d="M520 220 Q 300 260 225 158"/>
+            <path class="arrow bad" d="M640 190 L700 152"/>
+            <path class="arrow dashed" d="M360 100 Q 300 50 240 98"/>
+            <text class="label small" x="75" y="90">due time reached</text>
+            <text class="label small" x="300" y="60">lease expired</text>
+            <text class="label small" x="330" y="248">back-off, attempt+1</text>
+            <text class="label small" x="720" y="186">max attempts</text>
+            <path class="arrow dashed" d="M60 150 Q 120 205 205 152"/>
+            <text class="label small left" x="10" y="206">stuck PENDING/QUEUED</text>
+            <text class="label small left" x="10" y="224">past due + 60 s:</text>
+            <text class="label small left" x="10" y="242">reaper re-publishes</text>
+          </svg>
+          <figcaption>Every run walks this state machine. Three arrows go backwards or loop: an expired lease (the worker vanished), a retry after back-off, and the reaper re-publishing a run that was committed as PENDING/QUEUED but never reached Kafka (the scheduler crashed in between). All of them can put the same run in the queue twice, which is why runs must be idempotent.</figcaption>
+        </figure>
+        <h3>SQL or NoSQL?</h3>
+        <p><b>"I would pick sharded PostgreSQL (or MySQL) because the scheduler needs a range query on <code>next_run_at</code> and atomic state changes on a run; the cost is manual sharding; if writes outgrow it, I would move run history to Cassandra or DynamoDB with a time-bucket partition key."</b></p>
+        <ul>
+          <li>SQL gives us <code>SELECT ... FOR UPDATE SKIP LOCKED</code>, which lets many scheduler threads grab <em>different</em> due rows without blocking each other.</li>
+          <li>In NoSQL (Cassandra / DynamoDB) you cannot range-scan the whole table by time. The trick is a partition key of <code>(time_bucket_minute, shard)</code>: "all jobs due in minute 09:00, shard 7" is one partition. The scheduler reads the current minute's partitions. Run history (append-heavy, read by key) is a perfect NoSQL fit.</li>
+        </ul>
+<pre><code class="language-sql">-- one scheduler thread, shard 7: grab up to 500 due jobs that nobody else holds
+BEGIN;
+SELECT job_id, schedule, next_run_at
+FROM   jobs
+WHERE  shard_id = 7 AND state = 'ACTIVE' AND next_run_at &lt;= now()
+ORDER  BY next_run_at
+LIMIT  500
+FOR UPDATE SKIP LOCKED;
+-- for each row: INSERT job_runs (... ON CONFLICT (run_id) DO NOTHING),
+--               UPDATE jobs SET next_run_at = &lt;next cron time&gt;, version = version + 1
+COMMIT;</code></pre>
+        <div class="callout warn"><p><b>Careful:</b> the run insert and the <code>next_run_at</code> update must be in <b>one transaction</b>. If you advance <code>next_run_at</code> but crash before creating the run, that occurrence is lost forever. If you create the run but do not advance, the next poll creates it again (the <code>ON CONFLICT DO NOTHING</code> on <code>run_id</code> saves you).</p></div>
+      

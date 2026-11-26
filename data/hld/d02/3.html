@@ -1,0 +1,75 @@
+
+        <h2>Key APIs</h2>
+        <p>A rate limiter has two "APIs": the <b>internal check</b> the gateway calls, and the <b>HTTP contract</b> clients see.</p>
+<pre><code class="language-bash"># Internal: gateway -&gt; limiter (often a library call or gRPC, not HTTP)
+ShouldAllow(descriptors=[("api_key","k_8f2"), ("route","POST /v1/orders")], cost=1)
+  -&gt; { allowed: false, limit: 100, remaining: 0, reset_after_ms: 4200 }
+
+# Rules (config, hot-reloaded; stored in a config service or a K8s ConfigMap)
+rules:
+  - match: { api_key: "*" }          ; limit: 100 per minute ; algorithm: token_bucket
+  - match: { route: "POST /login" }  ; key: username ; limit: 5 per minute ; fail: closed
+  - match: { route: "*" }            ; limit: 50000 per second (global) ; algorithm: token_bucket
+
+# What the client sees when limited
+HTTP/1.1 429 Too Many Requests
+Retry-After: 4
+RateLimit-Policy: "default";q=100;w=60
+RateLimit: "default";r=0;t=4
+Content-Type: application/json
+{"error":"rate_limited","retry_after_seconds":4}</code></pre>
+        <p>The <code>RateLimit-Policy</code> and <code>RateLimit</code> headers come from an <a href="https://datatracker.ietf.org/doc/draft-ietf-httpapi-ratelimit-headers/" target="_blank" rel="noopener">IETF draft</a> (q = quota, w = window seconds, r = remaining, t = seconds until reset). Many public APIs still send the older informal <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, <code>X-RateLimit-Reset</code> trio. Either is fine in an interview; what matters is telling the client <b>when to come back</b>, so well-behaved clients back off instead of hammering.</p>
+        <div class="callout note"><p><b>429 or 503?</b> 429 means "<i>you</i> sent too much" (a per-client limit). 503 Service Unavailable means "<i>we</i> are overloaded" (load shedding, for everyone). Stripe's write-up uses exactly this split: 429 for its per-user limiters, 503 from its load shedders.</p></div>
+
+        <h3>Try it: a toy limited API</h3>
+        <p>A 30-line server using only the Python standard library: a per-API-key token bucket with capacity 5 and refill 1 token per second.</p>
+<pre><code class="language-python"># rl_server.py - toy API protected by a per-client token bucket (5 burst, 1 token/s)
+import math, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CAPACITY, RATE = 5, 1.0
+buckets, lock = {}, threading.Lock()
+
+def take(key):
+    now = time.monotonic()
+    with lock:
+        tokens, last = buckets.get(key, (CAPACITY, now))
+        tokens = min(CAPACITY, tokens + (now - last) * RATE)   # refill
+        allowed = tokens &gt;= 1
+        if allowed:
+            tokens -= 1                                        # spend
+        buckets[key] = (tokens, now)
+        return allowed, tokens
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        key = self.headers.get("X-Api-Key", self.client_address[0])
+        allowed, tokens = take(key)
+        self.send_response(200 if allowed else 429)
+        self.send_header("RateLimit-Policy", f'"burst";q={CAPACITY};w={int(CAPACITY / RATE)}')
+        self.send_header("RateLimit", f'"burst";r={int(tokens)};t={0 if tokens &gt;= 1 else math.ceil((1 - tokens) / RATE)}')
+        if not allowed:
+            self.send_header("Retry-After", str(math.ceil((1 - tokens) / RATE)))
+        body = b'{"ok":true}\n' if allowed else b'{"error":"rate_limited"}\n'
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("127.0.0.1", 8082), H).serve_forever()</code></pre>
+<pre class="terminal"><code>$ python rl_server.py &amp;
+$ for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w "%{http_code} " -H "X-Api-Key: demo" localhost:8082/v1/orders; done
+200 200 200 200 200 429
+
+$ curl -si -H "X-Api-Key: demo" localhost:8082/v1/orders
+HTTP/1.0 429 Too Many Requests
+Server: BaseHTTP/0.6 Python/3.11.9
+Date: Sun, 22 Nov 2026 20:50:02 GMT
+RateLimit-Policy: "burst";q=5;w=5
+RateLimit: "burst";r=0;t=1
+Retry-After: 1
+Content-Length: 25
+
+{"error":"rate_limited"}</code></pre>
+        <p>Five requests use the burst; the sixth is rejected. Wait one second and one more is allowed. This works perfectly for <b>one</b> process. The rest of the page is about making it work for 50 gateway machines.</p>
+      

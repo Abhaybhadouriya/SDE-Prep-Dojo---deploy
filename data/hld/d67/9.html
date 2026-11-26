@@ -1,0 +1,142 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (real reports, 2025-2026):</p>
+          <ul>
+            <li>Amazon SDE2, Oct 2026, hiring-manager round: design CoWIN (<a href="https://leetcode.com/discuss/post/8575075/" target="_blank" rel="noopener">post</a>). The same loop had an LLD round on Amazon Fresh delivery-slot booking.</li>
+            <li>Amazon SDE2, Oct 2026: nationwide location-based vaccine slot booking with payment. LPs for 30-35 minutes, then architecture only (no APIs). Probed Elasticsearch geo, double booking, payment, Redis TTL holds, webhooks, CDN vs Redis, archival, a surge queue and Saga; estimation went badly (<a href="https://leetcode.com/discuss/post/8555479/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Tekion Senior, Jul 2026: car service-centre slot booking; search, slots, concurrency, high availability. Splitting into search/availability/booking services with a transactional DB "was not enough" (<a href="https://leetcode.com/discuss/post/8417125/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Amazon SDE2, Sep 2025: adventure-park ride slots, 8 per ride, pay then ticket ID, 1M users/min and 10K concurrent; FR/NFR, block diagram, DB choice, schema, concurrency (<a href="https://leetcode.com/discuss/post/7178881/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Amazon SDE2, Jun 2025: slot reservation with per-slot booking limits; concurrency when many users have selected but not booked; mixed feedback and a down-level (<a href="https://leetcode.com/discuss/post/6883459/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Amazon SDE2, 2025 compiled list: vehicle service-centre management (<a href="https://leetcode.com/discuss/post/6906753/" target="_blank" rel="noopener">post</a>). Amazon SDE2, Dec 2025: meeting room scheduler, grilled on Redis, Kafka, Elasticsearch and DB choices (<a href="https://leetcode.com/discuss/post/7393613/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Salesforce MTS, Jun 2026: venue rental with packages, entities and schema (<a href="https://leetcode.com/discuss/post/8325797/" target="_blank" rel="noopener">post</a>). Yellow.ai, Oct 2026: conference-room booking, data model and time zones (<a href="https://leetcode.com/discuss/post/8586568/" target="_blank" rel="noopener">post</a>).</li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: scope.</strong> Which costume (vaccine, ride, service, room)? Capacity per slot? Hold length? Paid or free? Say the two paths: reads AP and stale, the slot write CP.</li>
+          <li><strong>5-10 min: numbers.</strong> Inventory in GB, bookings in thousands per second at release, reads in a million per second. Conclusions: caches for reads, shard by region, an admission gate for hot slots.</li>
+          <li><strong>10-15 min: data.</strong> The slot row (capacity, booked, held, CHECK), hold, booking in the same database. Skip APIs if the interviewer signals it.</li>
+          <li><strong>15-25 min: diagram.</strong> The stepper: edge, search, availability, gate, booking + DB, payment, outbox + Kafka, sweeper, archiver.</li>
+          <li><strong>25-40 min: deep dives.</strong> Lead with the conditional update and the race. Then holds and expiry, then the surge, then the payment Saga.</li>
+          <li><strong>40-45 min: wrap up.</strong> Failure per box; metrics: hold success rate, hold-to-booking conversion, expired holds per minute, late-payment refunds, overbooking check (must be zero, from a nightly reconciliation query).</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"Each slot row has capacity and booked. To book, I run UPDATE booked = booked + 1 WHERE booked &lt; capacity and check one row changed. Search uses Elasticsearch with geo distance, availability is cached in Redis. Paid centres hold the place for 5 minutes and confirm on the payment webhook." Correct and safe.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"Holds count against capacity with a deadline; a sweeper with SKIP LOCKED frees them, and the CHECK constraint makes overbooking impossible even for buggy code. Slot and booking share one database, so it is one local transaction. The payment is a Saga with idempotent webhooks, a reconciler and auto-refund on late payment. Releases go through a CDN and a waiting room, and the hottest slots get a per-slot queue. Old bookings are archived to S3." Numbers, races, failure handling.</p></div>
+        </div>
+        <div class="callout interview"><p><b>60-second answer:</b> "Search and availability are read-heavy and may be seconds stale, so they come from Elasticsearch, Redis and a CDN. The slot is one row with capacity, booked and held, guarded by a CHECK constraint. A hold is one conditional UPDATE that adds to held only if there is room, plus a hold row with a 5-minute deadline. Booking and slot live in the same sharded Postgres, so confirming is one local transaction triggered by an idempotent payment webhook; late payments are refunded. Expired holds are released by a sweeper. For release-time surges, a waiting room admits users at the rate the shard can handle, and events flow through an outbox to Kafka for SMS, reminders and cache updates."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> read-check-write in application code; using Redis as the only record of a hold; holding a lock while waiting for payment; putting slot counts and bookings in two services' databases; "autoscale it" as the surge answer; no per-user hold limit; storing local times without a zone; giving estimation numbers with no conclusion; drawing boxes without saying how each one fails.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Tekion">
+          <summary>How do you make sure a slot is never booked beyond its capacity?</summary>
+          <div class="answer">
+            <p>Do the check and the write in one atomic statement on the slot row: <code>UPDATE slot SET held = held + :n WHERE slot_id = :id AND booked + held + :n &lt;= capacity</code>, then check that exactly one row changed. The database row lock serialises concurrent updates on that row, and in Postgres a waiting update re-checks the WHERE clause on the latest version, so the loser gets 0 rows and a "slot just filled" message. Add <code>CHECK (booked + held &lt;= capacity)</code> as a seat belt for any code path that forgets.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the race first (two reads of 9/10, two writes), then the fix, then the constraint. Mention optimistic versioning and SELECT FOR UPDATE as alternatives in one line each, and when you would pick them.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What isolation level do you need? (READ COMMITTED is enough for this single-statement pattern.)</li><li>What if a booking needs two consecutive slots? (One transaction, update both, lock in time order, roll back if either returns 0.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>Many users have selected the same slot but have not booked yet. How do you handle the concurrency?</summary>
+          <div class="answer">
+            <p>Turn "selected" into a real, time-limited hold that counts against capacity. Holding runs the conditional update on <code>held</code>; the hold row carries <code>expires_at</code> (about 5 minutes) and the user sees a countdown. Only holders reach payment, so nobody pays for a place that is gone. A sweeper (batching with <code>FOR UPDATE SKIP LOCKED</code>) expires old holds and gives places back; one active hold per beneficiary and a per-account rate limit stop hoarding. For very hot slots, a Redis Lua gate rejects most requests before they reach the database.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show both bad extremes (no hold: paid for nothing; endless hold: fake "full") and land on a short hold. Then give the expiry mechanism and the anti-hoarding limits. This was the follow-up behind a down-level in June 2025, so be complete.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long should the hold be? (Long enough for UPI on a slow phone, 3-5 min; measure payment p99 and tune.)</li><li>Can you show live "2 left" counts? (Yes, from Redis, updated by events, labelled as approximate.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tekion">
+          <summary>You split search, availability and booking into services with a transactional DB. The interviewer says that is not enough. What is missing?</summary>
+          <div class="answer">
+            <p>A box diagram does not say <i>how</i> correctness and availability are achieved. Fill the gaps explicitly: (1) the exact atomic write and constraint that prevents overbooking; (2) the hold model with expiry, and what happens to a hold when payment is slow; (3) how the availability service stays consistent with the booking DB (events from an outbox, a short TTL, and "the cache is never used to decide"); (4) high availability of the database (synchronous standby, failover time, what users see during it); (5) the shard key and the hot-centre problem; (6) the failure walk-through: Redis down, Kafka down, duplicate webhook, double click on Book (idempotency key). The report does not say what the interviewer wanted, so treat this as a checklist rather than a known answer key.</p>
+            <div class="approach"><h5>How to answer</h5><p>After drawing services, immediately pick the riskiest box and go deep without being asked. Seniors are judged on the mechanism and failure handling, not the box count.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is availability a separate service at all? (Different scale and consistency: a million stale reads vs thousands of strict writes.)</li><li>What if two service centres share a technician pool? (Model the technician as the resource; a booking holds a technician slot and a bay slot in one transaction.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Why keep the order (booking) and the slot in the same database?</summary>
+          <div class="answer">
+            <p>Because the invariant "bookings &lt;= capacity" spans both. In one database, confirming is one local ACID transaction: change the counter, insert or update the booking, write the outbox row, commit. Split across two services' databases, you need a distributed transaction (2PC) or a Saga with compensations just to keep counts right, and every failure in between leaves a slot counted but not booked, or booked but not counted. Group data by the invariants it must keep together.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say the invariant, then the cost of splitting it. Then show where a Saga is still needed: the external payment, which you cannot put in your transaction.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does this create a monolith? (No: search, availability, payment and notifications are separate services; only the strongly coupled pair shares a schema.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>Walk me through payment. What if the webhook comes twice, never comes, or comes after the hold expired?</summary>
+          <div class="answer">
+            <p>The booking is a Saga: hold, create a PAYMENT_PENDING booking and a PSP order with an idempotency key, confirm on webhook. Twice: the confirm update is conditional on <code>status='PAYMENT_PENDING'</code> and <code>psp_order_id</code> is unique, so the second delivery changes nothing and returns 200. Never: a reconciler polls the PSP for orders pending too long. After expiry: try to re-take the place with the same conditional update; if the slot is full, mark REFUNDED and refund automatically. Never confirm a place you no longer hold.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the happy path in one line, then each failure with its exact fix. Mention signature verification on the webhook.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not 2PC with the PSP? (You cannot enlist an external bank; 2PC blocks when the coordinator fails.)</li><li>Should payment happen before or after the hold? (After: never charge for something you cannot give.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>1M users per minute and 10K concurrent bookers want 8 seats per ride slot. How does the system stay up and stay fair?</summary>
+          <div class="answer">
+            <p>First do the math: 17K requests per second is easy for a cache, but thousands of writers on one counter is a contention problem. Serve availability from Redis and a CDN. Put a waiting room in front of the booking step that admits users in arrival order at a fixed rate. For the hottest ride slots, either pre-create 8 place rows and claim with <code>FOR UPDATE SKIP LOCKED</code> (writers spread over rows), or route all holds for a slot to one Kafka partition and let a single consumer decide in order, in memory, replying through push. Losers get an instant "full, try 11:30" with alternatives.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "throughput" from "contention" out loud. Offer two mechanisms and pick one with a reason (SKIP LOCKED for simplicity; per-slot queue for strict fairness).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does the user get the result from the queue? (Poll with the request id, or SSE/push.)</li><li>What DB would you choose and why? (Postgres for the transaction and constraints; the data is tiny.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>How does "find vaccine centres near me" work? Why Elasticsearch?</summary>
+          <div class="answer">
+            <p>Each centre is indexed with a <code>geo_point</code> (lat, lon) plus filter fields (vaccine, min age, fee, district). A <code>geo_distance</code> query with a radius, filters and a sort by distance returns the nearest centres in milliseconds. The index is rebuilt from the centre table by CDC or nightly jobs; it holds no availability, only reference data. Availability counts are joined from Redis by centre id. Alternatives: PostGIS in Postgres (fine at 100K centres), or a geohash/H3 cell lookup in a key-value store.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say what goes in the index and what does not (live counts change too fast for a search index). Mention a PIN-code or district lookup for users without location.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would you put availability in Elasticsearch? (Not live counts; at most a "has slots today" flag refreshed every minute, for filtering.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>CDN or Redis for availability? And how do you buffer a surge?</summary>
+          <div class="answer">
+            <p>Both, for different reads. The CDN serves identical responses to many people (the district's slot summary JSON, 2-5 s TTL), which absorbs the refresh storm. Redis serves keyed, possibly personalised lookups (per centre, per age group) the CDN cannot cache well. For the write surge, a waiting room or token gate admits users at the shard's capacity, and optionally a queue per hot slot serialises holds. Neither cache ever decides a booking.</p>
+            <div class="approach"><h5>How to answer</h5><p>"CDN for the crowd, Redis for the key, the database for the truth, and a gate in front of the truth."</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you invalidate the CDN JSON? (Short TTL instead of purges; purge only on admin cancellations.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>Estimate the capacity you need for CoWIN.</summary>
+          <div class="answer">
+            <p>State assumptions, round, conclude. 100K centres x 15 days x 16 slots = 24M slot rows, about 2.4 GB: fits in memory, so shard for write rate and blast radius, not size. 10M doses a day, 1.5 people per booking: about 7M bookings a day, about 70 per second average; 30% in the first 10 minutes after release gives about 3,500 per second, on hot rows, so shard by region and gate admissions. 5M users refreshing every 5 s is 1M reads per second, so CDN plus Redis. 3.5 GB of bookings a day is about 1.3 TB a year, so archive after 60 days. Sanity check: the real platform reported 8 million registrations in its first three hours for the 18-44 group.</p>
+            <div class="approach"><h5>How to answer</h5><p>Four lines (inventory, writes, reads, storage), each ending in a design decision. Do not compute to three significant figures.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many booking pods? (If one pod handles about 500 holds per second, 3,500/s at release needs about 8, so run 2x for headroom.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Yellow.ai,Salesforce,Amazon">
+          <summary>Design the data model for conference rooms. How do you handle overlaps and time zones?</summary>
+          <div class="answer">
+            <p>Entities: <code>building(tz)</code>, <code>room(capacity, features)</code>, <code>user</code>, <code>booking(room_id, during tstzrange, organiser, status)</code>, <code>attendee</code>. Overlaps: a Postgres exclusion constraint on (room_id =, during &amp;&amp;) makes the second overlapping booking fail atomically; without Postgres, use a 15-minute cell grid with capacity 1 per cell. Time zones: store instants in UTC, store the room's IANA zone, convert at display; recurring meetings are a rule plus a zone, expanded per occurrence, so daylight-saving shifts are handled. Venue packages are bundles of resources held in one transaction.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the entities first (these rounds were mostly about schema), then the overlap guarantee, then time zones with one DST example.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you find a free room for 8 people with a projector from 3 to 4 pm? (Filter rooms by features in Elasticsearch or SQL, then anti-join bookings overlapping the range; cache free/busy in Redis.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>How and when do you archive old bookings?</summary>
+          <div class="answer">
+            <p>Bookings are hot for a short life: until the appointment, attendance and certificate. After 30-60 days, a nightly job copies them (with beneficiaries and audit) to object storage as Parquet partitioned by date and state, verifies counts, then deletes them from Postgres in batches (or drops a monthly partition, which is instant). Analytics and audits query the archive with Athena or Spark; the certificate service keeps its own record. This keeps indexes and backups small and the hot path fast.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the trigger, the format, the verification and the delete. Partitioning by month makes the delete a cheap DROP.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about legal retention? (Archive retention is a policy setting; encrypt and restrict access, it is health data.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: slots show available, but every Book click says "slot just filled"</h4>
+          <div class="situation"><p>At 16:00 release, users in one district see green slots but every hold fails for two minutes. Complaints flood in.</p></div>
+          <div class="bad"><p>Weak answer: "Redis is out of sync; flush the cache."</p></div>
+          <div class="good"><p>Strong answer: check the two paths separately. Are holds failing with SLOT_FULL (correct refusals: the cache is stale and demand is extreme) or with timeouts (the shard is overloaded)? If refusals: the availability updater is lagging (consumer lag on the booking topic), so shorten TTLs and alert on lag. If timeouts: admissions exceed the shard's rate; lower the token rate and pre-scale. Either way, show alternatives ("10:30 has 4 left") with every refusal.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which three dashboards would you look at first?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: 11 people arrived for a 10-person slot</h4>
+          <div class="situation"><p>A centre reports more confirmed appointments than doses for one slot.</p></div>
+          <div class="bad"><p>Weak answer: "The UPDATE prevents that, so someone forged a booking."</p></div>
+          <div class="good"><p>Strong answer: assume the invariant broke. Look for a path that bypasses the conditional update: an admin "add capacity, then reduce it" flow that did not re-check, a reschedule that added to the new slot before checking, a failover to an async replica that lost a write. Add the CHECK constraint so the database refuses it, and a nightly reconciliation that compares <code>booked</code> with the count of confirmed bookings per slot.</p></div>
+        </div>
+      

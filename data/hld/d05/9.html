@@ -1,0 +1,134 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> Post, follow, home feed, scroll. Ask: one-way follow or friends? Ranked or chronological? How fresh? State: read-heavy, 500M DAU, &lt;200 ms feed, eventual consistency OK.</li>
+          <li><strong>5-10 min: numbers</strong> ~58K reads/s (175K peak), ~580 posts/s, 116K fan-out inserts/s, the 50M-follower line, 4 TB of feed cache. Say what each changes.</li>
+          <li><strong>10-15 min: API + data model</strong> <code>POST /posts</code> with an idempotency key, <code>GET /feed?cursor=</code>, posts by id, graph stored twice, feed cache of ids.</li>
+          <li><strong>15-25 min: high-level design</strong> Draw the write path, then the read path (the stepper). Start with pure push, then show it breaking on a celebrity.</li>
+          <li><strong>25-40 min: deep dives</strong> Lead with hybrid fan-out, then pick one or two: hydration and hot keys, ranking funnel, deletes/privacy, fan-out at scale.</li>
+          <li><strong>40-45 min: wrap up</strong> Failure table, metrics (feed p99, fan-out lag, cache hit rate, empty-feed rate), next steps (ranking, multi-region).</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"When someone posts, we save it and put an event on a queue. Workers copy the post id into each follower's feed list in Redis. Reading the feed is one Redis call plus looking up the posts. For celebrities we skip the copy and fetch their posts at read time." Correct and clear.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"Reads are ~100x writes, so we precompute. The fan-out budget is ~116K inserts/s; one 50M-follower post would eat minutes of it, hence hybrid with hysteresis on the threshold. Ids only in feeds, batched hydration, coalescing for hot keys, cursor pagination, outbox to Kafka, autoscale workers on lag, and chronological fallback when ranking times out." Numbers and failure handling, unprompted.</p></div>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> computing the feed with a SQL join over all followees on every request; storing full posts in every follower's feed; offset pagination; forgetting celebrities; forgetting inactive users; sending images through the API servers; synchronous fan-out inside the post request; no fallback when ranking is down; spending 15 minutes on the ML model instead of the system.</p></div>
+
+        <h3>60-second answer</h3>
+        <div class="callout interview"><p>"A news feed is read-heavy, about a hundred reads per post, so I precompute feeds. When a user posts, the post service saves it and emits an event to Kafka through an outbox. Fan-out workers look up the followers and add the post id to each follower's feed, a Redis sorted set trimmed to a few hundred ids. Reading is one cache call for the ids, a batched lookup to hydrate them from a post cache, and an optional ranking step. Celebrities break push, because one post would mean millions of writes, so for them we skip fan-out and merge their latest posts at read time. That is the hybrid model Twitter described. Pagination uses cursors, the author always sees their own post, deletes and privacy are checked at hydration, and if ranking is slow we fall back to chronological order."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Amazon,Microsoft">
+          <summary>Fan-out on write or fan-out on read? Which would you choose?</summary>
+          <div class="answer">
+            <p>Neither alone. Fan-out on write makes reads one cache lookup but costs one write per follower, which explodes for accounts with millions of followers. Fan-out on read makes posting one write but every feed open must query everyone you follow and merge, which is slow for people who follow thousands. Since reads outnumber writes by roughly 100:1, push for most users and pull for celebrities, merged at read time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define both in one line each, give the cost of each in terms of N followers and M followees, then the read/write ratio, then the hybrid. Mention the threshold and inactive users.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where exactly is the celebrity threshold, and how do you avoid flapping?</li><li>What happens when a normal user suddenly goes viral?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Google">
+          <summary>Why not just run a SQL query that joins posts with follows, ordered by time?</summary>
+          <div class="answer">
+            <p>It works for thousands of users and is the right first version. At 175K feed reads per second, each query touches posts from hundreds of authors spread across many shards, sorts them and pages them. That is a scatter-gather across shards on every request, with latency set by the slowest shard. Precomputing the result into a per-user list moves that work off the read path.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not mock the simple version. Say when it breaks (numbers), then why (cross-shard fan-in on every read), then the fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you shard the posts table?</li><li>Could a read replica fix it? (Only reduces load; the per-query cost remains.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>What exactly is stored in the feed cache, and how much memory does it need?</summary>
+          <div class="answer">
+            <p>Post ids with a score (time or rank), per user, trimmed to the newest few hundred. About 8 bytes per id; with scores and overhead, roughly 8 KB per user for 500 entries. For 500M active users that is about 4 TB, so roughly 60-ish 64 GB shards before replicas. Inactive users get no cache and are rebuilt by pull on return.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the multiplication out loud, then say why ids and not objects (edits, deletes, memory).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens when a user scrolls past 500 items? (Fall back to pull from <code>posts_by_author</code>, slower but rare.)</li><li>Redis list or sorted set? (Sorted set supports score-based cursors and dedupe.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>How do you paginate an infinite-scrolling feed?</summary>
+          <div class="answer">
+            <p>With a cursor: the server returns an opaque token holding the last item's sort key (score plus post id as a tie-breaker), and the next request asks for items strictly after it. New posts at the top do not shift the position, so the user sees no duplicates or gaps, and each page costs the same. For ranked feeds, the cursor indexes into the ranked list cached for that session.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain why offsets break (shifting items, deep-skip cost), then the cursor, then the ranked-feed wrinkle.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show "5 new posts" at the top? (A cheap count since the newest id the client has.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google,Amazon">
+          <summary>A user with 2M followers posts. Walk me through what happens.</summary>
+          <div class="answer">
+            <p>The post is saved and the event published as usual. The fan-out worker checks the author's flag. If the account is above the celebrity threshold, there is no push: the post sits in <code>posts_by_author</code>, which is heavily cached. When any follower opens the feed, the feed service sees the author in that follower's short "celebrities I follow" list, fetches the newest posts, and merges them with the pushed feed by score. The cost is a few cache hits per read instead of 2M writes per post.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the write path, the decision point, then the read-time merge. Mention the hot cache key for that celebrity's post list and how you replicate it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The account was at 9,000 followers yesterday and 2M today (viral). What now? (Flag updated by a stream job; in-flight fan-out capped per post.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Flipkart,Walmart">
+          <summary>Why put Kafka between the post service and the fan-out workers?</summary>
+          <div class="answer">
+            <p>Three reasons. Decoupling: posting returns in milliseconds without waiting for hundreds of cache writes. Buffering: a burst of posts or a slow cache becomes consumer lag, not errors. Fan-in of consumers: search, notifications, counters and analytics read the same events in their own consumer groups. Kafka's retention also lets us replay events to rebuild feeds after a bug. Delivery is at-least-once; the <code>ZADD</code> is idempotent, so duplicates are harmless.</p>
+            <div class="approach"><h5>How to answer</h5><p>Decouple, buffer, many readers, replay. Then name the key and the delivery guarantee. Mention the outbox for the DB-to-Kafka step.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What partition key do you use and why?</li><li>Why not SQS? (Fine for the work queue; Kafka wins when many consumers need the same stream and replay.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>A viral post is read 5 million times a minute. What breaks and how do you fix it?</summary>
+          <div class="answer">
+            <p>Its post-cache key becomes a hot key: all reads hash to one cache node, which saturates its CPU or NIC. Like counts on it also take a write storm. Fixes: replicate the hot key across several nodes (key suffixes or a read-replica tier), add a small in-process cache in each feed pod with a TTL of a few seconds, coalesce concurrent misses, and serve like counts from sharded counters aggregated every few seconds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure (hot key), why hashing does not help (one key, one shard), then layered fixes from cheapest to most complex.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect hot keys? (Per-key request sampling; client-side top-K.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>A user deletes a post or blocks someone. How do you keep feeds correct?</summary>
+          <div class="answer">
+            <p>Treat precomputed feeds as hints. On delete, mark the post deleted and evict it from the post cache; hydration drops deleted ids, so it disappears everywhere at once without touching millions of feed entries. Blocks and privacy are checked at hydration time against the current settings. Optional background jobs clean dead ids out of feeds later to save memory.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point out the cost of eager cleanup, then the lazy filter at read time, then the async cleanup. Show you know privacy is enforced on read.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about a page that now has 19 posts instead of 20? (Over-fetch slightly, e.g. 25, then trim.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,LinkedIn">
+          <summary>How would you add ML ranking without blowing the latency budget?</summary>
+          <div class="answer">
+            <p>Use a funnel: gather a few thousand candidates (push feed plus pulls), filter cheaply to a few hundred, score those with the heavy model using precomputed features from a feature store, then apply re-ranking rules for diversity. Rank once per session and cache the ranked list so scrolling just pages through it. Give ranking a strict time budget and fall back to chronological order on timeout.</p>
+            <div class="approach"><h5>How to answer</h5><p>Funnel stages with rough counts, where features come from (Kafka streams of engagement), caching per session, and the fallback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you evaluate a new model? (A/B test on engagement and time spent, with guardrail metrics.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Meta,Amazon,Google">
+          <summary>How would you run this across multiple regions?</summary>
+          <div class="answer">
+            <p>Users are served from their nearest region. Posts and the graph replicate asynchronously between regions; each region runs its own Kafka, fan-out workers and feed caches, fed by replicated post events (for example with MirrorMaker 2). Feeds are caches, so each region builds its own; no cross-region writes on the read path. Accept seconds of cross-region delay for posts. If a region fails, users move to another, where feeds can be rebuilt by pull while caches warm.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate source-of-truth data (replicate) from derived data (rebuild locally). Name the consistency you accept and the failover story.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about two users in different regions following each other?</li><li>How do you avoid fan-out running twice for the same post?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="k8s" data-company="Microsoft,Walmart">
+          <summary>How do you autoscale the fan-out workers on Kubernetes?</summary>
+          <div class="answer">
+            <p>Scale on Kafka consumer lag rather than CPU, because lag measures how late feeds are. A tool such as KEDA reads the lag for the consumer group and drives the HPA. Cap replicas at the partition count, since extra consumers in a group sit idle. Add partitions ahead of growth, because adding later reshuffles keys.</p>
+            <div class="approach"><h5>How to answer</h5><p>Right metric, the partition ceiling, and how fast scaling reacts versus a sudden spike (pre-scale for known events).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Lag is growing but CPU is low. Why? (Waiting on Redis or the graph service; check dependency latency.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: feeds are 20 minutes behind on a cricket final night</h4>
+          <div class="situation"><p>Users complain that friends' posts appear 20 minutes late. Posting works. The fan-out consumer group lag is climbing on a few partitions only.</p></div>
+          <div class="bad"><p>Weak answer: "Add more servers and restart Kafka."</p></div>
+          <div class="good"><p>Strong answer: "Lag on a few partitions, not all, means a hot key or a slow chunk, not a capacity shortage. I would check which posts are in those partitions; likely a few accounts that went viral and are not flagged as celebrities, so their fan-out is huge. Short term: flip them to pull, cap per-post fan-out, and scale workers up to the partition count. Long term: move borderline accounts to a separate topic, update the celebrity flag from a streaming follower count, and alert on per-partition lag."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would adding partitions now help? (Not for already-queued data, and it remaps keys.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: after a deploy, feed p99 jumps from 150 ms to 2 s</h4>
+          <div class="situation"><p>The new feed-service version shipped an hour ago. Cache hit rate on the post cache dropped from 98% to 60%, and the posts DB CPU is at 90%.</p></div>
+          <div class="bad"><p>Weak answer: "Scale the database."</p></div>
+          <div class="good"><p>Strong answer: "A hit-rate cliff right after a deploy points to a changed cache key format or TTL in the new version, so every request misses and stampedes the DB. First roll back (fast, safe). Then confirm by diffing key names. To prevent it: version keys deliberately and warm the new keyspace, canary deploys that watch hit rate and DB load, and request coalescing so misses cannot stampede."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would a canary have caught this? (Hit rate and DB QPS per version as rollout gates.)</li></ul></div>
+        </div>
+      

@@ -1,0 +1,146 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Minute</th><th>Do</th><th>Say</th></tr></thead>
+            <tbody>
+              <tr><td>0-5</td><td>Requirements</td><td>"Redirect latency? Query granularity? How fresh? Is this used for billing - so exact?"</td></tr>
+              <tr><td>5-9</td><td>Estimate</td><td>"1B/day ≈ 12k/s, plan 60k/s peak, 500 B each - 30 MB/s. Scale is fine; correctness is the hard part."</td></tr>
+              <tr><td>9-14</td><td>API + data model</td><td>302 redirect API, query API; raw event vs aggregate tables; upsert key.</td></tr>
+              <tr><td>14-22</td><td>Diagram</td><td>Click service → Kafka → Flink → OLAP → query; S3 + batch underneath.</td></tr>
+              <tr><td>22-38</td><td>Deep dives</td><td>Dedup &amp; exactly-once, event time &amp; watermarks, hot ads, reconciliation.</td></tr>
+              <tr><td>38-45</td><td>Failures + wrap</td><td>Walk crash, Kafka slow, hot ad, late events, region down.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout interview"><p><b>60-second answer:</b> "The click link hits a stateless click service that checks a signed token, sends an event to Kafka asynchronously and returns a 302 - counting never slows the redirect. Events go to a Kafka topic keyed by ad ID with acks=all and idempotence, 7 days of retention. A Flink job dedups by click ID - the impression ID - with keyed state and a TTL, filters obvious fraud, and counts clicks in 1-minute tumbling windows on event time, with a watermark about 30 seconds behind so late clicks still land in the right minute. Checkpoints save state and offsets together, and the sink upserts the full window value by ad and minute, so a replay after a crash rewrites the same number instead of adding to it. Results land in an OLAP store like Pinot or ClickHouse with hour and day rollups, behind a cached query service. Raw events also go to object storage, and a nightly batch recount reconciles and finalizes billing numbers. Hot ads get salted keys and two-stage aggregation."</p></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>SDE-1 bar (a pass)</th><th>SDE-2 bar (a strong hire)</th></tr></thead>
+            <tbody>
+              <tr><td>Click service → Kafka → stream job counts per minute → OLAP store → dashboard.</td><td>Same skeleton, but drives the talk to <b>correctness</b> without being asked.</td></tr>
+              <tr><td>Mentions "dedup by click ID".</td><td>Names the three duplicate sources (user, producer retry, processor replay) and a fix for each.</td></tr>
+              <tr><td>Counts per minute.</td><td>Says <b>event time</b>, explains watermarks, allowed lateness and the side output.</td></tr>
+              <tr><td>Writes counts to a database.</td><td>Chooses an <b>idempotent upsert</b> over increment and explains why retries then are harmless.</td></tr>
+              <tr><td>Clean estimates (12k/s avg, 60k/s peak).</td><td>Raises <b>hot ads</b> (salting, two-stage) and <b>nightly reconciliation</b> for billing unprompted.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details class="qa" data-level="3" data-topic="hld,streaming" data-company="Meta,Amazon">
+          <summary>Why not just insert each click into a SQL table and run COUNT(*)?</summary>
+          <div class="answer">
+            <p>At 60k inserts per second the database becomes the bottleneck, and every dashboard query scans millions of rows - so both writes and reads get slower as data grows. The click redirect would also depend on the database. Pre-aggregating in a stream processor turns a billion rows a day into a few hundred million small window rows, and queries read those. The raw clicks still exist in Kafka and object storage for audits.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the numbers, name both bottlenecks (write rate, scan cost), then propose pre-aggregation - and keep raw data for truth.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about <a href="{{BASE}}interview/glossary#redis">Redis</a> INCR per ad-minute? (fast, but not idempotent and loses data on failover)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming,kafka" data-company="Meta,Uber">
+          <summary>How do you make sure a click is counted exactly once?</summary>
+          <div class="answer">
+            <p>Handle each duplicate source separately. User double-clicks and reloads: dedup on <code>click_id</code> (the signed impression ID), kept in Flink keyed state with a TTL. Producer retries: Kafka's idempotent producer drops repeated sequence numbers. Processor crashes: Flink checkpoints save state and Kafka offsets together, so after a restart it replays from a consistent point; the sink either upserts the whole window value by key (idempotent) or uses a transactional 2-phase-commit Kafka sink with <code>read_committed</code> downstream. Finally, a nightly batch recount verifies it - because "exactly-once" claims should be checked, not trusted.</p>
+            <div class="approach"><h5>How to answer</h5><p>Three duplicate sources, three fixes, plus verification. Avoid saying "Kafka exactly-once" as the whole answer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the same click arrives 2 hours later, after the TTL? (batch reconciliation catches it; or a longer-lived dedup store keyed by impression)</li><li>What does read_committed do? (The consumer skips messages from aborted transactions and waits for commit markers, so it only sees exactly-once output.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming" data-company="Google,Meta">
+          <summary>Event time vs processing time - which do you use and how do you handle late clicks?</summary>
+          <div class="answer">
+            <p>Event time, because billing must attribute a click to the minute it happened, and because replays must produce the same answer as live processing. A watermark set to "newest event time minus 30 seconds" decides when a window is complete. Clicks that arrive within an allowed-lateness period update the window (the upsert handles the update). Later clicks go to a side output and are included by the nightly batch. I would pick the watermark delay from the measured lateness distribution.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define both in one line each, choose event time with two reasons, then explain watermark + allowed lateness + side output as three tiers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens if one partition has no traffic? (watermark stalls; configure idleness)</li><li>Tumbling vs sliding vs session windows? (Tumbling = fixed, non-overlapping minutes; sliding = overlapping, e.g. last 5 min every 1 min; session = closes after a gap of inactivity per key.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming,kafka" data-company="Amazon,Flipkart">
+          <summary>One ad gets 30% of all clicks during a big cricket match. What breaks and how do you fix it?</summary>
+          <div class="answer">
+            <p>With key = ad_id, that ad's clicks all go to one Kafka partition and one Flink task, which saturates while the rest idle; its lag and the freshness of that ad's numbers suffer. Fix: salt hot keys (<code>ad_id#(hash(click_id) mod N)</code>) so they spread over N partitions/tasks, count partially per salt and window, then sum the N partial counts per ad in a second, cheap stage. Using <code>click_id</code> for the salt keeps duplicates together, so dedup still works. Also enable local pre-aggregation in the job.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the symptom (one partition's lag), explain the cause (key skew), then the two-stage fix and why dedup still holds.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you know which ads are hot in advance? (top-K from the last minute, or campaign metadata)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,streaming" data-company="Meta,Microsoft">
+          <summary>How do you keep the redirect fast even if Kafka is slow?</summary>
+          <div class="answer">
+            <p>The click service never waits for Kafka. It hands the event to the producer's in-memory buffer (asynchronous send with a callback) and returns the 302 immediately. If the buffer fills because Kafka is unreachable, events spill to local disk and a background sender retries. The service exposes metrics for buffer and spill size, and readiness fails only if the spill is nearly full. The redirect target comes from the signed token itself, so no database lookup is needed either.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Decouple the user path from the counting path" - then the buffering layers, then how you would notice trouble.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the click service pod dies with events in memory? (small window of loss; reconcile with impression logs, or a synchronous write for very high value clicks)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming" data-company="Google,Amazon">
+          <summary>Lambda vs Kappa - which would you choose here?</summary>
+          <div class="answer">
+            <p>For billing data, I keep a Lambda-style batch <b>check</b>: the nightly job recounts from raw files and finalizes numbers, which protects against subtle streaming bugs and very late events. For reprocessing after a code bug, I use the Kappa approach: deploy the fixed streaming job, replay from Kafka (or tiered storage/object storage) into a new table, and switch reads. So: one processing codebase (stream), plus an independent verification (batch).</p>
+            <div class="approach"><h5>How to answer</h5><p>Define both briefly, then give a mixed, reasoned answer tied to "this is money".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long must Kafka retain data for Kappa replays? (as long as your replay window; tiered storage makes it cheap)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,olap" data-company="Meta,Walmart">
+          <summary>Which database stores the aggregates, and what is the primary key?</summary>
+          <div class="answer">
+            <p>A columnar OLAP store - Pinot, Druid or ClickHouse - because queries are time-range scans with sums and group-bys, and these stores ingest from Kafka and serve sub-second aggregations. The minute table's key is <code>(ad_id, window_start, country, device)</code>; the job upserts the full count for that key, so retries are harmless. Hour and day rollup tables serve long ranges, and the query service picks the coarsest table that answers the question.</p>
+            <div class="approach"><h5>How to answer</h5><p>Query shape → store type → key design → rollups.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you support "unique users per ad"? (HyperLogLog sketches per window, mergeable across windows)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming" data-company="Meta,Google">
+          <summary>How do you detect and handle click fraud without hurting latency?</summary>
+          <div class="answer">
+            <p>Two speeds. Inline in the stream job, apply cheap deterministic rules: bad signature, click without a matching impression, known bot user agents and data-centre IP ranges, and rate limits per user/IP per second. These mark clicks invalid before counting. Asynchronously, an ML model scores clicks over minutes to hours using richer features; invalid clicks are subtracted through corrections, and the nightly batch finalizes. The redirect itself never waits for fraud scoring - the user still goes to the site; we just do not bill the click.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "do not redirect" (almost never) from "do not bill" (fraud), then fast rules vs slow ML.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do advertisers see corrected numbers? (final flag, adjustments table)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,streaming,kafka" data-company="Uber,Meta">
+          <summary>A Flink TaskManager crashes in the middle of a window. Walk me through recovery.</summary>
+          <div class="answer">
+            <p>The JobManager notices the lost TaskManager (heartbeat timeout), cancels the running tasks and restarts the job from the latest completed checkpoint, using a replacement pod. Each operator restores its state - dedup sets, partial window counts - from the checkpoint in object storage, and the Kafka sources rewind to the offsets stored in the same checkpoint. The job re-reads the events after that point, rebuilds identical partial counts, and when the window closes it upserts the same value as before (or, with a transactional sink, the uncommitted transaction is aborted and redone). The only visible effect is a short delay.</p>
+            <div class="approach"><h5>How to answer</h5><p>Detection → restore state + offsets together → replay → idempotent/transactional output. The word "together" is the key.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why are offsets stored in the checkpoint and not committed to Kafka first? (So offsets and state describe the same instant; committing offsets first would skip events whose state was never saved.)</li><li>What is a savepoint? (a manual checkpoint used for upgrades)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming" data-company="Amazon,Microsoft">
+          <summary>How would you run this across regions?</summary>
+          <div class="answer">
+            <p>Put click services and a Kafka cluster in every region so clicks are captured locally with low latency and survive a region failure of the aggregation site. Either aggregate per region and merge the small aggregate streams centrally, or mirror raw clicks to one or two aggregation regions with MirrorMaker 2. Uber's ad pipeline is described as running its Flink jobs in two regions. Deduplication must use the global click ID so a click replicated to two regions is still counted once, and the merged per-ad totals are upserted by key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Capture locally, aggregate where convenient, dedup globally, merge idempotently.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Active-active aggregation in two regions - how do you avoid double counting? (one region is the writer for billing; or dedup on merge)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Writing every click to SQL and running <code>COUNT(*)</code> for dashboards.</li>
+          <li>Counting with processing-time windows (wrong minute, non-repeatable replays).</li>
+          <li>Incrementing counters in the sink (retries double count).</li>
+          <li>Saying "Kafka exactly-once" and stopping there.</li>
+          <li>Making the redirect wait for Kafka, the database or fraud checks.</li>
+          <li>Ignoring hot ads and late events.</li>
+          <li>No reconciliation for billing data.</li>
+        </ul>
+
+        <div class="scenario">
+          <h4>Scenario: an advertiser says you over-billed them by 4%</h4>
+          <div class="situation"><p>An advertiser compares your dashboard with their own site analytics for last Tuesday and claims you counted 4% more clicks than they received. Your streaming numbers and nightly batch numbers agree.</p></div>
+          <div class="bad"><p>Weak answer: "Our system is exactly-once, so they are wrong."</p></div>
+          <div class="good"><p>Strong answer: "First I reproduce from raw data: pull that advertiser's raw clicks for Tuesday from object storage and check duplicates by impression ID, clicks without impressions, and the distribution of IP hashes and user agents. If batch and stream agree, the counting is consistent, so the question is definitions: their analytics counts page loads, and users who bounce before the page loads are clicks for us but not visits for them - some gap is normal and is in the contract. If I find duplicates with different impression IDs from the same user within seconds, that is a dedup rule gap, and I would add a per-user/ad time-window rule, recompute, issue a credit, and add a monitor on duplicate patterns."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you issue corrections without rewriting history? (adjustment records, versioned final tables)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the dashboard shows zero for the last 10 minutes</h4>
+          <div class="situation"><p>At 8:10 PM the advertiser dashboard shows no clicks after 8:00, but the click service is serving redirects normally.</p></div>
+          <div class="bad"><p>Weak answer: "Restart Flink."</p></div>
+          <div class="good"><p>Strong answer: "Clicks are reaching Kafka (I check bytes-in on <code>ad-clicks</code>), so data is safe. Next: is Flink consuming? If <a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a> is growing, the job is stuck or slow - check for a failing checkpoint, backpressure from the sink, or a restart loop. If lag is near zero but no windows close, the <b>watermark is stuck</b>: one idle partition or one producer with a wrong clock holds it back. Fix with source idleness configuration and by clamping absurd future timestamps. After recovery the windows emit, and the upsert sink fills in the missing 10 minutes without duplicates."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What would you alert on to catch this in 2 minutes? (watermark lag vs wall clock, last window emitted time)</li></ul></div>
+        </div>
+      

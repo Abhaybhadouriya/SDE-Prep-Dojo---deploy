@@ -1,0 +1,89 @@
+
+        <h2>acks and min.insync.replicas: the matrix</h2>
+        <p class="chips level-chips"><span class="chip ok">must know</span></p>
+        <p>Two settings decide when a write counts as successful.</p>
+        <ul>
+          <li><b><code>acks</code></b> is a <b>producer</b> setting (see <a href="{{BASE}}devops/kafka-03">Producers</a>). <code>acks=0</code>: do not wait at all. <code>acks=1</code>: wait until the leader has appended the record to its log (page cache, not fsync). <code>acks=all</code> (or <code>-1</code>, the default since Kafka 3.0): wait until <b>every replica currently in the ISR</b> has it.</li>
+          <li><b><code>min.insync.replicas</code></b> is a <b>topic or broker</b> setting (default 1). It only matters for <code>acks=all</code>: if the ISR has fewer members than this, the leader <b>refuses</b> the write with <code>NotEnoughReplicas</code> instead of accepting it with too few copies.</li>
+        </ul>
+        <p>Why do you need both? Because "all of the ISR" can shrink. If two followers fall out, the ISR is just the leader, and <code>acks=all</code> silently becomes <code>acks=1</code>. <code>min.insync.replicas=2</code> is the floor that stops that. Here is the full picture for RF = 3:</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 340" role="img" aria-label="Matrix of acks settings against min.insync.replicas and their safety">
+            <text class="label small" x="110" y="30">acks \ min.insync</text>
+            <text class="label" x="300" y="30">min.insync = 1</text>
+            <text class="label" x="510" y="30">min.insync = 2</text>
+            <text class="label" x="710" y="30">min.insync = 3</text>
+
+            <text class="label" x="110" y="90">acks = 0</text>
+            <rect class="box fail" x="200" y="50" width="590" height="80"/>
+            <text class="label bad" x="495" y="80">Fire and forget. min.insync is ignored.</text>
+            <text class="label small" x="495" y="106">Fastest; any network blip or leader crash can lose data; no errors reported.</text>
+
+            <text class="label" x="110" y="180">acks = 1</text>
+            <rect class="box queue" x="200" y="140" width="590" height="80"/>
+            <text class="label" x="495" y="170">Leader has it. min.insync does not block the write.</text>
+            <text class="label small" x="495" y="196">Lost if the leader dies before followers copy it (the new leader never had it).</text>
+
+            <text class="label" x="110" y="270">acks = all</text>
+            <rect class="box queue" x="200" y="230" width="200" height="100"/>
+            <text class="label" x="300" y="258">Risky</text>
+            <text class="label small" x="300" y="282">ISR can shrink to the</text>
+            <text class="label small" x="300" y="302">leader alone = acks 1</text>
+            <rect class="box db hot" x="410" y="230" width="200" height="100"/>
+            <text class="label" x="510" y="258">Recommended</text>
+            <text class="label small" x="510" y="282">2 copies always; survives</text>
+            <text class="label small" x="510" y="302">1 broker down, still writable</text>
+            <rect class="box fail" x="620" y="230" width="170" height="100"/>
+            <text class="label bad" x="705" y="258">Fragile</text>
+            <text class="label small" x="705" y="282">any 1 broker down</text>
+            <text class="label small" x="705" y="302">= writes rejected</text>
+          </svg>
+          <figcaption>RF = 3. Green is the standard production recipe: <b>RF=3, min.insync.replicas=2, acks=all</b>. It keeps every acknowledged write on at least 2 brokers and keeps accepting writes with one broker down.</figcaption>
+        </figure>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Setting (RF=3)</th><th>Brokers that can be down and still write</th><th>Can an acked write be lost?</th><th>Typical use</th></tr></thead>
+            <tbody>
+              <tr><td>acks=0</td><td>Up to 2 (if leaders move)</td><td>Yes, easily</td><td>Metrics where a gap is fine</td></tr>
+              <tr><td>acks=1</td><td>Up to 2</td><td>Yes, on leader failure</td><td>Logs, clickstream, high volume and low value</td></tr>
+              <tr><td>acks=all, min.insync=1</td><td>Up to 2</td><td>Yes, if the ISR had shrunk to 1</td><td>Out-of-the-box default (not durable)</td></tr>
+              <tr><td><b>acks=all, min.insync=2</b></td><td><b>1</b></td><td><b>No, unless 2 brokers fail together</b></td><td><b>Orders, payments, anything that matters</b></td></tr>
+              <tr><td>acks=all, min.insync=3</td><td>0</td><td>No</td><td>Rare; every maintenance blocks writes</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn"><p><b>The out-of-the-box broker defaults are not durable:</b> <code>default.replication.factor=1</code> and <code>min.insync.replicas=1</code>. Set RF and min ISR on every important topic (or as broker defaults) yourself. Also note <code>min.insync.replicas</code> counts the leader: <code>2</code> means "leader + at least 1 follower".</p></div>
+
+        <h3>Try it: watch the ISR shrink</h3>
+        <p>The reference project has a 3-broker KRaft cluster. From <code>pipeline/code</code>:</p>
+        <div class="callout note"><p><b>Version note:</b> the reference project pins <code>apache/kafka:4.3.2</code> (the newest version that Strimzi 1.3.1 supports, so the local and Kubernetes labs run the same Kafka). Everything on this page behaves the same on 4.4. <b>Shell note:</b> the commands are bash (<code>$K/...</code> and trailing <code>\</code>). On Windows use Git Bash or WSL. In PowerShell, write the full <code>docker compose exec kafka-1 /opt/kafka/bin/kafka-topics.sh ...</code> each time and replace each trailing <code>\</code> with a backtick (<code>`</code>).</p></div>
+<pre><code class="language-bash">docker compose up -d kafka-1 kafka-2 kafka-3
+K="docker compose exec kafka-1 /opt/kafka/bin"
+$K/kafka-topics.sh --bootstrap-server kafka-1:19092 --create --topic payments \
+  --partitions 3 --replication-factor 3 --config min.insync.replicas=2
+$K/kafka-topics.sh --bootstrap-server kafka-1:19092 --describe --topic payments</code></pre>
+<pre class="terminal"><code>Topic: payments  TopicId: 9mJ3...  PartitionCount: 3  ReplicationFactor: 3  Configs: min.insync.replicas=2
+    Topic: payments  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,2,3  Elr:   LastKnownElr:
+    Topic: payments  Partition: 1  Leader: 2  Replicas: 2,3,1  Isr: 2,3,1  Elr:   LastKnownElr:
+    Topic: payments  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1,2  Elr:   LastKnownElr:</code></pre>
+        <p class="muted">The <code>Elr</code> and <code>LastKnownElr</code> columns are explained in <a href="#internals">Leader epochs, unclean election and ELR</a> below. Empty is normal for a healthy topic.</p>
+        <p>Kill broker 2, wait a few seconds, and describe again. Partition 1 has a new leader and every ISR has shrunk to two members:</p>
+<pre><code class="language-bash">docker compose kill kafka-2
+$K/kafka-topics.sh --bootstrap-server kafka-1:19092 --describe --under-replicated-partitions</code></pre>
+<pre class="terminal"><code>    Topic: payments  Partition: 0  Leader: 1  Replicas: 1,2,3  Isr: 1,3  Elr:   LastKnownElr:
+    Topic: payments  Partition: 1  Leader: 3  Replicas: 2,3,1  Isr: 3,1  Elr:   LastKnownElr:
+    Topic: payments  Partition: 2  Leader: 3  Replicas: 3,1,2  Isr: 3,1  Elr:   LastKnownElr:</code></pre>
+        <p>Writes with <code>acks=all</code> still succeed (2 in ISR, min is 2). To see the producer refuse to write, keep <code>kafka-2</code> down and raise the bar instead of killing a second node: ask for 3 in-sync replicas when only 2 are alive.</p>
+<pre><code class="language-bash">$K/kafka-configs.sh --bootstrap-server kafka-1:19092 --alter   --entity-type topics --entity-name payments --add-config min.insync.replicas=3
+# produce with acks=all: every send is now rejected
+docker compose exec kafka-1 bash -c "echo hello | /opt/kafka/bin/kafka-console-producer.sh   --bootstrap-server kafka-1:19092 --topic payments --command-property acks=all"
+# put it back
+$K/kafka-configs.sh --bootstrap-server kafka-1:19092 --alter   --entity-type topics --entity-name payments --add-config min.insync.replicas=2</code></pre>
+        <p>The producer keeps retrying with <code>NOT_ENOUGH_REPLICAS</code> until its <code>delivery.timeout.ms</code> (2 minutes) expires. That is the system choosing <b>consistency over availability</b> on purpose. Bring the broker back with <code>docker compose start kafka-2</code> and watch the ISR grow again. The scripted version of this drill is <a href="{{BASE}}data/files/pipeline/code/scripts/chaos/01-kill-broker.sh">scripts/chaos/01-kill-broker.sh</a>.</p>
+<pre class="terminal"><code>WARN [Producer clientId=console-producer] Got error produce response with correlation id 7 on topic-partition payments-0, retrying (2147483646 attempts left). Error: NOT_ENOUGH_REPLICAS</code></pre>
+        <p class="muted">The exact log text varies by client version; the error name is what to look for.</p>
+        <div class="callout warn"><p><b>Why not just kill a second broker?</b> In this lab every node is <b>also a controller</b> (combined mode, 3 voters). Killing two of three nodes also kills the controller quorum: with only 1 of 3 voters left there is no active controller, so leaders cannot move and ISRs cannot shrink. Clients then see request timeouts, and partitions led by the dead broker have no leader at all, instead of the clean <code>NOT_ENOUGH_REPLICAS</code>. In production, run controllers on separate nodes (see <a href="{{BASE}}devops/kafka-08">KRaft &amp; the controller quorum</a>) so losing brokers never costs you the quorum.</p></div>
+      

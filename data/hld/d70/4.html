@@ -1,0 +1,54 @@
+
+        <h2>Data model</h2>
+        <p>Store choice reasoning is in <a href="{{BASE}}hld/hld-08">Choosing Storage</a>. Five kinds of data, five access patterns.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Device registry: id, type, owner, fixed location + H3 cell, cert fingerprint, firmware, config version</td><td>PostgreSQL (or DynamoDB)</td><td><code>device_id</code>; index by owner, by cell</td><td>Small, relational, needs uniqueness and joins to owners</td></tr>
+              <tr><td>Raw readings</td><td>Time-series DB (TimescaleDB hypertable, InfluxDB, Amazon Timestream) or Cassandra wide rows</td><td><code>(device_id, ts)</code>, partitioned by time chunk</td><td>Append-only, range reads per device, compresses well, drop old chunks cheaply</td></tr>
+              <tr><td>Rollups: per device per hour/day; per cell per minute/hour</td><td>Continuous aggregates in the TSDB, or an OLAP store (Apache Pinot, ClickHouse, Druid)</td><td><code>(device_id | cell, bucket)</code></td><td>Years of history at chart speed; area queries scan cells, not devices</td></tr>
+              <tr><td>Live state per cell</td><td>Redis hash per region/city</td><td><code>heat:{city}</code> field = cell id</td><td>O(1) upsert and full-map read in milliseconds</td></tr>
+              <tr><td>Rules and alerts</td><td>PostgreSQL</td><td>Rules by <code>(sensor_type)</code> + override <code>(machine_id, sensor_type)</code>; alerts by id, index <code>(machine_id, state)</code></td><td>Alerts are business records with transitions, audit and user actions</td></tr>
+              <tr><td>Data lake</td><td>S3 / HDFS Parquet, partitioned by date and region</td><td><code>dt=2026-11-22/city=blr/</code></td><td>Cheap, replayable; batch jobs build daily views and fix late data</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <pre><code class="language-sql">-- TimescaleDB: raw readings, chunked by day, compressed after 2 days, dropped after 90
+CREATE TABLE reading (
+  device_id  BIGINT       NOT NULL,
+  ts         TIMESTAMPTZ  NOT NULL,
+  seq        BIGINT       NOT NULL,
+  metric     SMALLINT     NOT NULL,
+  value      DOUBLE PRECISION,
+  PRIMARY KEY (device_id, ts, metric)
+);
+SELECT create_hypertable('reading', 'ts', chunk_time_interval =&gt; INTERVAL '1 day');
+
+-- hourly rollup maintained in the background
+CREATE MATERIALIZED VIEW reading_1h WITH (timescaledb.continuous) AS
+SELECT device_id, metric, time_bucket('1 hour', ts) AS bucket,
+       sum(value) AS total, avg(value) AS avg, min(value) AS min, max(value) AS max, count(*) AS n
+FROM reading GROUP BY device_id, metric, bucket;
+
+SELECT add_compression_policy('reading', INTERVAL '2 days');
+SELECT add_retention_policy('reading', INTERVAL '90 days');   -- rollups are kept longer
+
+-- alerts: one OPEN alert per (sensor, rule) at a time
+CREATE TABLE alert (
+  alert_id     BIGINT PRIMARY KEY,
+  machine_id   BIGINT NOT NULL,
+  sensor_id    BIGINT NOT NULL,
+  rule_id      BIGINT NOT NULL,
+  state        TEXT   NOT NULL,      -- OPEN, ACKNOWLEDGED, RESOLVED, IGNORED
+  opened_at    TIMESTAMPTZ NOT NULL,
+  first_value  DOUBLE PRECISION,
+  peak_value   DOUBLE PRECISION,
+  acked_by     BIGINT, acked_at TIMESTAMPTZ,
+  resolved_at  TIMESTAMPTZ, resolution TEXT,     -- AUTO (back in range) or MANUAL
+  ignore_until TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX one_active_alert ON alert (sensor_id, rule_id)
+  WHERE state IN ('OPEN', 'ACKNOWLEDGED');</code></pre>
+        <div class="callout tip"><p>The partial unique index is the interview gem: the database itself refuses a second active alert for the same sensor and rule, so a retried or duplicated breach event cannot open two alerts. Same idea as the armed flag in <a href="{{BASE}}hld/d53">Price Tracker &amp; Alerts</a>.</p></div>
+      

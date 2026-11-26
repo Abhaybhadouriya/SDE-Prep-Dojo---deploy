@@ -1,0 +1,303 @@
+
+  <h2>Code: inventory (Java), price ticker (Python), notifier chain (C++14)</h2>
+  <p>All three programs were compiled and run; the output is real. Java shows push events, subscription handles, copy-on-write iteration, exception isolation and the <code>java.util.concurrent.Flow</code> API. Python shows the pull model and weak references against leaks. C++14 mimics a Linux notifier chain with priorities and <code>NOTIFY_STOP</code>. Files live in <code>lld-code/lld-pat-observer/</code>.</p>
+  <div class="callout note syntax-notes">
+    <p><b>Syntax you will meet in this code</b>, mapped to C. Skim it now and come back when a line puzzles you:</p>
+    <ul>
+      <li><b>Java <code>interface</code></b>: a struct of function pointers with no data. A class that <code>implements</code> it must fill every slot.</li>
+      <li><b><code>record Foo(int a, String b)</code></b> (Java): an immutable struct with a constructor, getters (<code>a()</code>, <code>b()</code>), <code>equals</code> and <code>toString</code> generated for you.</li>
+      <li><b>Lambda <code>x -&gt; x * 2</code></b>: a function pointer plus the variables it captured, packed into one object (like a callback with a <code>void *ctx</code>).</li>
+      <li><b>Anonymous class <code>new Foo() { ... }</code></b>: defines and creates a one-off implementation in place, like a static ops table filled inline.</li>
+      <li><b>Generics <code>Foo&lt;T&gt;</code></b>: a type parameter chosen by the user of the class. Think of a macro that generates one typed struct per element type, but checked by the compiler.</li>
+      <li><b><code>std::function&lt;R(Args)&gt;</code></b>: holds any callable: a plain function pointer, a lambda with captured state, or an object with <code>operator()</code>.</li>
+      <li><b>C++ lambda <code>[&amp;](int x) { ... }</code></b>: an inline function; the brackets list what it captures from the enclosing scope (<code>&amp;</code> = by reference, <code>=</code> = by copy).</li>
+    </ul>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c">OOP from C</a>; records, lambdas, generics and the rest also have short entries in <a href="{{BASE}}lld/lld-oop-toolkit">the OOP toolkit</a>.</p>
+  </div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+
+public class ObserverDemo {
+
+    // ---- The event (push model: the subject sends what changed) ----
+    record StockEvent(String sku, int oldQty, int newQty) { }
+
+    // ---- Observer interface ----
+    interface StockListener {
+        void onStockChanged(StockEvent e);
+    }
+
+    // ---- Subject: knows only the interface, never the concrete observers ----
+    static final class Inventory {
+        // Copy-on-write: publish() iterates a snapshot, so listeners may unsubscribe
+        // (or new ones subscribe) while a notification is in progress.
+        // Only the listener LIST is thread-safe. qty is single-threaded in this demo; for concurrent
+        // setQty, guard it with a lock or use ConcurrentHashMap.compute.
+        private final List&lt;StockListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+        private final Map&lt;String, Integer&gt; qty = new HashMap&lt;&gt;();
+
+        /** Returns a handle; closing it unsubscribes. No handle kept = easy leak to spot in review. */
+        AutoCloseable subscribe(StockListener l) {
+            listeners.add(l);
+            return () -&gt; listeners.remove(l);
+        }
+
+        void setQty(String sku, int newQty) {
+            int old = qty.getOrDefault(sku, 0);
+            if (old == newQty) return;                         // no change, no noise
+            qty.put(sku, newQty);
+            publish(new StockEvent(sku, old, newQty));
+        }
+
+        // Named publish, not notifyAll: notifyAll() already exists on every Object (wait/notifyAll).
+        private void publish(StockEvent e) {
+            for (StockListener l : listeners) {
+                try {
+                    l.onStockChanged(e);
+                } catch (RuntimeException ex) {                // one bad observer must not starve the rest
+                    System.out.println("  [inventory] listener failed: " + ex.getMessage());
+                }
+            }
+        }
+        int listenerCount() { return listeners.size(); }
+    }
+
+    // ---- Concrete observers ----
+    static final class BackInStockNotifier implements StockListener {
+        private final String user, sku;
+        private AutoCloseable handle;
+        BackInStockNotifier(String user, String sku) { this.user = user; this.sku = sku; }
+        void attach(Inventory inv) { handle = inv.subscribe(this); }
+        public void onStockChanged(StockEvent e) {
+            if (!e.sku().equals(sku) || e.oldQty() != 0 || e.newQty() == 0) return;
+            System.out.println("  SMS to " + user + ": " + sku + " is back in stock");
+            try { handle.close(); } catch (Exception ignored) { }   // one-shot: unsubscribe itself
+        }
+    }
+
+    static final class LowStockAlert implements StockListener {
+        public void onStockChanged(StockEvent e) {
+            if (e.newQty() &gt; 0 &amp;&amp; e.newQty() &lt; 3) System.out.println("  ALERT ops: " + e.sku() + " low (" + e.newQty() + ")");
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Inventory inv = new Inventory();
+        new BackInStockNotifier("asha", "PS5").attach(inv);
+        new BackInStockNotifier("ravi", "PS5").attach(inv);
+        inv.subscribe(new LowStockAlert());
+        AutoCloseable audit = inv.subscribe(e -&gt; System.out.println("  audit: " + e));      // a lambda observer
+        inv.subscribe(e -&gt; { throw new IllegalStateException("analytics down"); });
+
+        System.out.println("PS5 restocked to 2 (listeners: " + inv.listenerCount() + ")");
+        inv.setQty("PS5", 2);
+        System.out.println("PS5 sold down to 1 (listeners: " + inv.listenerCount() + ")");
+        audit.close();                                                                     // explicit unsubscribe
+        inv.setQty("PS5", 1);
+
+        // ---- java.util.concurrent.Flow: async observer with back-pressure ----
+        System.out.println("Flow API: async delivery, subscriber asks for 1 item at a time");
+        CountDownLatch done = new CountDownLatch(1);
+        try (SubmissionPublisher&lt;StockEvent&gt; pub = new SubmissionPublisher&lt;&gt;()) {
+            pub.subscribe(new Flow.Subscriber&lt;&gt;() {
+                private Flow.Subscription sub;
+                public void onSubscribe(Flow.Subscription s) { sub = s; s.request(1); }
+                public void onNext(StockEvent e) {
+                    System.out.println("  async got " + e.sku() + " -&gt; " + e.newQty() + " on " +
+                            (Thread.currentThread().getName().contains("ForkJoinPool") ? "pool thread" : "other thread"));
+                    sub.request(1);                                  // pull the next one when ready
+                }
+                public void onError(Throwable t) { done.countDown(); }
+                public void onComplete() { System.out.println("  async complete"); done.countDown(); }
+            });
+            pub.submit(new StockEvent("TV", 0, 5));
+            pub.submit(new StockEvent("TV", 5, 4));
+        }                                                            // close() -&gt; onComplete
+        done.await(5, TimeUnit.SECONDS);
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out ObserverDemo.java &amp;&amp; java -cp out ObserverDemo
+PS5 restocked to 2 (listeners: 5)
+  SMS to asha: PS5 is back in stock
+  SMS to ravi: PS5 is back in stock
+  ALERT ops: PS5 low (2)
+  audit: StockEvent[sku=PS5, oldQty=0, newQty=2]
+  [inventory] listener failed: analytics down
+PS5 sold down to 1 (listeners: 3)
+  ALERT ops: PS5 low (1)
+  [inventory] listener failed: analytics down
+Flow API: async delivery, subscriber asks for 1 item at a time
+  async got TV -&gt; 5 on pool thread
+  async got TV -&gt; 4 on pool thread
+  async complete</code></pre>
+      <p>Count the listeners: 5 before the restock, 3 after, because the two one-shot notifiers unsubscribed themselves during the walk. The failing lambda is reported on each change but never blocks the others. In the Flow part the subscriber calls <code>request(1)</code> each time: that is <b>back-pressure</b>, the subscriber telling the publisher how much it can take, like a TCP receive window.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Observer in Python: a price ticker with weak references, so forgotten observers do not leak.
+
+Pull model here: the subject only says "I changed"; observers read what they need.
+"""
+import gc
+import weakref
+
+
+class Ticker:                                         # Subject
+    def __init__(self, symbol):
+        self.symbol, self._price = symbol, 0.0
+        self._observers = weakref.WeakSet()           # does not keep observers alive
+
+    def attach(self, obs):
+        self._observers.add(obs)
+
+    def detach(self, obs):
+        self._observers.discard(obs)
+
+    @property
+    def price(self):
+        return self._price
+
+    def set_price(self, p):
+        self._price = p
+        for obs in list(self._observers):             # copy: observers may detach while we loop
+            obs.update(self)                          # pull: pass the subject, not the data
+
+
+class PriceAlert:                                     # Concrete observer
+    def __init__(self, name, above):
+        self.name, self.above = name, above
+
+    def update(self, ticker):
+        if ticker.price &gt; self.above:
+            print(f"  {self.name}: {ticker.symbol} at {ticker.price} &gt; {self.above}")
+
+
+class Chart:
+    def __init__(self):
+        self.points = []
+
+    def update(self, ticker):
+        self.points.append(ticker.price)
+
+
+if __name__ == "__main__":
+    infy = Ticker("INFY")
+    chart, alert = Chart(), PriceAlert("asha", 1500)
+    infy.attach(chart)
+    infy.attach(alert)
+
+    def screen_opened():                              # an observer that nobody detaches
+        temp = PriceAlert("temp-screen", 0)
+        infy.attach(temp)
+        print(f"  observers while screen open: {len(infy._observers)}")
+
+    screen_opened()
+    gc.collect()                                      # CPython frees it at once; collect() makes it explicit
+    print(f"  observers after screen closed: {len(infy._observers)} (weak ref let it go)")
+
+    for p in (1490, 1510, 1525):
+        infy.set_price(p)
+    infy.detach(alert)
+    infy.set_price(1600)                              # alert no longer hears this
+    print(f"  chart saw {chart.points}")</code></pre>
+<pre class="terminal"><code>$ python observer.py
+  observers while screen open: 3
+  observers after screen closed: 2 (weak ref let it go)
+  asha: INFY at 1510 &gt; 1500
+  asha: INFY at 1525 &gt; 1500
+  chart saw [1490, 1510, 1525, 1600]</code></pre>
+      <p>The temporary screen's observer disappeared on its own because the subject holds it only through a <code>WeakSet</code>. The trade-off: an observer that nobody else references vanishes immediately, so <code>infy.attach(PriceAlert("x", 0))</code> would silently do nothing. For bound methods use <code>weakref.WeakMethod</code>, since a bound method object is created fresh on every attribute access.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Observer in C++14, shaped like a Linux notifier chain:
+// a priority-ordered list of callbacks; a callback can stop the walk.
+// Build: g++ -std=c++14 -Wall observer.cpp -o observer
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;list&gt;
+#include &lt;string&gt;
+
+enum NetEvent { NETDEV_UP, NETDEV_DOWN, NETDEV_CHANGEMTU };
+const char* evName(NetEvent e) {
+    return e == NETDEV_UP ? "NETDEV_UP" : e == NETDEV_DOWN ? "NETDEV_DOWN" : "NETDEV_CHANGEMTU";
+}
+
+enum { NOTIFY_DONE = 0x0000, NOTIFY_OK = 0x0001, NOTIFY_STOP_MASK = 0x8000,
+       NOTIFY_STOP = NOTIFY_OK | NOTIFY_STOP_MASK };          // same values as linux/notifier.h
+
+struct NotifierBlock {                                    // like struct notifier_block
+    std::string name;
+    int priority;                                         // higher runs first
+    std::function&lt;int(NetEvent, const std::string&amp;)&gt; call;
+};
+
+class NotifierChain {                                     // the Subject
+    std::list&lt;NotifierBlock*&gt; chain_;                     // caller owns the blocks, as in the kernel
+public:
+    void reg(NotifierBlock* nb) {                         // insert sorted by priority
+        auto it = chain_.begin();
+        while (it != chain_.end() &amp;&amp; (*it)-&gt;priority &gt;= nb-&gt;priority) ++it;
+        chain_.insert(it, nb);
+    }
+    void unreg(NotifierBlock* nb) { chain_.remove(nb); }
+    int call(NetEvent ev, const std::string&amp; dev) {      // like call_netdevice_notifiers()
+        int ret = NOTIFY_DONE;
+        for (auto it = chain_.begin(); it != chain_.end();) {
+            NotifierBlock* nb = *it++;                    // advance first: callee may unregister itself
+            ret = nb-&gt;call(ev, dev);
+            if (ret &amp; NOTIFY_STOP_MASK) {
+                std::cout &lt;&lt; "    (" &lt;&lt; nb-&gt;name &lt;&lt; " stopped the chain)\n";
+                break;
+            }
+        }
+        return ret;
+    }
+};
+
+int main() {
+    NotifierChain netdev_chain;
+
+    NotifierBlock routing{"routing", 10, [](NetEvent e, const std::string&amp; d) {
+        std::cout &lt;&lt; "  routing : " &lt;&lt; evName(e) &lt;&lt; " " &lt;&lt; d
+                  &lt;&lt; (e == NETDEV_DOWN ? " -&gt; flush routes via " + d : "") &lt;&lt; "\n";
+        return NOTIFY_OK;
+    }};
+    NotifierBlock bonding{"bonding", 20, [](NetEvent e, const std::string&amp; d) {
+        std::cout &lt;&lt; "  bonding : " &lt;&lt; evName(e) &lt;&lt; " " &lt;&lt; d &lt;&lt; "\n";
+        if (e == NETDEV_CHANGEMTU &amp;&amp; d == "bond0") return NOTIFY_STOP;   // veto: slaves must match
+        return NOTIFY_OK;
+    }};
+    NotifierBlock logger{"logger", 0, [](NetEvent e, const std::string&amp; d) {
+        std::cout &lt;&lt; "  logger  : " &lt;&lt; evName(e) &lt;&lt; " " &lt;&lt; d &lt;&lt; "\n";
+        return NOTIFY_DONE;                                // "not interested", keep going
+    }};
+
+    netdev_chain.reg(&amp;routing);
+    netdev_chain.reg(&amp;logger);
+    netdev_chain.reg(&amp;bonding);                            // registered last, runs first (priority 20)
+
+    std::cout &lt;&lt; "eth0 goes down:\n";
+    netdev_chain.call(NETDEV_DOWN, "eth0");
+    std::cout &lt;&lt; "MTU change on bond0:\n";
+    netdev_chain.call(NETDEV_CHANGEMTU, "bond0");
+
+    netdev_chain.unreg(&amp;bonding);                          // module unload MUST unregister first
+    std::cout &lt;&lt; "eth0 up, bonding unloaded:\n";
+    netdev_chain.call(NETDEV_UP, "eth0");
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall observer.cpp -o observer &amp;&amp; ./observer
+eth0 goes down:
+  bonding : NETDEV_DOWN eth0
+  routing : NETDEV_DOWN eth0 -&gt; flush routes via eth0
+  logger  : NETDEV_DOWN eth0
+MTU change on bond0:
+  bonding : NETDEV_CHANGEMTU bond0
+    (bonding stopped the chain)
+eth0 up, bonding unloaded:
+  routing : NETDEV_UP eth0
+  logger  : NETDEV_UP eth0</code></pre>
+      <p>Bonding registered last but ran first, because the chain is ordered by priority. When it returned <code>NOTIFY_STOP</code> for the MTU change, the lower-priority listeners never heard of it. The walk advances the iterator before the call, so a callback may unregister itself, which is the same care the kernel takes when walking its chains.</p>
+    </div>
+  </div>

@@ -1,0 +1,95 @@
+
+  <h2>Secrets in state: the trap everyone falls into</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>State stores <b>every attribute</b> of every resource, because that is its job. If a resource has a password, a private key, or a token as an attribute, that value is in the state file. In plain text, by default.</p>
+<pre><code class="language-hcl">variable "db_password" {
+  type      = string
+  sensitive = true          # hides it from CLI output... and that is all
+}
+
+resource "aws_db_instance" "orders" {
+  identifier        = "orders"
+  engine            = "postgres"
+  instance_class    = "db.t4g.medium"
+  allocated_storage = 50
+  username          = "app"
+  password          = var.db_password
+}</code></pre>
+<pre class="terminal"><code>$ terraform plan
+  + password = (sensitive value)              &lt;- hidden in plan output
+
+$ terraform state pull | jq -r '.resources[] | select(.type=="aws_db_instance")
+    | .instances[0].attributes.password'
+S3cr3t-Pa55w0rd!                              &lt;- but sitting in state</code></pre>
+  <p><code>sensitive = true</code> is a display filter, not encryption. The Terraform docs say it directly: values marked sensitive are still stored in state and plan files. Saved plan files (<code>tfplan</code>) in CI artifacts leak in the same way.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>It is <code>show running-config</code> printing <code>password 7 ...</code>: the display is masked or obfuscated, but the config file on flash still holds a reversible secret, and anyone who can copy the file has it. Or a core dump of a process that held a TLS key. The fix is the same as in your world: control who can read the file, encrypt it at rest, and best of all, do not put the secret in it.</p>
+  </div>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Defence in depth for secrets and state: keep secrets out of state first, then encrypt the bucket with KMS, restrict IAM, enforce TLS, block public access, log access with CloudTrail">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box ring" x="20" y="20" width="760" height="260"/>
+      <text class="label left" x="36" y="44">5. Audit: CloudTrail data events on the bucket, alert on unexpected .tflock deletes</text>
+      <rect class="box ring" x="50" y="56" width="700" height="210"/>
+      <text class="label left" x="66" y="80">4. Network + public: deny non-TLS (aws:SecureTransport), Block Public Access</text>
+      <rect class="box ring" x="80" y="92" width="640" height="160"/>
+      <text class="label left" x="96" y="116">3. IAM: only CI role writes prod state; humans read-only or break-glass</text>
+      <rect class="box ring" x="110" y="128" width="580" height="110"/>
+      <text class="label left" x="126" y="152">2. Encryption at rest: SSE-KMS key with its own key policy</text>
+      <rect class="box ok" x="140" y="166" width="520" height="60"/>
+      <text class="label" x="400" y="192">1. Keep secrets OUT of state</text>
+      <text class="label small" x="400" y="212">managed secrets, ephemeral values, write-only arguments</text>
+    </svg>
+    <figcaption>Layer 1 removes the problem; layers 2 to 5 limit the damage for the secrets you cannot remove. Old versions in a versioned bucket hold old secrets too, so all layers apply to them.</figcaption>
+  </figure>
+
+  <h3>Layer 1: keep the secret out of state</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Let AWS own it">
+      <p>Many AWS services can generate and store the secret themselves. For RDS, ask it to manage the master password in AWS Secrets Manager. Terraform never sees the password; state only holds the secret's ARN.</p>
+<pre><code class="language-hcl">resource "aws_db_instance" "orders" {
+  identifier                  = "orders"
+  engine                      = "postgres"
+  instance_class              = "db.t4g.medium"
+  allocated_storage           = 50
+  username                    = "app"
+  manage_master_user_password = true   # RDS creates + rotates it in Secrets Manager
+}
+
+output "db_secret_arn" {
+  value = aws_db_instance.orders.master_user_secret[0].secret_arn
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Write-only (1.11+)">
+      <p>Terraform 1.10 added <b>ephemeral</b> values (variables and <code>ephemeral</code> resources that exist only during a run) and 1.11 added <b>write-only arguments</b>: the provider sends the value to the API but it is never stored in plan or state. By convention they end in <code>_wo</code>, with a <code>_wo_version</code> you bump to rotate.</p>
+<pre><code class="language-hcl">ephemeral "random_password" "db" {
+  length = 24
+}
+
+resource "aws_db_instance" "orders" {
+  # ...
+  username            = "app"
+  password_wo         = ephemeral.random_password.db.result
+  password_wo_version = 1      # change to 2 to push a new password
+}</code></pre>
+      <p>The app then needs the password from somewhere else, so in practice you also write it into Secrets Manager with a write-only <code>secret_string_wo</code>, or prefer the managed option.</p>
+    </div>
+    <div class="tab-panel" data-title="Read at runtime">
+      <p>Do not pass secrets through Terraform at all. Terraform creates the empty secret container and the IAM permission; the application reads the value at startup (Secrets Manager / SSM Parameter Store, or a Kubernetes Secret synced by an operator). State then contains an ARN, not a password.</p>
+<pre><code class="language-hcl">resource "aws_secretsmanager_secret" "stripe_key" {
+  name = "prod/payments/stripe-key"
+  # the value is put in by a human or a rotation Lambda, never by Terraform
+}</code></pre>
+    </div>
+  </div>
+
+  <h3>Layers 2 to 5: protect the backend</h3>
+  <ol class="steps">
+    <li><strong>Encrypt.</strong> <code>encrypt = true</code> plus a customer-managed <code>kms_key_id</code>. A KMS key gives you a second permission check: reading the object needs both <code>s3:GetObject</code> and <code>kms:Decrypt</code> on that key.</li>
+    <li><strong>Least privilege.</strong> The S3 backend needs only <code>s3:ListBucket</code> on the bucket and <code>s3:GetObject</code> / <code>s3:PutObject</code> on the state key (plus Get/Put/Delete on the <code>.tflock</code> key). Give prod write access only to the CI role; humans get read-only or a break-glass role.</li>
+    <li><strong>Enforce TLS and block public access.</strong> A bucket policy that denies every request where <code>aws:SecureTransport</code> is false, plus S3 Block Public Access.</li>
+    <li><strong>Version and expire.</strong> Versioning is your undo button, but each old version is another copy of old secrets. Keep enough history to recover (for example 90 days of noncurrent versions) via a lifecycle rule.</li>
+    <li><strong>Audit.</strong> Turn on CloudTrail <b>data events</b> for the state bucket (off by default) so every <code>GetObject</code> on state is logged with the caller's identity.</li>
+  </ol>
+  <div class="callout note"><p><b>OpenTofu difference.</b> OpenTofu (since 1.7) can encrypt state and plan files on the client before they leave your machine, with keys from AWS KMS, GCP KMS or a passphrase. Terraform relies on the backend's encryption at rest. Worth one sentence in an interview if the team uses OpenTofu.</p></div>

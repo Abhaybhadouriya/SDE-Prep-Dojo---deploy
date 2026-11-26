@@ -1,0 +1,70 @@
+
+        <h2>How a ClusterIP really works: kube-proxy and DNAT</h2>
+        <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+        <p>Here is the question every networking engineer should ask: <i>"Is the Service IP a real IP on an interface? Who answers ARP for it?"</i></p>
+        <p><b>Answer: in the default mode, nobody.</b> 10.96.45.10 is not configured on any interface on any machine. It exists only as <b>matching rules in netfilter</b> on every node. When a pod sends a packet to it, the packet goes to the pod's default gateway (the node) - so no ARP for the ClusterIP is ever needed - and in the node's netfilter <code>nat</code> table a rule rewrites the destination (DNAT) to a real pod IP before routing. <b>conntrack</b> remembers the rewrite so replies are translated back.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="iptables chain walk: KUBE-SERVICES matches the ClusterIP, KUBE-SVC picks an endpoint at random, KUBE-SEP does DNAT">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="110" width="140" height="60"/>
+            <text class="label" x="90" y="132">PREROUTING</text>
+            <text class="label small" x="90" y="154">/ OUTPUT (nat)</text>
+            <rect class="box k8s" x="200" y="110" width="160" height="60"/>
+            <text class="label" x="280" y="132">KUBE-SERVICES</text>
+            <text class="label small" x="280" y="154">dst 10.96.45.10:80?</text>
+            <rect class="box k8s solid" x="400" y="110" width="150" height="60"/>
+            <text class="label white" x="475" y="132">KUBE-SVC-XYZ</text>
+            <text class="label white" x="475" y="154" style="font-size:13px">random pick</text>
+            <rect class="box docker" x="600" y="20" width="180" height="56"/>
+            <text class="label" x="690" y="40">KUBE-SEP-1 p=1/3</text>
+            <text class="label small" x="690" y="62">DNAT 10.244.1.7:8080</text>
+            <rect class="box docker" x="600" y="112" width="180" height="56"/>
+            <text class="label" x="690" y="132">KUBE-SEP-2 p=1/2</text>
+            <text class="label small" x="690" y="154">DNAT 10.244.2.9:8080</text>
+            <rect class="box docker" x="600" y="204" width="180" height="56"/>
+            <text class="label" x="690" y="224">KUBE-SEP-3 (rest)</text>
+            <text class="label small" x="690" y="246">DNAT 10.244.2.12:8080</text>
+            <path class="arrow" d="M160 140 L195 140"/>
+            <path class="arrow" d="M360 140 L395 140"/>
+            <path class="arrow" d="M550 130 L595 50"/>
+            <path class="arrow" d="M550 140 L595 140"/>
+            <path class="arrow" d="M550 150 L595 230"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M90 140 L280 140 L475 140 L600 48"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M90 140 L280 140 L475 140 L600 140"/></circle>
+            <circle class="packet k8s" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M90 140 L280 140 L475 140 L600 232"/></circle>
+          </svg>
+          <figcaption>iptables mode: a chain per Service, a chain per endpoint. Probabilities 1/3, then 1/2 of the rest, then the remainder give an even three-way split. Only the first packet of a connection walks this; conntrack handles the rest.</figcaption>
+        </figure>
+<pre class="terminal"><code># on any node (trimmed; real chain names are hashes)
+$ sudo iptables-save -t nat | grep -E 'backend|KUBE-SVC-XYZ|KUBE-SEP'
+-A KUBE-SERVICES -d 10.96.45.10/32 -p tcp -m comment --comment "default/backend:http cluster IP" -m tcp --dport 80 -j KUBE-SVC-XYZ
+-A KUBE-SVC-XYZ -m statistic --mode random --probability 0.33333333349 -j KUBE-SEP-1
+-A KUBE-SVC-XYZ -m statistic --mode random --probability 0.50000000000 -j KUBE-SEP-2
+-A KUBE-SVC-XYZ -j KUBE-SEP-3
+-A KUBE-SEP-1 -p tcp -m tcp -j DNAT --to-destination 10.244.1.7:8080
+-A KUBE-SEP-2 -p tcp -m tcp -j DNAT --to-destination 10.244.2.9:8080
+-A KUBE-SEP-3 -p tcp -m tcp -j DNAT --to-destination 10.244.2.12:8080
+
+$ sudo conntrack -L -d 10.96.45.10
+tcp 6 86397 ESTABLISHED src=10.244.1.20 dst=10.96.45.10 sport=40112 dport=80 src=10.244.2.9 dst=10.244.1.20 sport=8080 dport=40112 [ASSURED] use=1</code></pre>
+        <p>Read the conntrack line like a networking engineer: original tuple to the ClusterIP, reply tuple from the real pod. That pair is the whole trick.</p>
+        <div class="callout tip"><p><b>Can you ping a ClusterIP?</b> In iptables and nftables mode, no: the rules only match the Service's protocol and port, and no interface owns the IP, so ICMP echo gets no answer. (In the old IPVS mode, the IPs are bound to a dummy <code>kube-ipvs0</code> interface, so ping does answer - a nice detail to mention.) Test Services with <code>curl</code> or <code>nc</code>, never ping.</p></div>
+
+        <h3>The kube-proxy modes (know the 2026 status)</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Mode</th><th>How it picks a backend</th><th>Scale behaviour</th><th>Status</th></tr></thead>
+            <tbody>
+              <tr><td><b>iptables</b></td><td>Linear chain walk with random probabilities</td><td>Rules grow with services x endpoints; updates rewrite large tables and get slow with tens of thousands of Services</td><td>Still the <b>default</b> in v1.37; set <code>mode</code> explicitly (<a href="https://kubernetes.io/docs/reference/networking/virtual-ips/" target="_blank" rel="noopener">virtual IPs doc</a>)</td></tr>
+              <tr><td><b>nftables</b></td><td>Verdict maps (hash lookup)</td><td>Much faster updates and lookups</td><td>GA in v1.33; recommended on K8s 1.36+ with kernel 5.13+ (<a href="https://kubernetes.io/blog/2025/02/28/nftables-kube-proxy/" target="_blank" rel="noopener">nftables blog</a>)</td></tr>
+              <tr><td><b>IPVS</b></td><td>Kernel L4 load balancer (LVS), hash tables, many algorithms</td><td>Good lookup scale</td><td><b>Deprecated since v1.35</b>; removal planned around v1.40 (<a href="https://github.com/kubernetes/enhancements/issues/5495" target="_blank" rel="noopener">KEP-5495</a>, a KEP = Kubernetes Enhancement Proposal). Migrate away</td></tr>
+              <tr><td><b>eBPF (Cilium, no kube-proxy)</b></td><td>BPF maps, socket-level load balancing</td><td>Constant-time lookups, no per-packet NAT for in-cluster traffic</td><td>Widely used; not part of upstream kube-proxy</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>kube-proxy is "pushing NAT/ACL tables to every line card": one agent per node, each with the full table, so any node can forward to any Service. iptables mode is like a <b>linear ACL</b> evaluated top to bottom; nftables verdict maps are like moving to a <b>hash/TCAM lookup</b>. IPVS is LVS, the kernel's L4 load balancer. Where it breaks: unlike a hardware VIP on a load balancer appliance, there is no central box here - the "load balancer" is distributed into the source node's kernel, so traffic never hairpins through a middle hop.</p>
+        </div>
+      

@@ -1,0 +1,94 @@
+
+  <h2>Core flows</h2>
+  <h3>TTL: lazy reads and the expiry heap (step through it)</h3>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 820 300" role="img" aria-label="Expiry heap with a stale item that is skipped">
+      <text class="label left" x="20" y="30">Entries</text>
+      <rect class="box db" x="120" y="12" width="210" height="32"/><text class="label small mono" x="225" y="28">otp:42 exp 30s v5</text>
+      <rect class="box db" x="340" y="12" width="210" height="32"/><text class="label small mono" x="445" y="28">session:9 exp 5s v6</text>
+      <text class="label left" x="20" y="100">Heap</text>
+      <rect class="box queue" x="120" y="82" width="210" height="32"/><text class="label small mono" x="225" y="98">(5s, session:9, v6)</text>
+      <rect class="box queue" x="340" y="82" width="210" height="32"/><text class="label small mono" x="445" y="98">(30s, otp:42, v5)</text>
+      <g data-step="2">
+        <rect class="box db" x="560" y="12" width="240" height="32"/><text class="label small mono" x="680" y="28">session:9 exp 60s v7 (rewrite)</text>
+        <rect class="box queue" x="560" y="82" width="240" height="32"/><text class="label small mono" x="680" y="98">(60s, session:9, v7)</text>
+        <path class="line bad" d="M340 28 H550" style="stroke-width:3"/>
+      </g>
+      <g data-step="3">
+        <text class="label small" x="410" y="160">clock = 10 s: purge pops (5s, session:9, v6)</text>
+        <text class="label small bad" x="410" y="184">current session:9 is v7, not v6: stale item, skip. Key survives.</text>
+        <path class="line bad" d="M120 98 H330" style="stroke-width:3"/>
+      </g>
+      <g data-step="4">
+        <text class="label small" x="410" y="220">clock = 30 s: get(otp:42) sees now &gt;= expiresAt and returns nil (no sweep needed)</text>
+      </g>
+      <g data-step="5">
+        <rect class="box ok" x="120" y="244" width="680" height="40"/>
+        <text class="label small" x="460" y="264">next purge pops (30s, otp:42, v5): versions match, remove it, then notify the listener after unlocking</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Two keys with a TTL: each entry stores an absolute expiry, and the heap holds one (expiresAt, key, version) item per TTL write, earliest first.</li>
+      <li>session:9 is rewritten with a 60 s TTL. We push a new heap item and leave the old one where it is: finding it would cost O(n).</li>
+      <li>At 10 s the sweep pops the 5 s item, sees the key's current version is 7, not 6, and skips it. Without the version check, a rewritten key would be deleted early.</li>
+      <li>At 30 s a read of otp:42 already misses: lazy expiry makes reads correct at the exact deadline even if the sweep is late.</li>
+      <li>The sweep (every write purges up to 16 due items; a scheduler can call purgeExpired) physically removes it and tells listeners once.</li>
+    </ol>
+  </div>
+  <h3>Nested transactions (step through it)</h3>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 820 300" role="img" aria-label="Nested transaction layers being rolled back and committed">
+      <rect class="box db" x="20" y="230" width="780" height="44"/><text class="label small mono" x="410" y="256">store: a=10  b=20</text>
+      <g data-step="1">
+        <rect class="box cache" x="20" y="170" width="780" height="44"/><text class="label small mono" x="410" y="196">T1: a=11</text>
+      </g>
+      <g data-step="2">
+        <rect class="box cache" x="20" y="110" width="780" height="44"/><text class="label small mono" x="410" y="136">T2: a=12  b=(tombstone)  c=30</text>
+        <text class="label small" x="410" y="90">tx.get(a)=12, tx.get(b)=nil; another client still sees a=10</text>
+      </g>
+      <g data-step-only="3">
+        <path class="line bad" d="M20 132 H800" style="stroke-width:3"/>
+        <text class="label small" x="410" y="90">rollback pops T2: tx.get(a)=11, b=20, c=nil again</text>
+      </g>
+      <g data-step-only="4">
+        <rect class="box cache" x="20" y="110" width="780" height="44"/><text class="label small mono" x="410" y="136">T3: d=40</text>
+        <text class="label small" x="410" y="90">inner commit: T3 merges into T1, store unchanged</text>
+      </g>
+      <g data-step="5">
+        <rect class="box ok" x="20" y="20" width="780" height="44"/><text class="label small" x="410" y="46">outer commit: check read versions, then write a=11, d=40 under the write lock, in one step</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li><code>begin()</code> pushes T1. <code>set(a, 11)</code> writes into T1 only.</li>
+      <li>A nested <code>begin()</code> pushes T2. Reads look at T2, then T1, then the store; the tombstone for b hides the store's b.</li>
+      <li><code>rollback()</code> pops only T2. Everything T1 did is still there.</li>
+      <li>A new T3 is committed: an inner commit just merges its map into T1. Nothing reaches the store yet.</li>
+      <li>The outermost <code>commit()</code> validates the keys read from the store and applies the whole write set atomically. Other clients see all of it or none of it.</li>
+    </ol>
+  </div>
+  <h3>The outer commit</h3>
+  <figure class="diagram">
+    <svg viewBox="0 0 900 340" role="img" aria-label="Sequence diagram of an optimistic outer commit">
+      <rect class="box client" x="20" y="10" width="120" height="40"/><text class="label small" x="80" y="30">Client</text>
+      <rect class="box cache" x="220" y="10" width="140" height="40"/><text class="label small" x="290" y="30">Session</text>
+      <rect class="box svc" x="440" y="10" width="160" height="40"/><text class="label small" x="520" y="30">InMemoryStore</text>
+      <rect class="box kafka" x="700" y="10" width="160" height="40"/><text class="label small" x="780" y="30">ExpiryListener</text>
+      <path class="line" d="M80 50 V330" style="stroke-dasharray:4 4"/>
+      <path class="line" d="M290 50 V330" style="stroke-dasharray:4 4"/>
+      <path class="line" d="M520 50 V330" style="stroke-dasharray:4 4"/>
+      <path class="line" d="M780 50 V330" style="stroke-dasharray:4 4"/>
+      <path class="arrow" d="M80 80 L284 80"/><text class="label mono" x="182" y="70">get(balance)</text>
+      <path class="arrow" d="M290 106 L514 106"/><text class="label mono" x="405" y="96">read: v=12 (read lock)</text>
+      <text class="label small" x="405" y="126">readVersions[balance] = 12</text>
+      <path class="arrow" d="M80 156 L284 156"/><text class="label mono" x="182" y="146">set(balance, 110)</text>
+      <text class="label small" x="405" y="166">top layer only, no lock</text>
+      <path class="arrow" d="M80 196 L284 196"/><text class="label mono" x="182" y="186">commit()</text>
+      <path class="arrow" d="M290 222 L514 222"/><text class="label mono" x="405" y="212">commit(reads, writes)</text>
+      <rect class="box ghost" x="530" y="230" width="160" height="62"/>
+      <text class="label small left" x="538" y="248">write lock</text>
+      <text class="label small left" x="538" y="266">balance still v12? apply</text>
+      <text class="label small left" x="538" y="284">else ConflictException</text>
+      <path class="arrow" d="M520 312 L774 312"/><text class="label mono" x="650" y="304">onExpired(...) if a purge ran</text>
+    </svg>
+    <figcaption>Only the commit takes the write lock, for as long as it takes to compare a few versions and write a few entries. The client's thinking time is spent with no lock held.</figcaption>
+  </figure>

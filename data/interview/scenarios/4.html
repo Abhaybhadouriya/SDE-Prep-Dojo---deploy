@@ -1,0 +1,233 @@
+
+        <h2>Docker drills (D1 - D8)</h2>
+        <p>These are the container problems every backend engineer meets in the first year. Most of them are really Linux problems wearing a container costume, which is good news for you. Background reading: <a href="{{BASE}}devops/docker-04">Running containers</a>, <a href="{{BASE}}devops/docker-05">Docker networking</a>, <a href="{{BASE}}devops/docker-08">Internals</a>, <a href="{{BASE}}devops/docker-09">Production and security</a>.</p>
+
+        <div class="scenario" id="d1">
+          <h4>Scenario D1: the container keeps restarting with exit code 137</h4>
+          <div class="situation">
+            <p>A Java service in a container restarts every 20 to 40 minutes under load. <code>docker ps</code> shows "Restarting (137)". The developer says "the app only uses 300 MB, the limit is 512 MB".</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">memory</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: Amazon, Walmart, Microsoft</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "137 means it crashed, so I would look at the Java code for a bug and maybe double the memory." It does not decode 137, does not prove it was an OOM kill, and doubling memory without understanding may only delay the crash.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Decode the number.</strong> 137 = 128 + 9, so the process got <b><a href="{{BASE}}interview/glossary#exit-code">SIGKILL</a></b>. Nobody catches SIGKILL, so either the kernel <a href="{{BASE}}interview/glossary#oomkilled">OOM killer</a> or a forced stop sent it.</li>
+              <li><strong>Prove it was memory.</strong> Check the OOMKilled flag and the kernel log.</li>
+              <li><strong>Find where the memory goes.</strong> "300 MB" is usually only the Java heap. The container also pays for metaspace, thread stacks, direct buffers, the JIT and page cache that counts against the <a href="{{BASE}}interview/glossary#cgroup">cgroup</a>. Watch <code>docker stats</code> over time to see if it is a slow leak or a spike.</li>
+              <li><strong>Mitigate.</strong> Raise the limit a little to buy time, and make the JVM container-aware: set <code>-XX:MaxRAMPercentage=75</code> so the heap leaves room for non-heap memory.</li>
+              <li><strong>Fix and prevent.</strong> If memory keeps climbing, take a heap dump and fix the leak. Alert on memory usage at 80-90% of the limit and on restart count, so you hear about it before users do.</li>
+            </ol>
+<pre class="terminal"><code>$ docker inspect -f '{{.State.OOMKilled}} {{.State.ExitCode}}' orders-api
+true 137
+$ dmesg | grep -i -E "killed process|oom" | tail -2
+Memory cgroup out of memory: Killed process 48211 (java) ...
+$ docker stats --no-stream orders-api
+CONTAINER ID   NAME         CPU %   MEM USAGE / LIMIT   MEM %
+3f9c2a1b7e44   orders-api   84.2%   509.6MiB / 512MiB   99.53%</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>What is the difference between exit 137 and 143? (143 = 128 + 15 = SIGTERM, a polite stop the app could handle.)</li>
+            <li>Which cgroup file holds the limit? (<code>memory.max</code> in cgroup v2; <code>memory.events</code> counts oom_kill.)</li>
+            <li>What happens at a CPU limit instead? (No kill. The process is throttled by <code>cpu.max</code>, so it just gets slow.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d2">
+          <h4>Scenario D2: every deploy waits exactly 10 seconds per container</h4>
+          <div class="situation">
+            <p>Rolling out a new version is slow. Each <code>docker stop</code> takes exactly 10 seconds, and in-flight requests are cut off instead of finishing.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">signals, <a href="{{BASE}}interview/glossary#pid-1">PID 1</a></span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: any company</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Docker is just slow; I would use <code>docker kill</code> to make it faster." This makes shutdown even less graceful and loses requests.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> exactly 10 seconds is a clue, not a coincidence. <code>docker stop</code> sends SIGTERM, waits for the default grace period of 10 seconds, then sends SIGKILL. So the app is ignoring SIGTERM.</p>
+            <ol class="steps">
+              <li><strong>Check PID 1.</strong> If the Dockerfile uses the shell form, <code>CMD java -jar app.jar</code>, then <code>/bin/sh -c</code> is PID 1 and it does not forward signals to Java.</li>
+              <li><strong>Remember PID 1 is special.</strong> The kernel gives PID 1 no default signal actions, so unless the program installs a handler, SIGTERM does nothing.</li>
+              <li><strong>Fix.</strong> Use the exec form <code>CMD ["java","-jar","app.jar"]</code>, or run with <code>--init</code> (tini) so a tiny init forwards signals and reaps zombies. Make the app handle SIGTERM: stop taking new work, finish in-flight requests, close connections, exit.</li>
+              <li><strong>Prevent.</strong> Add a shutdown test in CI that sends SIGTERM and checks the exit happens within a few seconds.</li>
+            </ol>
+<pre class="terminal"><code>$ docker exec orders-api ps -o pid,comm
+PID   COMMAND
+    1 sh
+    7 java
+$ time docker stop orders-api
+real    0m10.4s      # the grace period ran out, then SIGKILL</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>What is a zombie process and why does PID 1 have to reap it?</li>
+            <li>How does Kubernetes do the same thing? (SIGTERM, <code>terminationGracePeriodSeconds</code> default 30 s, then SIGKILL; a <code>preStop</code> hook runs first.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d3">
+          <h4>Scenario D3: the Docker host disk is 100% full</h4>
+          <div class="situation">
+            <p>A build server or a single-host deployment stops working. New containers fail to start with "no space left on device".</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">disk</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: any company</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Run <code>docker system prune -a --volumes</code>." That might delete a database volume someone needs. Never run destructive cleanup before you know what is using the space.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Measure first.</strong> <code>df -h</code> to confirm which filesystem, then <code>docker system df</code> to split images, containers, volumes and build cache.</li>
+              <li><strong>Check the usual suspects.</strong> (1) Container logs: the default <code>json-file</code> driver does not rotate, so a chatty app can write gigabytes into <code>/var/lib/docker/containers/*/*-json.log</code>. (2) Dangling images and old build cache on CI hosts. (3) Anonymous volumes left by removed containers. (4) An app writing files inside its container layer instead of a volume.</li>
+              <li><strong>Mitigate safely.</strong> Remove only what is proven unused: <code>docker image prune</code>, <code>docker builder prune</code>, truncate the giant log of a known container.</li>
+              <li><strong>Prevent.</strong> Set log rotation in <code>/etc/docker/daemon.json</code>, add a scheduled prune on CI hosts, and alert on disk at 80%.</li>
+            </ol>
+<pre class="terminal"><code>$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          87        6         41.2GB    37.9GB (91%)
+Containers      9         6         212MB     12MB (5%)
+Local Volumes   31        4         18.4GB    15.1GB (82%)
+Build Cache     604       0         22.7GB    22.7GB</code></pre>
+<pre><code class="language-json">{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "50m", "max-file": "3" }
+}</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Why does deleting a file inside the image in a later layer not shrink the image? (Lower layers are read-only; a whiteout only hides the file.)</li>
+            <li>In Kubernetes, what happens when node disk fills? (The kubelet reports DiskPressure and evicts pods.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d4">
+          <h4>Scenario D4: "it works on my laptop" but the app cannot reach the database container</h4>
+          <div class="situation">
+            <p>With Docker Compose, the API container logs "connection refused to localhost:5432". On the laptop without containers, everything worked.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">networking</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: Flipkart</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Use <code>--network host</code> so everything is on localhost." It hides the problem, does not work the same on Mac or Windows, and throws away isolation.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> each container has its <b>own network namespace</b>, so <code>localhost</code> inside the API container means the API container itself, not the database.</p>
+            <ol class="steps">
+              <li><strong>Use service names.</strong> On a user-defined network (Compose creates one), Docker's embedded DNS at <code>127.0.0.11</code> resolves the service name. Connect to <code>db:5432</code>.</li>
+              <li><strong>Check the listener.</strong> The database must listen on <code>0.0.0.0</code> inside its container, not only on <code>127.0.0.1</code>.</li>
+              <li><strong>Check the port.</strong> Containers talk to the <b>container</b> port (5432), not the published host port.</li>
+              <li><strong>Check start order.</strong> <code>depends_on</code> alone only waits for the container to start, not for Postgres to be ready. Use a <code>healthcheck</code> plus <code>condition: service_healthy</code>, and retry connections in the app anyway.</li>
+            </ol>
+<pre class="terminal"><code>$ docker compose exec api getent hosts db
+172.20.0.3      db
+$ docker compose exec api sh -c "nc -zv db 5432"
+db (172.20.0.3:5432) open</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>What other "works on my machine" causes do you know? (CPU architecture arm64 vs amd64, musl vs glibc on Alpine, missing env vars, file permissions when running as non-root, time zone.)</li>
+            <li>How does the default bridge network differ from a user-defined one? (No DNS by name on the default bridge.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d5">
+          <h4>Scenario D5: the new image runs on the laptop but crashes on the new ARM servers</h4>
+          <div class="situation">
+            <p>The team moves to cheaper ARM (Graviton-style) nodes. Pods on the new nodes die instantly with <code>exec format error</code>.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">multi-arch</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: Amazon, Swiggy</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "The image is corrupt; rebuild it." Rebuilding on the same x86 CI runner produces the same x86 binary.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> <code>exec format error</code> means the kernel cannot run the binary format, which almost always means the image was built for <b>amd64</b> and the node is <b>arm64</b>.</p>
+            <ol class="steps">
+              <li><strong>Confirm.</strong> Inspect the image's platform and the node's architecture.</li>
+              <li><strong>Mitigate.</strong> Pin these pods to amd64 nodes with a <code>nodeSelector</code> on <code>kubernetes.io/arch</code> until the fix ships.</li>
+              <li><strong>Fix.</strong> Build a <b>multi-arch</b> image: one tag pointing to a manifest list with both architectures, so each node pulls the right one.</li>
+              <li><strong>Prevent.</strong> Make multi-arch the default in the shared CI template, and add a smoke test that runs the image on both node types. Swiggy described building exactly this kind of pipeline when it moved Kubernetes workloads to Graviton.</li>
+            </ol>
+<pre class="terminal"><code>$ docker buildx imagetools inspect registry.local/orders-api:1.8.0 | grep Platform
+  Platform:  linux/amd64
+$ kubectl get node ip-10-0-7-21 -o jsonpath='{.status.nodeInfo.architecture}'
+arm64
+$ docker buildx build --platform linux/amd64,linux/arm64 -t registry.local/orders-api:1.8.1 --push .</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>How does one tag serve two architectures? (An OCI image index / manifest list; the client picks by platform.)</li>
+            <li>Why can emulated (QEMU) builds be slow, and what is the alternative? (Native ARM builders, or cross-compiling in a multi-stage build.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d6">
+          <h4>Scenario D6: deploys are slow because the image is 1.4 GB</h4>
+          <div class="situation">
+            <p>Scaling up during traffic spikes takes minutes because new nodes must pull a 1.4 GB image. CI builds take 15 minutes because the cache never hits.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">build, images</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: any company</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Use Alpine." It can help, but on its own it ignores build tools left in the image and the cache order, and Alpine's musl libc can break some native libraries.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Look before cutting.</strong> <code>docker history</code> shows which layer is big. A tool like dive shows wasted files.</li>
+              <li><strong>Multi-stage build.</strong> Compile in a full SDK image, copy only the final artifact into a slim or distroless runtime image. Compilers, caches and test files never ship.</li>
+              <li><strong>Order for the cache.</strong> Copy the dependency manifest and install dependencies <b>before</b> <code>COPY . .</code>. Then a code change does not reinstall every library.</li>
+              <li><strong>Add <code>.dockerignore</code>.</strong> Keep <code>.git</code>, <code>node_modules</code> and local build output out of the build context.</li>
+              <li><strong>At the fleet level.</strong> Pre-pull common base layers on nodes, use a regional registry mirror, and keep images that scale fast small. Uber reported cutting build time and image size sharply when it rebuilt its image tooling (see <a href="{{BASE}}devops/docker-09">Production page</a>).</li>
+            </ol>
+<pre><code class="language-dockerfile"># build stage: has the SDK
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+COPY pom.xml .
+RUN mvn -q dependency:go-offline        # cached until pom.xml changes
+COPY src ./src
+RUN mvn -q package -DskipTests
+
+# runtime stage: only the JRE and the jar
+FROM eclipse-temurin:21-jre
+COPY --from=build /src/target/app.jar /app/app.jar
+USER 10001
+ENTRYPOINT ["java","-XX:MaxRAMPercentage=75","-jar","/app/app.jar"]</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Why does <code>RUN apt-get update</code> in its own layer cause stale package problems? (Cached forever; combine with install in one RUN.)</li>
+            <li>Why pin images by digest in production instead of <code>:latest</code>?</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d7">
+          <h4>Scenario D7: a secret API key is found inside a public image</h4>
+          <div class="situation">
+            <p>A security scan finds a cloud access key in an image layer, even though the Dockerfile deletes the key file in a later step.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">security</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: Amazon, Microsoft</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Delete the file and rebuild." The leaked key is already in every copy of the old image and in the registry.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> treat it as a real security incident.</p>
+            <ol class="steps">
+              <li><strong>Mitigate first: rotate the key.</strong> Revoke it at the provider now. Assume it is stolen. Check the provider's access logs for use.</li>
+              <li><strong>Explain the cause.</strong> Each <code>RUN</code>/<code>COPY</code> is a layer. Deleting a file in a later layer only adds a whiteout; the bytes stay in the earlier layer and anyone can extract them with <code>docker save</code>.</li>
+              <li><strong>Remove the image.</strong> Delete the affected tags from the registry, rebuild, redeploy.</li>
+              <li><strong>Fix the build.</strong> Use BuildKit secret mounts (<code>RUN --mount=type=secret,id=npmrc ...</code>), which never write the secret into a layer. At runtime, inject secrets from a secret manager or Kubernetes Secret, never bake them in.</li>
+              <li><strong>Prevent.</strong> Secret scanning in CI that blocks the push, and short-lived credentials (workload identity) so a leak expires on its own.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Are Kubernetes Secrets encrypted? (Base64 is not encryption; turn on encryption at rest for etcd and restrict RBAC.)</li>
+            <li>How do pods get cloud credentials without any static key? (EKS Pod Identity / IRSA, Azure Workload Identity, GKE Workload Identity.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="d8">
+          <h4>Scenario D8: the firewall says port 8080 is blocked, but the world can still reach the container</h4>
+          <div class="situation">
+            <p>An admin configured <code>ufw deny 8080</code> on a host. A container started with <code>-p 8080:80</code> is still reachable from the internet.</p>
+            <p><span class="chip docker">Docker</span> <span class="chip">iptables</span> <span class="chip">level: SDE-1 and SDE-2</span> <span class="chip company">commonly reported at: Microsoft</span> <span class="chip">team: networking-heavy teams</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "ufw is broken, reinstall it." The tool works; the packet never reaches the rules ufw manages.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> this is a packet-path question, and it is your home ground.</p>
+            <ol class="steps">
+              <li><strong>Trace the packet.</strong> Docker publishes ports with a <b>DNAT</b> rule in the <code>nat</code> table (PREROUTING to the DOCKER chain). The destination is rewritten to the container IP <i>before</i> the filter decision, so the packet goes through the FORWARD chain, not INPUT, where ufw's host rules live.</li>
+              <li><strong>Mitigate.</strong> Bind the published port to localhost if only a local proxy needs it: <code>-p 127.0.0.1:8080:80</code>.</li>
+              <li><strong>Fix properly.</strong> Put your own filtering in the <code>DOCKER-USER</code> chain, which Docker evaluates before its own forwarding rules and never overwrites.</li>
+              <li><strong>Prevent.</strong> Default to binding on 127.0.0.1 in Compose files and scan hosts for unexpectedly open ports.</li>
+            </ol>
+<pre class="terminal"><code>$ sudo iptables -t nat -L DOCKER -n | grep 8080
+DNAT  tcp  --  0.0.0.0/0  0.0.0.0/0  tcp dpt:8080 to:172.17.0.2:80
+$ sudo iptables -I DOCKER-USER -p tcp --dport 80 ! -s 10.0.0.0/8 -j DROP</code></pre>
+            <p>(The DOCKER-USER rule matches on port 80 because the destination is already rewritten to the container port by then.)</p>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>What does <a href="{{BASE}}interview/glossary#iptables">conntrack</a> do here, and what happens when the conntrack table fills? (New connections are dropped: "nf_conntrack: table full" in dmesg.)</li>
+            <li>How is a Kubernetes Service similar? (kube-proxy also uses DNAT to pick a pod IP.)</li>
+          </ul></div>
+        </div>
+      

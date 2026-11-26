@@ -1,0 +1,74 @@
+
+  <h2>Where migrations run in a Kubernetes pipeline</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>The schema step must run <b>once</b>, <b>before</b> the app rollout that needs it, and must not depend on how many pods start. The common patterns:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 220" role="img" aria-label="Pipeline: artifact, migration Job runs once, waits for success, then the Deployment rolls out">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="10" y="80" width="120" height="56"/>
+      <text class="label" x="70" y="104">git commit</text>
+      <text class="label small" x="70" y="124">app + V42.sql</text>
+      <rect class="box k" x="170" y="80" width="130" height="56"/>
+      <text class="label" x="235" y="104">Argo CD sync</text>
+      <text class="label small" x="235" y="124">wave -1 first</text>
+      <rect class="box queue" x="340" y="20" width="160" height="56"/>
+      <text class="label" x="420" y="44">migrate Job</text>
+      <text class="label small" x="420" y="64">flyway migrate (once)</text>
+      <rect class="box db" x="560" y="20" width="120" height="56"/>
+      <text class="label" x="620" y="52">Postgres</text>
+      <rect class="box docker" x="340" y="140" width="160" height="56"/>
+      <text class="label" x="420" y="164">Deployment</text>
+      <text class="label small" x="420" y="184">rolling update</text>
+      <rect class="box ok" x="560" y="140" width="220" height="56"/>
+      <text class="label" x="670" y="164">v2 pods</text>
+      <text class="label small" x="670" y="184">only after Job succeeded</text>
+      <path class="arrow" d="M130 108 L165 108"/>
+      <path class="arrow" d="M300 100 L335 52"/>
+      <path class="arrow" d="M500 48 L555 48"/>
+      <path class="arrow dashed" d="M420 76 L420 135"/>
+      <path class="arrow" d="M500 168 L555 168"/>
+      <text class="label small" x="470" y="110">health OK</text>
+      <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M130 108 L235 108 L420 48 L620 48"/></circle>
+      <circle class="packet k" r="6"><animateMotion dur="4s" begin="2s" repeatCount="indefinite" path="M420 76 L420 168 L670 168"/></circle>
+    </svg>
+    <figcaption>The migration is a separate, single-run step that gates the rollout. If it fails, the rollout never starts and the old pods keep serving.</figcaption>
+  </figure>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Pattern</th><th>How</th><th>Watch out</th></tr></thead>
+      <tbody>
+        <tr><td>Pipeline step</td><td>CI/CD job runs <code>flyway migrate</code> against the DB, then triggers the deploy</td><td>Pipeline needs DB network access and credentials</td></tr>
+        <tr><td>Argo CD sync hook / wave</td><td>A <code>Job</code> annotated <code>argocd.argoproj.io/hook: PreSync</code> (or a lower sync-wave) runs before the Deployment is applied</td><td>Job must be idempotent; set <code>backoffLimit</code> and a deadline</td></tr>
+        <tr><td>Helm hook</td><td><code>helm.sh/hook: pre-upgrade</code> Job</td><td>Failed hook leaves the release failed; know how to retry</td></tr>
+        <tr><td>On app startup / initContainer</td><td>Every pod runs migrate on boot (tool lock serializes them)</td><td>Couples pod start to DB locks; slow migration = pods stuck, readiness fails, rollout stalls. Avoid for anything non-trivial.</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: Job
+metadata:
+  name: users-migrate-v42
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: flyway
+          image: registry.example.internal/users-migrations:1.9.0   # immutable, built once
+          args: ["migrate"]
+          envFrom:
+            - secretRef: { name: users-db-migrator }               # DDL-capable user, not the app user</code></pre>
+<pre class="terminal"><code>$ kubectl logs job/users-migrate-v42
+Flyway OSS Edition by Redgate
+Database: jdbc:postgresql://users-db:5432/users (PostgreSQL 18.1)
+Successfully validated 42 migrations (execution time 00:00.031s)
+Current version of schema "public": 41
+Migrating schema "public" to version "42 - phone e164 constraint"
+Successfully applied 1 migration to schema "public", now at version v42 (execution time 00:04.212s)</code></pre>
+  <p>Notice the migration image is itself an <b>immutable artifact</b> built once (the rule from <a href="{{BASE}}devops/devops-cicd-02#promote">build once, promote many</a>), and it uses a separate database user with DDL rights, so the app's own credentials cannot alter the schema.</p>
+  <div class="callout danger"><p><b>The lock queue outage.</b> In Postgres, <code>ALTER TABLE</code> needs an <code>ACCESS EXCLUSIVE</code> lock for an instant. If one long-running query (an analytics report) holds a conflicting lock, the ALTER waits, and <b>every new query on that table queues behind the ALTER</b>. A "instant" metadata change takes the whole service down. Always <code>SET lock_timeout</code> (a few seconds) in migrations, and retry with backoff when it fires.</p></div>

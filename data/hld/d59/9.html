@@ -1,0 +1,131 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> requirements; call out strong consistency for matches only, 300 ms stack, no repeats.</li>
+          <li><strong>5-10 min:</strong> numbers: 2B swipes/day = 20k-60k writes/s; stacks only about 400/s. Split services.</li>
+          <li><strong>10-15 min:</strong> APIs (swiper from token) and entities (User, Swipe, Match).</li>
+          <li><strong>15-25 min:</strong> high-level: profile + geo index, recommendation with cache, swipe service, notifier.</li>
+          <li><strong>25-40 min:</strong> deep dives: the match race (pair key + atomic op), geo sharding, Bloom filter.</li>
+          <li><strong>40-45 min:</strong> failures and extensions (Redis loss, user moves, ranking).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Two very different workloads, so two services. Swipes are 20 to 60 thousand writes a second of tiny key-value data; stacks are only a few hundred geo searches a second. For the stack, profile and location changes flow through Kafka keyed by user id into an Elasticsearch cluster geosharded by load-balanced S2 cells; the recommendation service queries the two or three shards that overlap the user's distance circle, ranks, removes already-seen profiles with a per-user Bloom filter, and caches about 100 cards. For swipes, the key is the pair, min(a,b):max(a,b); a right swipe runs one atomic Redis Lua script that writes my yes and reads yours, so two simultaneous yeses can never miss each other. Only right swipes from the last two weeks live in Redis; everything is durable in Cassandra. A match gets a deterministic id and a push to the first swiper."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: the two services and their numbers, the pair key and why swiper-keyed storage races, an atomic check, a geo index for nearby profiles, a precomputed stack, a Bloom filter for seen profiles, and push for the first swiper. SDE-2 adds: Redis memory sizing (only right swipes, short TTL), load-balanced geosharding and user moves between shards with ordering by user id, reconciliation when Redis loses data, consumer-lag effects, Bloom filter sizing and rebuilds, hot geoshards on big nights.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a proximity service like Yelp.</b> Yelp's places barely move and are read by everyone; Tinder's "places" are people who move, filter each other both ways, and must never be shown twice. Also do not confuse <b>S2 vs geohash</b>: both map the Earth to cell ids, but geohash cells are rectangles whose area shrinks near the poles, while S2 cells at one level have roughly equal area on a sphere, which makes load-based shards easier to build.</p></div>
+        <p class="small">About the company tags on the questions below: Tinder is the subject of the design, not a reported interviewer. We found no self-reported company interview for this exact problem; the geo and contention parts are commonly reported in proximity and booking rounds at large companies.</p>
+        <h3>Common mistakes</h3>
+        <div class="callout warn"><p><b>Common mistakes:</b> keeping every swipe in Redis (tens of TB of RAM); partitioning swipes only by swiper and then "read the other side" (the race); one giant SQL query with lat/lng ranges; computing the stack per request; storing the swiper id in the request body; an exact "seen" set per user in RAM; equal-area geo shards; forgetting how the first swiper is notified.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Tinder">
+          <summary>Design Tinder. Give me the high-level architecture.</summary>
+          <div class="answer">
+            <p>Split by workload. A profile service owns profiles and locations in a KV store and publishes changes to Kafka; an indexer keeps a geo-sharded search index up to date. A recommendation service builds a ranked stack of about 100 candidates per user from the geoshards overlapping their distance circle, filters out seen profiles with a Bloom filter and caches the stack in Redis. A separate swipe service handles 20k-60k writes/s: an atomic write-and-check on a pair key in Redis, durable copy to Cassandra. Matches go to a notifier (APNs/FCM/WebSocket).</p>
+            <div class="approach"><h5>How to answer</h5><p>Let the estimate justify the split: swipes are hot and simple; stacks are rare and expensive.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which part needs strong consistency?</li><li>How fresh is the stack?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder">
+          <summary>Two users swipe right on each other at the same instant. How do you guarantee a match?</summary>
+          <div class="answer">
+            <p>Make both directions live under one key, <code>min(a,b):max(a,b)</code>, and do "write mine, read theirs" atomically on that key: a Redis Lua script (or a single-partition operation in Cassandra). Operations on one key are serialised, so the second operation always sees the first. Create the match with a deterministic id and insert-if-not-exists, so duplicates are harmless. A reconciliation job over durable swipes catches anything lost if Redis fails.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the race first (both write, both read, nobody matches). Then the fix. Then idempotency.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not a distributed transaction?</li><li>What if the Redis primary fails right after the script?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder">
+          <summary>How do you find nearby candidates that match filters, fast?</summary>
+          <div class="answer">
+            <p>Use a search engine with geo fields (or a geo index: geohash, quadtree, S2) plus filter fields, and shard it by geography. Shard by load, not area: score S2 cells by active users and queries, group neighbours until a threshold - that is a geoshard (Tinder used S2 levels 7-8, roughly 1,300-5,200 km<sup>2</sup> per cell). A query hits only the shards its circle overlaps (about 3 on average for 160 km per the systemdesign.one write-up), in parallel. Then precompute and cache the stack so reads are cheap.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain why a two-range SQL query is slow, then the index, then the sharding. Link to proximity search.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Geohash vs S2 - why S2? (Equal-area cells, no edge distortion near poles.)</li><li>What happens when a user flies to another city?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Tinder">
+          <summary>How do you avoid showing a profile the user already swiped?</summary>
+          <div class="answer">
+            <p>Three layers: the client keeps its last few hundred swipes and filters locally (covers replication lag); the server keeps a per-user Bloom filter of swiped ids and checks every candidate (about 9.6 bits per item at 1% error - about 120 KB for a 100k-swipe user); the durable swipe table is the truth from which filters are rebuilt. The Bloom filter's only error is hiding a never-seen profile occasionally, which is acceptable; it never lets a repeat through.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the error direction and why it is the right one here. Give a sizing number.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you support "undo last swipe" if Bloom filters cannot delete?</li><li>The Redis node with filters dies - now what?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder">
+          <summary>A user moves from one geoshard to another. What can go wrong and how do you fix it?</summary>
+          <div class="answer">
+            <p>The move is two writes: delete from the old index, insert into the new. If updates for the same user are processed out of order (say an older location applied after a newer one), the user ends up in the wrong shard, in both, or in none. Route all of a user's updates through one Kafka partition keyed by user id so they apply in order, carry a version number so older updates are ignored, use the latest-version read (Elasticsearch Get API) when consistency matters, and run a periodic re-sync against the source of truth - the approach Tinder describes.</p>
+            <div class="approach"><h5>How to answer</h5><p>State the ordering problem, then "partition by entity key" and "version + reconcile".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about the Passport feature (instant teleport)?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Tinder">
+          <summary>How do you keep the stack load under 300 ms?</summary>
+          <div class="answer">
+            <p>Precompute about 100 ranked candidates per active user into Redis with a TTL under an hour; the request just reads the list and hydrates cards (profiles and photo URLs cached, photos from a CDN). Refill in the background when the client has 10-20 cards left, so the user never waits. Invalidate on location or filter changes. Warm only recently active users.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cache plus prefetch plus invalidation rules.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How stale can a stack be before it is a problem (someone deleted their account)?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Tinder">
+          <summary>How is the first swiper told about the match?</summary>
+          <div class="answer">
+            <p>The second swiper learns from the swipe response (<code>matched: true</code>). The first swiper is not in that request, so the swipe service emits a match event; the notifier sends it over an open WebSocket if the app is in the foreground and a push notification through APNs/FCM otherwise. The match is stored first, so even if the push is lost the Matches tab shows it on next open.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point out the asymmetry; store-then-notify.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid sending the notification twice? (Deterministic match id.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder">
+          <summary>Where would you trade strong consistency for availability in this design?</summary>
+          <div class="answer">
+            <p>Everywhere except the match check. Stacks can be minutes stale; the search index is near real-time and re-synced in the background; "who liked me" counts can lag; the durable copy of swipes can be written asynchronously. Even the match check can be relaxed in a degraded mode: accept the swipe, and let the reconciliation job create matches a few minutes later, rather than failing the swipe.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that consistency is a per-feature choice, and that you have a degraded mode.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you detect that matches are being missed? (Compare reconciliation output with live matches.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder">
+          <summary>How much memory does the Redis match store need, and what do you keep in it?</summary>
+          <div class="answer">
+            <p>Do the arithmetic first. Keeping every swipe for 90 days is 2B x 90 = 180B entries, roughly 18-36 TB of RAM at 100-200 bytes each: not sensible. A match only needs the other side's "yes", so Redis keeps right swipes only, with a short TTL. At about 35% right swipes and 14 days that is ~10B entries x ~150 B = ~1.5 TB, spread over a sharded cluster. Left swipes go to Cassandra and the user's Bloom filter. If the script finds nothing, the service reads the pair row in Cassandra once; that covers a "yes" older than the hot window, and it is race-free because old writes are already visible.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the wrong number, then shrink it with two observations: only "yes" matters, and only recent swipes can race.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a Redis shard is lost? (Recent right swipes are also in Kafka and Cassandra; the reconciliation job finds mutual likes the live path missed.)</li><li>Could you drop Redis and use Cassandra only? (Yes: pair-key partition, QUORUM writes and reads, or a lightweight transaction; it costs latency.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Tinder">
+          <summary>Why S2 cells rather than geohash or a plain lat/lng range query?</summary>
+          <div class="answer">
+            <p>A lat/lng range needs two range conditions, and a B-tree index serves only one well, so it scans. Geohash and S2 both turn a location into a cell id where nearby places usually share a prefix, so "near me" becomes a few cell lookups. S2 has two advantages for sharding: its cells at one level have roughly equal area anywhere on the sphere (geohash rectangles distort with latitude), and its cells follow a Hilbert curve, so neighbouring cell ids are usually neighbours on the map. That makes it easy to group adjacent cells by load into geoshards. Geohash is still a fine answer for a smaller system or when your database supports it natively.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the B-tree problem, then give one reason S2 helps sharding (equal area or Hilbert locality). Do not over-sell: geohash works too.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A user is at the edge of a cell. How do you avoid missing people just across it? (Query the covering cells of the whole distance circle, not just the user's cell.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Tinder,Bumble,Uber">
+          <summary>Your app shows "3 km away" on every profile. How could an attacker find a user's home, and how do you stop it?</summary>
+          <div class="answer">
+            <p>By trilateration: spoof GPS to three positions, read the distance from each, intersect the circles. Rounding alone is not enough; Bumble rounded down to whole miles in 2021, and probing for the point where "3" flips to "4" gave exact distances again. The fix is layered: compute distances only on the server; snap every stored location to a coarse grid cell (about 0.1 degree, or a coarse S2 cell) <i>before</i> computing distance; show bands like "less than 5 km"; never add fresh random noise per request (it averages out); rate-limit distance lookups and flag impossible travel; and store only the coarse location if the product allows it.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the attack, give one real example, then say "snap, then compute, then band", and explain why per-request noise fails. Finish with abuse controls.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big should the cell be? (Big enough to cover many homes; a longitude degree shrinks with latitude.)</li><li>What about users near a cell edge? (They may look about one cell apart; bands hide most of the error.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "I matched but never got notified"</h4>
+          <div class="situation">Support tickets say some users discover old matches only when they scroll the Matches tab. No errors in the logs.</div>
+          <div class="bad">Weak answer: "Retry push notifications three times."</div>
+          <div class="good">Strong answer: Separate two bugs. (1) Missed match detection: are swipes for one pair landing on different keys (for example ids not sorted consistently, or a resharding that split pair keys)? Compare the reconciliation job's mutual likes with live matches to measure it. (2) Missed notification: push tokens expire, the first swiper's WebSocket was on another node. Store the match first, notify from an event with retries and a deterministic id, and show an in-app badge on next open.</div>
+          <div class="followups"><ul><li>How would you alert on (1) before users report it?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: New Year's Eve in one city</h4>
+          <div class="situation">Traffic in one metro area goes 5x for three hours; stack latency there rises to 2 seconds.</div>
+          <div class="bad">Weak answer: "Add more Elasticsearch nodes to the whole cluster."</div>
+          <div class="good">Strong answer: The hot geoshard is the bottleneck. Add replicas for that shard's index (Tinder adjusts replicas per shard), pre-warm stacks for active users there before midnight, lengthen the stack TTL temporarily, and shed non-critical work (ranking model features) for that region. Long term, split the shard into smaller ones by load score.</div>
+          <div class="followups"><ul><li>Why is this cheaper than scaling the whole cluster?</li></ul></div>
+        </div>
+      

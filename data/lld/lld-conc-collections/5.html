@@ -1,0 +1,77 @@
+
+  <h2>Inside ConcurrentHashMap (Java 8+)</h2>
+  <p>Java 7's version split the map into 16 <b>segments</b>, each its own lock. Java 8 rewrote it with a finer design, and that design is what interviewers expect:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 820 330" role="img" aria-label="ConcurrentHashMap internals: array of bins; empty bin insert by CAS; list bin locked on its head node; tree bin; forwarding node during resize; counter cells for size">
+      <text class="label small left" x="20" y="22">table: volatile Node[] (power-of-two length)</text>
+      <rect class="box plain" x="20" y="36" width="70" height="44"/><text class="label mono" x="55" y="58">0</text>
+      <rect class="box plain" x="90" y="36" width="70" height="44"/><text class="label mono" x="125" y="58">1</text>
+      <rect class="box plain" x="160" y="36" width="70" height="44"/><text class="label mono" x="195" y="58">2</text>
+      <rect class="box plain" x="230" y="36" width="70" height="44"/><text class="label mono" x="265" y="58">3</text>
+      <rect class="box plain" x="300" y="36" width="70" height="44"/><text class="label mono" x="335" y="58">...</text>
+
+      <path class="arrow ok" d="M55 80 L55 128"/>
+      <rect class="box ok" x="10" y="130" width="140" height="56"/><text class="label small" x="80" y="150">empty bin:</text><text class="label mono" x="80" y="170">CAS in new node</text>
+
+      <path class="arrow" d="M125 80 C 150 100, 190 110, 200 218"/>
+      <rect class="box warn" x="170" y="220" width="70" height="40"/><text class="label mono" x="205" y="240">head</text>
+      <rect class="box svc" x="260" y="220" width="60" height="40"/><text class="label mono" x="290" y="240">n</text>
+      <rect class="box svc" x="340" y="220" width="60" height="40"/><text class="label mono" x="370" y="240">n</text>
+      <path class="arrow" d="M240 240 L258 240"/><path class="arrow" d="M320 240 L338 240"/>
+      <text class="label small" x="285" y="285">collision: synchronized (head) only</text>
+      <text class="label small" x="285" y="305">other bins stay free</text>
+
+      <path class="arrow" d="M265 80 L470 128"/>
+      <rect class="box cache" x="420" y="130" width="160" height="56"/><text class="label small" x="500" y="150">TreeBin</text><text class="label mono" x="500" y="170">red-black, 8+ nodes</text>
+
+      <path class="arrow dashed" d="M335 80 L640 50"/>
+      <rect class="box queue" x="640" y="20" width="170" height="56"/><text class="label small" x="725" y="40">ForwardingNode</text><text class="label mono" x="725" y="60">"see new table"</text>
+
+      <rect class="box db" x="620" y="200" width="190" height="80"/>
+      <text class="label small" x="715" y="220">size counter</text>
+      <text class="label mono" x="715" y="244">baseCount + cells[]</text>
+      <text class="label small" x="715" y="266">(the LongAdder idea)</text>
+      <text class="label small left" x="420" y="220">get(): no lock at all,</text>
+      <text class="label small left" x="420" y="240">just volatile reads</text>
+    </svg>
+    <figcaption>One lock per bin, taken only on collision. Reads never lock. A resize is shared: threads that bump into a ForwardingNode help move bins to the new table.</figcaption>
+  </figure>
+  <ul>
+    <li><b>Reads</b> (<code>get</code>, <code>containsKey</code>) take no lock. They see the latest completed write to that key.</li>
+    <li><b>Insert into an empty bin</b> is a single CAS. <b>Insert into a busy bin</b> locks only that bin's first node with <code>synchronized</code>.</li>
+    <li>A bin with 8 or more nodes becomes a <b>red-black tree</b> (when the table has at least 64 bins; smaller tables resize instead), so a flood of colliding keys costs O(log n), not O(n).</li>
+    <li><b>Size</b> uses the LongAdder trick. <code>size()</code> is an estimate while writers run. Prefer <code>mappingCount()</code>, which returns a <code>long</code>.</li>
+    <li><b>No null keys or values.</b> <code>get(k) == null</code> must mean "absent", with no ambiguity. Our demo: <code>put(k, null)</code> throws <code>NullPointerException</code>.</li>
+    <li><b>Iterators are weakly consistent.</b> They never throw <code>ConcurrentModificationException</code> and may or may not show changes made after they were created.</li>
+  </ul>
+  <h3>compute, merge, computeIfAbsent: atomic per key</h3>
+  <p>These methods run your function <b>while holding that key's bin</b>, so read-modify-write becomes one step. They are the answer to "make this map update thread-safe" in nearly every LLD round:</p>
+  <div class="tabs" data-tabs="before-after">
+    <div class="tab-panel" data-title="Before: racy">
+<pre><code class="language-java">// 1. counting
+counts.put(item, counts.getOrDefault(item, 0) + 1);       // lost updates
+
+// 2. lazy per-key value
+if (!followers.containsKey(user))                         // two threads both see "absent"
+    followers.put(user, new HashSet&lt;&gt;());                 // second put replaces the first set
+followers.get(user).add(f);                               // and HashSet itself is unsafe</code></pre>
+    </div>
+    <div class="tab-panel" data-title="After: atomic per key">
+<pre><code class="language-java">// 1. counting: one atomic step per key
+counts.merge(item, 1, Integer::sum);
+
+// 2. lazy per-key value: built exactly once, and the set is concurrent too
+followers.computeIfAbsent(user, k -&gt; ConcurrentHashMap.newKeySet()).add(f);
+
+// 3. conditional update: reserve stock only if enough is left
+boolean[] ok = {false};
+stock.computeIfPresent(item, (k, left) -&gt; {
+    if (left &lt; qty) return left;          // refuse, unchanged
+    ok[0] = true;
+    return left - qty;
+});</code></pre>
+    </div>
+  </div>
+  <p>Our demo: <code>merge</code> reached 800,000 / 800,000, and <code>computeIfAbsent</code> built the follower set exactly once while 8 threads raced.</p>
+  <div class="callout danger"><p><b>Rules for the function you pass:</b> keep it short, and never touch <b>other keys of the same map</b> inside it. Other writers to that bin wait while it runs. Updating another key from inside can deadlock or, in recent JDKs, throw <code>IllegalStateException: Recursive update</code>. No I/O, no remote calls, no locks inside.</p></div>
+  <p>One atomic key is not a transaction across keys. "Move 5 units from warehouse A to warehouse B" touches two keys, and two separate <code>compute</code> calls can be seen half-done. For that you need a lock that covers both (taken in a fixed order to avoid <a href="{{BASE}}lld/lld-conc-deadlock">deadlock</a>), or one immutable value that holds both, swapped with CAS.</p>

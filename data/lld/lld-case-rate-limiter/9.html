@@ -1,0 +1,1210 @@
+
+  <h2>Full code (runs as shown)</h2>
+  <p>Every file below was compiled and run: Java 21 (<code>javac -d out *.java &amp;&amp; java -cp out Main</code>), Python 3.11 (<code>python main.py</code> and <code>python -m unittest test_rate_limiter</code>), and C++14 (<code>g++ -std=c++14 -O2 -Wall main.cpp</code>). The Java and Python demos include multi-threaded checks. The C++ build we ran is single-threaded (the MinGW toolchain used has no <code>std::thread</code>); compile with <code>-DRL_THREADS -pthread</code> on Linux to add a mutex per limiter.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: each line is a Y/N sequence at fixed times.</li><li><code>RateLimiterService.allow</code> and <code>limiterFor</code>: rule lookup and <code>computeIfAbsent</code>.</li><li><code>TokenBucket.acquire</code> and <code>FixedWindow.acquire</code> (Limiters.java): the algorithms, about 10 lines each. This is the heart.</li><li><code>CompositeLimiter</code>: undo with permit tokens.</li><li>Skip on first read: <code>Clock</code>, <code>LimitRule</code>, <code>LimiterFactory</code>.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="rl-code">
+    <div class="tab-panel" data-title="Java: Limiters.java">
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.List;
+
+/** Strategy: one algorithm, one key's state. Every method takes "now" so tests can control time. */
+interface Limiter {
+    long NO_PERMIT = Long.MIN_VALUE;
+
+    /** Take one permit if the limit allows it. Thread-safe. Returns a permit token that says WHERE the permit
+     *  was counted (the window start, or the exact timestamp), or NO_PERMIT. */
+    long acquire(long nowMs);
+
+    /** Give back a permit from acquire() (CompositeLimiter does this when a later limit says no). It only undoes
+     *  the count if that count still matters: a permit from a window that has already ended is left alone. */
+    void rollback(long permit);
+
+    default boolean tryAcquire(long nowMs) { return acquire(nowMs) != NO_PERMIT; }
+}
+
+/** Token bucket: a bucket of `capacity` tokens, refilled at `ratePerSec`. Allows bursts up to capacity. */
+final class TokenBucket implements Limiter {
+    private final long capacity;
+    private final double refillPerMs;
+    private double tokens;
+    private long lastRefillMs;
+
+    TokenBucket(long capacity, double ratePerSec, long nowMs) {
+        if (capacity &lt;= 0 || ratePerSec &lt; 0) throw new IllegalArgumentException("bad token bucket");
+        this.capacity = capacity;
+        this.refillPerMs = ratePerSec / 1000.0;
+        this.tokens = capacity;                       // start full: a new user may burst
+        this.lastRefillMs = nowMs;
+    }
+
+    private void refill(long nowMs) {
+        if (nowMs &gt; lastRefillMs) {
+            tokens = Math.min(capacity, tokens + (nowMs - lastRefillMs) * refillPerMs);
+            lastRefillMs = nowMs;
+        }
+    }
+
+    @Override public synchronized long acquire(long nowMs) {
+        refill(nowMs);
+        if (tokens &gt;= 1.0) { tokens -= 1.0; return nowMs; }
+        return NO_PERMIT;
+    }
+
+    /** A token is a token whenever it comes back; the cap keeps a refund from creating extra burst. */
+    @Override public synchronized void rollback(long permit) { tokens = Math.min(capacity, tokens + 1.0); }
+}
+
+/** Leaky bucket as a meter: water leaks out at `leakPerSec`; each request adds one unit if it fits. */
+final class LeakyBucket implements Limiter {
+    private final long capacity;
+    private final double leakPerMs;
+    private double level;
+    private long lastLeakMs;
+
+    LeakyBucket(long capacity, double leakPerSec, long nowMs) {
+        if (capacity &lt;= 0 || leakPerSec &lt;= 0) throw new IllegalArgumentException("bad leaky bucket");
+        this.capacity = capacity;
+        this.leakPerMs = leakPerSec / 1000.0;
+        this.lastLeakMs = nowMs;
+    }
+
+    @Override public synchronized long acquire(long nowMs) {
+        if (nowMs &gt; lastLeakMs) {
+            level = Math.max(0.0, level - (nowMs - lastLeakMs) * leakPerMs);
+            lastLeakMs = nowMs;
+        }
+        if (level + 1.0 &lt;= capacity) { level += 1.0; return nowMs; }
+        return NO_PERMIT;
+    }
+
+    @Override public synchronized void rollback(long permit) { level = Math.max(0.0, level - 1.0); }
+}
+
+/** Fixed window: at most `limit` requests per aligned window [k*w, (k+1)*w). O(1) memory, edge bursts. */
+final class FixedWindow implements Limiter {
+    private final long limit, windowMs;
+    private long windowStart = Long.MIN_VALUE;
+    private long count;
+
+    FixedWindow(long limit, long windowMs) {
+        if (limit &lt;= 0 || windowMs &lt;= 0) throw new IllegalArgumentException("bad fixed window");
+        this.limit = limit;
+        this.windowMs = windowMs;
+    }
+
+    @Override public synchronized long acquire(long nowMs) {
+        long start = nowMs - Math.floorMod(nowMs, windowMs);
+        if (start != windowStart) { windowStart = start; count = 0; }   // a new window began
+        if (count &lt; limit) { count++; return start; }                    // the permit names its window
+        return NO_PERMIT;
+    }
+
+    /** Undo only inside the same window. If a new window began meanwhile, the old count is gone already;
+     *  decrementing the new window would hand out a slot this request never used (over-admission). */
+    @Override public synchronized void rollback(long permit) { if (permit == windowStart &amp;&amp; count &gt; 0) count--; }
+}
+
+/** Sliding window log: keep every accepted timestamp of the last window. Exact, O(limit) memory per key. */
+final class SlidingWindowLog implements Limiter {
+    private final long limit, windowMs;
+    private final ArrayDeque&lt;Long&gt; log = new ArrayDeque&lt;&gt;();
+
+    SlidingWindowLog(long limit, long windowMs) {
+        if (limit &lt;= 0 || windowMs &lt;= 0) throw new IllegalArgumentException("bad sliding log");
+        this.limit = limit;
+        this.windowMs = windowMs;
+    }
+
+    @Override public synchronized long acquire(long nowMs) {
+        while (!log.isEmpty() &amp;&amp; log.peekFirst() &lt;= nowMs - windowMs) log.pollFirst();   // expire old entries
+        if (log.size() &lt; limit) { log.addLast(nowMs); return nowMs; }    // the permit is its own timestamp
+        return NO_PERMIT;
+    }
+
+    /** Remove exactly our timestamp. pollLast() could remove another thread's newer entry and leave ours,
+     *  which expires sooner and frees capacity too early. (Already expired? Then there is nothing to undo.) */
+    @Override public synchronized void rollback(long permit) { log.removeLastOccurrence(permit); }
+}
+
+/** Sliding window counter: previous window's count, weighted by overlap, plus current count. O(1) memory. */
+final class SlidingWindowCounter implements Limiter {
+    private final long limit, windowMs;
+    private long currStart = Long.MIN_VALUE;
+    private long currCount, prevCount;
+
+    SlidingWindowCounter(long limit, long windowMs) {
+        if (limit &lt;= 0 || windowMs &lt;= 0) throw new IllegalArgumentException("bad sliding counter");
+        this.limit = limit;
+        this.windowMs = windowMs;
+    }
+
+    @Override public synchronized long acquire(long nowMs) {
+        long start = nowMs - Math.floorMod(nowMs, windowMs);
+        if (start != currStart) {
+            boolean adjacent = currStart != Long.MIN_VALUE &amp;&amp; start - currStart == windowMs;
+            prevCount = adjacent ? currCount : 0;   // more than one window passed? forget it
+            currCount = 0;
+            currStart = start;
+        }
+        double prevWeight = 1.0 - (double) (nowMs - currStart) / windowMs;
+        double estimate = prevCount * prevWeight + currCount;
+        if (estimate + 1.0 &lt;= limit) { currCount++; return start; }
+        return NO_PERMIT;
+    }
+
+    /** Undo in the window the permit was counted in: still current, or now the weighted "previous" one. */
+    @Override public synchronized void rollback(long permit) {
+        if (permit == currStart) { if (currCount &gt; 0) currCount--; }
+        else if (permit == currStart - windowMs) { if (prevCount &gt; 0) prevCount--; }
+        // older than that: the count no longer affects any decision, so there is nothing to undo
+    }
+}
+
+/** Composite: a request passes only if EVERY child limiter allows it (per-API AND group AND global). */
+final class CompositeLimiter implements Limiter {
+    private final List&lt;Limiter&gt; children;
+
+    CompositeLimiter(List&lt;Limiter&gt; children) { this.children = List.copyOf(children); }
+
+    @Override public long acquire(long nowMs) {
+        long[] permits = new long[children.size()];
+        for (int i = 0; i &lt; children.size(); i++) {
+            permits[i] = children.get(i).acquire(nowMs);
+            if (permits[i] == NO_PERMIT) {
+                for (int j = i - 1; j &gt;= 0; j--) children.get(j).rollback(permits[j]);   // undo the ones that said yes
+                return NO_PERMIT;
+            }
+        }
+        return nowMs;
+    }
+
+    /** Composites are not nested in this design, so nobody rolls one back; say so loudly instead of guessing. */
+    @Override public void rollback(long permit) {
+        throw new UnsupportedOperationException("a composite permit cannot be rolled back; nest children, not composites");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: RateLimiterService.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Time source. Inject a ManualClock in tests so results never depend on the machine's speed. */
+interface Clock { long nowMs(); }
+
+final class SystemClock implements Clock {
+    @Override public long nowMs() { return System.nanoTime() / 1_000_000; }   // monotonic, not wall time
+}
+
+final class ManualClock implements Clock {
+    private final AtomicLong now = new AtomicLong();
+    ManualClock(long startMs) { now.set(startMs); }
+    @Override public long nowMs() { return now.get(); }
+    void advance(long ms) { now.addAndGet(ms); }
+}
+
+enum Algorithm { TOKEN_BUCKET, LEAKY_BUCKET, FIXED_WINDOW, SLIDING_LOG, SLIDING_COUNTER }
+
+/** Value object: "limit requests per windowMs using algorithm". Buckets use limit as capacity, limit/window as rate. */
+record LimitRule(Algorithm algorithm, long limit, long windowMs) {
+    LimitRule {
+        if (algorithm == null || limit &lt;= 0 || windowMs &lt;= 0) throw new IllegalArgumentException("bad rule");
+    }
+    double perSecond() { return limit * 1000.0 / windowMs; }
+}
+
+/** Factory: the only place that knows which class implements which algorithm. */
+final class LimiterFactory {
+    private LimiterFactory() {}
+
+    static Limiter create(LimitRule r, long nowMs) {
+        switch (r.algorithm()) {
+            case TOKEN_BUCKET:    return new TokenBucket(r.limit(), r.perSecond(), nowMs);
+            case LEAKY_BUCKET:    return new LeakyBucket(r.limit(), r.perSecond(), nowMs);
+            case FIXED_WINDOW:    return new FixedWindow(r.limit(), r.windowMs());
+            case SLIDING_LOG:     return new SlidingWindowLog(r.limit(), r.windowMs());
+            case SLIDING_COUNTER: return new SlidingWindowCounter(r.limit(), r.windowMs());
+            default: throw new IllegalArgumentException("unknown algorithm " + r.algorithm());
+        }
+    }
+}
+
+/**
+ * Facade the API layer calls: allow(clientId, api).
+ * Rules: one per API (or the default), plus optional group rules that cap several APIs combined.
+ * State: one Limiter per (client, rule) key, created lazily and shared by all threads.
+ */
+final class RateLimiterService {
+    private final Clock clock;
+    private final LimitRule defaultRule;
+    private final Map&lt;String, LimitRule&gt; apiRules = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, LimitRule&gt; groupRules = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Set&lt;String&gt;&gt; groupApis = new ConcurrentHashMap&lt;&gt;();
+    private final ConcurrentHashMap&lt;String, Limiter&gt; limiters = new ConcurrentHashMap&lt;&gt;();
+
+    RateLimiterService(Clock clock, LimitRule defaultRule) {
+        this.clock = clock;
+        this.defaultRule = defaultRule;
+    }
+
+    /** Per-API limit, e.g. /search: 10 per second. Configure before traffic arrives. */
+    void setApiRule(String api, LimitRule rule) { apiRules.put(api, rule); }
+
+    /** Combined limit, e.g. /pay + /refund together: 5 per minute per client. */
+    void setGroupRule(String group, Set&lt;String&gt; apis, LimitRule rule) {
+        groupRules.put(group, rule);
+        groupApis.put(group, Set.copyOf(apis));
+    }
+
+    boolean allow(String clientId, String api) {
+        if (clientId == null || clientId.isEmpty() || api == null) throw new IllegalArgumentException("client and api required");
+        long now = clock.nowMs();
+        List&lt;Limiter&gt; chain = new ArrayList&lt;&gt;();
+        chain.add(limiterFor(clientId + "|api:" + api, apiRules.getOrDefault(api, defaultRule), now));
+        for (Map.Entry&lt;String, Set&lt;String&gt;&gt; g : groupApis.entrySet()) {
+            if (g.getValue().contains(api)) {
+                chain.add(limiterFor(clientId + "|group:" + g.getKey(), groupRules.get(g.getKey()), now));
+            }
+        }
+        Limiter l = chain.size() == 1 ? chain.get(0) : new CompositeLimiter(chain);
+        return l.tryAcquire(now);
+    }
+
+    /** computeIfAbsent is atomic: two threads racing on a new key still get ONE limiter. */
+    private Limiter limiterFor(String key, LimitRule rule, long now) {
+        return limiters.computeIfAbsent(key, k -&gt; LimiterFactory.create(rule, now));
+    }
+
+    int trackedKeys() { return limiters.size(); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Demo driver + assertions. Run: javac -d out *.java &amp;&amp; java -cp out Main */
+public class Main {
+    private static int passed = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        passed++;
+    }
+
+    /** Fire one request at each time in `times` and return a string like "YYYN". */
+    static String run(Limiter l, long... times) {
+        StringBuilder sb = new StringBuilder();
+        for (long t : times) sb.append(l.tryAcquire(t) ? 'Y' : 'N');
+        return sb.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("== 1. token bucket: capacity 5, refill 5/s ==");
+        Limiter tb = new TokenBucket(5, 5.0, 0);
+        String burst = run(tb, 0, 0, 0, 0, 0, 0);
+        String later = run(tb, 400, 400, 400);          // 400 ms later: 2 tokens came back
+        System.out.println("  t=0 x6: " + burst + "   t=400ms x3: " + later);
+        check(burst.equals("YYYYYN"), "burst of 5 then reject");
+        check(later.equals("YYN"), "refill 2 tokens in 400 ms");
+
+        System.out.println("== 2. fixed window 3 per 1000 ms: the boundary burst ==");
+        Limiter fw = new FixedWindow(3, 1000);
+        String fwOut = run(fw, 900, 950, 999, 1000, 1001, 1002, 1003);
+        System.out.println("  t=900..1003: " + fwOut + "  (6 requests passed within 103 ms)");
+        check(fwOut.equals("YYYYYYN"), "fixed window resets at 1000");
+
+        System.out.println("== 3. sliding window log 3 per 1000 ms: exact ==");
+        Limiter log = new SlidingWindowLog(3, 1000);
+        String logOut = run(log, 900, 950, 999, 1000, 1899, 1900, 1901);
+        System.out.println("  t=900,950,999,1000,1899,1900,1901: " + logOut);
+        check(logOut.equals("YYYNNYN"), "log frees a slot exactly 1000 ms after each accept");
+
+        System.out.println("== 4. sliding window counter 3 per 1000 ms: weighted estimate ==");
+        Limiter swc = new SlidingWindowCounter(3, 1000);
+        String swcOut = run(swc, 900, 950, 999, 1000, 1500, 1700);
+        System.out.println("  t=900,950,999,1000,1500,1700: " + swcOut);
+        // at 1000: 3*1.0 + 0 = 3 -&gt; reject; at 1500: 3*0.5 + 0 = 1.5 -&gt; accept; at 1700: 3*0.3 + 1 = 1.9 -&gt; accept
+        check(swcOut.equals("YYYNYY"), "counter estimates prev window by overlap");
+
+        System.out.println("== 5. leaky bucket capacity 3, leak 2/s ==");
+        Limiter lb = new LeakyBucket(3, 2.0, 0);
+        String lbOut = run(lb, 0, 0, 0, 0, 500, 500);
+        System.out.println("  t=0 x4, t=500 x2: " + lbOut);
+        check(lbOut.equals("YYYNYN"), "one unit leaked in 500 ms");
+
+        System.out.println("== 6. composite rolls back on a later 'no' ==");
+        Limiter a = new FixedWindow(2, 1000), b = new FixedWindow(1, 1000);
+        Limiter both = new CompositeLimiter(List.of(a, b));
+        String compOut = run(both, 0, 0);
+        System.out.println("  composite(a=2, b=1) x2: " + compOut);
+        check(compOut.equals("YN"), "second call blocked by b");
+        check(a.tryAcquire(0), "a got its permit back, so it still has one left");
+        check(!a.tryAcquire(0), "and now a is full");
+
+        System.out.println("== 6b. a rollback that arrives after the window rolled over ==");
+        FixedWindow fw2 = new FixedWindow(2, 1000);
+        long old = fw2.acquire(999);                       // counted in window [0, 1000)
+        fw2.acquire(1000); fw2.acquire(1000);             // another thread fills window [1000, 2000)
+        fw2.rollback(old);                               // must NOT free a slot in the new window
+        boolean third = fw2.tryAcquire(1001);
+        System.out.println("  fixed window 2/s, rollback of a t=999 permit at t=1000: 3rd call in new window " + (third ? "Y" : "N"));
+        check(!third, "a stale rollback must not over-admit in the next window");
+        SlidingWindowLog swl = new SlidingWindowLog(2, 1000);
+        long mine = swl.acquire(100);
+        swl.acquire(900);                                // a newer permit from another thread
+        swl.rollback(mine);                              // removes 100, not 900
+        String swlOut = run(swl, 1050, 1060);
+        System.out.println("  sliding log 2/s, roll back t=100 while t=900 stays: t=1050,1060: " + swlOut);
+        check(swlOut.equals("YN"), "the newer timestamp is kept, so only one slot is free");
+
+        System.out.println("== 7. service: per-API rules, default rule, per-client isolation ==");
+        ManualClock clock = new ManualClock(0);
+        RateLimiterService svc = new RateLimiterService(clock, new LimitRule(Algorithm.FIXED_WINDOW, 100, 60_000));
+        svc.setApiRule("/search", new LimitRule(Algorithm.TOKEN_BUCKET, 2, 1000));
+        StringBuilder alice = new StringBuilder(), bob = new StringBuilder();
+        for (int i = 0; i &lt; 3; i++) alice.append(svc.allow("alice", "/search") ? 'Y' : 'N');
+        for (int i = 0; i &lt; 2; i++) bob.append(svc.allow("bob", "/search") ? 'Y' : 'N');
+        boolean profile = svc.allow("alice", "/profile");
+        System.out.println("  alice /search x3: " + alice + "  bob /search x2: " + bob + "  alice /profile: " + profile);
+        check(alice.toString().equals("YYN"), "alice limited to 2 on /search");
+        check(bob.toString().equals("YY"), "bob has his own bucket");
+        check(profile, "other APIs use the default rule");
+        clock.advance(500);
+        check(svc.allow("alice", "/search"), "one token back after 500 ms");
+
+        System.out.println("== 8. combined limit: /pay + /refund share 3 per minute ==");
+        RateLimiterService pay = new RateLimiterService(clock, new LimitRule(Algorithm.FIXED_WINDOW, 100, 60_000));
+        pay.setApiRule("/pay", new LimitRule(Algorithm.SLIDING_LOG, 2, 60_000));
+        pay.setApiRule("/refund", new LimitRule(Algorithm.SLIDING_LOG, 2, 60_000));
+        pay.setGroupRule("money", Set.of("/pay", "/refund"), new LimitRule(Algorithm.SLIDING_LOG, 3, 60_000));
+        String seq = "" + yn(pay.allow("alice", "/pay")) + yn(pay.allow("alice", "/pay")) + yn(pay.allow("alice", "/pay"))
+                + yn(pay.allow("alice", "/refund")) + yn(pay.allow("alice", "/refund"));
+        System.out.println("  pay,pay,pay,refund,refund: " + seq + "  (3rd pay: API limit; 2nd refund: group limit)");
+        check(seq.equals("YYNYN"), "per-API and group limits both apply");
+        check(pay.allow("alice", "/search"), "APIs outside the group are not affected");
+
+        System.out.println("== 9. invalid input ==");
+        try { new LimitRule(Algorithm.TOKEN_BUCKET, 0, 1000); check(false, "zero limit accepted"); }
+        catch (IllegalArgumentException e) { System.out.println("  rejected as expected: " + e.getMessage()); passed++; }
+        try { svc.allow("", "/search"); check(false, "empty client accepted"); }
+        catch (IllegalArgumentException e) { System.out.println("  rejected as expected: " + e.getMessage()); passed++; }
+
+        System.out.println("== 10. concurrency: 8 threads x 500 calls, one new key, limit 100 ==");
+        ManualClock frozen = new ManualClock(0);                 // time stands still: no refill during the race
+        RateLimiterService hot = new RateLimiterService(frozen, new LimitRule(Algorithm.TOKEN_BUCKET, 100, 1000));
+        AtomicInteger allowed = new AtomicInteger();
+        CountDownLatch start = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        for (int t = 0; t &lt; 8; t++) {
+            pool.execute(() -&gt; {
+                try { start.await(); } catch (InterruptedException e) { return; }
+                for (int i = 0; i &lt; 500; i++) if (hot.allow("carol", "/search")) allowed.incrementAndGet();
+            });
+        }
+        start.countDown();                                       // release all threads at once
+        pool.shutdown();
+        check(pool.awaitTermination(10, TimeUnit.SECONDS), "threads finished");
+        System.out.println("  allowed=" + allowed.get() + " of 4000, limiter objects for carol=" + hot.trackedKeys());
+        check(allowed.get() == 100, "exactly the capacity was admitted");
+        check(hot.trackedKeys() == 1, "racing threads shared one limiter");
+
+        System.out.println("== 11. concurrency on a combined limit: group 50, each API 40 ==");
+        RateLimiterService grp = new RateLimiterService(frozen, new LimitRule(Algorithm.FIXED_WINDOW, 1000, 60_000));
+        grp.setApiRule("/pay", new LimitRule(Algorithm.FIXED_WINDOW, 40, 60_000));
+        grp.setApiRule("/refund", new LimitRule(Algorithm.FIXED_WINDOW, 40, 60_000));
+        grp.setGroupRule("money", Set.of("/pay", "/refund"), new LimitRule(Algorithm.FIXED_WINDOW, 50, 60_000));
+        AtomicInteger payOk = new AtomicInteger(), refundOk = new AtomicInteger();
+        ExecutorService pool2 = Executors.newFixedThreadPool(8);
+        for (int t = 0; t &lt; 8; t++) {
+            final String api = (t % 2 == 0) ? "/pay" : "/refund";
+            final AtomicInteger counter = (t % 2 == 0) ? payOk : refundOk;
+            pool2.execute(() -&gt; { for (int i = 0; i &lt; 300; i++) if (grp.allow("dave", api)) counter.incrementAndGet(); });
+        }
+        pool2.shutdown();
+        check(pool2.awaitTermination(10, TimeUnit.SECONDS), "threads finished");
+        System.out.println("  total admitted=" + (payOk.get() + refundOk.get())
+                + ", each API &lt;= 40: " + (payOk.get() &lt;= 40 &amp;&amp; refundOk.get() &lt;= 40) + " (the split varies run to run)");
+        check(payOk.get() + refundOk.get() == 50, "group cap holds under contention");
+        check(payOk.get() &lt;= 40 &amp;&amp; refundOk.get() &lt;= 40, "per-API caps hold");
+
+        System.out.println("All " + passed + " checks passed");
+    }
+
+    static char yn(boolean b) { return b ? 'Y' : 'N'; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: rate_limiter.py">
+<pre><code class="language-python">"""Rate limiter: five algorithms behind one Strategy interface, a factory, and a thread-safe service."""
+from __future__ import annotations
+
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+
+
+class Limiter(ABC):
+    """Strategy: one algorithm, one key's state. Every call takes `now_ms` so tests control time."""
+
+    @abstractmethod
+    def acquire(self, now_ms: int) -&gt; int | None:
+        """Take one permit if allowed. Returns a permit token saying where it was counted
+        (window start or exact timestamp), or None."""
+
+    @abstractmethod
+    def rollback(self, permit: int) -&gt; None:
+        """Undo a permit from acquire(), only while its count still matters (its window is current)."""
+
+    def try_acquire(self, now_ms: int) -&gt; bool:
+        return self.acquire(now_ms) is not None
+
+
+class TokenBucket(Limiter):
+    def __init__(self, capacity: int, rate_per_sec: float, now_ms: int):
+        if capacity &lt;= 0 or rate_per_sec &lt; 0:
+            raise ValueError("bad token bucket")
+        self._cap, self._per_ms = capacity, rate_per_sec / 1000.0
+        self._tokens, self._last = float(capacity), now_ms   # start full: a new user may burst
+        self._lock = threading.Lock()
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        with self._lock:
+            if now_ms &gt; self._last:
+                self._tokens = min(self._cap, self._tokens + (now_ms - self._last) * self._per_ms)
+                self._last = now_ms
+            if self._tokens &gt;= 1.0:
+                self._tokens -= 1.0
+                return now_ms
+            return None
+
+    def rollback(self, permit: int) -&gt; None:
+        with self._lock:
+            self._tokens = min(self._cap, self._tokens + 1.0)
+
+
+class LeakyBucket(Limiter):
+    """Leaky bucket as a meter: the level drains at `leak_per_sec`; a request adds 1 if it fits."""
+
+    def __init__(self, capacity: int, leak_per_sec: float, now_ms: int):
+        if capacity &lt;= 0 or leak_per_sec &lt;= 0:
+            raise ValueError("bad leaky bucket")
+        self._cap, self._per_ms = capacity, leak_per_sec / 1000.0
+        self._level, self._last = 0.0, now_ms
+        self._lock = threading.Lock()
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        with self._lock:
+            if now_ms &gt; self._last:
+                self._level = max(0.0, self._level - (now_ms - self._last) * self._per_ms)
+                self._last = now_ms
+            if self._level + 1.0 &lt;= self._cap:
+                self._level += 1.0
+                return now_ms
+            return None
+
+    def rollback(self, permit: int) -&gt; None:
+        with self._lock:
+            self._level = max(0.0, self._level - 1.0)
+
+
+class FixedWindow(Limiter):
+    def __init__(self, limit: int, window_ms: int):
+        if limit &lt;= 0 or window_ms &lt;= 0:
+            raise ValueError("bad fixed window")
+        self._limit, self._win = limit, window_ms
+        self._start, self._count = None, 0
+        self._lock = threading.Lock()
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        with self._lock:
+            start = now_ms - now_ms % self._win
+            if start != self._start:                 # a new window began
+                self._start, self._count = start, 0
+            if self._count &lt; self._limit:
+                self._count += 1
+                return start                         # the permit names its window
+            return None
+
+    def rollback(self, permit: int) -&gt; None:
+        with self._lock:
+            if permit == self._start:                # a newer window? then the old count is already gone
+                self._count = max(0, self._count - 1)
+
+
+class SlidingWindowLog(Limiter):
+    def __init__(self, limit: int, window_ms: int):
+        if limit &lt;= 0 or window_ms &lt;= 0:
+            raise ValueError("bad sliding log")
+        self._limit, self._win = limit, window_ms
+        self._log: deque[int] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        with self._lock:
+            while self._log and self._log[0] &lt;= now_ms - self._win:   # expire old entries
+                self._log.popleft()
+            if len(self._log) &lt; self._limit:
+                self._log.append(now_ms)
+                return now_ms                        # the permit is its own timestamp
+            return None
+
+    def rollback(self, permit: int) -&gt; None:
+        with self._lock:
+            # remove exactly our timestamp (the last equal one), never another thread's newer entry
+            for i in range(len(self._log) - 1, -1, -1):
+                if self._log[i] == permit:
+                    del self._log[i]
+                    break
+
+
+class SlidingWindowCounter(Limiter):
+    def __init__(self, limit: int, window_ms: int):
+        if limit &lt;= 0 or window_ms &lt;= 0:
+            raise ValueError("bad sliding counter")
+        self._limit, self._win = limit, window_ms
+        self._curr_start, self._curr, self._prev = None, 0, 0
+        self._lock = threading.Lock()
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        with self._lock:
+            start = now_ms - now_ms % self._win
+            if start != self._curr_start:
+                adjacent = self._curr_start is not None and start - self._curr_start == self._win
+                self._prev = self._curr if adjacent else 0   # more than one window passed? forget it
+                self._curr, self._curr_start = 0, start
+            weight = 1.0 - (now_ms - self._curr_start) / self._win
+            if self._prev * weight + self._curr + 1.0 &lt;= self._limit:
+                self._curr += 1
+                return start
+            return None
+
+    def rollback(self, permit: int) -&gt; None:
+        with self._lock:
+            if permit == self._curr_start:
+                self._curr = max(0, self._curr - 1)
+            elif self._curr_start is not None and permit == self._curr_start - self._win:
+                self._prev = max(0, self._prev - 1)   # it is the weighted previous window now
+
+
+class CompositeLimiter(Limiter):
+    """A request passes only if every child allows it; earlier 'yes' answers are undone on a 'no'."""
+
+    def __init__(self, children: list[Limiter]):
+        self._children = list(children)
+
+    def acquire(self, now_ms: int) -&gt; int | None:
+        taken: list[tuple[Limiter, int]] = []
+        for child in self._children:
+            permit = child.acquire(now_ms)
+            if permit is None:
+                for done, done_permit in reversed(taken):   # undo the ones that said yes, each in its own window
+                    done.rollback(done_permit)
+                return None
+            taken.append((child, permit))
+        return now_ms
+
+    def rollback(self, permit: int) -&gt; None:
+        raise NotImplementedError("a composite permit cannot be rolled back; nest children, not composites")
+
+
+class Algorithm(Enum):
+    TOKEN_BUCKET = "token_bucket"
+    LEAKY_BUCKET = "leaky_bucket"
+    FIXED_WINDOW = "fixed_window"
+    SLIDING_LOG = "sliding_log"
+    SLIDING_COUNTER = "sliding_counter"
+
+
+@dataclass(frozen=True)
+class LimitRule:
+    algorithm: Algorithm
+    limit: int
+    window_ms: int
+
+    def __post_init__(self):
+        if self.limit &lt;= 0 or self.window_ms &lt;= 0:
+            raise ValueError("bad rule")
+
+    @property
+    def per_second(self) -&gt; float:
+        return self.limit * 1000.0 / self.window_ms
+
+
+def create_limiter(rule: LimitRule, now_ms: int) -&gt; Limiter:
+    """Factory: the only place that maps an algorithm name to a class."""
+    a = rule.algorithm
+    if a is Algorithm.TOKEN_BUCKET:
+        return TokenBucket(rule.limit, rule.per_second, now_ms)
+    if a is Algorithm.LEAKY_BUCKET:
+        return LeakyBucket(rule.limit, rule.per_second, now_ms)
+    if a is Algorithm.FIXED_WINDOW:
+        return FixedWindow(rule.limit, rule.window_ms)
+    if a is Algorithm.SLIDING_LOG:
+        return SlidingWindowLog(rule.limit, rule.window_ms)
+    if a is Algorithm.SLIDING_COUNTER:
+        return SlidingWindowCounter(rule.limit, rule.window_ms)
+    raise ValueError(f"unknown algorithm {a}")
+
+
+class SystemClock:
+    def now_ms(self) -&gt; int:
+        return time.monotonic_ns() // 1_000_000   # monotonic, not wall time
+
+
+class ManualClock:
+    def __init__(self, start_ms: int = 0):
+        self._now = start_ms
+
+    def now_ms(self) -&gt; int:
+        return self._now
+
+    def advance(self, ms: int) -&gt; None:
+        self._now += ms
+
+
+class RateLimiterService:
+    """Facade: allow(client_id, api). One limiter per (client, rule) key, created lazily."""
+
+    def __init__(self, clock, default_rule: LimitRule):
+        self._clock, self._default = clock, default_rule
+        self._api_rules: dict[str, LimitRule] = {}
+        self._groups: dict[str, tuple[frozenset[str], LimitRule]] = {}
+        self._limiters: dict[str, Limiter] = {}
+        self._map_lock = threading.Lock()          # guards creation of new keys only
+
+    def set_api_rule(self, api: str, rule: LimitRule) -&gt; None:
+        self._api_rules[api] = rule
+
+    def set_group_rule(self, group: str, apis: set[str], rule: LimitRule) -&gt; None:
+        self._groups[group] = (frozenset(apis), rule)
+
+    def allow(self, client_id: str, api: str) -&gt; bool:
+        if not client_id or not api:
+            raise ValueError("client and api required")
+        now = self._clock.now_ms()
+        chain = [self._limiter_for(f"{client_id}|api:{api}", self._api_rules.get(api, self._default), now)]
+        for name, (apis, rule) in self._groups.items():
+            if api in apis:
+                chain.append(self._limiter_for(f"{client_id}|group:{name}", rule, now))
+        limiter = chain[0] if len(chain) == 1 else CompositeLimiter(chain)
+        return limiter.try_acquire(now)
+
+    def _limiter_for(self, key: str, rule: LimitRule, now: int) -&gt; Limiter:
+        lim = self._limiters.get(key)              # fast path: no lock once the key exists
+        if lim is None:
+            with self._map_lock:                   # slow path: check again under the lock
+                lim = self._limiters.get(key)
+                if lim is None:
+                    lim = create_limiter(rule, now)
+                    self._limiters[key] = lim
+        return lim
+
+    def tracked_keys(self) -&gt; int:
+        return len(self._limiters)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">"""Demo driver. Run: python main.py   (tests: python -m unittest -v test_rate_limiter)"""
+import threading
+
+from rate_limiter import (Algorithm, CompositeLimiter, FixedWindow, LeakyBucket, LimitRule, ManualClock,
+                          RateLimiterService, SlidingWindowCounter, SlidingWindowLog, TokenBucket)
+
+
+def run(limiter, *times):
+    return "".join("Y" if limiter.try_acquire(t) else "N" for t in times)
+
+
+def main():
+    print("== 1. token bucket: capacity 5, refill 5/s ==")
+    tb = TokenBucket(5, 5.0, 0)
+    burst, later = run(tb, 0, 0, 0, 0, 0, 0), run(tb, 400, 400, 400)
+    print(f"  t=0 x6: {burst}   t=400ms x3: {later}")
+    assert burst == "YYYYYN" and later == "YYN"
+
+    print("== 2. fixed window 3 per 1000 ms: the boundary burst ==")
+    out = run(FixedWindow(3, 1000), 900, 950, 999, 1000, 1001, 1002, 1003)
+    print(f"  t=900..1003: {out}  (6 requests passed within 103 ms)")
+    assert out == "YYYYYYN"
+
+    print("== 3. sliding window log 3 per 1000 ms: exact ==")
+    out = run(SlidingWindowLog(3, 1000), 900, 950, 999, 1000, 1899, 1900, 1901)
+    print(f"  t=900,950,999,1000,1899,1900,1901: {out}")
+    assert out == "YYYNNYN"
+
+    print("== 4. sliding window counter 3 per 1000 ms: weighted estimate ==")
+    out = run(SlidingWindowCounter(3, 1000), 900, 950, 999, 1000, 1500, 1700)
+    print(f"  t=900,950,999,1000,1500,1700: {out}")
+    assert out == "YYYNYY"
+
+    print("== 5. leaky bucket capacity 3, leak 2/s ==")
+    out = run(LeakyBucket(3, 2.0, 0), 0, 0, 0, 0, 500, 500)
+    print(f"  t=0 x4, t=500 x2: {out}")
+    assert out == "YYYNYN"
+
+    print("== 6. service: per-API rule, per-client isolation, combined group ==")
+    clock = ManualClock(0)
+    svc = RateLimiterService(clock, LimitRule(Algorithm.FIXED_WINDOW, 100, 60_000))
+    svc.set_api_rule("/search", LimitRule(Algorithm.TOKEN_BUCKET, 2, 1000))
+    svc.set_api_rule("/pay", LimitRule(Algorithm.SLIDING_LOG, 2, 60_000))
+    svc.set_api_rule("/refund", LimitRule(Algorithm.SLIDING_LOG, 2, 60_000))
+    svc.set_group_rule("money", {"/pay", "/refund"}, LimitRule(Algorithm.SLIDING_LOG, 3, 60_000))
+    alice = "".join("Y" if svc.allow("alice", "/search") else "N" for _ in range(3))
+    bob = "".join("Y" if svc.allow("bob", "/search") else "N" for _ in range(2))
+    money = "".join("Y" if svc.allow("alice", api) else "N" for api in ["/pay", "/pay", "/pay", "/refund", "/refund"])
+    print(f"  alice /search x3: {alice}  bob /search x2: {bob}  pay,pay,pay,refund,refund: {money}")
+    assert alice == "YYN" and bob == "YY" and money == "YYNYN"
+    clock.advance(500)
+    assert svc.allow("alice", "/search")
+
+    print("== 7. concurrency: 8 threads x 500 calls, one new key, limit 100 ==")
+    hot = RateLimiterService(ManualClock(0), LimitRule(Algorithm.TOKEN_BUCKET, 100, 1000))
+    allowed = [0]
+    count_lock, gate = threading.Lock(), threading.Event()
+
+    def worker():
+        gate.wait()
+        mine = sum(1 for _ in range(500) if hot.allow("carol", "/search"))
+        with count_lock:
+            allowed[0] += mine
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    gate.set()                                  # release all threads at once
+    for t in threads:
+        t.join()
+    print(f"  allowed={allowed[0]} of 4000, limiter objects for carol={hot.tracked_keys()}")
+    assert allowed[0] == 100 and hot.tracked_keys() == 1
+
+    a, b = FixedWindow(2, 1000), FixedWindow(1, 1000)
+    assert run(CompositeLimiter([a, b]), 0, 0) == "YN" and a.try_acquire(0) and not a.try_acquire(0)
+    print("Python demo OK")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import threading
+import unittest
+
+from rate_limiter import (Algorithm, CompositeLimiter, FixedWindow, LeakyBucket, LimitRule, ManualClock,
+                          RateLimiterService, SlidingWindowCounter, SlidingWindowLog, TokenBucket)
+
+
+def run(limiter, *times):
+    return "".join("Y" if limiter.try_acquire(t) else "N" for t in times)
+
+
+class AlgorithmTests(unittest.TestCase):
+    def test_token_bucket_burst_then_refill(self):
+        tb = TokenBucket(5, 5.0, 0)
+        self.assertEqual(run(tb, *[0] * 6), "YYYYYN")
+        self.assertEqual(run(tb, 400, 400, 400), "YYN")
+
+    def test_token_bucket_never_exceeds_capacity(self):
+        tb = TokenBucket(3, 10.0, 0)
+        self.assertEqual(run(tb, 10_000, 10_000, 10_000, 10_000), "YYYN")   # a long idle gap still caps at 3
+
+    def test_fixed_window_boundary_burst(self):
+        self.assertEqual(run(FixedWindow(3, 1000), 900, 950, 999, 1000, 1001, 1002, 1003), "YYYYYYN")
+
+    def test_sliding_log_is_exact(self):
+        self.assertEqual(run(SlidingWindowLog(3, 1000), 900, 950, 999, 1000, 1899, 1900, 1901), "YYYNNYN")
+
+    def test_sliding_counter_weights_previous_window(self):
+        self.assertEqual(run(SlidingWindowCounter(3, 1000), 900, 950, 999, 1000, 1500, 1700), "YYYNYY")
+
+    def test_sliding_counter_forgets_after_two_windows(self):
+        swc = SlidingWindowCounter(2, 1000)
+        self.assertEqual(run(swc, 0, 0, 0, 2500, 2500), "YYNYY")
+
+    def test_leaky_bucket(self):
+        self.assertEqual(run(LeakyBucket(3, 2.0, 0), 0, 0, 0, 0, 500, 500), "YYYNYN")
+
+    def test_composite_rolls_back(self):
+        a, b = FixedWindow(2, 1000), FixedWindow(1, 1000)
+        self.assertEqual(run(CompositeLimiter([a, b]), 0, 0), "YN")
+        self.assertTrue(a.try_acquire(0))
+        self.assertFalse(a.try_acquire(0))
+
+    def test_stale_rollback_does_not_over_admit_next_window(self):
+        fw = FixedWindow(2, 1000)
+        old = fw.acquire(999)                 # counted in window [0, 1000)
+        fw.acquire(1000), fw.acquire(1000)    # another thread fills the next window
+        fw.rollback(old)                      # must not free a slot in [1000, 2000)
+        self.assertFalse(fw.try_acquire(1001))
+
+    def test_sliding_log_rollback_removes_only_its_own_timestamp(self):
+        log = SlidingWindowLog(2, 1000)
+        mine = log.acquire(100)
+        log.acquire(900)                      # a newer permit from another thread
+        log.rollback(mine)
+        self.assertEqual(run(log, 1050, 1060), "YN")
+
+    def test_sliding_counter_rollback_after_rollover_hits_previous_window(self):
+        c = SlidingWindowCounter(2, 1000)
+        old = c.acquire(999)
+        c.acquire(1000)                       # rolls the window: old's count is now "previous"
+        c.rollback(old)                       # refunds the previous window, not the current one
+        self.assertEqual(run(c, 1001), "Y")   # prev 0 + curr 1 + 1 &lt;= 2
+
+    def test_bad_rules_rejected(self):
+        with self.assertRaises(ValueError):
+            LimitRule(Algorithm.TOKEN_BUCKET, 0, 1000)
+        with self.assertRaises(ValueError):
+            FixedWindow(1, 0)
+
+
+class ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = ManualClock(0)
+        self.svc = RateLimiterService(self.clock, LimitRule(Algorithm.FIXED_WINDOW, 100, 60_000))
+
+    def test_per_api_and_per_client(self):
+        self.svc.set_api_rule("/search", LimitRule(Algorithm.TOKEN_BUCKET, 2, 1000))
+        self.assertEqual([self.svc.allow("alice", "/search") for _ in range(3)], [True, True, False])
+        self.assertTrue(self.svc.allow("bob", "/search"))
+        self.assertTrue(self.svc.allow("alice", "/profile"))
+
+    def test_group_limit(self):
+        for api in ("/pay", "/refund"):
+            self.svc.set_api_rule(api, LimitRule(Algorithm.SLIDING_LOG, 2, 60_000))
+        self.svc.set_group_rule("money", {"/pay", "/refund"}, LimitRule(Algorithm.SLIDING_LOG, 3, 60_000))
+        got = [self.svc.allow("alice", api) for api in ["/pay", "/pay", "/pay", "/refund", "/refund"]]
+        self.assertEqual(got, [True, True, False, True, False])
+        self.clock.advance(60_000)
+        self.assertTrue(self.svc.allow("alice", "/refund"))
+
+    def test_empty_client_rejected(self):
+        with self.assertRaises(ValueError):
+            self.svc.allow("", "/x")
+
+    def test_concurrent_new_key(self):
+        svc = RateLimiterService(ManualClock(0), LimitRule(Algorithm.TOKEN_BUCKET, 100, 1000))
+        results, gate = [], threading.Event()
+
+        def worker():
+            gate.wait()
+            results.append(sum(1 for _ in range(500) if svc.allow("carol", "/x")))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        gate.set()
+        for t in threads:
+            t.join()
+        self.assertEqual(sum(results), 100)
+        self.assertEqual(svc.tracked_keys(), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14: main.cpp">
+<pre><code class="language-cpp">// Rate limiter in C++14: same design as the Java version (Strategy + Factory + Composite + service).
+// Build: g++ -std=c++14 -O2 -Wall -o rl main.cpp            (single-threaded demo)
+//        g++ -std=c++14 -O2 -DRL_THREADS -pthread -o rl main.cpp   (adds a std::mutex per limiter)
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cstdint&gt;
+#include &lt;deque&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+#ifdef RL_THREADS
+#include &lt;mutex&gt;
+#define RL_LOCK std::lock_guard&lt;std::mutex&gt; guard_(mu_)
+#define RL_MUTEX mutable std::mutex mu_;
+#else
+#define RL_LOCK
+#define RL_MUTEX
+#endif
+
+using Ms = std::int64_t;
+
+// Strategy: one algorithm, one key's state. Like a C ops table: two function pointers per object.
+class Limiter {
+public:
+    static constexpr Ms NO_PERMIT = INT64_MIN;
+    virtual ~Limiter() = default;
+    // Returns a permit token naming where the permit was counted (window start or timestamp), or NO_PERMIT.
+    virtual Ms acquire(Ms now) = 0;
+    // Undo a permit only while its count still matters (same window); a stale permit is ignored.
+    virtual void rollback(Ms permit) = 0;
+    bool tryAcquire(Ms now) { return acquire(now) != NO_PERMIT; }
+};
+
+class TokenBucket : public Limiter {
+    double cap_, perMs_, tokens_;
+    Ms last_;
+    RL_MUTEX
+public:
+    TokenBucket(long cap, double ratePerSec, Ms now) : cap_(cap), perMs_(ratePerSec / 1000.0), tokens_(cap), last_(now) {
+        if (cap &lt;= 0 || ratePerSec &lt; 0) throw std::invalid_argument("bad token bucket");
+    }
+    Ms acquire(Ms now) override {
+        RL_LOCK;
+        if (now &gt; last_) { tokens_ = std::min(cap_, tokens_ + (now - last_) * perMs_); last_ = now; }
+        if (tokens_ &gt;= 1.0) { tokens_ -= 1.0; return now; }
+        return NO_PERMIT;
+    }
+    void rollback(Ms) override { RL_LOCK; tokens_ = std::min(cap_, tokens_ + 1.0); }
+};
+
+class LeakyBucket : public Limiter {
+    double cap_, perMs_, level_ = 0.0;
+    Ms last_;
+    RL_MUTEX
+public:
+    LeakyBucket(long cap, double leakPerSec, Ms now) : cap_(cap), perMs_(leakPerSec / 1000.0), last_(now) {
+        if (cap &lt;= 0 || leakPerSec &lt;= 0) throw std::invalid_argument("bad leaky bucket");
+    }
+    Ms acquire(Ms now) override {
+        RL_LOCK;
+        if (now &gt; last_) { level_ = std::max(0.0, level_ - (now - last_) * perMs_); last_ = now; }
+        if (level_ + 1.0 &lt;= cap_) { level_ += 1.0; return now; }
+        return NO_PERMIT;
+    }
+    void rollback(Ms) override { RL_LOCK; level_ = std::max(0.0, level_ - 1.0); }
+};
+
+class FixedWindow : public Limiter {
+    long limit_; Ms win_; Ms start_ = -1; long count_ = 0;
+    RL_MUTEX
+public:
+    FixedWindow(long limit, Ms win) : limit_(limit), win_(win) {
+        if (limit &lt;= 0 || win &lt;= 0) throw std::invalid_argument("bad fixed window");
+    }
+    Ms acquire(Ms now) override {
+        RL_LOCK;
+        Ms s = now - now % win_;                       // demo times are &gt;= 0
+        if (s != start_) { start_ = s; count_ = 0; }
+        if (count_ &lt; limit_) { ++count_; return s; }      // the permit names its window
+        return NO_PERMIT;
+    }
+    void rollback(Ms permit) override { RL_LOCK; if (permit == start_ &amp;&amp; count_ &gt; 0) --count_; }
+};
+
+class SlidingWindowLog : public Limiter {
+    std::size_t limit_; Ms win_; std::deque&lt;Ms&gt; log_;
+    RL_MUTEX
+public:
+    SlidingWindowLog(long limit, Ms win) : limit_(static_cast&lt;std::size_t&gt;(limit)), win_(win) {
+        if (limit &lt;= 0 || win &lt;= 0) throw std::invalid_argument("bad sliding log");
+    }
+    Ms acquire(Ms now) override {
+        RL_LOCK;
+        while (!log_.empty() &amp;&amp; log_.front() &lt;= now - win_) log_.pop_front();
+        if (log_.size() &lt; limit_) { log_.push_back(now); return now; }
+        return NO_PERMIT;
+    }
+    void rollback(Ms permit) override {             // remove exactly our timestamp, not a newer one
+        RL_LOCK;
+        for (auto it = log_.rbegin(); it != log_.rend(); ++it)
+            if (*it == permit) { log_.erase(std::next(it).base()); break; }
+    }
+};
+
+class SlidingWindowCounter : public Limiter {
+    long limit_; Ms win_; Ms currStart_ = -1; long curr_ = 0, prev_ = 0;
+    RL_MUTEX
+public:
+    SlidingWindowCounter(long limit, Ms win) : limit_(limit), win_(win) {
+        if (limit &lt;= 0 || win &lt;= 0) throw std::invalid_argument("bad sliding counter");
+    }
+    Ms acquire(Ms now) override {
+        RL_LOCK;
+        Ms s = now - now % win_;
+        if (s != currStart_) {
+            bool adjacent = currStart_ &gt;= 0 &amp;&amp; s - currStart_ == win_;
+            prev_ = adjacent ? curr_ : 0;
+            curr_ = 0;
+            currStart_ = s;
+        }
+        double weight = 1.0 - static_cast&lt;double&gt;(now - currStart_) / win_;
+        if (prev_ * weight + curr_ + 1.0 &lt;= limit_) { ++curr_; return s; }
+        return NO_PERMIT;
+    }
+    void rollback(Ms permit) override {
+        RL_LOCK;
+        if (permit == currStart_) { if (curr_ &gt; 0) --curr_; }
+        else if (permit == currStart_ - win_) { if (prev_ &gt; 0) --prev_; }
+    }
+};
+
+// Composite: all children must say yes; undo earlier yeses on the first no. Children are borrowed.
+class CompositeLimiter : public Limiter {
+    std::vector&lt;Limiter*&gt; kids_;
+public:
+    explicit CompositeLimiter(std::vector&lt;Limiter*&gt; kids) : kids_(std::move(kids)) {}
+    Ms acquire(Ms now) override {
+        std::vector&lt;Ms&gt; permits(kids_.size());
+        for (std::size_t i = 0; i &lt; kids_.size(); ++i) {
+            permits[i] = kids_[i]-&gt;acquire(now);
+            if (permits[i] == NO_PERMIT) {
+                for (std::size_t j = i; j-- &gt; 0;) kids_[j]-&gt;rollback(permits[j]);   // each in its own window
+                return NO_PERMIT;
+            }
+        }
+        return now;
+    }
+    void rollback(Ms) override { throw std::logic_error("a composite permit cannot be rolled back"); }
+};
+
+enum class Algorithm { TokenBucket, LeakyBucket, FixedWindow, SlidingLog, SlidingCounter };
+
+struct LimitRule {
+    Algorithm algorithm; long limit; Ms windowMs;
+    LimitRule(Algorithm a, long l, Ms w) : algorithm(a), limit(l), windowMs(w) {
+        if (l &lt;= 0 || w &lt;= 0) throw std::invalid_argument("bad rule");
+    }
+    double perSecond() const { return limit * 1000.0 / windowMs; }
+};
+
+// Factory
+std::unique_ptr&lt;Limiter&gt; createLimiter(const LimitRule&amp; r, Ms now) {
+    switch (r.algorithm) {
+        case Algorithm::TokenBucket:    return std::unique_ptr&lt;Limiter&gt;(new TokenBucket(r.limit, r.perSecond(), now));
+        case Algorithm::LeakyBucket:    return std::unique_ptr&lt;Limiter&gt;(new LeakyBucket(r.limit, r.perSecond(), now));
+        case Algorithm::FixedWindow:    return std::unique_ptr&lt;Limiter&gt;(new FixedWindow(r.limit, r.windowMs));
+        case Algorithm::SlidingLog:     return std::unique_ptr&lt;Limiter&gt;(new SlidingWindowLog(r.limit, r.windowMs));
+        case Algorithm::SlidingCounter: return std::unique_ptr&lt;Limiter&gt;(new SlidingWindowCounter(r.limit, r.windowMs));
+    }
+    throw std::invalid_argument("unknown algorithm");
+}
+
+struct ManualClock { Ms now = 0; Ms nowMs() const { return now; } };
+
+class RateLimiterService {
+    const ManualClock&amp; clock_;
+    LimitRule default_;
+    std::unordered_map&lt;std::string, LimitRule&gt; apiRules_;
+    struct Group { std::vector&lt;std::string&gt; apis; LimitRule rule; };
+    std::unordered_map&lt;std::string, Group&gt; groups_;
+    std::unordered_map&lt;std::string, std::unique_ptr&lt;Limiter&gt;&gt; limiters_;   // owns every limiter
+    RL_MUTEX
+
+    Limiter* limiterFor(const std::string&amp; key, const LimitRule&amp; rule, Ms now) {
+        RL_LOCK;   // a shared_mutex (C++17) or striped locks would let lookups run in parallel
+        auto it = limiters_.find(key);
+        if (it == limiters_.end()) it = limiters_.emplace(key, createLimiter(rule, now)).first;
+        return it-&gt;second.get();
+    }
+public:
+    RateLimiterService(const ManualClock&amp; c, LimitRule def) : clock_(c), default_(def) {}
+    void setApiRule(const std::string&amp; api, LimitRule r) { apiRules_.erase(api); apiRules_.emplace(api, r); }
+    void setGroupRule(const std::string&amp; g, std::vector&lt;std::string&gt; apis, LimitRule r) {
+        groups_.erase(g); groups_.emplace(g, Group{std::move(apis), r});
+    }
+    bool allow(const std::string&amp; client, const std::string&amp; api) {
+        if (client.empty() || api.empty()) throw std::invalid_argument("client and api required");
+        Ms now = clock_.nowMs();
+        auto r = apiRules_.find(api);
+        std::vector&lt;Limiter*&gt; chain{limiterFor(client + "|api:" + api, r == apiRules_.end() ? default_ : r-&gt;second, now)};
+        for (auto&amp; g : groups_)
+            if (std::find(g.second.apis.begin(), g.second.apis.end(), api) != g.second.apis.end())
+                chain.push_back(limiterFor(client + "|group:" + g.first, g.second.rule, now));
+        if (chain.size() == 1) return chain[0]-&gt;tryAcquire(now);
+        CompositeLimiter all(chain);
+        return all.tryAcquire(now);
+    }
+    std::size_t trackedKeys() const { return limiters_.size(); }
+};
+
+static std::string run(Limiter&amp; l, std::initializer_list&lt;Ms&gt; times) {
+    std::string s;
+    for (Ms t : times) s += l.tryAcquire(t) ? 'Y' : 'N';
+    return s;
+}
+
+int main() {
+    TokenBucket tb(5, 5.0, 0);
+    std::string burst = run(tb, {0, 0, 0, 0, 0, 0}), later = run(tb, {400, 400, 400});
+    std::cout &lt;&lt; "token bucket   t=0 x6: " &lt;&lt; burst &lt;&lt; "  t=400 x3: " &lt;&lt; later &lt;&lt; "\n";
+    assert(burst == "YYYYYN" &amp;&amp; later == "YYN");
+
+    FixedWindow fw(3, 1000);
+    std::string f = run(fw, {900, 950, 999, 1000, 1001, 1002, 1003});
+    std::cout &lt;&lt; "fixed window   t=900..1003: " &lt;&lt; f &lt;&lt; "\n";
+    assert(f == "YYYYYYN");
+
+    SlidingWindowLog lg(3, 1000);
+    std::string l = run(lg, {900, 950, 999, 1000, 1899, 1900, 1901});
+    std::cout &lt;&lt; "sliding log    " &lt;&lt; l &lt;&lt; "\n";
+    assert(l == "YYYNNYN");
+
+    SlidingWindowCounter sc(3, 1000);
+    std::string c = run(sc, {900, 950, 999, 1000, 1500, 1700});
+    std::cout &lt;&lt; "sliding count  " &lt;&lt; c &lt;&lt; "\n";
+    assert(c == "YYYNYY");
+
+    LeakyBucket lb(3, 2.0, 0);
+    std::string k = run(lb, {0, 0, 0, 0, 500, 500});
+    std::cout &lt;&lt; "leaky bucket   " &lt;&lt; k &lt;&lt; "\n";
+    assert(k == "YYYNYN");
+    {   // a rollback that arrives after the window rolled over must not free a slot in the new window
+        FixedWindow fw(2, 1000);
+        Ms old = fw.acquire(999);
+        fw.acquire(1000); fw.acquire(1000);
+        fw.rollback(old);
+        SlidingWindowLog sl(2, 1000);
+        Ms mine = sl.acquire(100);
+        sl.acquire(900);
+        sl.rollback(mine);                               // removes t=100, keeps the newer t=900
+        std::string r = std::string(fw.tryAcquire(1001) ? "Y" : "N") + " " + run(sl, {1050, 1060});
+        std::cout &lt;&lt; "stale rollback " &lt;&lt; r &lt;&lt; "\n";
+        assert(r == "N YN");
+    }
+
+    ManualClock clock;
+    RateLimiterService svc(clock, LimitRule(Algorithm::FixedWindow, 100, 60000));
+    svc.setApiRule("/search", LimitRule(Algorithm::TokenBucket, 2, 1000));
+    svc.setApiRule("/pay", LimitRule(Algorithm::SlidingLog, 2, 60000));
+    svc.setApiRule("/refund", LimitRule(Algorithm::SlidingLog, 2, 60000));
+    svc.setGroupRule("money", {"/pay", "/refund"}, LimitRule(Algorithm::SlidingLog, 3, 60000));
+    std::string alice, money;
+    for (int i = 0; i &lt; 3; ++i) alice += svc.allow("alice", "/search") ? 'Y' : 'N';
+    for (const char* api : {"/pay", "/pay", "/pay", "/refund", "/refund"}) money += svc.allow("alice", api) ? 'Y' : 'N';
+    std::cout &lt;&lt; "service        alice /search x3: " &lt;&lt; alice &lt;&lt; "  pay,pay,pay,refund,refund: " &lt;&lt; money &lt;&lt; "\n";
+    assert(alice == "YYN" &amp;&amp; money == "YYNYN");
+    assert(svc.allow("bob", "/search"));
+    clock.now += 500;
+    assert(svc.allow("alice", "/search"));
+
+    try { LimitRule bad(Algorithm::TokenBucket, 0, 1000); (void)bad; assert(false); }
+    catch (const std::invalid_argument&amp; e) { std::cout &lt;&lt; "rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    std::cout &lt;&lt; "keys tracked: " &lt;&lt; svc.trackedKeys() &lt;&lt; "\nC++ demo OK\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  

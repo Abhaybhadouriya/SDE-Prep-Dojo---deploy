@@ -1,0 +1,56 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>There are two pieces of shared state, and each gets its own, smallest possible protection.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two threads both read one token and both pass; a lock around refill-check-subtract admits exactly one">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">Request thread A</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">Request thread B</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">bucket for alice</text><text class="label small" x="400" y="166">tokens = 1</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. reads tokens = 1, so allow</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. reads tokens = 1, so allow</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">both subtract and write 0:</text><text class="label bad" x="645" y="164">2 requests admitted on 1 token</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A takes the token under the lock</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: synchronized acquire()</text><text class="label mono" x="645" y="66">refill; check; tokens -= 1</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">B enters after A leaves the lock</text><text class="label small" x="645" y="242">sees tokens = 0: NO_PERMIT</text><text class="label small" x="645" y="266">the caller answers HTTP 429</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Two requests for the same client arrive together. Both read <code>tokens = 1</code>, both decide "allow", both write 0. Two requests passed on one token: a lost update.</li>
+      <li>The guard: <code>acquire()</code> is <code>synchronized</code> on that client's limiter, so refill, check and subtract are one step. Different clients have different limiter objects and never wait for each other (per-key locking).</li>
+      <li>B gets the lock only after A has released it. It sees 0 tokens and returns <code>NO_PERMIT</code>, so the service answers 429. Exactly one request was admitted.</li>
+    </ol>
+  </div>
+
+  <ol class="steps">
+    <li><strong>The map of limiters.</strong> Two threads may see a brand-new key at the same moment. With a plain <code>get</code> then <code>put</code>, both create a bucket, one overwrites the other, and that client gets twice the limit for a moment. <code>ConcurrentHashMap.computeIfAbsent</code> runs the factory at most once per key, atomically. Python uses a double-checked lock around creation only; C++ locks the map around find-or-emplace.</li>
+    <li><strong>The state inside each limiter.</strong> "Read tokens, refill, compare, subtract" is a read-modify-write. Two threads could both read <code>tokens = 1</code> and both pass. Each <code>tryAcquire</code> is <code>synchronized</code> on its own limiter object, so threads for <i>different</i> clients never wait for each other. This is per-key locking, the same idea as one spinlock per hash bucket rather than one global lock.</li>
+    <li><strong>The composite takes no lock of its own</strong>, and never holds two limiter locks at once: it calls child A (lock, unlock), then child B (lock, unlock). No nested locks means no lock-order deadlock, by construction. See <a href="{{BASE}}lld/lld-conc-deadlock">Deadlock</a> for why that matters.</li>
+  </ol>
+  <div class="callout warn"><p><b>The cost of not nesting locks.</b> Between "A said yes" and "B said no, roll A back", another thread may see A's permit as used and be rejected, so the system can briefly <b>under-admit</b>. For a rate limiter that is the safe direction. It is only safe if the rollback is exact, though. A naive <code>rollback(now)</code> that just does <code>count--</code> is wrong when a new window starts between the acquire and the rollback: it frees a slot in a window the request never used, which <b>over-admits</b>. A naive sliding-log rollback that pops the newest timestamp can remove another thread's entry and leave ours, which expires earlier and frees capacity too soon. So <code>acquire</code> returns a <b>permit token</b> (the window start for the window algorithms, the exact timestamp for the log), and <code>rollback(permit)</code> undoes only if that window is still the current one (the sliding counter also refunds the previous window, which still weighs in) and removes exactly that timestamp from the log. Demo line 6b tests exactly this interleaving. If the interviewer wants strict all-or-nothing instead, lock all children in a fixed global order (for example by key string), check all, then consume all.</p></div>
+  <h3>Lock-free alternative</h3>
+  <p>A fixed window can be an <code>AtomicLong</code> counter plus a window id, updated with a compare-and-set loop. A token bucket can pack <code>(tokens, lastRefill)</code> into one immutable object held in an <code>AtomicReference</code> and swap it with CAS (this is roughly what libraries such as Bucket4j do). Lock-free wins under very heavy contention on one hot key; <code>synchronized</code> on a per-key object is simpler, obviously correct, and fast enough for an interview. Say both, code the simple one.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p><code>computeIfAbsent</code> is the user-space version of the kernel idiom "look up under RCU; on a miss take the bucket lock, look up again, then insert". The per-limiter <code>synchronized</code> is a <code>spin_lock(&amp;rs-&gt;lock)</code> around the counter, which is what <code>___ratelimit()</code> itself does: it guards <code>struct ratelimit_state</code> with a spinlock taken by trylock, and long-standing versions simply suppress the message when that lock is busy, choosing under-admission too.</p>
+  </div>
+  <p>The Java demo proves both rules with a test: 8 threads released together by a <code>CountDownLatch</code> fire 4,000 requests at one new key with capacity 100 and a frozen clock. Exactly 100 pass, and exactly one limiter object exists. A second test hammers a group limit of 50 from 8 threads and gets exactly 50.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>CountDownLatch</code> / <code>Barrier</code> = <code>struct completion</code>: threads wait until a count reaches zero (the tests use it to release all threads at once).</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

@@ -1,0 +1,156 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Ingestion: pull, push, or crawl?</h3>
+        <p>Publishers expose new articles in three common ways, and a real aggregator uses all of them:</p>
+        <ul>
+          <li><b>RSS / Atom feeds (pull).</b> An XML list of recent items. We poll it. To save bytes we send <code>If-None-Match: &lt;etag&gt;</code> and <code>If-Modified-Since</code>; an unchanged feed returns <b>304</b> with no body.</li>
+          <li><b>WebSub (push).</b> A W3C standard (formerly PubSubHubbub). The feed advertises a <b>hub</b> with a <code>Link: rel="hub"</code> header. We POST a subscription (<code>hub.callback</code>, <code>hub.topic</code>, <code>hub.mode=subscribe</code>, optional <code>hub.lease_seconds</code> and <code>hub.secret</code>). The hub verifies we really asked by sending a GET with <code>hub.challenge</code> that we must echo back. On every update the hub POSTs the new content to our callback, signed with an HMAC in <code>X-Hub-Signature</code>. Subscriptions are leases, so a job must renew them before they expire.</li>
+          <li><b>News sitemaps and crawling.</b> Google's news sitemap format lists only articles from the <b>last 2 days</b>, at most <b>1,000</b> <code>&lt;news:news&gt;</code> entries per file, each with publication name, language, publication date and title. For sites with neither feed nor sitemap we crawl section pages, which brings in the whole <a href="{{BASE}}hld/d16">Web Crawler</a> problem.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 250" role="img" aria-label="Polling with conditional GET versus WebSub push via a hub">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="24">Pull (polling)</text>
+            <rect class="box svc" x="20" y="40" width="130" height="56"/><text class="label" x="85" y="73">Fetcher</text>
+            <rect class="box client" x="300" y="40" width="130" height="56"/><text class="label" x="365" y="73">Publisher</text>
+            <path class="arrow" d="M150 55 L293 55"/><text class="label small" x="222" y="48">GET If-None-Match</text>
+            <path class="arrow" d="M300 85 L157 85"/><text class="label small" x="222" y="110">304 (nothing new)</text>
+            <circle class="packet" r="5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M150 55 L300 55 L300 85 L150 85"/></circle>
+            <text class="label left" x="470" y="24">Push (WebSub)</text>
+            <rect class="box client" x="470" y="40" width="110" height="56"/><text class="label" x="525" y="73">Publisher</text>
+            <rect class="box queue" x="610" y="40" width="100" height="56"/><text class="label" x="660" y="73">Hub</text>
+            <rect class="box svc" x="740" y="40" width="105" height="56"/><text class="label small" x="792" y="66">Our callback</text><text class="label small" x="792" y="84">verify HMAC</text>
+            <path class="arrow" d="M580 68 L603 68"/>
+            <path class="arrow" d="M710 68 L733 68"/>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M580 68 L740 68"/></circle>
+            <rect class="box plain" x="20" y="140" width="400" height="90"/>
+            <text class="label small" x="220" y="165">+ works with every publisher</text>
+            <text class="label small" x="220" y="188">- delay up to one poll interval</text>
+            <text class="label small" x="220" y="211">- wasted requests on quiet feeds</text>
+            <rect class="box plain" x="470" y="140" width="375" height="90"/>
+            <text class="label small" x="657" y="165">+ seconds of delay, no wasted polls</text>
+            <text class="label small" x="657" y="188">- few publishers support it</text>
+            <text class="label small" x="657" y="211">- lost pushes: keep a slow poll as backup</text>
+          </svg>
+          <figcaption>Pull costs a request per interval even when nothing changed; push costs nothing until something changes. Use push where offered and adaptive polling everywhere else.</figcaption>
+        </figure>
+        <p><b>Adaptive polling.</b> Do not poll every feed every 5 minutes. Learn each feed's rhythm: if the last 10 polls of a feed found something new, poll it more often (down to 1 minute for wire services); if it has been quiet, back off exponentially (up to 1-2 hours). Store the next time in <code>next_poll_at</code>. Add jitter so 50,000 feeds do not all fire on the minute.</p>
+        <p><b>Politeness.</b> Respect <code>robots.txt</code>. RFC 9309 says a crawler should not use a cached robots.txt for more than 24 hours, must parse at least 500 KiB of it, and must assume "disallow everything" if the file returns a 5xx error. Limit concurrent connections per host, and send a stable User-Agent so publishers can contact you.</p>
+        <div class="bridge"><h4>From your world</h4><p>Polling vs push is polling vs interrupts. Pure polling wastes cycles on idle devices; pure interrupts can storm or be lost. Linux NAPI mixes them: take the interrupt, then poll while traffic is busy, then go back to interrupts when quiet. Our ingestion does the same - push when the publisher supports it, adaptive polling that speeds up on busy feeds and backs off on idle ones, and a slow safety poll because a lost interrupt (a dropped WebSub POST) must not lose an article.</p></div>
+
+        <h3>2. Duplicates and stories: SimHash and MinHash</h3>
+        <p>There are three levels of "same":</p>
+        <ol class="steps">
+          <li><strong>Same URL.</strong> Canonicalise and hash. Handled in the parser.</li>
+          <li><strong>Same text, different URL.</strong> A wire-service article (say from a news agency) is reprinted by 50 papers with a different header, footer and ads. A normal hash (SHA-256) of the page changes completely if one byte changes, so it cannot catch these.</li>
+          <li><strong>Same event, different words.</strong> Ten papers write their own reports on the same storm. They share key names, places and phrases but not sentences. These belong in one <b>story</b>, not deleted.</li>
+        </ol>
+        <p><b>SimHash</b> (Charikar's technique, used by Google's crawler) solves level 2. It turns a document into a 64-bit fingerprint where <b>similar documents get similar fingerprints</b>: they differ in only a few bit positions. How: split the text into weighted features (words, phrases). Keep 64 counters. For each feature, hash it to 64 bits; for every bit that is 1 add the feature's weight to that counter, for every 0 subtract it. At the end, each positive counter becomes a 1 bit, each negative one a 0 bit. Manku, Jain and Das Sarma (WWW 2007) showed that for a repository of <b>8 billion web pages, 64-bit fingerprints with "at most 3 bits different" (k = 3)</b> worked well. Their whole table of 8B fingerprints was 64 GB, and they found all near-duplicates for 1 million query fingerprints in roughly 100 seconds by keeping several copies of the table, each sorted on a different permutation of the bits.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 335" role="img" aria-label="SimHash: features vote on bits, two near-identical articles differ in two bits">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="24">Article A: "storm hits coast, 3 dead" (8-bit toy version)</text>
+            <g data-step="1">
+              <rect class="box plain" x="20" y="40" width="150" height="40"/><text class="label small" x="95" y="65">storm (w=3)</text>
+              <rect class="box plain" x="20" y="90" width="150" height="40"/><text class="label small" x="95" y="115">coast (w=2)</text>
+              <rect class="box plain" x="20" y="140" width="150" height="40"/><text class="label small" x="95" y="165">dead (w=2)</text>
+              <text class="label mono" x="300" y="65">1 0 1 1 0 0 1 0</text>
+              <text class="label mono" x="300" y="115">1 1 0 1 0 1 1 0</text>
+              <text class="label mono" x="300" y="165">0 0 1 1 1 0 1 0</text>
+              <path class="arrow" d="M170 60 L215 60"/><path class="arrow" d="M170 110 L215 110"/><path class="arrow" d="M170 160 L215 160"/>
+            </g>
+            <g data-step="2">
+              <text class="label left" x="460" y="65">bit 1: +3 +2 -2 = +3</text>
+              <text class="label left" x="460" y="90">bit 2: -3 +2 -2 = -3</text>
+              <text class="label left" x="460" y="115">... sum the votes per bit</text>
+              <text class="label left" x="460" y="140">positive -&gt; 1, negative -&gt; 0</text>
+            </g>
+            <g data-step="3">
+              <rect class="box highlight" x="220" y="200" width="200" height="36"/><text class="label mono" x="320" y="223">A = 1 0 1 1 0 0 1 0</text>
+            </g>
+            <g data-step="4">
+              <rect class="box highlight" x="220" y="245" width="200" height="36"/><text class="label mono" x="320" y="268">B = 1 0 1 1 1 0 1 1</text>
+              <text class="label left" x="450" y="235">B = same story + extra footer</text>
+              <text class="label left" x="450" y="305">Hamming distance = 2 bits</text>
+              <text class="label left" x="450" y="328">&lt;= k, so B is a near-duplicate of A</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li>Each feature (word or phrase, with a weight) is hashed to a bit string. Real SimHash uses 64 bits; we show 8.</li>
+            <li>Every feature votes on every bit: add its weight where its hash has a 1, subtract where it has a 0.</li>
+            <li>The sign of each sum becomes one bit of the fingerprint.</li>
+            <li>A reprint with an extra footer changes only a few votes, so only a few bits flip. Compare fingerprints by Hamming distance (XOR, then popcount). A distance of 3 or less means "near-duplicate".</li>
+          </ol>
+        </div>
+        <p><b>MinHash</b> (Broder, 1997, built for AltaVista) solves level 3 better. Break each article into <b>shingles</b> (runs of, say, 5 consecutive words). Two articles' resemblance is the Jaccard similarity of their shingle sets: |A and B| / |A or B|. MinHash keeps, for each of N hash functions, the minimum hash value over all shingles. The chance that two documents share a minimum equals their Jaccard similarity, so comparing 100 small numbers estimates the overlap of thousands of shingles. Broder's paper clustered more than 30 million AltaVista documents (over 150 GB) this way. To avoid comparing every pair, use <b>locality-sensitive hashing (LSH)</b>: split the 100 MinHash values into 20 bands of 5, hash each band into a bucket, and only compare articles that share at least one bucket.</p>
+        <p><b>Clustering into stories, in practice:</b></p>
+        <ul>
+          <li>Only compare against stories from the <b>last 24-48 hours</b> in the same language. News is time-local; a storm today is not the storm from last year. This keeps the candidate set to a few hundred thousand.</li>
+          <li>Add cheap signals: shared named entities (people, places), title similarity, and time closeness. Modern systems also use text embeddings and a nearest-neighbour index, as in <a href="{{BASE}}hld/d48">Recommendation System</a>.</li>
+          <li>Pick a <b>lead article</b> per story: the most authoritative or the earliest original source, not the last one to arrive.</li>
+          <li>Run an offline job every hour to <b>merge</b> stories that the online step split, and to split ones that grew too broad.</li>
+        </ul>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Technique</th><th>Catches</th><th>Size per article</th><th>Lookup</th></tr></thead>
+            <tbody>
+              <tr><td>Canonical URL hash</td><td>Same URL, tracking params</td><td>8-16 bytes</td><td>Exact key lookup</td></tr>
+              <tr><td>SHA-256 of body</td><td>Byte-identical copies</td><td>32 bytes</td><td>Exact key lookup</td></tr>
+              <tr><td>SimHash (64-bit)</td><td>Near-identical text (reprints)</td><td>8 bytes</td><td>Hamming distance &lt;= 3 via permuted sorted tables</td></tr>
+              <tr><td>MinHash + LSH</td><td>Overlapping text (same event)</td><td>about 100 x 4 bytes</td><td>Band buckets, then compare candidates</td></tr>
+              <tr><td>Embeddings + ANN</td><td>Same meaning, different words/languages</td><td>1-3 KB</td><td>Vector index (approximate)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bridge"><h4>From your world</h4><p>A CRC tells you a frame changed; it does not tell you by how much. SimHash is the opposite design goal: a "checksum" where a small change flips few bits, so XOR plus <code>popcount</code> (one CPU instruction) measures distance. The permuted-table trick is like a TCAM lookup split into blocks: if two 64-bit values differ in at most 3 bits, then at least one of several bit-blocks must match exactly, so you do exact lookups on each block.</p></div>
+
+        <h3>3. Infinite scroll without repeats</h3>
+        <p>Offset pagination (<code>?page=2</code> = "skip 20, take 20") breaks on a live feed. While you read page 1, five new stories arrive at the top. Page 2 now starts five items earlier, so you see five stories twice. If stories are removed or re-ranked, you can also skip some.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="Offset pagination repeats items when new stories arrive; cursor pagination does not">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="24">Offset: skip 3, take 3</text>
+            <rect class="box hot" x="20" y="40" width="70" height="36"/><text class="label small" x="55" y="63">N1</text>
+            <rect class="box hot" x="95" y="40" width="70" height="36"/><text class="label small" x="130" y="63">N2</text>
+            <rect class="box" x="170" y="40" width="70" height="36"/><text class="label small" x="205" y="63">S1</text>
+            <rect class="box fail" x="245" y="40" width="70" height="36"/><text class="label small" x="280" y="63">S2</text>
+            <rect class="box fail" x="320" y="40" width="70" height="36"/><text class="label small" x="355" y="63">S3</text>
+            <rect class="box" x="395" y="40" width="70" height="36"/><text class="label small" x="430" y="63">S4</text>
+            <text class="label left" x="20" y="105">You saw S1 S2 S3 on page 1. Two new stories N1 N2 arrived.</text>
+            <text class="label left bad" x="20" y="128">Page 2 = items 4-6 = S2 S3 S4: two repeats</text>
+            <text class="label left" x="500" y="24">Cursor: after (score, id) of S3</text>
+            <rect class="box ghost" x="500" y="40" width="70" height="36"/><text class="label small" x="535" y="63">S3</text>
+            <rect class="box ok" x="580" y="40" width="70" height="36"/><text class="label small" x="615" y="63">S4</text>
+            <rect class="box ok" x="655" y="40" width="70" height="36"/><text class="label small" x="690" y="63">S5</text>
+            <rect class="box ok" x="730" y="40" width="70" height="36"/><text class="label small" x="765" y="63">S6</text>
+            <path class="arrow" d="M535 90 L600 90"/>
+            <text class="label left" x="500" y="128">Page 2 = S4 S5 S6, no repeats</text>
+            <text class="label left" x="20" y="180">New stories (N1, N2) are shown with a "5 new stories - tap to refresh" pill,</text>
+            <text class="label left" x="20" y="203">exactly as the big news and social apps do, instead of shifting the list under the reader.</text>
+          </svg>
+          <figcaption>A cursor says where you stopped, not how many to skip, so inserts above it cannot shift your next page.</figcaption>
+        </figure>
+        <p>Two good options:</p>
+        <ul>
+          <li><b>Keyset cursor.</b> The cursor encodes the last seen score, and the next page is <code>ZREVRANGEBYSCORE feed:IN:tech (score -inf LIMIT 0 20</code>. Careful: the <code>(</code> makes the bound exclusive, so if several stories share the last score (two stories published in the same second), every one of them that was not on the last page is skipped, and a Redis sorted set cannot tie-break on a second field inside that command. The fix we use: <b>make every score unique</b> by folding the tie-breaker into it, for example <code>score = publish_ms x 1000 + (story_id mod 1000)</code>. Scores then never collide (for up to 1,000 stories per millisecond), the exclusive bound is exact, and the cursor is just that one number. (The other fix is an inclusive bound plus "skip members up to and including the last seen id", done on the server.) Works well when the order is by publish time.</li>
+          <li><b>Snapshot cursor.</b> When ranking changes every minute, scores are not stable. Instead the ranker writes versioned lists (<code>feed:IN:tech:v1712</code>) and keeps the last few versions for 10-15 minutes. The cursor encodes <code>(version, offset)</code>, so the reader keeps scrolling through the same frozen list. Offset is safe here because a snapshot never changes.</li>
+        </ul>
+        <p>Base64-encode the cursor and sign it, so clients treat it as opaque and cannot tamper with it.</p>
+
+        <h3>4. Under 200 ms, and surviving breaking news</h3>
+        <ol class="steps">
+          <li><strong>Precompute.</strong> The ranker does all the work. A feed request is "read 20 ids from a sorted set, batch-get 20 cards". Both are in-memory lookups: a few milliseconds.</li>
+          <li><strong>Cache the whole response at the CDN.</strong> The non-personalised feed for (region, category, first page) is identical for everyone, so give it <code>Cache-Control: public, max-age=30, stale-while-revalidate=60</code>. 4,000 feed keys at the edge absorb almost all first-page traffic.</li>
+          <li><strong>Request coalescing.</strong> When a CDN entry expires during a spike, thousands of requests miss at once (a <b>thundering herd</b>). The CDN or the API collapses them into one origin fetch and serves stale content while it refreshes.</li>
+          <li><strong>Replicate Redis for reads.</strong> 64 MB of feeds copied to a few replicas per region. A replica can serve 100k+ simple reads per second.</li>
+          <li><strong>Thumbnails through the CDN.</strong> Never serve images from the API. Resize at ingest to a few fixed sizes (with WebP), so edge hit rates stay high.</li>
+          <li><strong>Graceful degradation.</strong> If the ranker is late, keep serving the last list. If the KV store is slow, serve cards from the card cache. If even Redis fails, serve a static "top stories" JSON snapshot from object storage.</li>
+        </ol>
+        <p>Breaking news is also a <b>write</b>-freshness problem: the story is only useful if it is on the board in minutes. Give wire-service feeds and big publishers 1-minute polling or WebSub, and let the ranker run an extra "fast lane" pass for stories whose source count is climbing quickly - the same velocity idea as <a href="{{BASE}}hld/d29">Trending Topics</a>.</p>
+
+        <h3>5. Bonus: category feeds and personalisation</h3>
+        <p><b>Categories.</b> A classifier tags each article (sports, tech...) at ingest. A story's category is the majority of its articles. Each (region, category) gets its own sorted set. That is just more precomputed lists - the cost is 64 MB, not a new system.</p>
+        <p><b>Personalisation.</b> Google's WWW 2007 paper describes the original "Recommended for you" in Google News. It combined three signals with a linear model: <b>MinHash clustering of users</b> by the set of stories they clicked, <b>PLSI</b> (a probabilistic topic model of users), and <b>co-visitation</b> (stories clicked by the same user within a short time). Clicks were stored with time decay. User data lived in Bigtable keyed by user id. The recommendation step had a budget of only <b>a few hundred milliseconds</b> inside the page request. A smart detail: the server that <i>updates</i> click statistics was separate from the one that <i>serves</i> recommendations, so if the update side failed, recommendations kept working on slightly stale statistics.</p>
+        <p>In an interview: serve the shared, cached feed as the base, then <b>re-rank</b> the top 200 candidates per signed-in user with a small model. Personalising the whole page would destroy the CDN hit rate - the trade-off the interviewer is waiting for. Google's 2018 redesign kept "Full Coverage" and headlines <b>unpersonalised</b> on purpose.</p>
+      

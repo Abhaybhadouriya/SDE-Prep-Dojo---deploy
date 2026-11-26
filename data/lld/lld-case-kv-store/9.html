@@ -1,0 +1,26 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Three kinds of shared state need protection: the entry map, the expiry heap, and the version counter. Sessions are owned by one client (one thread) and are <b>not</b> shared, so their layers need no lock at all.</p>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Operation</th><th>Lock</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><code>get</code>, <code>ttlMillis</code>, <code>snapshot</code></td><td>Read lock (shared)</td><td>Reads run in parallel. An expired entry is reported as absent but <b>not removed</b>: removing would need the write lock, and a reader cannot upgrade a read lock in <code>ReentrantReadWriteLock</code> (it deadlocks).</td></tr>
+        <tr><td><code>set</code>, <code>delete</code>, <code>expire</code>, <code>restore</code></td><td>Write lock</td><td>Map, heap and version counter change together.</td></tr>
+        <tr><td><code>commit</code></td><td>Write lock</td><td>Validation and application must be one atomic step, or another commit could slip in between the check and the write (check-then-act).</td></tr>
+        <tr><td><code>purgeExpired</code></td><td>Write lock, bounded batch</td><td>Up to 16 due items on every write, so no single call pauses for long (Redis also does incremental active expiry).</td></tr>
+        <tr><td>Listeners</td><td>None</td><td>Collected under the lock, called after it is released, so a slow listener cannot block the store.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Optimistic or pessimistic transactions?</h3>
+  <div class="proscons">
+    <div class="pros"><h5>Optimistic (ours): validate at commit</h5><ul><li>No lock held while the client works; readers never block writers.</li><li>No deadlocks possible.</li><li>Cheap when conflicts are rare (most KV workloads).</li><li>Matches Redis <code>WATCH</code> + <code>MULTI/EXEC</code>: the transaction aborts if a watched key changed.</li></ul></div>
+    <div class="cons"><h5>Costs and the alternative</h5><ul><li>Hot keys (one global counter) cause many retries: our 8-thread test retries a lot.</li><li>Callers must loop on <code>ConflictException</code>.</li><li>Pessimistic alternative: lock each key on first read or write (two-phase locking), release at commit; no retries but deadlocks need ordering or timeouts.</li><li>For a hot counter, offer an atomic <code>incr</code> instead of a transaction.</li></ul></div>
+  </div>
+  <p>What we validate matters. Only keys the transaction <b>read from the store</b> are checked. A blind write (set without reading) does not conflict: last writer wins, which is correct because the transaction's result did not depend on the old value. A key read as absent is recorded as version 0, so "someone created it meanwhile" is caught too. Rolling back an inner transaction keeps its reads in the set: conservative (may cause an extra retry) but never wrong.</p>
+  <p>Our reads see the latest committed value each time (<b>read committed</b> while running), but because every read is validated at commit, any transaction that commits behaves as if it ran at its commit instant (<b>serialisable</b> for the keys it read). Snapshot isolation (MVCC: keep several versions per key, read the one as of <code>begin</code>) is the next step if the interviewer asks for repeatable reads.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is the kernel's <b>seqlock</b> pattern: readers note the sequence number, read without a lock, and retry if the number changed; writers bump it under a spinlock. Our versions are a per-key sequence, our commit is the writer, and <code>ConflictException</code> is the reader's retry. A read-write lock with "no upgrade" is the same rule as <code>rwlock_t</code>: you cannot turn a <code>read_lock</code> into a <code>write_lock</code> without dropping it first.</p>
+  </div>

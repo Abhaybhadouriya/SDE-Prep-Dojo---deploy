@@ -1,0 +1,161 @@
+
+        <h2>Deep dives</h2>
+
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the architecture above + why CDC beats polling and dual writes + per-row ordering by primary key (deep dive 2, including the dual-write picture) is a passing SDE-1 answer. Snapshots and the watermark handoff, replication slots, schema evolution and lake upserts (deep dives 1, 3, 4, 5) are expected at SDE-2.</p></div>
+        <h3>1. Snapshot first, then stream - and the handoff in between</h3>
+        <p>The log only holds recent changes (binlogs are purged after days). A new consumer needs <b>all existing rows</b> first. The classic Debezium <b>initial snapshot</b> does <code>SELECT *</code> on each table (emitting <code>op: "r"</code> events), records the log position from when it started, then streams from that position. The trouble: a full snapshot of a 2 TB table takes hours, and the older approach needed locks or a long-running consistent read.</p>
+        <p>The better way is the <b>incremental, watermark-based snapshot</b>, published by Netflix as <b>DBLog</b> and adopted by Debezium. The connector keeps streaming the log, and in between it reads the table in small primary-key chunks. Around each chunk it writes a <b>low watermark</b> and a <b>high watermark</b> into a signal table, so those markers appear in the log too. Any row that also shows up as a live log event between the two watermarks is <b>dropped from the chunk</b>, because the log event is newer. No locks, and you can snapshot one table any time.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Watermark snapshot: a chunk read between low and high watermarks; rows that changed in the log during the window are dropped from the chunk">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="10" y="30">Log stream (time →)</text>
+            <path class="arrow" d="M10 70 L790 70"/>
+            <rect class="box queue" x="200" y="52" width="40" height="36"/><text class="label small" x="220" y="110">LOW</text>
+            <rect class="box queue" x="520" y="52" width="40" height="36"/><text class="label small" x="540" y="110">HIGH</text>
+            <circle cx="120" cy="70" r="9" class="box kafka"/>
+            <circle cx="330" cy="70" r="9" class="box kafka"/><text class="label small" x="330" y="40">id 7 updated</text>
+            <circle cx="440" cy="70" r="9" class="box kafka"/><text class="label small" x="440" y="40">id 3 deleted</text>
+            <circle cx="650" cy="70" r="9" class="box kafka"/>
+            <rect class="zone" x="200" y="130" width="360" height="110"/>
+            <text class="zone-label" x="214" y="150">Chunk SELECT id 1..10</text>
+            <rect class="box db" x="214" y="162" width="32" height="30"/><text class="label small" x="230" y="182">1</text>
+            <rect class="box db" x="250" y="162" width="32" height="30"/><text class="label small" x="266" y="182">2</text>
+            <rect class="box fail" x="286" y="162" width="32" height="30"/><text class="label small" x="302" y="182">3</text>
+            <rect class="box db" x="322" y="162" width="32" height="30"/><text class="label small" x="338" y="182">4</text>
+            <rect class="box db" x="358" y="162" width="32" height="30"/><text class="label small" x="374" y="182">5</text>
+            <rect class="box db" x="394" y="162" width="32" height="30"/><text class="label small" x="410" y="182">6</text>
+            <rect class="box fail" x="430" y="162" width="32" height="30"/><text class="label small" x="446" y="182">7</text>
+            <rect class="box db" x="466" y="162" width="32" height="30"/><text class="label small" x="482" y="182">8</text>
+            <rect class="box db" x="502" y="162" width="32" height="30"/><text class="label small" x="518" y="182">9</text>
+            <text class="label small" x="380" y="224">3 and 7 dropped from chunk: the log events win</text>
+            <path class="arrow dashed" d="M560 186 L640 186"/>
+            <text class="label small left" x="646" y="182">emit rest</text>
+            <text class="label small left" x="646" y="200">at HIGH</text>
+          </svg>
+          <figcaption>DBLog-style chunk snapshot. Rows changed in the log between the low and high watermarks are removed from the chunk, so an old snapshot value can never overwrite a newer change.</figcaption>
+        </figure>
+<pre><code class="language-sql">-- Ask Debezium for an incremental snapshot of one table (signal table configured
+-- with signal.data.collection=public.debezium_signal; the table is created, granted and
+-- added to the publication in the Postgres setup tab further down)
+INSERT INTO debezium_signal (id, type, data)
+VALUES ('resnap-orders-2026-11-23', 'execute-snapshot',
+        '{"data-collections": ["public.orders"], "type": "incremental"}');</code></pre>
+
+        <h3>2. Ordering, keys and deletes</h3>
+        <p>Kafka orders records only <b>inside a partition</b>. Debezium uses the primary key as the record key, so every change to row 1042 goes to the same partition and arrives in commit order. That is enough for most sinks, because they apply changes per row. What you do <b>not</b> get for free:</p>
+        <ul>
+          <li><b>Cross-row / cross-table order.</b> An order row and its order_items rows are in different topics. A consumer may see items before the order. Fix: make the sink tolerant (<a href="{{BASE}}interview/glossary#upsert">upsert</a>, allow "orphan" items briefly), or use the <b><a href="{{BASE}}interview/glossary#outbox">outbox</a> pattern</b> to publish one business event per transaction.</li>
+          <li><b>Primary-key changes.</b> If someone updates the PK, Debezium emits a delete for the old key (plus tombstone) and a create for the new key - two partitions, so there is a moment where both or neither exist downstream.</li>
+          <li><b>Partition count changes.</b> Adding partitions changes <code>hash(key) mod N</code>, so new changes for row 1042 may land on a different partition than old ones. Pick partition counts up front for CDC topics.</li>
+        </ul>
+        <h4>Dual write vs outbox, in one picture</h4>
+        <p>The cross-table fix above deserves a picture, because it is the question interviewers ask most. A <b>dual write</b> means the application writes to two systems (the database and Kafka) in two separate steps. There is no transaction across them, so a crash or a failed call between the steps leaves them disagreeing - in either order.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 330" role="img" aria-label="Left: dual write loses a change when the Kafka publish fails or publishes a change that rolled back. Right: the outbox row is written in the same transaction and Debezium relays it from the WAL to Kafka">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="10" width="400" height="310"/><text class="zone-label" x="22" y="32">Dual write (broken)</text>
+            <rect class="box svc" x="30" y="50" width="110" height="50"/><text class="label" x="85" y="80">App</text>
+            <rect class="box db" x="270" y="44" width="120" height="40"/><text class="label small" x="330" y="69">DB: commit ok</text>
+            <rect class="box kafka" x="270" y="104" width="120" height="40"/><text class="label small" x="330" y="129">Kafka</text>
+            <path class="arrow ok" d="M140 66 L262 64"/><text class="label small ok" x="200" y="56">1. write</text>
+            <path class="arrow bad" d="M140 86 L262 122"/><text class="label small bad" x="190" y="126">2. publish</text>
+            <text class="label bad big" x="250" y="132">X</text>
+            <text class="label small bad" x="210" y="168">Order A: commit, then publish fails</text>
+            <text class="label small bad" x="210" y="186">= change lost (search never hears it)</text>
+            <text class="label small bad" x="210" y="235">Order B: publish, then the DB rolls back</text>
+            <text class="label small bad" x="210" y="253">= event for a change that never happened</text>
+            <text class="label small" x="210" y="290">retrying cannot fix it: the app may crash</text>
+            <text class="label small" x="210" y="308">between the two steps at any time</text>
+            <rect class="zone" x="440" y="10" width="410" height="310"/><text class="zone-label" x="452" y="32">Outbox + CDC (safe)</text>
+            <rect class="box svc" x="460" y="50" width="100" height="50"/><text class="label" x="510" y="80">App</text>
+            <rect class="box db" x="600" y="44" width="230" height="96"/><text class="label small" x="715" y="64">ONE transaction:</text>
+            <text class="label small mono" x="715" y="88">UPDATE orders ...</text><text class="label small mono" x="715" y="110">INSERT outbox_events ...</text><text class="label small ok" x="715" y="131">both or neither</text>
+            <path class="arrow ok" d="M560 75 L592 75"/>
+            <rect class="box queue" x="600" y="165" width="230" height="36"/><text class="label small" x="715" y="188">WAL (the DB's own log)</text>
+            <rect class="box svc" x="600" y="220" width="230" height="36"/><text class="label small" x="715" y="243">Debezium tails the WAL</text>
+            <rect class="box kafka" x="600" y="275" width="230" height="36"/><text class="label small" x="715" y="298">Kafka: OrderShipped event</text>
+            <path class="arrow" d="M715 140 L715 159"/><path class="arrow" d="M715 201 L715 214"/><path class="arrow" d="M715 256 L715 269"/>
+            <text class="label small" x="520" y="200">the app never</text><text class="label small" x="520" y="218">talks to Kafka</text>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M560 75 L600 75 L715 140 L715 165 L715 220 L715 275 L715 300"/></circle>
+          </svg>
+          <figcaption>Left: two separate writes fail in two ways - a lost change, or a phantom event. Right: the business row and the outbox row commit together; Debezium reads the committed WAL, so Kafka gets the event if and only if the transaction committed (at least once - consumers dedup by event id).</figcaption>
+        </figure>
+        <div class="callout note"><p><b>You might confuse this with...</b></p><ul>
+          <li><b>Polling vs CDC vs outbox:</b> polling = a job runs <code>SELECT ... WHERE updated_at &gt; ?</code> on a timer (misses deletes, adds DB load, minutes of delay); CDC = read the database's own change log (every insert, update and delete, in commit order); outbox = <i>what</i> you write (a deliberate event row in the same transaction), usually <i>relayed</i> by CDC. Outbox and CDC work together; they are not rivals.</li>
+          <li><b>Raw-table CDC vs outbox events:</b> raw-table CDC publishes your internal columns as they are (great for analytics, fragile as a contract); outbox events are designed, versioned business events (best for service-to-service).</li>
+          <li><b>At-least-once vs effectively-once:</b> CDC delivers each change at least once (after a crash some are re-sent). "Effectively once" is what you get when the consumer is idempotent - upsert by key, or dedup by event id - so duplicates change nothing.</li>
+        </ul></div>
+        <p>Deletes become a delete event plus a <b>tombstone</b> (key, null value). On a compacted topic the tombstone tells the log cleaner "forget this key" after <code>delete.retention.ms</code> (default 1 day), so a consumer rebuilding from scratch never sees the deleted row.</p>
+
+        <h3>3. The replication slot that ate the disk</h3>
+        <p>Postgres keeps WAL until <b>every replication slot</b> has confirmed it. If the Debezium connector stops (crashed, paused, misconfigured) the slot stays, and the primary keeps <b>every WAL segment</b> from that moment on. Hours later the database disk fills and production writes stop. This is one of the most common CDC outages reported by teams running Debezium on Postgres.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="When the connector stops, WAL retained by the replication slot grows until the disk is full">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M60 190 L780 190"/><text class="label small" x="740" y="210">time</text>
+            <path class="arrow" d="M60 190 L60 20"/><text class="label small left" x="68" y="30">WAL kept on disk</text>
+            <path class="arrow none ok" d="M60 170 L250 168"/>
+            <path class="arrow none bad" d="M250 168 L640 50"/>
+            <rect class="box fail" x="640" y="30" width="140" height="44"/><text class="label bad" x="710" y="57">DISK FULL</text>
+            <path class="arrow dashed none" d="M60 50 L640 50"/><text class="label small left" x="70" y="44">disk size</text>
+            <rect class="box k8s" x="200" y="100" width="130" height="40"/><text class="label small" x="265" y="125">connector stops</text>
+            <path class="arrow" d="M250 140 L250 160"/>
+            <rect class="box queue" x="380" y="130" width="230" height="44"/><text class="label small" x="495" y="149">alert at 20% of disk!</text><text class="label small" x="495" y="166">max_slot_wal_keep_size caps it</text>
+            <circle class="packet bad" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M250 168 L640 50"/></circle>
+          </svg>
+          <figcaption>A healthy slot keeps WAL flat. A stopped connector makes it climb until the primary runs out of disk. Alert early and cap it.</figcaption>
+        </figure>
+<pre class="terminal"><code>$ psql -c "SELECT slot_name, active,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+    FROM pg_replication_slots;"
+    slot_name     | active | retained_wal
+------------------+--------+--------------
+ debezium_shop    | f      | 187 GB
+(1 row)</code></pre>
+        <p>Defences: (a) alert on retained WAL per slot and on connector state, (b) set <code>max_slot_wal_keep_size</code> (Postgres 13+) so Postgres invalidates the slot instead of dying - you then re-snapshot, which is far better than an outage, (c) set Debezium <code>heartbeat.interval.ms</code> so a slot on a quiet database still advances, (d) drop slots of retired connectors. MySQL has the mirror-image risk: the binlog is purged on a timer (<code>binlog_expire_logs_seconds</code>) whether or not you have read it, so a connector down longer than that loses its position and must re-snapshot.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The slot is a <b>receive window that never closes</b>: the sender (Postgres) must buffer everything the slowest receiver has not acknowledged. A dead receiver with no timeout means unbounded buffer growth - the same reason TCP has keepalives and BFD has dead intervals. <code>max_slot_wal_keep_size</code> is your "drop the session after N bytes of unacked data" knob. <b>Where it breaks:</b> when TCP drops a session, the peer just reconnects and resends. When Postgres invalidates a slot, the WAL it needed is gone for good, so the connector cannot resume - it must take a fresh snapshot of every table.</p>
+        </div>
+
+        <h3>4. Schema changes without breaking consumers</h3>
+        <p>Someone runs <code>ALTER TABLE orders ADD COLUMN gift_wrap BOOLEAN</code>. Debezium sees the new column and registers a new schema version. With <b>Avro or Protobuf plus Schema Registry</b> in <b>BACKWARD</b> compatibility mode, adding an optional column with a default is allowed; old consumers just ignore it. Be precise about what each mode rejects: under <b>BACKWARD</b> (new schema must read old data) you may delete fields and add fields that have defaults, and only <b>adding a field without a default</b> is rejected; under <b>FORWARD</b> or <b>FULL</b>, <b>deleting a field without a default</b> is rejected. Changing a type incompatibly is rejected in every mode. A rejection makes the connector fail loudly instead of silently breaking ten downstream teams - but note what BACKWARD lets through: a <b>rename</b> registers as "delete old + add new", and because Debezium maps nullable columns to optional fields with default null, the registry usually <b>accepts</b> it. Old consumers then silently see the old field disappear (null). Use <b>FULL</b> / <b>FULL_TRANSITIVE</b>, or a contract layer such as the outbox, when consumers must not break. Iceberg supports adding and renaming columns as metadata-only changes, so the lake can evolve too.</p>
+        <p>The cultural fix matters as much: raw table CDC <b>exposes your internal schema</b> as a public contract. If the orders team renames a column, every consumer breaks. That is the main argument for the <b>outbox pattern</b> for service-to-service events: publish a deliberate, versioned business event, and keep raw table CDC for analytics.</p>
+
+        <h3>5. Upserts in the lake: copy-on-write vs merge-on-read</h3>
+        <p>Object storage files are immutable. Updating one row in a 512 MB Parquet file means either rewriting that file (<b>copy-on-write</b>: slow writes, fast reads) or writing a small <b>delete file</b> that says "row 1042 in file X is gone" plus the new row in a new file (<b>merge-on-read</b>: fast writes, reads merge on the fly). CDC streams are update-heavy, so merge-on-read is the usual choice for freshness, with a scheduled <b>compaction</b> job that rewrites small files and folds delete files back in.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Copy-on-write rewrites the whole file; merge-on-read writes a small delete file and a new data file, then compaction merges them">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="14" width="380" height="204"/><text class="zone-label" x="24" y="36">Copy-on-write</text>
+            <rect class="box db" x="30" y="60" width="130" height="80"/><text class="label" x="95" y="96">file A</text><text class="label small" x="95" y="116">1M rows</text>
+            <path class="arrow" d="M160 100 L222 100"/><text class="label small" x="192" y="88">1 row changed</text>
+            <rect class="box db" x="230" y="60" width="140" height="80"/><text class="label" x="300" y="96">file A' (all</text><text class="label small" x="300" y="116">1M rows rewritten)</text>
+            <text class="label small" x="200" y="178">slow write, fast read</text>
+
+            <rect class="zone kafka" x="410" y="14" width="380" height="204"/><text class="zone-label" x="424" y="36">Merge-on-read</text>
+            <rect class="box db" x="430" y="60" width="120" height="80"/><text class="label" x="490" y="96">file A</text><text class="label small" x="490" y="116">untouched</text>
+            <rect class="box fail" x="580" y="56" width="190" height="36"/><text class="label small" x="675" y="79">delete file: A row 1042</text>
+            <rect class="box cache" x="580" y="104" width="190" height="36"/><text class="label small" x="675" y="127">tiny new file: row 1042'</text>
+            <text class="label small" x="600" y="170">fast write, read merges</text>
+            <text class="label small" x="600" y="196">compaction folds them later</text>
+          </svg>
+          <figcaption>Two ways to update immutable files. CDC pipelines usually write merge-on-read for freshness and compact in the background.</figcaption>
+        </figure>
+<pre><code class="language-sql">-- Flink SQL: upsert CDC rows into an Iceberg v2 table
+CREATE TABLE lake.orders (
+  id BIGINT, status STRING, total_paise BIGINT, updated_at TIMESTAMP(3),
+  PRIMARY KEY (id) NOT ENFORCED
+) WITH ('format-version' = '2', 'write.upsert.enabled' = 'true');
+
+-- Spark: nightly maintenance so small files do not pile up
+CALL lake.system.rewrite_data_files(table => 'db.orders');
+CALL lake.system.expire_snapshots(table => 'db.orders', older_than => TIMESTAMP '2026-11-16 00:00:00');</code></pre>
+
+        <h3>6. Delivery guarantees, said precisely</h3>
+        <p>Treat the change stream as <b>at-least-once</b>: after a crash the connector replays from its last saved position, so some events appear twice. Kafka Connect added <a href="{{BASE}}interview/glossary#eos">exactly-once</a> support for source connectors (KIP-618, Kafka 3.3), but whether a connector supports it depends on the connector and version, so check before you promise it. Kafka transactions also stop at Kafka's edge - they do not cover writes into Elasticsearch or S3 (see <a href="{{BASE}}devops/kafka-06">Delivery Semantics</a>). So the honest design is: <b>at-least-once transport + idempotent sinks</b>. Upsert by primary key, and ignore an event whose source position (LSN or binlog position) is older than what the sink already applied. That gives <b>effectively-once results</b>.</p>
+        <div class="callout interview"><p>"CDC is at-least-once. I make every sink idempotent: upsert by primary key and drop events whose source LSN is not newer than the stored one. That turns duplicates and replays into no-ops." This one sentence answers half the follow-ups.</p></div>
+      

@@ -1,0 +1,140 @@
+
+        <h2>How Schema Registry works</h2>
+        <p>Schema Registry is a separate small REST service (Confluent's is the best known; Apicurio, Karapace and AWS Glue Schema Registry are alternatives). It stores its own data in a compacted Kafka topic called <code>_schemas</code>, so it is stateless and easy to run as a few replicas. Clients talk to it over HTTP, by default on port 8081. The magic happens inside the <strong>serializer</strong> and <strong>deserializer</strong> libraries in your producers and consumers. Step through one message:</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 330" role="img" aria-label="Producer serializer registers or looks up the schema, gets ID 7, writes magic byte and ID; consumer fetches schema 7 and decodes">
+            <rect class="box svc" x="20" y="200" width="170" height="70"/><text class="label" x="105" y="228">Producer</text><text class="label small" x="105" y="250">Avro serializer</text>
+            <rect class="box cache" x="315" y="20" width="170" height="70"/><text class="label" x="400" y="48">Schema Registry</text><text class="label small" x="400" y="70">:8081</text>
+            <rect class="box kafka" x="315" y="200" width="170" height="70"/><text class="label" x="400" y="228">topic: orders</text><text class="label small" x="400" y="250">partition 0</text>
+            <rect class="box svc" x="610" y="200" width="170" height="70"/><text class="label" x="695" y="228">Consumer</text><text class="label small" x="695" y="250">Avro deserializer</text>
+
+            <g data-step="1">
+              <path class="arrow" d="M150 198 L313 70"/>
+              <text class="label small" x="180" y="115">"orders-value": this schema?</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow ok" d="M313 85 L170 198"/>
+              <text class="label small ok" x="290" y="150">compatible. id = 7</text>
+            </g>
+            <g data-step="3">
+              <rect class="box kafka solid" x="200" y="285" width="40" height="34"/><text class="label white mono" x="220" y="307">0</text>
+              <rect class="box hot" x="245" y="285" width="110" height="34"/><text class="label mono" x="300" y="307">00 00 00 07</text>
+              <rect class="box svc" x="360" y="285" width="200" height="34"/><text class="label small" x="460" y="307">Avro body (8 bytes)</text>
+              <path class="arrow kafka" d="M190 235 L313 235"/>
+              <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M190 235 L313 235"/></circle>
+            </g>
+            <g data-step="4">
+              <path class="arrow kafka" d="M485 235 L608 235"/>
+              <path class="arrow" d="M650 198 L487 70"/>
+              <text class="label small" x="640" y="120">GET /schemas/ids/7</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow ok" d="M487 85 L700 198"/>
+              <text class="label small ok" x="640" y="160">schema 7 (cached forever)</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box highlight" x="560" y="90" width="230" height="40"/>
+              <text class="label small" x="675" y="115">Order{id:42, name:"Asha", ...}</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Producer asks.</b> On the first send with a given schema, the serializer asks the registry about it under the subject <code>orders-value</code>. With <code>auto.register.schemas=true</code> (the client default) it registers it; in production you usually register from CI and set this to false.</li>
+            <li><b>Registry checks and answers.</b> The registry runs the compatibility check against the subject's existing versions. If it passes, the schema gets a globally unique ID, say 7. The same schema text always gets the same ID. The producer caches the ID, so this HTTP call happens once, not per message.</li>
+            <li><b>Write the 5-byte header.</b> Each message value is: magic byte <code>0</code>, then the 4-byte schema ID in big-endian, then the binary payload. The full schema is never in the message.</li>
+            <li><b>Consumer reads the ID.</b> The deserializer peels off the 5 bytes and, if it has not seen ID 7 before, fetches it from the registry.</li>
+            <li><b>Fetch once, cache forever.</b> Schema IDs are immutable, so the consumer can cache ID 7 for its lifetime. A registry outage does not stop clients that already have their schemas cached.</li>
+            <li><b>Decode.</b> The deserializer decodes the bytes with the writer's schema (ID 7) and, for Avro, resolves them into the reader's own schema version. That resolution is what makes evolution work.</li>
+          </ol>
+        </div>
+
+        <h3>The wire format, byte by byte</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 145" role="img" aria-label="Wire format: byte 0 magic, bytes 1 to 4 schema id, then payload">
+            <rect class="box kafka solid" x="20" y="40" width="110" height="60"/><text class="label white" x="75" y="66">magic</text><text class="label white mono" x="75" y="88">0x00</text>
+            <rect class="box hot" x="135" y="40" width="250" height="60"/><text class="label" x="260" y="66">schema ID (4 bytes, big-endian)</text><text class="label mono" x="260" y="88">00 00 00 07</text>
+            <rect class="box svc" x="390" y="40" width="390" height="60"/><text class="label" x="585" y="66">payload</text><text class="label small" x="585" y="88">Avro / Protobuf (+ message indexes) / JSON</text>
+            <text class="label small" x="75" y="125">byte 0</text>
+            <text class="label small" x="260" y="125">bytes 1-4</text>
+            <text class="label small" x="585" y="125">bytes 5 ...</text>
+          </svg>
+          <figcaption>Five bytes of overhead per message. A consumer that is not using the registry's deserializer sees these bytes as garbage at the start of the value, which is a classic "why is my JSON broken" bug. Protobuf adds a short list of "message indexes" so a .proto file can hold several message types.</figcaption>
+        </figure>
+
+<pre class="terminal"><code>$ kcat -b localhost:9092 -t orders -C -c 1 -f '%s' | xxd | head -1
+00000000: 0000 0000 0754 0841 7368 61e6 07         .....T.Asha..</code></pre>
+        <p>There it is: <code>00</code> magic, <code>00 00 00 07</code> schema ID, then the same 8 Avro bytes we counted by hand. (If your example also has the <code>coupon</code> field, a null union adds one more byte, <code>00</code>, for the union branch.)</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The 5-byte header is your <b>EtherType + version field</b>. The receiver reads a tiny fixed header to decide how to parse everything after it, and the meaning of each value is held in a shared registry (IANA there, Schema Registry here). Nobody puts the full protocol spec in every frame.</p>
+        </div>
+
+        <h3>Subjects: where versions are grouped</h3>
+        <p>A <strong>subject</strong> is a named list of schema versions, and compatibility is checked within one subject. Which subject a message's schema belongs to is decided by the <strong>subject name strategy</strong>:</p>
+        <ul>
+          <li><code>TopicNameStrategy</code> (default): subject = <code>&lt;topic&gt;-key</code> or <code>&lt;topic&gt;-value</code>. One event type per topic. Simple and the most common.</li>
+          <li><code>RecordNameStrategy</code>: subject = the record's full name, e.g. <code>com.shop.events.Order</code>. The same type can appear in many topics.</li>
+          <li><code>TopicRecordNameStrategy</code>: subject = <code>&lt;topic&gt;-&lt;record name&gt;</code>. Lets one topic carry several event types (<code>OrderPlaced</code>, <code>OrderPaid</code>) while still keeping ordering per order key. Useful for event-sourced aggregates.</li>
+        </ul>
+
+        <h3>Talking to the registry with curl</h3>
+<pre><code class="language-bash">SR=http://localhost:8081
+CT='Content-Type: application/vnd.schemaregistry.v1+json'
+
+# Register version 1 of the value schema for topic "orders"
+curl -s -X POST -H "$CT" $SR/subjects/orders-value/versions \
+  --data '{"schema": "{\"type\":\"record\",\"name\":\"Order\",\"namespace\":\"com.shop.events\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"amount\",\"type\":\"int\"}]}"}'
+
+curl -s $SR/subjects
+curl -s $SR/subjects/orders-value/versions
+curl -s $SR/config                                  # global compatibility level</code></pre>
+<pre class="terminal"><code>{"id":7}
+["orders-value"]
+[1]
+{"compatibilityLevel":"BACKWARD"}</code></pre>
+        <p>Before you ship a change, ask the registry whether it would be accepted. This is the command to put in CI:</p>
+<pre><code class="language-bash"># Proposed v2: rename amount -&gt; total (a breaking change)
+curl -s -X POST -H "$CT" $SR/compatibility/subjects/orders-value/versions/latest?verbose=true \
+  --data '{"schema": "{\"type\":\"record\",\"name\":\"Order\",\"namespace\":\"com.shop.events\",\"fields\":[{\"name\":\"id\",\"type\":\"long\"},{\"name\":\"name\",\"type\":\"string\"},{\"name\":\"total\",\"type\":\"int\"}]}"}'</code></pre>
+<pre class="terminal"><code>{"is_compatible":false,"messages":["... READER_FIELD_MISSING_DEFAULT_VALUE, location:/fields/2, message:total, ..."]}</code></pre>
+        <p>The new reader expects a field <code>total</code> that old messages do not have, and it has no default, so it could not read old data. Add <code>"default": 0</code> and keep <code>amount</code> (or use an Avro alias) and the check passes. You can also set the mode per subject with <code>curl -X PUT -H "$CT" $SR/config/orders-value --data '{"compatibility":"FULL"}'</code>.</p>
+
+        <h3>Producer and consumer config</h3>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">Properties p = new Properties();
+p.put("bootstrap.servers", "kafka:9092");
+p.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+p.put("value.serializer", "io.confluent.kafka.serializers.KafkaAvroSerializer");
+p.put("schema.registry.url", "http://schema-registry:8081");
+p.put("auto.register.schemas", "false");   // CI registers schemas; apps only look them up
+p.put("use.latest.version", "true");       // serialize with the latest registered version
+
+// consumer side
+c.put("value.deserializer", "io.confluent.kafka.serializers.KafkaAvroDeserializer");
+c.put("schema.registry.url", "http://schema-registry:8081");
+c.put("specific.avro.reader", "true");     // decode into generated Order classes</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">from confluent_kafka import Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
+
+schema_str = open("order.avsc").read()
+sr = SchemaRegistryClient({"url": "http://localhost:8081"})
+# Same rule as the Java client: CI registers schemas, the app only looks them up.
+# (For a quick lab you can drop conf=... and let it auto-register, never in production.)
+to_avro = AvroSerializer(sr, schema_str,
+                         conf={"auto.register.schemas": False, "use.latest.version": True})
+
+p = Producer({"bootstrap.servers": "localhost:9092"})
+order = {"id": 42, "name": "Asha", "amount": 499, "coupon": None}
+p.produce("orders", key="42",
+          value=to_avro(order, SerializationContext("orders", MessageField.VALUE)))
+p.flush()</code></pre>
+          </div>
+        </div>
+        <p>Kafka Connect uses the same idea through converters: set <code>value.converter=io.confluent.connect.avro.AvroConverter</code> and <code>value.converter.schema.registry.url=...</code>, and every Debezium change event is registered and sent as Avro. See <a href="{{BASE}}devops/kafka-09">Connect &amp; Streams</a>.</p>
+      

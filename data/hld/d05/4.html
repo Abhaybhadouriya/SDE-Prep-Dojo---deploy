@@ -1,0 +1,100 @@
+
+        <h2>Data model: what we store and where</h2>
+        <p>Start from the reads. The hot reads are (1) "the newest N post ids in <i>my</i> feed", (2) "the full post for these 20 ids", (3) "who follows user X" (for fan-out) and (4) "who does user Y follow" (for pulling celebrities). None needs a join across shards. That tells us: key-value and wide-column style stores, each keyed by the thing we look up. See <a href="{{BASE}}hld/hld-08">Choosing Storage</a> and <a href="{{BASE}}hld/hld-07">Data Modeling</a>.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 340" role="img" aria-label="Four stores: posts table keyed by post id, two follow tables, feed cache sorted sets in Redis, and media in blob storage">
+            <rect class="zone db" x="10" y="10" width="410" height="190"/>
+            <text class="zone-label" x="26" y="32">Durable stores (sharded)</text>
+            <rect class="box db" x="28" y="46" width="180" height="140"/>
+            <text class="label" x="118" y="68">posts</text>
+            <text class="label small" x="118" y="92">PK: post_id</text>
+            <text class="label small" x="118" y="112">author_id, text,</text>
+            <text class="label small" x="118" y="132">media_keys,</text>
+            <text class="label small" x="118" y="152">created_at, deleted</text>
+            <rect class="box db" x="222" y="46" width="185" height="64"/>
+            <text class="label small" x="314" y="70">followers_of</text>
+            <text class="label small" x="314" y="92">PK: followee | CK: follower</text>
+            <rect class="box db" x="222" y="122" width="185" height="64"/>
+            <text class="label small" x="314" y="146">following_of</text>
+            <text class="label small" x="314" y="168">PK: follower | CK: followee</text>
+            <rect class="zone" x="440" y="10" width="410" height="190"/>
+            <text class="zone-label" x="456" y="32">In memory (rebuildable)</text>
+            <rect class="box cache" x="458" y="46" width="180" height="140"/>
+            <text class="label" x="548" y="68">feed:{user_id}</text>
+            <text class="label small" x="548" y="92">sorted set</text>
+            <text class="label small" x="548" y="112">member = post_id</text>
+            <text class="label small" x="548" y="132">score = time/rank</text>
+            <text class="label small" x="548" y="152">trimmed to 500</text>
+            <rect class="box cache" x="652" y="46" width="185" height="64"/>
+            <text class="label small" x="744" y="70">post:{id} cache</text>
+            <text class="label small" x="744" y="92">hydrated objects</text>
+            <rect class="box cache" x="652" y="122" width="185" height="64"/>
+            <text class="label small" x="744" y="146">counters</text>
+            <text class="label small" x="744" y="168">likes, comments</text>
+            <rect class="box queue" x="28" y="236" width="380" height="80"/>
+            <text class="label" x="218" y="266">Blob storage + CDN</text>
+            <text class="label small" x="218" y="292">photos in 3-4 sizes, keyed by media_id</text>
+            <rect class="box plain" x="458" y="236" width="380" height="80"/>
+            <text class="label" x="648" y="266">users (SQL)</text>
+            <text class="label small" x="648" y="292">profile, settings, is_celebrity flag</text>
+          </svg>
+          <figcaption>Everything durable is keyed by the thing we look up. The feed cache holds only ids; the post cache holds the full objects once, shared by every reader.</figcaption>
+        </figure>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Cassandra / CQL">
+<pre><code class="language-sql">-- Posts: one row per post, looked up by id (hydration)
+CREATE TABLE posts (
+  post_id     bigint PRIMARY KEY,        -- Snowflake id: time-sortable
+  author_id   bigint,
+  body        text,
+  media_keys  list&lt;text&gt;,
+  created_at  timestamp,
+  deleted     boolean
+);
+
+-- One author's own posts, newest first (profile page and celebrity pull)
+CREATE TABLE posts_by_author (
+  author_id bigint,
+  post_id   bigint,
+  PRIMARY KEY ((author_id), post_id)
+) WITH CLUSTERING ORDER BY (post_id DESC);
+
+-- The social graph, stored twice so both directions are one-partition reads
+CREATE TABLE followers_of (followee bigint, follower bigint, since timestamp,
+  PRIMARY KEY ((followee), follower));
+CREATE TABLE following_of (follower bigint, followee bigint, since timestamp,
+  PRIMARY KEY ((follower), followee));</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Redis feed cache">
+<pre><code class="language-bash"># Fan-out worker: add post 1859300 to Sara's feed with score = created time
+ZADD feed:sara 1763920251 1859300
+# keep only the newest 500 entries (drop the oldest)
+ZREMRANGEBYRANK feed:sara 0 -501
+# Feed service: first page, newest first, with scores (for the cursor). Redis 6.2+ form:
+ZRANGE feed:sara +inf -inf BYSCORE REV LIMIT 0 20 WITHSCORES
+# Next page: INCLUSIVE of the cursor score (no "(" prefix), one extra item of slack.
+# The service then skips members with score == 1763920000 and id &gt;= 18592999,
+# so posts made in the same second as the cursor item are not lost.
+ZRANGE feed:sara 1763920000 -inf BYSCORE REV LIMIT 0 21 WITHSCORES</code></pre>
+<div class="callout tip"><p><b>Two ways to handle ties.</b> (1) As above: query inclusively and filter on <code>(score, post_id)</code> in the service. (2) Simpler: make the score unique by using the Snowflake <code>post_id</code> itself as the score, since it is already time-ordered; then an exclusive range such as <code>ZRANGE feed:sara (18592999 -inf BYSCORE REV LIMIT 0 20</code> works directly. <code>ZREVRANGEBYSCORE</code> still works but has been deprecated since Redis 6.2 in favour of <code>ZRANGE ... BYSCORE REV</code>. (Snowflake ids above 2<sup>53</sup> lose precision as a Redis double score, so option 2 needs ids shortened to 53 bits, or option 1.)</p></div>
+          </div>
+        </div>
+<pre class="terminal"><code>$ redis-cli ZADD feed:sara 1763920251 1859300 1763920102 1859277 1763919950 1859201
+(integer) 3
+$ redis-cli ZRANGE feed:sara +inf -inf BYSCORE REV LIMIT 0 2 WITHSCORES
+1) "1859300"
+2) "1763920251"
+3) "1859277"
+4) "1763920102"
+$ redis-cli ZCARD feed:sara
+(integer) 3</code></pre>
+        <p class="muted">Real output shape from <code>redis-cli</code>; try it with <code>docker run --rm -p 6379:6379 redis:7</code> (or Valkey). Note: when two posts share a score, Redis orders equal scores by member, so use the post id in the cursor as a tie-breaker.</p>
+        <ul>
+          <li><b>Why NoSQL for posts and the graph?</b> Billions of rows, lookup by key, no joins, and easy horizontal scaling. Facebook actually keeps its graph in sharded MySQL behind a graph cache called TAO, so "sharded SQL + a big cache" is also a correct answer. Say why, not which brand.</li>
+          <li><b>Why store the graph twice?</b> Fan-out asks "followers of X" and pull asks "who does Y follow". One table can only be partitioned one way. Writing two rows per follow is cheap; scanning the wrong partition is not.</li>
+          <li><b>Why ids in the feed, not full posts?</b> A post edited or deleted would otherwise need fixing in 200 (or 50M) places. Store the id; hydrate from one place.</li>
+          <li><b>Why Snowflake ids?</b> They are 64-bit and roughly time-ordered (41 bits of milliseconds first), so sorting by id is sorting by time. See <a href="{{BASE}}hld/d31">Unique ID Generator</a>.</li>
+        </ul>
+      

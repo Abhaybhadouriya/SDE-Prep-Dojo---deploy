@@ -1,0 +1,63 @@
+
+        <h2>The big caveat: exactly-once stops at Kafka's edge</h2>
+        <p class="chips level-chips"><span class="chip ok">must know</span></p>
+        <p>Kafka's exactly-once covers <b>read from Kafka, process, write to Kafka</b>. The moment your code touches something else - a database, Redis, an email server, a payment gateway, an HTTP API - Kafka transactions cannot roll that back. If you charge a card inside a Kafka transaction and the transaction aborts, the card is still charged, and the retry charges it again.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 235" role="img" aria-label="End-to-end pipeline: which tool gives exactly-once on each hop">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone kafka" x="190" y="40" width="420" height="170"/>
+            <text class="label small kafka" x="400" y="58">Kafka transactions cover this box</text>
+
+            <rect class="box client" x="10" y="100" width="150" height="70"/><text class="label" x="85" y="125">Order API</text><text class="label small muted" x="85" y="150">+ DB + outbox</text>
+            <rect class="box kafka" x="210" y="100" width="110" height="70"/><text class="label small" x="265" y="135">orders</text>
+            <rect class="box svc" x="345" y="100" width="110" height="70"/><text class="label small" x="400" y="125">stream</text><text class="label small" x="400" y="145">processor</text>
+            <rect class="box kafka" x="480" y="100" width="110" height="70"/><text class="label small" x="535" y="135">payments</text>
+            <rect class="box svc" x="640" y="70" width="150" height="56"/><text class="label small" x="715" y="98">ledger DB sink</text>
+            <rect class="box db" x="640" y="150" width="150" height="56"/><text class="label small" x="715" y="178">card gateway</text>
+
+            <path class="arrow" d="M160 135 L208 135"/>
+            <path class="arrow" d="M320 135 L343 135"/>
+            <path class="arrow" d="M455 135 L478 135"/>
+            <path class="arrow" d="M590 125 L638 100"/>
+            <path class="arrow" d="M590 145 L638 175"/>
+            <circle class="packet" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M160 135 L590 135 L640 100"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3.5s" begin="1.7s" repeatCount="indefinite" path="M160 135 L590 135 L640 178"/></circle>
+
+          </svg>
+          <figcaption>"End-to-end exactly-once" is a chain. Every hop needs its own trick; Kafka transactions are only the middle link.</figcaption>
+        </figure>
+        <ul>
+          <li>Hop 1 (DB &rarr; Kafka): outbox table + CDC (Debezium). At-least-once, so carry an event ID.</li>
+          <li>Hop 2 (Kafka &rarr; Kafka): transactions / Kafka Streams exactly_once_v2 / Flink EXACTLY_ONCE.</li>
+          <li>Hop 3a (Kafka &rarr; DB): upsert by event ID, or store offsets in the same DB transaction.</li>
+          <li>Hop 3b (Kafka &rarr; payment API): idempotency key sent to the gateway; gateway dedups.</li>
+        </ul>
+
+        <p>For each kind of sink, the standard toolbox:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Technique</th><th>How it works</th><th>Use when</th></tr></thead>
+            <tbody>
+              <tr><td><b>Upsert by a natural key</b></td><td><code>INSERT ... ON CONFLICT (event_id) DO NOTHING</code> or <code>UPDATE ... SET status='PAID'</code>. A replay overwrites with the same value.</td><td>The write is "set state", not "add to state"</td></tr>
+              <tr><td><b>Dedup table</b></td><td>In the same DB transaction as the business change, insert the event ID into a <code>processed_events</code> table with a unique constraint. A duplicate fails the insert and the transaction rolls back.</td><td>Increments, counters, ledger entries</td></tr>
+              <tr><td><b>Offsets in the sink</b></td><td>Store the Kafka offset in the same DB transaction as the result. On restart, <code>seek()</code> to the stored offset instead of using Kafka's commit.</td><td>One database sink, you control the consumer</td></tr>
+              <tr><td><b>Idempotency key to the API</b></td><td>Send a unique key (derived from the event ID) with the request. The provider returns the first result for repeats.</td><td>Payment gateways, third-party APIs that support it</td></tr>
+              <tr><td><b>Version / state machine checks</b></td><td>Apply an event only if the row's version is older, or only if the state transition is legal (PENDING to PAID, never PAID to PAID).</td><td>Out-of-order or repeated events on an entity</td></tr>
+              <tr><td><b>Two-phase commit sinks</b></td><td>Frameworks like Flink pre-commit writes at checkpoints and finalise them when the checkpoint completes. Flink's Kafka sink in EXACTLY_ONCE mode does this using Kafka transactions.</td><td>Stream processing frameworks with transactional sinks</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+<pre><code class="language-sql">-- Dedup table pattern (PostgreSQL). Run both statements in ONE transaction.
+BEGIN;
+INSERT INTO processed_events (event_id) VALUES ('ord-981-paid');   -- PRIMARY KEY
+UPDATE wallets SET balance = balance - 500 WHERE user_id = 77;
+COMMIT;
+-- A duplicate event fails the first INSERT with a unique violation:
+-- roll back, treat it as "already done", and commit the Kafka offset.</code></pre>
+
+        <div class="callout interview"><p><b>Interviewers love this:</b> in a payment or wallet design, say "Kafka gives us at-least-once delivery between services; the ledger write is made idempotent with the event ID as a unique key, and the gateway call carries an idempotency key. Kafka transactions only help on Kafka-to-Kafka hops." That one paragraph answers the follow-up before it comes. See <a href="{{BASE}}hld/d10">Payment System</a>, <a href="{{BASE}}hld/d41">Digital Wallet &amp; Ledger</a> and <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Events</a>.</p></div>
+
+        <p>And the first hop has a classic trap of its own: the <b>dual write</b>. An order service that does "commit to DB, then publish to Kafka" can crash between the two, leaving a DB row with no event (or an event with no row, if done the other way round). The fix is the <b>transactional outbox</b>: write the event into an <code>outbox</code> table in the <em>same</em> DB transaction, and let a relay (often Debezium CDC) publish it. The relay is at-least-once, so consumers still dedup by event ID. The <a href="{{BASE}}devops/pipeline-03">Stream Processing, Retries &amp; DLQ</a> page builds this end to end, and <a href="{{BASE}}devops/pipeline-01">Pipeline Architecture</a> shows where it sits.</p>
+      

@@ -1,0 +1,789 @@
+
+  <h2>Full code</h2>
+  <p>The same files as in <code>lld-code/lld-case-irctc/</code>. The Java demo builds a 3A coach with 8 berths (1-4 and 8 general, 5-6 tatkal quota, 7 a side-lower sold as two RAC halves) on a toy route NDLS-AGC-GWL-BPL-NGP, then runs nine scenes with 27 checks, including a 100-thread tatkal rush and a 300-request random race followed by 150 concurrent cancellations, after which an invariant checker rebuilds every mask from the tickets.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java">
+      <p><b>Model.java</b> - stations, route with the segment mask, berths, train classes, passengers, tickets, bookings, a manual clock.</p>
+<pre><code class="language-java">import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+enum BerthType { LOWER, MIDDLE, UPPER, SIDE_LOWER, SIDE_UPPER }
+
+enum Quota { GENERAL, TATKAL }
+
+enum Status { CNF, RAC, WL, CANCELLED }
+
+record Station(String code, String name, int km) {}
+
+/** Ordered stops. Segment i is the stretch between stop i and stop i+1. */
+final class Route {
+    private final List&lt;Station&gt; stops;
+    private final Map&lt;String, Integer&gt; index = new HashMap&lt;&gt;();
+
+    Route(List&lt;Station&gt; stops) {
+        if (stops.size() &lt; 2 || stops.size() &gt; 64) throw new IllegalArgumentException("2..64 stops");
+        this.stops = List.copyOf(stops);
+        for (int i = 0; i &lt; stops.size(); i++)
+            if (index.put(stops.get(i).code(), i) != null) throw new IllegalArgumentException("repeated stop");
+    }
+
+    int indexOf(String code) { Integer i = index.get(code); return i == null ? -1 : i; }
+    boolean serves(String from, String to) { int a = indexOf(from), b = indexOf(to); return a &gt;= 0 &amp;&amp; b &gt; a; }
+    int km(int from, int to) { return stops.get(to).km() - stops.get(from).km(); }
+    List&lt;Station&gt; stops() { return stops; }
+
+    /** Bits from..to-1 set: the segments a journey from stop `from` to stop `to` occupies. */
+    static long mask(int from, int to) { return ((1L &lt;&lt; to) - 1) &amp; ~((1L &lt;&lt; from) - 1); }
+}
+
+/** One physical berth. racBerth = a side-lower that is sold as two RAC halves. */
+record Berth(int no, BerthType type, Quota quota, boolean racBerth) {}
+
+/** One class of a train (3A, SL ...): its berths, waitlist limit and fare rate. */
+record TrainClass(String code, boolean ac, List&lt;Berth&gt; berths, int waitlistLimit, long rupeesPerKmX100) {}
+
+record Train(String number, String name, Route route, Map&lt;String, TrainClass&gt; classes) {}
+
+record Passenger(String name, int age, BerthType preference) {}
+
+/** One passenger's seat on a booking. Mutable, guarded by its JourneyInventory's lock. */
+final class PassengerTicket {
+    final Passenger passenger;
+    final Booking booking;   // back-pointer: promotion finds the trip mask in O(1), like skb-&gt;sk
+    Status status;
+    Berth berth;      // CNF: the berth; RAC: the shared side-lower
+    int racSlot = -1; // RAC: 0 or 1
+    int number;       // RAC n / WL n position, renumbered after every change
+
+    PassengerTicket(Passenger p, Booking b) { this.passenger = p; this.booking = b; }
+
+    String describe() {
+        return switch (status) {
+            case CNF -&gt; "CNF B1-" + berth.no() + " " + berth.type();
+            case RAC -&gt; "RAC " + number + " (B1-" + berth.no() + ")";
+            case WL -&gt; "WL " + number;
+            case CANCELLED -&gt; "CAN";
+        };
+    }
+}
+
+final class Booking {
+    final String pnr, userId, trainNo, classCode, from, to;
+    final LocalDate date;
+    final int fromIdx, toIdx;
+    final Quota quota;
+    final long fare;
+    final List&lt;PassengerTicket&gt; tickets = new ArrayList&lt;&gt;();
+
+    Booking(String pnr, String userId, String trainNo, LocalDate date, String classCode, String from, String to,
+            int fromIdx, int toIdx, Quota quota, long fare, List&lt;Passenger&gt; passengers) {
+        this.pnr = pnr; this.userId = userId; this.trainNo = trainNo; this.date = date; this.classCode = classCode;
+        this.from = from; this.to = to; this.fromIdx = fromIdx; this.toIdx = toIdx; this.quota = quota; this.fare = fare;
+        for (Passenger p : passengers) tickets.add(new PassengerTicket(p, this));
+    }
+
+    long mask() { return Route.mask(fromIdx, toIdx); }
+    List&lt;PassengerTicket&gt; tickets() { return Collections.unmodifiableList(tickets); }
+}
+
+record Availability(int general, int tatkal, int racFree, int waitlisted, int waitlistLimit) {
+    /** What the search page shows for the general quota. */
+    String display() {
+        if (general &gt; 0) return "AVAILABLE " + general;
+        if (racFree &gt; 0) return "RAC (" + racFree + " left)";
+        if (waitlisted &lt; waitlistLimit) return "WL " + (waitlisted + 1);
+        return "REGRET";
+    }
+}
+
+class NoSeatsException extends RuntimeException { NoSeatsException(String m) { super(m); } }
+
+class BookingClosedException extends RuntimeException { BookingClosedException(String m) { super(m); } }
+
+interface Clock { LocalDateTime now(); }
+
+final class ManualClock implements Clock {
+    private volatile LocalDateTime now;
+    ManualClock(LocalDateTime start) { now = start; }
+    public LocalDateTime now() { return now; }
+    void set(LocalDateTime t) { now = t; }
+}</code></pre>
+      <p><b>Strategies.java</b> - berth pickers, fare rules (with the tatkal decorator) and the listener.</p>
+<pre><code class="language-java">import java.util.List;
+
+/** A free berth for the requested segments, and what is already sold on it. */
+record Candidate(Berth berth, long occupied) {}
+
+/** Strategy: which free berth a passenger gets. */
+interface BerthPicker {
+    Candidate pick(List&lt;Candidate&gt; free, BerthType preference);
+}
+
+/** Preference first, then best fit: the berth that is already busiest on other segments,
+ *  so empty berths stay empty for long-distance passengers (less fragmentation). */
+final class PreferenceBestFitPicker implements BerthPicker {
+    public Candidate pick(List&lt;Candidate&gt; free, BerthType preference) {
+        Candidate best = null;
+        for (Candidate c : free) if (better(c, best, preference)) best = c;
+        return best;
+    }
+
+    private static boolean better(Candidate c, Candidate best, BerthType pref) {
+        if (best == null) return true;
+        boolean cp = c.berth().type() == pref, bp = best.berth().type() == pref;
+        if (cp != bp) return cp;
+        int cb = Long.bitCount(c.occupied()), bb = Long.bitCount(best.occupied());
+        if (cb != bb) return cb &gt; bb;
+        return c.berth().no() &lt; best.berth().no();
+    }
+}
+
+/** The naive picker, kept to show what best fit buys. */
+final class FirstFreePicker implements BerthPicker {
+    public Candidate pick(List&lt;Candidate&gt; free, BerthType preference) { return free.isEmpty() ? null : free.get(0); }
+}
+
+/** Strategy: fare in rupees. */
+interface FareRule {
+    long fare(TrainClass cls, int km, Quota quota);
+}
+
+/** Toy base fare: km x rate, with a minimum. (Not the real Indian Railways fare table.) */
+final class DistanceFare implements FareRule {
+    public long fare(TrainClass cls, int km, Quota quota) { return Math.max(100, km * cls.rupeesPerKmX100() / 100); }
+}
+
+/** Decorator: tatkal adds a percentage of the base fare, clamped. Toy numbers. */
+final class TatkalSurcharge implements FareRule {
+    private final FareRule inner;
+    private final int percent;
+    private final long min, max;
+
+    TatkalSurcharge(FareRule inner, int percent, long min, long max) {
+        this.inner = inner; this.percent = percent; this.min = min; this.max = max;
+    }
+
+    public long fare(TrainClass cls, int km, Quota quota) {
+        long base = inner.fare(cls, km, quota);
+        if (quota != Quota.TATKAL) return base;
+        return base + Math.min(max, Math.max(min, base * percent / 100));
+    }
+}
+
+/** Observer: SMS, email, the PNR-status page. */
+interface BookingListener {
+    void onStatusChange(Booking booking, PassengerTicket ticket, String before, String after);
+}
+
+/** A status change produced under the inventory lock and delivered after it is released. */
+record StatusEvent(Booking booking, PassengerTicket ticket, String before, String after) {}</code></pre>
+      <p><b>Inventory.java</b> - <code>JourneyInventory</code>: allocation, cancellation, promotion, availability, invariant checker.</p>
+<pre><code class="language-java">import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Seats of one class of one train on one date. Each berth keeps a bitmask of sold segments,
+ * so one berth can be sold NDLS-GWL to one passenger and GWL-NGP to another.
+ * Everything is guarded by one fair lock: requests for the same train-date-class are served
+ * in arrival order, and different trains or dates never block each other.
+ */
+final class JourneyInventory {
+    final Train train;
+    final TrainClass cls;
+    final LocalDate date;
+    private final BerthPicker picker;
+    private final ReentrantLock lock = new ReentrantLock(true);
+
+    private final List&lt;Berth&gt; berths;          // sold whole (CNF)
+    private final long[] occupied;             // per berth: sold segments
+    private final List&lt;Berth&gt; racBerths;       // side-lowers sold as two RAC halves
+    private final long[][] racOccupied;        // per RAC berth, per half: sold segments
+    private final List&lt;PassengerTicket&gt; racQueue = new ArrayList&lt;&gt;();
+    private final List&lt;PassengerTicket&gt; wlQueue = new ArrayList&lt;&gt;();
+    private final Set&lt;Booking&gt; bookings = new LinkedHashSet&lt;&gt;();   // O(1) add/remove, booking order kept
+
+    JourneyInventory(Train train, TrainClass cls, LocalDate date, BerthPicker picker) {
+        this.train = train; this.cls = cls; this.date = date; this.picker = picker;
+        this.berths = cls.berths().stream().filter(b -&gt; !b.racBerth()).toList();
+        this.racBerths = cls.berths().stream().filter(Berth::racBerth).toList();
+        this.occupied = new long[berths.size()];
+        this.racOccupied = new long[racBerths.size()][2];
+    }
+
+    /** Places every passenger (CNF, else RAC, else WL) or none of them. Returns the events. */
+    List&lt;StatusEvent&gt; allocate(Booking b) {
+        lock.lock();
+        try {
+            bookings.add(b);
+            List&lt;PassengerTicket&gt; placed = new ArrayList&lt;&gt;();
+            for (PassengerTicket t : b.tickets) {
+                if (tryConfirm(t, b.mask(), b.quota)) { placed.add(t); continue; }
+                if (b.quota == Quota.GENERAL &amp;&amp; tryRac(t, b.mask())) { racQueue.add(t); placed.add(t); continue; }
+                if (b.quota == Quota.GENERAL &amp;&amp; wlQueue.size() &lt; cls.waitlistLimit()) {
+                    t.status = Status.WL; wlQueue.add(t); placed.add(t); continue;
+                }
+                for (PassengerTicket p : placed) release(p, b.mask()); // all or nothing
+                for (PassengerTicket p : b.tickets) p.status = null;
+                bookings.remove(b);
+                throw new NoSeatsException(b.quota == Quota.TATKAL ? "REGRET: tatkal quota full" : "REGRET: waitlist full");
+            }
+            renumber();
+            List&lt;StatusEvent&gt; events = new ArrayList&lt;&gt;();
+            for (PassengerTicket t : b.tickets) events.add(new StatusEvent(b, t, "NEW", t.describe()));
+            return events;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Cancels every passenger of a booking, then promotes RAC and WL passengers into the gaps. */
+    List&lt;StatusEvent&gt; cancel(Booking b) {
+        lock.lock();
+        try {
+            List&lt;StatusEvent&gt; events = new ArrayList&lt;&gt;();
+            for (PassengerTicket t : b.tickets) {
+                if (t.status == Status.CANCELLED) continue;
+                String before = t.describe();
+                release(t, b.mask());
+                t.status = Status.CANCELLED;
+                events.add(new StatusEvent(b, t, before, "CAN"));
+            }
+            promote(events);
+            return events;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    Availability availability(int from, int to) {
+        long need = Route.mask(from, to);
+        lock.lock();
+        try {
+            int general = 0, tatkal = 0, rac = 0;
+            for (int i = 0; i &lt; berths.size(); i++)
+                if ((occupied[i] &amp; need) == 0) { if (berths.get(i).quota() == Quota.TATKAL) tatkal++; else general++; }
+            for (long[] halves : racOccupied) for (long h : halves) if ((h &amp; need) == 0) rac++;
+            return new Availability(general, tatkal, rac, wlQueue.size(), cls.waitlistLimit());
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    // ---- under the lock ----
+
+    private boolean tryConfirm(PassengerTicket t, long need, Quota quota) {
+        List&lt;Candidate&gt; free = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; berths.size(); i++)
+            if (berths.get(i).quota() == quota &amp;&amp; (occupied[i] &amp; need) == 0) free.add(new Candidate(berths.get(i), occupied[i]));
+        Candidate c = picker.pick(free, t.passenger.preference());
+        if (c == null) return false;
+        occupied[berths.indexOf(c.berth())] |= need;
+        t.status = Status.CNF; t.berth = c.berth(); t.racSlot = -1;
+        return true;
+    }
+
+    private boolean tryRac(PassengerTicket t, long need) {
+        for (int i = 0; i &lt; racBerths.size(); i++)
+            for (int h = 0; h &lt; 2; h++)
+                if ((racOccupied[i][h] &amp; need) == 0) {
+                    racOccupied[i][h] |= need;
+                    t.status = Status.RAC; t.berth = racBerths.get(i); t.racSlot = h;
+                    return true;
+                }
+        return false;
+    }
+
+    private void release(PassengerTicket t, long mask) {
+        switch (t.status) {
+            case CNF -&gt; occupied[berths.indexOf(t.berth)] &amp;= ~mask;
+            case RAC -&gt; { racOccupied[racBerths.indexOf(t.berth)][t.racSlot] &amp;= ~mask; racQueue.remove(t); }
+            case WL -&gt; wlQueue.remove(t);
+            default -&gt; { }
+        }
+    }
+
+    /** RAC -&gt; CNF first, then WL -&gt; CNF or RAC, each queue in booking order. A passenger whose
+     *  segments do not fit is skipped, so a later one with a shorter trip may move ahead. */
+    private void promote(List&lt;StatusEvent&gt; events) {
+        for (PassengerTicket t : new ArrayList&lt;&gt;(racQueue)) {
+            Booking b = bookingOf(t);
+            String before = t.describe();
+            int rb = racBerths.indexOf(t.berth), slot = t.racSlot;
+            if (tryConfirm(t, b.mask(), Quota.GENERAL)) {
+                racOccupied[rb][slot] &amp;= ~b.mask();
+                racQueue.remove(t);
+                events.add(new StatusEvent(b, t, before, null));
+            }
+        }
+        for (PassengerTicket t : new ArrayList&lt;&gt;(wlQueue)) {
+            Booking b = bookingOf(t);
+            String before = t.describe();
+            if (tryConfirm(t, b.mask(), Quota.GENERAL) || (tryRac(t, b.mask()) &amp;&amp; racQueue.add(t))) {
+                wlQueue.remove(t);
+                events.add(new StatusEvent(b, t, before, null));
+            }
+        }
+        renumber();
+        events.replaceAll(e -&gt; e.after() == null ? new StatusEvent(e.booking(), e.ticket(), e.before(), e.ticket().describe()) : e);
+    }
+
+    private void renumber() {
+        for (int i = 0; i &lt; racQueue.size(); i++) racQueue.get(i).number = i + 1;
+        for (int i = 0; i &lt; wlQueue.size(); i++) wlQueue.get(i).number = i + 1;
+    }
+
+    private static Booking bookingOf(PassengerTicket t) { return t.booking; }   // O(1), no scan under the lock
+
+    private boolean fitsGeneralBerth(long m) {
+        for (int i = 0; i &lt; berths.size(); i++) if (berths.get(i).quota() == Quota.GENERAL &amp;&amp; (occupied[i] &amp; m) == 0) return true;
+        return false;
+    }
+
+    private boolean fitsRacHalf(long m) {
+        for (long[] halves : racOccupied) for (long h : halves) if ((h &amp; m) == 0) return true;
+        return false;
+    }
+
+    /** Test hook: rebuilds the masks from the tickets, checks nothing is sold twice and no waiting passenger fits a free place. */
+    void checkInvariants() {
+        lock.lock();
+        try {
+            long[] cnf = new long[berths.size()];
+            long[][] rac = new long[racBerths.size()][2];
+            int racCount = 0, wlCount = 0;
+            for (Booking b : bookings)
+                for (PassengerTicket t : b.tickets) {
+                    if (t.status == Status.CNF) {
+                        int i = berths.indexOf(t.berth);
+                        if ((cnf[i] &amp; b.mask()) != 0) throw new AssertionError("berth " + t.berth.no() + " sold twice");
+                        cnf[i] |= b.mask();
+                    } else if (t.status == Status.RAC) {
+                        int i = racBerths.indexOf(t.berth);
+                        if ((rac[i][t.racSlot] &amp; b.mask()) != 0) throw new AssertionError("RAC half sold twice");
+                        rac[i][t.racSlot] |= b.mask();
+                        racCount++;
+                    } else if (t.status == Status.WL) wlCount++;
+                }
+            for (int i = 0; i &lt; cnf.length; i++) if (cnf[i] != occupied[i]) throw new AssertionError("mask drift on berth " + i);
+            for (int i = 0; i &lt; rac.length; i++)
+                for (int h = 0; h &lt; 2; h++) if (rac[i][h] != racOccupied[i][h]) throw new AssertionError("RAC mask drift");
+            if (racCount != racQueue.size() || wlCount != wlQueue.size()) throw new AssertionError("queue drift");
+            if (wlCount &gt; cls.waitlistLimit()) throw new AssertionError("waitlist over limit");
+            for (PassengerTicket t : racQueue) if (fitsGeneralBerth(bookingOf(t).mask())) throw new AssertionError("missed RAC promotion");
+            for (PassengerTicket t : wlQueue) {
+                long m = bookingOf(t).mask();
+                if (fitsGeneralBerth(m) || fitsRacHalf(m)) throw new AssertionError("missed WL promotion");
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+      <p><b>ReservationService.java</b> - catalogue with the station index, and the service.</p>
+<pre><code class="language-java">import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+
+/** Read-mostly catalogue with a reverse index station -&gt; trains. */
+final class TrainCatalog {
+    private final Map&lt;String, Train&gt; trains = new HashMap&lt;&gt;();
+    private final Map&lt;String, Set&lt;String&gt;&gt; byStation = new HashMap&lt;&gt;();
+
+    synchronized void add(Train t) {
+        trains.put(t.number(), t);
+        for (Station s : t.route().stops()) byStation.computeIfAbsent(s.code(), k -&gt; new HashSet&lt;&gt;()).add(t.number());
+    }
+
+    synchronized Train get(String number) {
+        Train t = trains.get(number);
+        if (t == null) throw new IllegalArgumentException("no train " + number);
+        return t;
+    }
+
+    /** Intersect the two stations' train sets, then keep trains that visit `from` before `to`. */
+    synchronized List&lt;Train&gt; between(String from, String to) {
+        Set&lt;String&gt; a = byStation.getOrDefault(from, Set.of()), b = byStation.getOrDefault(to, Set.of());
+        List&lt;Train&gt; out = new ArrayList&lt;&gt;();
+        for (String n : a) if (b.contains(n) &amp;&amp; trains.get(n).route().serves(from, to)) out.add(trains.get(n));
+        out.sort((x, y) -&gt; x.number().compareTo(y.number()));
+        return out;
+    }
+}
+
+final class ReservationService {
+    static final int MAX_GENERAL = 6, MAX_TATKAL = 4;
+
+    private final TrainCatalog catalog;
+    private final Clock clock;
+    private final FareRule fares;
+    private final BerthPicker picker;
+    private final Map&lt;String, JourneyInventory&gt; inventories = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Booking&gt; bookings = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;BookingListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final AtomicLong pnrSeq = new AtomicLong(4_000_000_000L);
+
+    ReservationService(TrainCatalog catalog, Clock clock, FareRule fares, BerthPicker picker) {
+        this.catalog = catalog; this.clock = clock; this.fares = fares; this.picker = picker;
+    }
+
+    void addListener(BookingListener l) { listeners.add(l); }
+
+    List&lt;Train&gt; search(String from, String to) { return catalog.between(from, to); }
+
+    Availability availability(String trainNo, LocalDate date, String cls, String from, String to) {
+        Train t = catalog.get(trainNo);
+        requireServes(t, from, to);
+        return inventory(t, cls, date).availability(t.route().indexOf(from), t.route().indexOf(to));
+    }
+
+    Booking book(String userId, String trainNo, LocalDate date, String cls, String from, String to,
+                 Quota quota, List&lt;Passenger&gt; passengers) {
+        Train t = catalog.get(trainNo);
+        requireServes(t, from, to);
+        TrainClass tc = trainClass(t, cls);
+        int max = quota == Quota.TATKAL ? MAX_TATKAL : MAX_GENERAL;
+        if (passengers.isEmpty() || passengers.size() &gt; max) throw new IllegalArgumentException("1.." + max + " passengers");
+        LocalDateTime now = clock.now();
+        if (!now.isBefore(date.atStartOfDay())) throw new BookingClosedException("train has left");
+        if (quota == Quota.TATKAL &amp;&amp; now.isBefore(tatkalOpens(tc, date)))
+            throw new BookingClosedException("tatkal opens at " + tatkalOpens(tc, date));
+        int a = t.route().indexOf(from), b = t.route().indexOf(to);
+        long fare = fares.fare(tc, t.route().km(a, b), quota) * passengers.size();
+        Booking booking = new Booking(String.valueOf(pnrSeq.incrementAndGet()), userId, trainNo, date, cls,
+                from, to, a, b, quota, fare, passengers);
+        List&lt;StatusEvent&gt; events = inventory(t, cls, date).allocate(booking); // throws NoSeatsException
+        bookings.put(booking.pnr, booking);
+        publish(events);
+        return booking;
+    }
+
+    Booking cancel(String pnr) {
+        Booking b = bookings.get(pnr);
+        if (b == null) throw new IllegalArgumentException("no PNR " + pnr);
+        Train t = catalog.get(b.trainNo);
+        publish(inventory(t, b.classCode, b.date).cancel(b));
+        return b;
+    }
+
+    Booking pnr(String pnr) { return bookings.get(pnr); }
+
+    JourneyInventory inventoryFor(String trainNo, String cls, LocalDate date) {
+        return inventory(catalog.get(trainNo), cls, date);
+    }
+
+    /** AC classes open at 10:00, non-AC at 11:00, one day before the journey. */
+    static LocalDateTime tatkalOpens(TrainClass tc, LocalDate date) {
+        return date.minusDays(1).atTime(tc.ac() ? LocalTime.of(10, 0) : LocalTime.of(11, 0));
+    }
+
+    private JourneyInventory inventory(Train t, String cls, LocalDate date) {
+        TrainClass tc = trainClass(t, cls);
+        return inventories.computeIfAbsent(t.number() + "|" + date + "|" + cls, k -&gt; new JourneyInventory(t, tc, date, picker));
+    }
+
+    private static TrainClass trainClass(Train t, String cls) {
+        TrainClass tc = t.classes().get(cls);
+        if (tc == null) throw new IllegalArgumentException("no class " + cls + " on " + t.number());
+        return tc;
+    }
+
+    private static void requireServes(Train t, String from, String to) {
+        if (!t.route().serves(from, to)) throw new IllegalArgumentException(t.number() + " does not run " + from + "-&gt;" + to);
+    }
+
+    /** Called after the inventory lock is released: a slow SMS gateway never blocks booking. */
+    private void publish(List&lt;StatusEvent&gt; events) {
+        for (StatusEvent e : events)
+            for (BookingListener l : listeners) l.onStatusChange(e.booking(), e.ticket(), e.before(), e.after());
+    }
+}</code></pre>
+      <p><b>Main.java</b> - the demo driver and race tests.</p>
+<pre><code class="language-java">import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static void expectThrows(Class&lt;? extends RuntimeException&gt; type, Runnable r, String what) {
+        try {
+            r.run();
+        } catch (RuntimeException e) {
+            check(type.isInstance(e), what + " (got " + e.getClass().getSimpleName() + ")");
+            System.out.println("  rejected as expected: " + e.getMessage());
+            return;
+        }
+        throw new AssertionError("FAILED: expected " + type.getSimpleName() + " for " + what);
+    }
+
+    static Station st(String code, int km) { return new Station(code, code, km); }
+
+    /** 3A coach B1: berths 1-4 and 8 general, 5-6 tatkal quota, 7 side-lower sold as two RAC halves. */
+    static TrainClass coach() {
+        List&lt;Berth&gt; b = List.of(
+                new Berth(1, BerthType.LOWER, Quota.GENERAL, false), new Berth(2, BerthType.MIDDLE, Quota.GENERAL, false),
+                new Berth(3, BerthType.UPPER, Quota.GENERAL, false), new Berth(4, BerthType.LOWER, Quota.GENERAL, false),
+                new Berth(5, BerthType.MIDDLE, Quota.TATKAL, false), new Berth(6, BerthType.UPPER, Quota.TATKAL, false),
+                new Berth(7, BerthType.SIDE_LOWER, Quota.GENERAL, true), new Berth(8, BerthType.SIDE_UPPER, Quota.GENERAL, false));
+        return new TrainClass("3A", true, b, 3, 250);
+    }
+
+    static Passenger p(String name) { return new Passenger(name, 30, null); }
+
+    static String show(Booking b) {
+        StringBuilder s = new StringBuilder("  PNR " + b.pnr + " " + b.from + "-&gt;" + b.to + " Rs " + b.fare + ":");
+        for (PassengerTicket t : b.tickets()) s.append(" ").append(t.passenger.name()).append("=").append(t.describe());
+        return s.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        Station ndls = st("NDLS", 0), agc = st("AGC", 195), gwl = st("GWL", 313), bpl = st("BPL", 701), ngp = st("NGP", 1091);
+        TrainCatalog catalog = new TrainCatalog();
+        catalog.add(new Train("12627", "Dojo Express", new Route(List.of(ndls, agc, gwl, bpl, ngp)), Map.of("3A", coach())));
+        catalog.add(new Train("12001", "Dojo Shatabdi", new Route(List.of(ndls, agc, gwl, bpl)), Map.of("3A", coach())));
+        catalog.add(new Train("12951", "Dojo Rajdhani", new Route(List.of(ndls, st("KOTA", 465), st("BCT", 1386))), Map.of("3A", coach())));
+
+        ManualClock clock = new ManualClock(LocalDateTime.of(2026, 12, 1, 9, 0));
+        FareRule fares = new TatkalSurcharge(new DistanceFare(), 30, 400, 500);
+        ReservationService irctc = new ReservationService(catalog, clock, fares, new PreferenceBestFitPicker());
+        List&lt;String&gt; sms = new ArrayList&lt;&gt;();
+        irctc.addListener((b, t, before, after) -&gt; sms.add(t.passenger.name() + ": " + before + " -&gt; " + after));
+        LocalDate day = LocalDate.of(2026, 12, 10);
+        String T = "12627";
+
+        System.out.println("== 1. search and availability ==");
+        List&lt;String&gt; found = irctc.search("NDLS", "BPL").stream().map(Train::number).toList();
+        System.out.println("  trains NDLS-&gt;BPL: " + found);
+        check(found.equals(List.of("12001", "12627")), "search uses the station index and stop order");
+        check(irctc.search("BPL", "NDLS").isEmpty(), "direction matters");
+        Availability a0 = irctc.availability(T, day, "3A", "NDLS", "NGP");
+        System.out.println("  12627 3A NDLS-&gt;NGP: " + a0.display() + ", tatkal " + a0.tatkal() + ", RAC halves " + a0.racFree());
+        check(a0.general() == 5 &amp;&amp; a0.tatkal() == 2 &amp;&amp; a0.racFree() == 2, "fresh coach counts");
+
+        System.out.println("== 2. one berth, two passengers (segment reuse) ==");
+        Booking alice = irctc.book("u1", T, day, "3A", "NDLS", "GWL", Quota.GENERAL, List.of(new Passenger("Alice", 34, BerthType.LOWER)));
+        Booking bob = irctc.book("u2", T, day, "3A", "GWL", "NGP", Quota.GENERAL, List.of(p("Bob")));
+        System.out.println(show(alice));
+        System.out.println(show(bob));
+        check(alice.tickets().get(0).berth.no() == 1 &amp;&amp; bob.tickets().get(0).berth.no() == 1, "best fit puts Bob on Alice's berth");
+        check(alice.fare == 782 &amp;&amp; bob.fare == 1945, "distance fare: 313 km and 778 km at Rs 2.50");
+        check(irctc.availability(T, day, "3A", "NDLS", "NGP").general() == 4, "berth 1 is now full end to end");
+
+        System.out.println("== 3. general quota runs out: CNF, then RAC, then WL ==");
+        Booking family = irctc.book("u3", T, day, "3A", "NDLS", "NGP", Quota.GENERAL,
+                List.of(p("Chitra"), p("Chirag"), p("Chetan"), p("Chhavi")));
+        Booking rac = irctc.book("u4", T, day, "3A", "NDLS", "NGP", Quota.GENERAL, List.of(p("Dev"), p("Esha")));
+        Booking wl = irctc.book("u5", T, day, "3A", "NDLS", "NGP", Quota.GENERAL, List.of(p("Farah"), p("Gopal")));
+        for (Booking b : List.of(family, rac, wl)) System.out.println(show(b));
+        check(family.tickets().stream().allMatch(t -&gt; t.status == Status.CNF), "family confirmed");
+        check(rac.tickets().get(0).describe().equals("RAC 1 (B1-7)") &amp;&amp; rac.tickets().get(1).describe().equals("RAC 2 (B1-7)"), "two RAC halves of berth 7");
+        check(wl.tickets().get(0).describe().equals("WL 1") &amp;&amp; wl.tickets().get(1).describe().equals("WL 2"), "waitlist numbers");
+        System.out.println("  display now: " + irctc.availability(T, day, "3A", "NDLS", "NGP").display());
+
+        System.out.println("== 4. all or nothing: 2 passengers, 1 waitlist place left ==");
+        expectThrows(NoSeatsException.class, () -&gt; irctc.book("u6", T, day, "3A", "NDLS", "NGP", Quota.GENERAL,
+                List.of(p("Jay"), p("Kiran"))), "second passenger does not fit");
+        check(irctc.availability(T, day, "3A", "NDLS", "NGP").waitlisted() == 2, "Jay's WL 3 was rolled back");
+        Booking hari = irctc.book("u7", T, day, "3A", "NDLS", "NGP", Quota.GENERAL, List.of(p("Hari")));
+        System.out.println(show(hari));
+        expectThrows(NoSeatsException.class, () -&gt; irctc.book("u8", T, day, "3A", "NDLS", "NGP", Quota.GENERAL,
+                List.of(p("Ira"))), "waitlist full");
+        System.out.println("  display now: " + irctc.availability(T, day, "3A", "NDLS", "NGP").display());
+
+        System.out.println("== 5. cancellation promotes RAC and WL in order ==");
+        sms.clear();
+        irctc.cancel(family.pnr);
+        sms.forEach(m -&gt; System.out.println("  SMS " + m));
+        check(rac.tickets().stream().allMatch(t -&gt; t.status == Status.CNF), "RAC 1 and 2 confirmed");
+        check(wl.tickets().stream().allMatch(t -&gt; t.status == Status.CNF), "WL 1 and 2 confirmed");
+        check(hari.tickets().get(0).describe().equals("RAC 1 (B1-7)"), "WL 3 moved to RAC 1");
+        check(sms.size() == 9, "4 cancellations + 5 promotions notified");
+        expectThrows(IllegalArgumentException.class, () -&gt; irctc.cancel("123"), "unknown PNR");
+
+        System.out.println("== 6. a gap that only fits a shorter trip ==");
+        irctc.cancel(bob.pnr);
+        check(hari.tickets().get(0).status == Status.RAC, "Hari (NDLS-&gt;NGP) does not fit the GWL-&gt;NGP gap");
+        Booking mohan = irctc.book("u9", T, day, "3A", "GWL", "BPL", Quota.GENERAL, List.of(p("Mohan")));
+        System.out.println(show(mohan));
+        check(mohan.tickets().get(0).describe().startsWith("CNF B1-1"), "Mohan gets the gap on berth 1");
+
+        System.out.println("== 7. tatkal window and the 10:00 rush ==");
+        clock.set(LocalDateTime.of(2026, 12, 9, 9, 59));
+        expectThrows(BookingClosedException.class, () -&gt; irctc.book("t0", T, day, "3A", "NDLS", "NGP", Quota.TATKAL,
+                List.of(p("Early"))), "tatkal before 10:00");
+        clock.set(LocalDateTime.of(2026, 12, 9, 10, 0));
+        int users = 100;
+        AtomicInteger won = new AtomicInteger(), regret = new AtomicInteger();
+        ConcurrentLinkedQueue&lt;Booking&gt; winners = new ConcurrentLinkedQueue&lt;&gt;();
+        runConcurrently(users, i -&gt; {
+            try {
+                winners.add(irctc.book("t" + i, T, day, "3A", "NDLS", "NGP", Quota.TATKAL, List.of(p("T" + i))));
+                won.incrementAndGet();
+            } catch (NoSeatsException e) {
+                regret.incrementAndGet();
+            }
+        });
+        System.out.println("  " + users + " users at 10:00:00 -&gt; " + won.get() + " confirmed, " + regret.get() + " regret");
+        winners.forEach(b -&gt; System.out.println(show(b)));
+        check(won.get() == 2 &amp;&amp; regret.get() == 98, "exactly the 2 tatkal berths are sold");
+        irctc.inventoryFor(T, "3A", day).checkInvariants();
+
+        System.out.println("== 8. random race: 300 bookings then 150 cancellations at once ==");
+        LocalDate day2 = day.plusDays(1);
+        clock.set(LocalDateTime.of(2026, 12, 1, 9, 0));
+        ConcurrentLinkedQueue&lt;Booking&gt; made = new ConcurrentLinkedQueue&lt;&gt;();
+        AtomicInteger full = new AtomicInteger();
+        String[] stops = {"NDLS", "AGC", "GWL", "BPL", "NGP"};
+        runConcurrently(300, i -&gt; {
+            Random r = new Random(i);
+            int a = r.nextInt(4), b = a + 1 + r.nextInt(4 - a);
+            List&lt;Passenger&gt; ps = r.nextBoolean() ? List.of(p("R" + i)) : List.of(p("R" + i), p("S" + i));
+            try {
+                made.add(irctc.book("r" + i, T, day2, "3A", stops[a], stops[b], Quota.GENERAL, ps));
+            } catch (NoSeatsException e) {
+                full.incrementAndGet();
+            }
+        });
+        JourneyInventory inv2 = irctc.inventoryFor(T, "3A", day2);
+        inv2.checkInvariants();
+        List&lt;Booking&gt; list = new ArrayList&lt;&gt;(made);
+        System.out.println("  booked " + list.size() + ", regret " + full.get() + "; invariants hold");
+        check(list.size() + full.get() == 300, "every request answered");
+        runConcurrently(list.size() / 2, i -&gt; irctc.cancel(list.get(i * 2).pnr));
+        inv2.checkInvariants();
+        long cnf = list.stream().flatMap(b -&gt; b.tickets().stream()).filter(t -&gt; t.status == Status.CNF).count();
+        System.out.println("  cancelled every second booking: " + cnf + " CNF passengers left; no double sale, no missed promotion");
+        check(list.stream().allMatch(b -&gt; b.tickets().stream().allMatch(t -&gt; t.status != null)), "every passenger has a status");
+
+        System.out.println("== 9. fares and validation ==");
+        clock.set(LocalDateTime.of(2026, 12, 9, 12, 0));
+        Booking tq = irctc.book("x1", "12001", day, "3A", "NDLS", "BPL", Quota.TATKAL, List.of(p("Neha")));
+        System.out.println(show(tq));
+        check(tq.fare == 1752 + 500, "tatkal surcharge 30% capped at Rs 500");
+        expectThrows(IllegalArgumentException.class, () -&gt; irctc.book("x2", "12951", day, "3A", "NDLS", "BPL",
+                Quota.GENERAL, List.of(p("X"))), "train does not serve BPL");
+        expectThrows(IllegalArgumentException.class, () -&gt; irctc.book("x3", T, day, "3A", "NDLS", "NGP", Quota.TATKAL,
+                List.of(p("a"), p("b"), p("c"), p("d"), p("e"))), "5 passengers on tatkal");
+        clock.set(LocalDateTime.of(2026, 12, 10, 0, 0));
+        expectThrows(BookingClosedException.class, () -&gt; irctc.book("x4", T, day, "3A", "NDLS", "AGC",
+                Quota.GENERAL, List.of(p("Late"))), "after departure day starts");
+
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+
+    interface Task { void run(int i) throws Exception; }
+
+    static void runConcurrently(int n, Task task) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(32);
+        CountDownLatch start = new CountDownLatch(1);
+        List&lt;Future&lt;Object&gt;&gt; futures = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) {
+            final int id = i;
+            futures.add(pool.submit(() -&gt; {
+                start.await();
+                task.run(id);
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future&lt;Object&gt; f : futures) f.get(30, TimeUnit.SECONDS); // rethrows any unexpected failure
+        pool.shutdown();
+    }
+}</code></pre>
+      <p>Build and run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>. In scene 7 the two tatkal winners differ between runs (thread timing decides who reaches the lock first), and scene 8's counts depend on the random interleaving; the checks hold every time.</p>
+<pre class="terminal"><code>== 1. search and availability ==
+  trains NDLS-&gt;BPL: [12001, 12627]
+  12627 3A NDLS-&gt;NGP: AVAILABLE 5, tatkal 2, RAC halves 2
+== 2. one berth, two passengers (segment reuse) ==
+  PNR 4000000001 NDLS-&gt;GWL Rs 782: Alice=CNF B1-1 LOWER
+  PNR 4000000002 GWL-&gt;NGP Rs 1945: Bob=CNF B1-1 LOWER
+== 3. general quota runs out: CNF, then RAC, then WL ==
+  PNR 4000000003 NDLS-&gt;NGP Rs 10908: Chitra=CNF B1-2 MIDDLE Chirag=CNF B1-3 UPPER Chetan=CNF B1-4 LOWER Chhavi=CNF B1-8 SIDE_UPPER
+  PNR 4000000004 NDLS-&gt;NGP Rs 5454: Dev=RAC 1 (B1-7) Esha=RAC 2 (B1-7)
+  PNR 4000000005 NDLS-&gt;NGP Rs 5454: Farah=WL 1 Gopal=WL 2
+  display now: WL 3
+== 4. all or nothing: 2 passengers, 1 waitlist place left ==
+  rejected as expected: REGRET: waitlist full
+  PNR 4000000007 NDLS-&gt;NGP Rs 2727: Hari=WL 3
+  rejected as expected: REGRET: waitlist full
+  display now: REGRET
+== 5. cancellation promotes RAC and WL in order ==
+  SMS Chitra: CNF B1-2 MIDDLE -&gt; CAN
+  SMS Chirag: CNF B1-3 UPPER -&gt; CAN
+  SMS Chetan: CNF B1-4 LOWER -&gt; CAN
+  SMS Chhavi: CNF B1-8 SIDE_UPPER -&gt; CAN
+  SMS Dev: RAC 1 (B1-7) -&gt; CNF B1-2 MIDDLE
+  SMS Esha: RAC 2 (B1-7) -&gt; CNF B1-3 UPPER
+  SMS Farah: WL 1 -&gt; CNF B1-4 LOWER
+  SMS Gopal: WL 2 -&gt; CNF B1-8 SIDE_UPPER
+  SMS Hari: WL 3 -&gt; RAC 1 (B1-7)
+  rejected as expected: no PNR 123
+== 6. a gap that only fits a shorter trip ==
+  PNR 4000000009 GWL-&gt;BPL Rs 970: Mohan=CNF B1-1 LOWER
+== 7. tatkal window and the 10:00 rush ==
+  rejected as expected: tatkal opens at 2026-12-09T10:00
+  100 users at 10:00:00 -&gt; 2 confirmed, 98 regret
+  PNR 4000000010 NDLS-&gt;NGP Rs 3227: T1=CNF B1-5 MIDDLE
+  PNR 4000000011 NDLS-&gt;NGP Rs 3227: T3=CNF B1-6 UPPER
+== 8. random race: 300 bookings then 150 cancellations at once ==
+  booked 11, regret 289; invariants hold
+  cancelled every second booking: 8 CNF passengers left; no double sale, no missed promotion
+== 9. fares and validation ==
+  PNR 4000000410 NDLS-&gt;BPL Rs 2252: Neha=CNF B1-5 MIDDLE
+  rejected as expected: 12951 does not run NDLS-&gt;BPL
+  rejected as expected: 1..4 passengers
+  rejected as expected: train has left
+ALL 27 CHECKS PASSED</code></pre>
+    </div>
+  </div>
+  

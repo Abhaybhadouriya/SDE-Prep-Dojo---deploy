@@ -1,0 +1,98 @@
+
+        <h2>Data model</h2>
+        <p>There are two very different kinds of data, and they want different stores.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Shape and access</th><th>Good store</th><th>Shard key</th></tr></thead>
+            <tbody>
+              <tr><td>Workspaces, users, channels, memberships, permissions</td><td>Relational, needs transactions ("create private channel + add 3 members"), joins for admin screens</td><td>Sharded MySQL (Slack uses Vitess) or a document DB (Teams uses Azure Cosmos DB)</td><td>workspace or channel id; membership also indexed by user id</td></tr>
+              <tr><td>Messages (and reactions, thread replies)</td><td>Append-heavy, read "latest N in channel" and "N before X", huge and growing forever</td><td>Wide-column (Cassandra / ScyllaDB like Discord) or sharded MySQL (like Slack)</td><td><b>(channel_id, time bucket)</b></td></tr>
+              <tr><td>Read cursors / unread</td><td>Tiny row per (user, channel), updated often</td><td>KV or the membership row itself, cached</td><td>user id</td></tr>
+              <tr><td>Presence, typing, connection map</td><td>Ephemeral, high rate, fine to lose</td><td>In-memory on presence/gateway servers; maybe Redis with TTL</td><td>user id (hashed)</td></tr>
+              <tr><td>Search index</td><td>Inverted index over text</td><td>Solr / Elasticsearch (Slack uses Solr)</td><td>workspace (tenant) or time</td></tr>
+              <tr><td>Files</td><td>Large blobs</td><td>Object store + CDN</td><td>object key</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">-- Metadata (relational, sharded)
+CREATE TABLE channels (
+  channel_id     BIGINT PRIMARY KEY,      -- Snowflake-style id
+  workspace_id   BIGINT NOT NULL,         -- the ORIGINATING workspace
+  name           VARCHAR(80),
+  is_private     BOOLEAN NOT NULL,
+  kind           ENUM('channel','dm','group_dm'),
+  created_at     TIMESTAMP
+);
+
+CREATE TABLE channel_members (
+  channel_id           BIGINT,
+  user_id              BIGINT,
+  last_read_message_id BIGINT,             -- the "bookmark"
+  mention_count        INT DEFAULT 0,      -- unread @mentions, kept as a counter
+  notify_pref          TINYINT,
+  PRIMARY KEY (channel_id, user_id)
+);
+CREATE INDEX by_user ON channel_members (user_id, channel_id);  -- "my channels"
+
+-- Shared channels across companies: ONE copy of the channel, plus a bridge row per workspace
+CREATE TABLE shared_channels (
+  channel_id              BIGINT,
+  target_workspace_id     BIGINT,
+  originating_workspace_id BIGINT,
+  name_override           VARCHAR(80),
+  PRIMARY KEY (channel_id, target_workspace_id)
+);</code></pre>
+<pre><code class="language-sql">-- Messages (Cassandra/ScyllaDB style, the shape Discord describes)
+CREATE TABLE messages (
+  channel_id  bigint,
+  bucket      int,          -- fixed time window, e.g. 10 days, so one partition never grows forever
+  message_id  bigint,       -- Snowflake: sortable by time
+  author_id   bigint,
+  thread_root bigint,       -- null for top-level messages
+  content     text,
+  edited_at   timestamp,
+  PRIMARY KEY ((channel_id, bucket), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Messages partitioned by channel and time bucket; metadata tables link workspaces, channels and members">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="zone-label" x="20" y="24">Metadata (sharded SQL)</text>
+            <rect class="box db" x="20" y="40" width="150" height="50"/>
+            <text class="label small" x="95" y="70">workspaces</text>
+            <rect class="box db" x="20" y="120" width="150" height="50"/>
+            <text class="label small" x="95" y="150">channels</text>
+            <rect class="box db" x="20" y="200" width="150" height="70"/>
+            <text class="label small" x="95" y="225">channel_members</text>
+            <text class="label small" x="95" y="250">last_read, mentions</text>
+            <path class="arrow" d="M95 90 L95 114"/>
+            <path class="arrow" d="M95 170 L95 194"/>
+            <rect class="zone" x="250" y="30" width="530" height="250"/>
+            <text class="zone-label" x="262" y="52">Messages: partition = (channel_id, bucket)</text>
+            <rect class="box cache" x="270" y="70" width="150" height="56"/>
+            <text class="label small" x="345" y="93">C42, bucket 101</text>
+            <text class="label small" x="345" y="113">old, cold disk</text>
+            <rect class="box cache" x="440" y="70" width="150" height="56"/>
+            <text class="label small" x="515" y="93">C42, bucket 102</text>
+            <text class="label small" x="515" y="113">last week</text>
+            <rect class="box hot" x="610" y="70" width="150" height="56"/>
+            <text class="label small" x="685" y="93">C42, bucket 103</text>
+            <text class="label small" x="685" y="113">NOW: appends here</text>
+            <rect class="box cache" x="270" y="160" width="150" height="56"/>
+            <text class="label small" x="345" y="193">C7, bucket 103</text>
+            <rect class="box cache" x="440" y="160" width="150" height="56"/>
+            <text class="label small" x="515" y="193">C9, bucket 99</text>
+            <rect class="box cache" x="610" y="160" width="150" height="56"/>
+            <text class="label small" x="685" y="193">C13, bucket 103</text>
+            <text class="label small" x="515" y="250">inside a partition: rows sorted by message_id DESC</text>
+            <path class="arrow dashed" d="M170 145 L262 100"/>
+            <circle class="packet" r="5"><animateMotion dur="2.5s" repeatCount="indefinite" path="M170 145 L262 100 L610 98"/></circle>
+          </svg>
+          <figcaption>A channel's history is split into time buckets. "Show the latest 50" reads one partition, already sorted. Old buckets are never written again, which is friendly to compaction and cheap storage.</figcaption>
+        </figure>
+        <h3>SQL or NoSQL? Say both, and why</h3>
+        <ul>
+          <li><b>Metadata wants SQL.</b> Permissions and membership need transactions and constraints; it is far smaller than messages. Slack runs this, and messages too, on MySQL sharded with Vitess.</li>
+          <li><b>Messages can be either.</b> The access pattern is "append, then range read by (channel, time)". A wide-column store does that natively and spreads writes well. Sharded MySQL also works if the shard key is the channel. Discord moved from 177 Cassandra nodes to 72 ScyllaDB nodes and saw history-fetch p99 fall from 40-125 ms to about 15 ms.</li>
+          <li><b>The shard key matters more than the engine.</b> Slack's original design put each whole workspace on one MySQL shard. The biggest customers outgrew the biggest hardware and one shard outage took a whole company offline. Moving to shard messages by <b>channel id</b> spread the load. See <a href="{{BASE}}hld/hld-07">Data Modeling &amp; Indexing</a> and <a href="{{BASE}}hld/hld-08">Choosing Storage</a>.</li>
+        </ul>
+      

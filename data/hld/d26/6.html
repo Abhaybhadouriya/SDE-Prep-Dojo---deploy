@@ -1,0 +1,256 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the order book structure, price-time priority with one worked match, and "single thread per shard + sequencer + journal" is a strong SDE-1 answer. Deep dives 2-4 are SDE-2. 5-6 are "good to know".</p></div>
+
+        <h3>1. Matching, one order at a time (must know)</h3>
+        <p>The book has asks A 200 @ 101, B 100 @ 101 (B arrived after A), C 300 @ 102, and a bid D 500 @ 100. Now order <b>E: BUY 400 @ 102 (limit)</b> arrives. Click through:</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Matching a buy order of 400 at 102 against asks at 101 and 102">
+            <rect class="box client" x="20" y="120" width="150" height="60"/>
+            <text class="label" x="95" y="146">E: BUY 400</text>
+            <text class="label small" x="95" y="166">limit 102</text>
+            <rect class="box kafka" x="260" y="40" width="70" height="40"/><text class="label" x="295" y="65">102</text>
+            <rect class="box kafka" x="260" y="140" width="70" height="40"/><text class="label" x="295" y="165">101</text>
+            <rect class="box db" x="260" y="240" width="70" height="40"/><text class="label" x="295" y="265">100</text>
+            <rect class="box plain" x="350" y="240" width="110" height="40"/><text class="label small" x="405" y="265">D bid 500</text>
+            <g data-step-only="1">
+              <rect class="box plain" x="350" y="40" width="110" height="40"/><text class="label small" x="405" y="65">C 300</text>
+              <rect class="box hot" x="350" y="140" width="110" height="40"/><text class="label small" x="405" y="165">A 200</text>
+              <rect class="box plain" x="480" y="140" width="110" height="40"/><text class="label small" x="535" y="165">B 100</text>
+              <path class="arrow" d="M170 150 L252 160"/>
+              <text class="label small" x="600" y="230">best ask 101 &lt;= 102: cross</text>
+            </g>
+            <g data-step-only="2">
+              <rect class="box plain" x="350" y="40" width="110" height="40"/><text class="label small" x="405" y="65">C 300</text>
+              <rect class="box fail" x="350" y="140" width="110" height="40"/><text class="label small" x="405" y="165">A filled</text>
+              <rect class="box hot" x="480" y="140" width="110" height="40"/><text class="label small" x="535" y="165">B 100</text>
+              <text class="label ok" x="660" y="120">trade 1: 200 @ 101 (A)</text>
+              <text class="label small" x="660" y="146">E still needs 200</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box hot" x="350" y="40" width="110" height="40"/><text class="label small" x="405" y="65">C 300</text>
+              <text class="label ok" x="660" y="120">trade 2: 100 @ 101 (B)</text>
+              <text class="label small" x="660" y="146">level 101 empty, removed</text>
+              <text class="label small" x="660" y="170">E still needs 100</text>
+            </g>
+            <g data-step-only="4">
+              <rect class="box plain" x="350" y="40" width="110" height="40"/><text class="label small" x="405" y="65">C 200 left</text>
+              <text class="label ok" x="660" y="120">trade 3: 100 @ 102 (C)</text>
+              <text class="label small" x="660" y="146">E fully filled</text>
+              <text class="label small" x="660" y="170">new best ask = 102</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Cross?</b> E is a buy at 102. The best ask is 101, which is at or below 102, so E can trade. It takes liquidity: E is the <b>taker</b>; resting orders are <b>makers</b>.</li>
+            <li><b>Time priority.</b> At 101, A arrived first, so A fills first: 200 @ 101. The trade price is the <b>resting</b> order's price (101), not E's limit (102). E has 200 left.</li>
+            <li><b>Next in line.</b> B fills 100 @ 101. Level 101 is now empty and is removed. E has 100 left.</li>
+            <li><b>Next level.</b> 102 is still within E's limit, so C fills 100 @ 102 and keeps 200 resting. E is done: three trades, each emitted as a sequenced event. If E had quantity left, it would rest on the bid side at 102.</li>
+          </ol>
+        </div>
+        <p>Here is the same thing as runnable Python (about 50 lines). Production engines use linked lists and tick-indexed arrays instead of <code>bisect.insort</code>, but the logic is identical:</p>
+<pre><code class="language-python">from collections import deque
+import bisect
+
+class Book:
+    """One symbol's order book. Prices are integers (ticks), never floats."""
+    def __init__(self):
+        self.bids, self.asks = {}, {}          # price -&gt; deque of [order_id, qty]
+        self.bid_px, self.ask_px = [], []      # sorted ascending price lists
+        self.index = {}                        # order_id -&gt; [order_id, qty] entry
+
+    def submit(self, oid, side, price, qty):
+        trades = []
+        if side == "BUY":                      # cross while best ask &lt;= my price
+            while qty and self.ask_px and self.ask_px[0] &lt;= price:
+                qty = self._fill(self.asks, self.ask_px, 0, oid, qty, trades)
+        else:                                  # cross while best bid &gt;= my price
+            while qty and self.bid_px and self.bid_px[-1] &gt;= price:
+                qty = self._fill(self.bids, self.bid_px, -1, oid, qty, trades)
+        if qty:                                # rest the remainder on the book
+            book, prices = (self.bids, self.bid_px) if side == "BUY" else (self.asks, self.ask_px)
+            if price not in book:
+                book[price] = deque()
+                bisect.insort(prices, price)
+            entry = [oid, qty]
+            book[price].append(entry)          # FIFO = time priority
+            self.index[oid] = entry
+        return trades
+
+    def cancel(self, oid):
+        entry = self.index.pop(oid, None)
+        if entry:
+            entry[1] = 0                       # lazy delete, skipped when matched
+
+    def _fill(self, book, prices, pos, oid, qty, trades):
+        price = prices[pos]
+        level = book[price]
+        while qty and level:
+            maker = level[0]
+            if maker[1] == 0:                  # cancelled earlier
+                level.popleft(); continue
+            n = min(qty, maker[1])
+            trades.append((maker[0], oid, price, n))   # trade at the RESTING price
+            maker[1] -= n; qty -= n
+            if maker[1] == 0:
+                level.popleft(); self.index.pop(maker[0], None)
+        if not level:
+            del book[price]; prices.pop(pos)
+        return qty
+
+b = Book()
+b.submit("A", "SELL", 101, 200)
+b.submit("B", "SELL", 101, 100)
+b.submit("C", "SELL", 102, 300)
+b.submit("D", "BUY", 100, 500)
+for t in b.submit("E", "BUY", 102, 400):
+    print("trade maker=%s taker=%s price=%d qty=%d" % t)
+print("best bid", b.bid_px[-1], "best ask", b.ask_px[0], "left at 102:", b.asks[102][0])</code></pre>
+<pre class="terminal"><code>$ python book.py
+trade maker=A taker=E price=101 qty=200
+trade maker=B taker=E price=101 qty=100
+trade maker=C taker=E price=102 qty=100
+best bid 100 best ask 102 left at 102: ['C', 200]</code></pre>
+
+        <h3>2. Determinism: sequencer, event sourcing and the hot standby (must know)</h3>
+        <p>The engine is a <b>state machine</b>: <code>state(n) = apply(state(n-1), input(n))</code>. If <code>apply</code> is deterministic (no wall-clock reads, no random numbers, no iteration over unordered hash maps, no thread timing), then <b>the input log fully defines the state</b>. That gives three superpowers at once:</p>
+        <ul>
+          <li><b>Recovery:</b> load last night's snapshot, replay the journal from the snapshot's sequence number. LMAX described snapshots plus replay giving a full restart in under a minute.</li>
+          <li><b>Hot standby:</b> a replica that consumes the same sequenced input has the same state at every sequence number. Failover = "standby, start publishing from seq N+1".</li>
+          <li><b>Audit:</b> regulators ask "why did order X fill before Y?" You replay and show it.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Sequencer feeds the same numbered inputs to primary and standby engines which produce identical states">
+            <rect class="box queue" x="20" y="95" width="140" height="60"/>
+            <text class="label" x="90" y="121">Sequencer</text>
+            <text class="label small" x="90" y="141">1, 2, 3, 4 ...</text>
+            <rect class="box db" x="250" y="20" width="160" height="50"/>
+            <text class="label" x="330" y="50">Journal (truth)</text>
+            <rect class="box kafka" x="250" y="100" width="160" height="50"/>
+            <text class="label" x="330" y="130">Primary engine</text>
+            <rect class="box kafka ghost" x="250" y="180" width="160" height="50"/>
+            <text class="label" x="330" y="210">Standby engine</text>
+            <path class="arrow" d="M160 110 L242 50"/>
+            <path class="arrow" d="M160 125 L242 125"/>
+            <path class="arrow" d="M160 140 L242 200"/>
+            <rect class="box plain" x="500" y="100" width="270" height="50"/>
+            <text class="label small" x="635" y="130">book @ seq 4 = hash 9f3a</text>
+            <rect class="box plain" x="500" y="180" width="270" height="50"/>
+            <text class="label small" x="635" y="210">book @ seq 4 = hash 9f3a (same)</text>
+            <path class="arrow" d="M410 125 L492 125"/>
+            <path class="arrow" d="M410 205 L492 205"/>
+            <circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M160 125 L250 125"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M160 140 L250 200"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M160 110 L250 50"/></circle>
+          </svg>
+          <figcaption>Same inputs in the same order + deterministic code = identical state. Comparing a hash of the book at checkpoints catches any non-determinism bug early.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Time inside the engine</b> comes from the sequencer's timestamp on each input, never from the engine's own clock. Otherwise primary and standby would disagree (for example on order expiry).</li>
+          <li><b>When is an order "accepted"?</b> Only after its input is durably replicated in the journal. The ack to the broker is gated on that. This is what makes "no acknowledged order is lost" true.</li>
+          <li><b>The sequencer itself</b> must be highly available: a primary/backup pair or a small consensus group (Raft) that agrees on the log. It is one logical writer per shard; that is the price of a total order.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is <b>active-active redundancy with lock-step inputs</b>, like two route processors that receive the same protocol messages in the same order so the standby is "hot" (NSR, non-stop routing). It is also exactly how Kafka followers work: they replay the leader's log in offset order. <b>Where this breaks:</b> one hidden source of non-determinism (a timestamp read, an unordered map) and the two copies silently diverge, so real systems checksum state at checkpoints.</p>
+        </div>
+
+        <h3>3. Why single-threaded? The LMAX Disruptor (must know at SDE-2)</h3>
+        <p>Your instinct says "use many threads to go faster". For a single order book, threads would have to lock the book, and lock contention, cache-line bouncing between cores and context switches cost far more than the matching itself. LMAX's business logic ran on <b>one thread</b>, kept all state in memory, and fed it through a <b>ring buffer</b> called the Disruptor. Parallelism comes from <b>sharding symbols</b> across cores and machines, not from threads sharing one book.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Disruptor ring buffer with producer sequence and consumer sequences for journaller, replicator and business logic">
+            <g>
+              <circle cx="260" cy="150" r="110" fill="none" stroke="var(--queue)" stroke-width="22" stroke-dasharray="36 7"/>
+              <animateTransform attributeName="transform" type="rotate" from="0 260 150" to="360 260 150" dur="20s" repeatCount="indefinite"/>
+            </g>
+            <text class="label" x="260" y="140">ring buffer</text>
+            <text class="label small" x="260" y="162">size = 2^n</text>
+            <text class="label small" x="260" y="180">index = seq &amp; (size - 1)</text>
+            <text class="label small" x="260" y="198">size 8: 13 &amp; 7 = slot 5</text>
+            <rect class="box svc" x="20" y="20" width="150" height="50"/>
+            <text class="label" x="95" y="50">Receiver (writes)</text>
+            <path class="arrow" d="M170 45 L210 70"/>
+            <rect class="box db" x="470" y="20" width="150" height="46"/>
+            <text class="label small" x="545" y="48">Journaller (disk)</text>
+            <rect class="box cache" x="470" y="80" width="150" height="46"/>
+            <text class="label small" x="545" y="108">Replicator (standby)</text>
+            <rect class="box kafka" x="640" y="170" width="150" height="56"/>
+            <text class="label small" x="715" y="194">Business logic</text>
+            <text class="label small" x="715" y="214">waits for both</text>
+            <path class="arrow" d="M372 120 L462 45"/>
+            <path class="arrow" d="M372 140 L462 103"/>
+            <path class="arrow dashed" d="M620 60 L690 162"/>
+            <path class="arrow dashed" d="M620 110 L670 162"/>
+            <text class="label small" x="260" y="290">no locks: each reader only advances its own sequence counter</text>
+          </svg>
+          <figcaption>One writer claims slots by sequence number; several readers follow, each with its own sequence. The journaller and replicator run in parallel; the business logic only processes slot N after both have finished slot N, so it never acts on an input that is not durable.</figcaption>
+        </figure>
+        <ul>
+          <li>LMAX reported ring buffers of 20 million slots (input) and 4 million (output), sized as powers of two so the slot index is a cheap bit mask.</li>
+          <li>Pre-allocated slots = no garbage collection on the hot path. Sequence counters padded to their own cache line = no false sharing.</li>
+          <li>Read the original: Martin Fowler's "The LMAX Architecture" and the Disruptor technical paper.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>You have written this already: a <b>NIC descriptor ring</b>. The driver advances a producer index, the NIC (or the consumer) advances a consumer index, the size is a power of two so wrap-around is <code>idx &amp; mask</code>, and memory barriers replace locks. The Disruptor is that idea in Java, with several consumers chained in a dependency graph. <b>Where this breaks:</b> a NIC ring has one producer and one consumer, but Disruptor consumers form a <b>dependency graph</b> (journaller and replicator must both pass a slot before business logic reads it), so the "free slot" index is the minimum over several consumer sequences, not one tail pointer. Pinning the engine thread with <code>isolcpus</code> / <code>taskset</code> and busy-polling instead of sleeping is NAPI-style polling taken to the extreme.</p>
+        </div>
+
+        <h3>4. Risk checks and money: why eventual consistency is wrong here (must know)</h3>
+        <ul>
+          <li>Before an order reaches the book, the exchange (and before that, the broker) must know the member can pay. A broker typically <b>blocks the funds or margin</b> when the order is placed and releases the unused part on cancel or fill. That is a <b>hold</b>, like a hotel card pre-authorisation.</li>
+          <li>The risk engine keeps each member's limits and current exposure <b>in memory</b>, updated from the same sequenced stream of fills. A database round-trip here would add milliseconds to every order.</li>
+          <li>Never "accept the order and check the balance asynchronously later": by then it may have traded, and trades cannot be undone. Balances on the trading path must be strongly consistent within the shard that owns them.</li>
+          <li>Price bands and circuit breakers: reject orders far from the last price; halt a symbol (or the market) when it moves too far too fast, and restart it with an <b>auction</b>.</li>
+        </ul>
+
+        <h3>5. Market data fan-out and fairness (should know)</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Market data published once by multicast, receiver detects a sequence gap and recovers via retransmit or snapshot">
+            <rect class="box svc" x="20" y="100" width="140" height="60"/>
+            <text class="label" x="90" y="126">Publisher</text>
+            <text class="label small" x="90" y="146">seq 501, 502, 503</text>
+            <rect class="box queue" x="220" y="100" width="130" height="60"/>
+            <text class="label" x="285" y="126">Switch</text>
+            <text class="label small" x="285" y="146">multicast group</text>
+            <path class="arrow" d="M160 130 L212 130"/>
+            <rect class="box client" x="430" y="20" width="160" height="50"/>
+            <text class="label small" x="510" y="50">Member 1: 501 502 503</text>
+            <rect class="box client" x="430" y="105" width="160" height="50"/>
+            <text class="label small" x="510" y="135">Member 2: 501 502 503</text>
+            <rect class="box fail" x="430" y="190" width="160" height="50"/>
+            <text class="label small" x="510" y="220">Member 3: 501 ___ 503</text>
+            <path class="arrow" d="M350 120 L422 50"/>
+            <path class="arrow" d="M350 130 L422 130"/>
+            <path class="arrow" d="M350 140 L422 210"/>
+            <rect class="box db" x="640" y="160" width="150" height="80"/>
+            <text class="label small" x="715" y="186">Retransmit server</text>
+            <text class="label small" x="715" y="206">or snapshot +</text>
+            <text class="label small" x="715" y="226">replay from seq</text>
+            <path class="arrow dashed" d="M590 215 L632 205"/>
+            <text class="label small bad" x="510" y="180">gap: 502 missing</text>
+            <circle class="packet" r="5"><animateMotion dur="1.8s" repeatCount="indefinite" path="M160 130 L285 130 L430 45"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="1.8s" repeatCount="indefinite" path="M160 130 L285 130 L430 130"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="1.8s" repeatCount="indefinite" path="M160 130 L285 130 L430 215"/></circle>
+          </svg>
+          <figcaption>One send, many receivers, same moment. UDP can drop packets, so every message carries a sequence number; a receiver that sees a gap asks a retransmit server, or rebuilds from a snapshot plus later messages.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Two tiers:</b> colocated professional members get raw multicast feeds in the exchange's data centre. Retail apps (a broker's mobile app) get a conflated feed (latest price every N ms) via WebSockets from the broker's servers. This is where Kubernetes and normal web scaling come back in.</li>
+          <li><b>Fairness:</b> exchanges try to give every colocated member equal network paths, because a shorter cable is a faster trade. "Fair" is a physical property here.</li>
+          <li><b>Snapshot + incremental:</b> a late joiner takes a snapshot tagged with <code>last_seq</code>, then applies incremental messages after that sequence. The same trick as a database replica: base backup + <a href="{{BASE}}interview/glossary#wal">WAL</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is <b>IP multicast with IGMP joins</b> and application-level sequence numbers: think of how routing protocols use sequence numbers to detect a missed LSA and request it again. The "snapshot + replay from sequence" join is like a new OSPF neighbour doing a database exchange and then receiving incremental updates. <b>Where this breaks:</b> IGMP only gets packets to you; it never repairs a gap. Market-data recovery is <b>application-level</b>: the subscriber notices a missing sequence number and must fetch it from a retransmit server, or, if it is too far behind, rebuild from a separate <b>snapshot channel</b>.</p>
+        </div>
+
+        <h3>6. Sharding, hot symbols and the opening auction (good to know)</h3>
+        <ul>
+          <li><b>Shard by symbol.</b> Symbols are independent books, so they are the natural unit. Each shard has its own sequencer stream and engine thread. Put a few hot symbols on dedicated shards; group the long tail of quiet ones.</li>
+          <li><b>Cross-symbol orders</b> (spreads, baskets) break the "one shard" rule. Real exchanges handle them with special combination books or by routing to one shard that owns the combo. Mention it; do not try to solve it with distributed transactions.</li>
+          <li><b>Opening auction:</b> at the open there is a burst of orders that already cross. Instead of matching them one by one, the exchange collects orders for a few minutes and picks one price that maximises traded volume (a <b>call auction</b>), then switches to continuous matching. It turns the worst spike into a single batch.</li>
+        </ul>
+        <figure class="diagram">
+          <img src="https://upload.wikimedia.org/wikipedia/commons/1/14/Order_book_depth_chart.gif" alt="Order book depth chart showing cumulative bids rising to the left and asks to the right of the mid price" loading="lazy">
+          <figcaption>A depth chart: cumulative bid size (left) and ask size (right) around the mid price. Image: Wikimedia Commons, "Order book depth chart", licensed CC BY-SA 4.0. Source: <a href="https://commons.wikimedia.org/wiki/File:Order_book_depth_chart.gif" target="_blank" rel="noopener">Wikimedia Commons</a>.</figcaption>
+        </figure>
+      

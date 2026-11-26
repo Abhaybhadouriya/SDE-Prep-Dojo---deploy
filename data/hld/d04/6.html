@@ -1,0 +1,134 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain the stepper above, the data model and the receipts below, you have a solid SDE-1 answer. SDE-2 candidates are expected to lead at least two of these deep dives without being asked.</p></div>
+
+        <h3>1. Routing: how does a message find the right gateway?</h3>
+        <p>There are three common answers, from simple to clever.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Option</th><th>How it works</th><th>Good</th><th>Bad</th></tr></thead>
+            <tbody>
+              <tr><td><b>Session registry</b> (our default)</td><td>Gateways write <code>user:device -&gt; gateway</code> in Redis with a TTL; senders look it up.</td><td>Simple; any user can be on any gateway; easy to reason about.</td><td>One extra lookup per message; the registry must be highly available; stale entries after a crash (TTL fixes it in ~60 s).</td></tr>
+              <tr><td><b>Consistent hashing</b> of user to gateway</td><td>The client is told "connect to the gateway that owns hash(user)"; senders compute the same hash.</td><td>No lookup at all.</td><td>When a gateway dies, its users must move; clients need a smart connect step; uneven load if hashing is naive.</td></tr>
+              <tr><td><b>Pub/sub per user or channel</b></td><td>Each gateway subscribes to topics for the users it holds (Redis Pub/Sub, or an internal broker); the chat service publishes to "user:ben".</td><td>Decouples senders from gateway ids; great for multi-device and channels.</td><td>Millions of tiny subscriptions; the broker becomes the critical path.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Slack's engineering blog describes a mix: stateful <b>channel servers</b> placed on a <b>consistent hash ring</b> (each owns a set of channels), and <b>gateway servers</b> in many regions that hold the WebSocket subscriptions. A message goes to the channel server that owns the channel, which pushes it to every gateway that has a subscriber. That works well when one message goes to many people (channels). For mostly 1:1 chat, the session registry is simpler. See <a href="{{BASE}}hld/d51">Team Chat (Slack / Teams)</a> for the channel version.</p>
+
+        <h3>2. Delivery guarantees, ticks and duplicates</h3>
+        <p>Networks fail in the worst places: the server stored the message but the ack never reached the phone. The phone will retry. If the server blindly stores it again, Ben sees "Hi! Hi!". The fix is <b>at-least-once delivery plus de-duplication</b> on both sides.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 400" role="img" aria-label="Sequence diagram of send, lost ack, retry with same client id, de-duplicated, then delivered and read receipts">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="60" y="10" width="140" height="40"/>
+            <text class="label" x="130" y="30">Asha's app</text>
+            <rect class="box k8s" x="330" y="10" width="140" height="40"/>
+            <text class="label" x="400" y="30">Server</text>
+            <rect class="box client" x="600" y="10" width="140" height="40"/>
+            <text class="label" x="670" y="30">Ben's app</text>
+            <path class="arrow none dashed" d="M130 50 L130 390"/>
+            <path class="arrow none dashed" d="M400 50 L400 390"/>
+            <path class="arrow none dashed" d="M670 50 L670 390"/>
+            <path class="arrow" d="M130 80 L393 80"/>
+            <text class="label small" x="265" y="70">send id=c7f1</text>
+            <path class="arrow bad" d="M400 110 L260 110"/>
+            <text class="label bad" x="235" y="110">X</text>
+            <text class="label small" x="310" y="128">ack lost (tunnel)</text>
+            <path class="arrow" d="M130 160 L393 160"/>
+            <text class="label small" x="265" y="150">retry, same id=c7f1</text>
+            <rect class="box hot" x="415" y="148" width="190" height="28"/>
+            <text class="label small" x="510" y="162">seen c7f1: no new row</text>
+            <path class="arrow ok" d="M400 200 L137 200"/>
+            <text class="label small" x="265" y="190">ack seq 4182 (1 tick)</text>
+            <path class="arrow" d="M400 240 L663 240"/>
+            <text class="label small" x="535" y="230">msg seq 4182</text>
+            <path class="arrow ok" d="M670 280 L407 280"/>
+            <text class="label small" x="535" y="270">delivered up_to 4182</text>
+            <path class="arrow ok" d="M400 310 L137 310"/>
+            <text class="label small" x="265" y="300">2 ticks</text>
+            <path class="arrow accent" d="M670 350 L407 350"/>
+            <text class="label small" x="535" y="340">read up_to 4182</text>
+            <path class="arrow accent" d="M400 380 L137 380"/>
+            <text class="label small" x="265" y="370">blue ticks</text>
+          </svg>
+          <figcaption>The client id makes the retry harmless. Receipts are cumulative ("everything up to 4182"), so one receipt covers a burst of messages.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Server-side dedupe</b>: keep <code>(chat_id, client_msg_id)</code> for a few days (a unique key in the store, or a Redis set with TTL). A repeat returns the original <code>seq</code>.</li>
+          <li><b>Client-side dedupe</b>: the receiving app ignores a <code>msg_id</code> it already has. The server may push the same message twice (for example, once live and once from <code>/sync</code> after a reconnect).</li>
+          <li><b>Never ack before durable</b>: the 1-tick ack is a promise. Write with QUORUM (2 of 3 replicas) first.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is TCP reliability, one layer up. <code>client_msg_id</code> is a sequence number that lets the receiver drop a retransmitted segment; the cumulative <code>up_to_seq</code> receipt is a cumulative ACK; the offline inbox is the retransmission queue. TCP only protects one connection - when the phone switches from Wi-Fi to 4G, the TCP session dies, so the app must repeat the trick end to end. <i>Where it breaks:</i> TCP state lives in two kernels for one connection; here the "receiver window" is spread across the store, the inbox and several devices, so dedupe keys must be stored durably and shared, not kept in one process.</p>
+        </div>
+
+        <h3>3. Ordering inside a chat</h3>
+        <p>Phones have wrong clocks, so you can not sort by the sender's timestamp. Two options:</p>
+        <ol class="steps">
+          <li><strong>Per-chat sequence number</strong> The chat service does an atomic increment on <code>chat_state.next_seq</code> (or Redis <code>INCR seq:{chat_id}</code>) before writing. Everyone sorts by <code>seq</code>. Simple and exact. The cost is one tiny hot counter per chat - fine, because even a busy group sends a few messages per second.</li>
+          <li><strong>Time-sortable unique ids</strong> (Snowflake: 41 bits of milliseconds, 10 bits of machine, 12 bits of sequence; see <a href="{{BASE}}hld/d31">Unique ID Generator</a>). No coordination, roughly ordered by server time. Two messages sent within the same millisecond on different servers may swap, which is usually acceptable for chat.</li>
+        </ol>
+        <p>Also route all messages of one chat through the same path where possible (for example, Kafka keyed by <code>chat_id</code>), so a later message can not overtake an earlier one in a queue.</p>
+
+        <h3>4. Group chats: fan-out</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="A group message fans out from the group service to each member's inbox and gateway">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="110" width="120" height="60" rx="12"/>
+            <text class="label" x="80" y="140">Sender</text>
+            <rect class="box k8s" x="200" y="110" width="150" height="60"/>
+            <text class="label" x="275" y="132">Group fan-out</text>
+            <text class="label small" x="275" y="153">reads members</text>
+            <rect class="box db" x="200" y="210" width="150" height="50"/>
+            <text class="label small" x="275" y="235">1 copy in messages</text>
+            <path class="arrow" d="M140 140 L193 140"/>
+            <path class="arrow" d="M275 170 L275 203"/>
+            <rect class="box svc" x="440" y="20" width="150" height="44"/>
+            <text class="label small" x="515" y="42">member 1 (online)</text>
+            <rect class="box svc" x="440" y="85" width="150" height="44"/>
+            <text class="label small" x="515" y="107">member 2 (online)</text>
+            <rect class="box ghost" x="440" y="150" width="150" height="44"/>
+            <text class="label small" x="515" y="172">member 3 (offline)</text>
+            <rect class="box svc" x="440" y="215" width="150" height="44"/>
+            <text class="label small" x="515" y="237">member N ...</text>
+            <path class="arrow" d="M350 130 L433 42"/>
+            <path class="arrow" d="M350 135 L433 107"/>
+            <path class="arrow dashed" d="M350 145 L433 172"/>
+            <path class="arrow" d="M350 150 L433 237"/>
+            <rect class="box queue" x="640" y="150" width="140" height="44"/>
+            <text class="label small" x="710" y="172">inbox + push</text>
+            <path class="arrow" d="M590 172 L633 172"/>
+            <circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M140 140 L275 140 L440 42"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="2s" begin="0.3s" repeatCount="indefinite" path="M140 140 L275 140 L440 107"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" begin="0.6s" repeatCount="indefinite" path="M140 140 L275 140 L440 172 L640 172"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="2s" begin="0.9s" repeatCount="indefinite" path="M140 140 L275 140 L440 237"/></circle>
+          </svg>
+          <figcaption>Store the group message once; fan out a pointer to each member. Online members get a live push, offline members get an inbox entry and a notification.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Store once, deliver many.</b> The message body is written once under the group's <code>chat_id</code>. Each member's inbox gets only a small pointer <code>(chat_id, seq)</code>.</li>
+          <li>With a cap around 1,000 members, write-time fan-out is fine: 1 message becomes at most ~1,000 deliveries. Do it asynchronously through Kafka (key = <code>group_id</code>) so the sender's ack is not delayed by 1,000 pushes.</li>
+          <li>For <b>huge channels</b> (100K+ followers), switch to fan-out on read: members pull the channel's latest <code>seq</code> when they open it, like a news feed. That is the same push-vs-pull choice as <a href="{{BASE}}hld/d05">News Feed</a> and <a href="{{BASE}}hld/p08">Fan-out (Push vs Pull)</a>.</li>
+          <li>With end-to-end encryption, groups use "sender keys": the sender encrypts once with a group key that members already hold, instead of once per member.</li>
+        </ul>
+
+        <h3>5. Presence and "typing..."</h3>
+        <p>Presence is the sneaky expensive feature. If one user with 500 contacts goes online, a naive server tells 500 people. Multiply by millions of users flapping between Wi-Fi and 4G and presence traffic dwarfs messages.</p>
+        <ul>
+          <li>Store presence as a key with a TTL, refreshed by heartbeats; "last seen" is the time the key expired.</li>
+          <li>Push presence <b>only to people who are looking</b>: when Ben opens the chat with Asha, his app subscribes to Asha's presence; when he leaves, it unsubscribes.</li>
+          <li>Debounce: wait a few seconds before announcing "offline" so a tunnel does not cause flicker.</li>
+          <li>"Typing..." is fire-and-forget: never stored, dropped if the receiver is offline, rate-limited to one event every few seconds.</li>
+        </ul>
+
+        <h3>6. Multi-device, media and encryption</h3>
+        <ul>
+          <li><b>Multi-device</b>: the registry key is <code>user:device</code>, and each device has its own inbox cursor. With end-to-end encryption, each device has its own keys, so the sender's app encrypts once per recipient device (that is why device count is capped).</li>
+          <li><b>Media</b>: the app asks for a signed upload URL, uploads bytes straight to blob storage (S3-like, see <a href="{{BASE}}hld/d36">Object Storage</a>), and sends only a small message with <code>media_id</code> and the decryption key. The chat servers never carry megabytes. Receivers download through a CDN.</li>
+          <li><b>End-to-end encryption</b> (Signal protocol): the server routes and stores ciphertext only. Consequences you should say out loud: no server-side search, no server-side spam scanning of content, and backups must be encrypted by the user.</li>
+        </ul>
+        <div class="callout warn"><p><b>Gateway restarts are the classic outage.</b> When a gateway with 500K connections restarts, 500K phones reconnect at once - a <b>reconnect storm</b> - and they all call <code>/sync</code>. Defend with: draining gateways slowly during deploys, clients reconnecting with <b>exponential backoff plus random jitter</b>, and the sync API protected by a rate limiter (see <a href="{{BASE}}hld/d02">Rate Limiter</a>).</p></div>
+      

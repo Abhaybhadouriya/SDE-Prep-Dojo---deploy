@@ -1,0 +1,94 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>The last double room for the night of 5 February. Two guests press "Book" at the same moment. If "is a room free?" and "take it" are two separate steps, both guests pass the check and both take the room. That is the <b>check-then-act</b> race, and in a hotel it has an extra twist: the check covers <b>several nights</b>, so a lock-free "pop one item" trick (as in a parking lot) is not enough. All nights must be checked and taken as one unit.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 310" role="img" aria-label="Check-then-act race on the last room and the per-hotel lock fix">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="42">Guest A thread</text>
+      <rect class="box client" x="20" y="210" width="150" height="44"/><text class="label small" x="95" y="232">Guest B thread</text>
+      <rect class="box db" x="320" y="110" width="170" height="70"/><text class="label" x="405" y="136">H2 DOUBLE</text><text class="label small" x="405" y="160">5 Feb, 6 Feb: 1 free</text>
+      <g data-step="1"><path class="arrow" d="M170 50 L314 120"/><text class="label small left" x="200" y="56">1. free(5..7)? 1</text></g>
+      <g data-step="2"><path class="arrow" d="M170 225 L314 170"/><text class="label small left" x="190" y="262">2. free(5..7)? still 1</text></g>
+      <g data-step-only="3">
+        <rect class="box ring fail" x="320" y="110" width="170" height="70"/>
+        <text class="label bad" x="650" y="120">3. both take():</text>
+        <text class="label bad" x="650" y="145">reserved = 2 of 1</text>
+        <text class="label small bad" x="650" y="170">two guests, one room</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="520" y="196" width="260" height="104"/>
+        <text class="label small" x="650" y="216">Fix: one critical section per hotel</text>
+        <text class="label mono" x="650" y="240">lock(H2)</text>
+        <text class="label mono" x="650" y="260">check all nights, take all nights</text>
+        <text class="label mono" x="650" y="280">unlock(H2)  - B then sees 0</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Guest A asks for the nights of 5 and 6 February: one room is free on both.</li>
+      <li>Before A writes anything, guest B asks the same question and gets the same answer.</li>
+      <li>Both write "taken". The counters now say 2 reserved out of 1. Nothing crashes; a family arrives at the desk to find no room.</li>
+      <li>The fix: check every night and take every night inside one critical section on the hotel's lock. B then waits, sees 0 free, and gets a clear error. The demo runs 8 threads at H2's only double: exactly 1 winner, 7 rejections.</li>
+    </ol>
+  </div>
+  <h3>Every shared thing and how it is protected</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Race</th><th>Protection in our code</th></tr></thead>
+      <tbody>
+        <tr><td>Per-night counts of one hotel</td><td>Overbooking the last room</td><td><code>hotel.lock</code> (a <code>ReentrantLock</code>) around check + take, release, and every status change</td></tr>
+        <tr><td>Booking status</td><td>Pay and expire at the same instant; cancel twice</td><td>Changed only under the hotel lock, through <code>canMoveTo</code>; the sweep re-checks the status after taking the lock</td></tr>
+        <tr><td>Hotels and bookings maps</td><td>Lookups during inserts</td><td><code>ConcurrentHashMap</code>; <code>putIfAbsent</code> rejects a duplicate hotel id</td></tr>
+        <tr><td>Booking id counter</td><td>Two bookings with one id</td><td><code>AtomicInteger.incrementAndGet()</code></td></tr>
+        <tr><td>Listener list</td><td>Adding a listener while notifying</td><td><code>CopyOnWriteArrayList</code>; listeners are called after the lock is released</td></tr>
+        <tr><td>Clock</td><td>Tests moving time across threads</td><td><code>volatile</code> field in <code>FakeClock</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Why one lock per hotel, and not one global lock or one per night?</h3>
+  <ul>
+    <li><b>Global lock:</b> obviously correct, but a booking in Goa waits for a booking in Delhi. Fine for a 20-minute demo, weak for an SDE-2 answer.</li>
+    <li><b>Per hotel (ours):</b> bookings in different hotels never wait for each other; a booking touches exactly one hotel, so there is never a second lock to order.</li>
+    <li><b>Per (type, night):</b> more parallel, but a 3-night stay needs 3 locks, so you must take them in date order to avoid deadlock, and a failed check means unlocking everything. It is the right shape for a database (row locks), not for in-memory code in an interview.</li>
+  </ul>
+  <p>Two smaller rules matter as much as the lock. <b>Never call listeners while holding the lock</b>: an email sender that blocks for two seconds would block every booking in that hotel. And <b>expire lazily</b>: <code>search</code> and <code>hold</code> call <code>expireHolds()</code> first, and <code>confirm</code> checks the time itself, so correctness never depends on a background timer firing on time. A scheduled sweep can still run in production for tidiness.</p>
+  <h3>The database version</h3>
+  <p>When inventory lives in the <code>room_type_inventory</code> table, there are two standard answers. Say both and pick by contention:</p>
+<pre><code class="language-sql">-- 1. Guarded update (no explicit lock; it implicitly row-locks the matched nights until COMMIT)
+UPDATE room_type_inventory
+   SET reserved = reserved + :rooms
+ WHERE hotel_id = :h AND room_type = :t
+   AND night &gt;= :check_in AND night &lt; :check_out
+   AND reserved + :rooms &lt;= total;
+-- success only if the row count equals the number of nights; otherwise ROLLBACK
+
+-- 2. Pessimistic: lock the night rows in a fixed order, then check and update
+BEGIN;
+SELECT night, total - reserved AS free
+  FROM room_type_inventory
+ WHERE hotel_id = :h AND room_type = :t AND night &gt;= :check_in AND night &lt; :check_out
+ ORDER BY night
+   FOR UPDATE;
+-- if every night has free &gt;= :rooms: UPDATE ... SET reserved = reserved + :rooms; COMMIT
+-- else ROLLBACK</code></pre>
+  <p>The guarded update is short and implicitly locks only the matched rows, in index order (and, in InnoDB, the gaps next to them), until commit, so it <b>rarely</b> deadlocks; it is not impossible if other transactions lock nights in a different order or the planner picks another index. Still retry on deadlock and serialization errors (PostgreSQL <code>40P01</code>/<code>40001</code>, MySQL <code>1213</code>). Check that the row count equals the number of nights and <code>ROLLBACK</code> when it does not. It also leans on the <code>CHECK (reserved &lt;= total)</code> constraint as a final safety net. The <code>ORDER BY night</code> in the pessimistic version is not cosmetic: two transactions that lock the same nights in the same order cannot deadlock. A version column with retries is the third option and fits when contention is low (most nights of most hotels). See <a href="{{BASE}}lld/lld-conc-booking">Booking concurrency</a> and <a href="{{BASE}}lld/lld-conc-deadlock">Deadlock</a> for the general patterns, and <a href="{{BASE}}hld/d40">the HLD hotel design</a> for how this scales across services.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The per-hotel lock is a per-object lock, like <code>inode-&gt;i_rwsem</code> or a per-socket lock (a <code>ReentrantLock</code> is a sleeping mutex, not a spinlock: a waiting thread blocks instead of spinning): fine-grained enough that unrelated objects never contend, coarse enough that one operation needs only one lock. Locking night rows <code>ORDER BY night</code> is the kernel's lock-ordering rule (for example, <code>double_rq_lock()</code> always takes the lower run-queue first). The state machine guarding HELD to CONFIRMED is the same discipline as a TCP state table: an ACK that arrives after a timer moved the socket to CLOSED is simply dropped.</p>
+  </div>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>Condition.await()</code> / <code>signal()</code></td><td><code>wait_event()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: test the condition under the lock and re-test in a <code>while</code> loop after every wake.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td>Java <code>volatile</code></td><td><b>Not</b> C's <code>volatile</code>. It means visibility plus ordering: every read is like <code>READ_ONCE()</code> with acquire semantics and every write like <code>WRITE_ONCE()</code> with release semantics (<code>smp_load_acquire</code>/<code>smp_store_release</code>). It does not make <code>x++</code> atomic. See <a href="{{BASE}}lld/lld-conc-basics#volatile">volatile in Concurrency basics</a>.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+        <tr><td><code>CountDownLatch</code></td><td><code>struct completion</code> with a count: <code>countDown()</code> is <code>complete()</code>, <code>await()</code> is <code>wait_for_completion()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

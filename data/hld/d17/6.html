@@ -1,0 +1,129 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Partitioning: modulo, consistent hashing, or hash slots</h3>
+        <p>The naive rule <code>node = hash(key) mod N</code> breaks the moment N changes: going from 4 to 5 nodes changes the answer for about 80% of keys (only keys where <code>h mod 4 == h mod 5</code> stay), so the hit ratio collapses and the database is flooded. Two fixes are used in practice:</p>
+        <ul>
+          <li><b>Consistent hashing with virtual nodes</b> (Memcached clients, Dynamo, Cassandra): put many points per server on a hash ring; a key belongs to the next point clockwise. Adding a server only takes the slices next to its points, about 1/N of keys. See <a href="{{BASE}}hld/hld-02">Distributed Building Blocks</a>.</li>
+          <li><b>Fixed hash slots</b> (Redis Cluster): the key space is cut into exactly <b>16,384 slots</b>; <code>slot = CRC16(key) mod 16384</code>; a small table maps slots to nodes. Scaling moves whole slots between nodes. A <b>hash tag</b> <code>{...}</code> makes several keys hash only on the part inside braces, so <code>{user:42}:cart</code> and <code>{user:42}:profile</code> land in one slot and can be used together in a multi-key command.</li>
+        </ul>
+<pre><code class="language-python">def crc16(data: bytes) -&gt; int:            # CRC16-XMODEM, as in the Redis Cluster spec
+    crc = 0
+    for b in data:
+        crc ^= b &lt;&lt; 8
+        for _ in range(8):
+            crc = ((crc &lt;&lt; 1) ^ 0x1021) if crc &amp; 0x8000 else (crc &lt;&lt; 1)
+            crc &amp;= 0xFFFF
+    return crc
+
+def key_slot(key: str) -&gt; int:
+    s = key.find("{")
+    if s != -1:
+        e = key.find("}", s + 1)
+        if e &gt; s + 1:                     # non-empty {hash tag}
+            key = key[s + 1:e]
+    return crc16(key.encode()) % 16384
+
+print(hex(crc16(b"123456789")))          # spec test vector: 0x31c3
+for k in ["user:42", "user:43", "{user:42}:cart", "{user:42}:profile"]:
+    print(f"{k:20} slot {key_slot(k)}")</code></pre>
+<pre class="terminal"><code>$ python slot.py
+0x31c3
+user:42              slot 15880
+user:43              slot 11817
+{user:42}:cart       slot 15880
+{user:42}:profile    slot 15880</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Adding a fifth node: with modulo most keys move; with slots only the slots given to the new node move">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="34">hash mod N, N: 4 -&gt; 5</text>
+            <rect class="box fail" x="20" y="50" width="300" height="40"/>
+            <text class="label bad" x="170" y="76">about 80% of keys move</text>
+            <text class="label left" x="20" y="134">hash slots: give node E 1/5 of slots</text>
+            <rect class="box cache" x="20" y="150" width="70" height="40"/><text class="label small" x="55" y="175">A</text>
+            <rect class="box cache" x="95" y="150" width="70" height="40"/><text class="label small" x="130" y="175">B</text>
+            <rect class="box cache" x="170" y="150" width="70" height="40"/><text class="label small" x="205" y="175">C</text>
+            <rect class="box cache" x="245" y="150" width="70" height="40"/><text class="label small" x="280" y="175">D</text>
+            <rect class="box hot" x="420" y="150" width="90" height="40"/><text class="label" x="465" y="175">E (new)</text>
+            <path class="arrow" d="M320 170 L414 170"/>
+            <text class="label small left" x="540" y="166">only ~20% of keys move,</text>
+            <text class="label small left" x="540" y="186">a few slots at a time</text>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M55 150 C 200 110, 350 110, 465 150"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.5s" begin="1.2s" repeatCount="indefinite" path="M280 150 C 350 120, 420 120, 465 150"/></circle>
+          </svg>
+          <figcaption>Every existing node donates a few slots to the new node; keys in all other slots stay put, so the hit ratio barely dips.</figcaption>
+        </figure>
+        <p><b>Smart client vs proxy.</b> A smart client (Redis Cluster clients, Memcached clients with consistent hashing) saves one network hop but puts routing logic in every language's library. A proxy (Twitter's twemproxy, Meta's mcrouter, Envoy's Redis filter) centralises routing, connection pooling and failover policy, at the cost of an extra hop and another tier to run. Big fleets often choose the proxy for operational control.</p>
+
+        <h3>2. Replication and failover: async, so it can lose writes</h3>
+        <p>Each primary streams its writes to one or more replicas. Redis replication is <b>asynchronous</b>: the primary acknowledges the client first and sends to replicas afterwards. If the primary crashes between those two moments, the promoted replica never saw the write. The <code>WAIT numreplicas timeout</code> command makes the client wait until N replicas acknowledged, which shrinks that window but does not make the system strongly consistent (a failover can still pick a replica that missed it).</p>
+        <p>Failure detection: in Redis Cluster, nodes ping each other over a cluster bus; when a majority of primaries agree a primary is unreachable for longer than <code>cluster-node-timeout</code>, one of its replicas is elected and promoted. In standalone mode, Redis Sentinel processes do the same job. Put each replica in a different availability zone from its primary.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Primary-replica with heartbeat failover is your active-standby control card with hello timers. Async replication is a standby that is "warm but behind": on switchover you lose whatever was not yet mirrored. The cluster's majority vote before promotion is split-brain protection, the same reason HA pairs use a quorum or witness. <i>Where this breaks:</i> a router's standby rebuilds state from neighbours (graceful restart); a cache replica cannot rebuild lost writes, it just turns them into misses, which is fine because the database still has them.</p>
+        </div>
+        <p>Persistence is optional for a cache. Redis offers RDB snapshots (a forked child writes the dataset to disk) and an AOF append-only log. Snapshots are useful for a warm restart: a cold 64 GB node means 64 GB of misses hitting the database. But note the fork: copy-on-write during a snapshot can temporarily need much more memory under heavy writes, which is one reason to leave RAM headroom.</p>
+
+        <h3>3. Hot keys and the thundering herd</h3>
+        <p><b>Hot keys.</b> From the estimate: one key at 90,000 reads/s maxes out its node no matter how many nodes you add. Fixes, cheapest first:</p>
+        <ul>
+          <li><b>Local in-process cache (L1)</b> with a very short TTL (1-5 s) in every app pod. 200 pods each refreshing once per 2 s turns 90,000 reads/s into about 100 reads/s on Redis. Cost: up to 2 s of staleness.</li>
+          <li><b>Replicate the hot key</b>: write it under N salted names (<code>product:9001#0</code> .. <code>#7</code>) that land on different nodes; readers pick one at random. Writers must update all copies.</li>
+          <li><b>Read from replicas</b> for that key (acceptable staleness).</li>
+          <li><b>Detect it</b>: client-side sampling, <code>redis-cli --hotkeys</code> (needs an LFU policy), or proxy metrics. You cannot fix what you cannot see.</li>
+        </ul>
+        <p><b>Cache stampede</b> (thundering herd, dogpile): a hot key expires, and 5,000 requests miss at the same instant and all run the same expensive query. Fixes:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Request coalescing: many requests for one missing key wait on a single database query instead of each running their own">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="28">Without coalescing</text>
+            <rect class="box client" x="20" y="40" width="80" height="30"/><rect class="box client" x="20" y="80" width="80" height="30"/><rect class="box client" x="20" y="120" width="80" height="30"/>
+            <text class="label small" x="60" y="60">req</text><text class="label small" x="60" y="100">req</text><text class="label small" x="60" y="140">req</text>
+            <rect class="box db hot" x="250" y="70" width="110" height="50"/><text class="label" x="305" y="100">DB</text>
+            <path class="arrow bad" d="M100 55 L244 85"/><path class="arrow bad" d="M100 95 L244 95"/><path class="arrow bad" d="M100 135 L244 105"/>
+            <text class="label bad" x="305" y="145">N queries</text>
+            <text class="label left" x="430" y="28">With coalescing / lease</text>
+            <rect class="box client" x="430" y="40" width="80" height="30"/><rect class="box client" x="430" y="80" width="80" height="30"/><rect class="box client" x="430" y="120" width="80" height="30"/>
+            <text class="label small" x="470" y="60">req</text><text class="label small" x="470" y="100">wait</text><text class="label small" x="470" y="140">wait</text>
+            <rect class="box svc" x="560" y="80" width="90" height="30"/><text class="label small" x="605" y="100">1 loader</text>
+            <rect class="box db" x="690" y="70" width="90" height="50"/><text class="label" x="735" y="100">DB</text>
+            <path class="arrow" d="M510 55 L554 90"/><path class="arrow dashed" d="M510 95 L554 95"/><path class="arrow dashed" d="M510 135 L554 100"/>
+            <path class="arrow ok" d="M650 95 L684 95"/>
+            <text class="label ok" x="735" y="145">1 query</text>
+            <circle class="packet bad" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M100 55 L250 85"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="1.5s" begin="0.3s" repeatCount="indefinite" path="M100 95 L250 95"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="1.5s" begin="0.6s" repeatCount="indefinite" path="M100 135 L250 105"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M560 95 L690 95"/></circle>
+            <text class="label small" x="400" y="210">+ jittered TTLs so many keys do not expire together</text>
+            <text class="label small" x="400" y="232">+ refresh early in the background before expiry</text>
+          </svg>
+          <figcaption>Left: every miss goes to the database at once. Right: one request loads the value; the rest wait for it (or briefly serve the old value).</figcaption>
+        </figure>
+        <ul>
+          <li><b>Request coalescing</b> ("single flight"): inside one process, concurrent misses for the same key share one in-flight load. Discord describes doing this in its Rust data services in front of its message database.</li>
+          <li><b>Leases</b> (Meta's memcache paper): on a miss the server hands out a lease token to only one client; others are told to wait briefly and retry. Meta's paper says servers issue a token for a given key at most once every 10 seconds. The same token also stops stale sets (deep dive 4).</li>
+          <li><b>Jittered TTLs</b>: <code>ttl = 300 + random(0, 60)</code> so keys filled together do not expire together.</li>
+          <li><b>Early refresh</b>: when a hot key is close to expiry, one request refreshes it in the background while others keep reading the current value (probabilistic early expiration).</li>
+          <li><b>Serve stale</b>: keep the old value a little past its soft TTL and return it while the refresh runs.</li>
+        </ul>
+
+        <h3>4. Keeping the cache and the database consistent</h3>
+        <p>Learner question answered: "How does a cache go stale?" Here is the classic race in cache-aside even when you delete on write:</p>
+        <ol class="steps">
+          <li><strong>Reader A misses</strong> and reads the old value <code>v1</code> from the database. Then A is slow (GC pause, network).</li>
+          <li><strong>Writer B</strong> updates the database to <code>v2</code> and deletes the cache key.</li>
+          <li><strong>Reader A wakes up</strong> and writes <code>v1</code> into the cache. Now the cache holds stale data until the TTL expires.</li>
+        </ol>
+        <p>Fixes, from simple to strong:</p>
+        <ul>
+          <li><b>TTL as a backstop</b>: always set one, so any bug heals within seconds or minutes.</li>
+          <li><b>Leases</b>: a delete invalidates any outstanding lease token, so A's late <code>set</code> with the old token is rejected. This is exactly how Meta's memcache prevents stale sets.</li>
+          <li><b>Versioned sets</b>: store a version (row version or commit timestamp) with the value and only overwrite with a higher version (compare-and-set).</li>
+          <li><b>Delete after commit, and delete again</b> ("double delete"): delete once after commit and once more a short delay later to catch in-flight fills. Cheap, not perfect.</li>
+          <li><b>CDC-driven invalidation</b>: instead of the app deleting keys, a change-data-capture tool (Debezium) reads the database's commit log and publishes each change to Kafka; an invalidator service consumes it and deletes the matching cache keys. You cannot forget an invalidation in some code path, and it works for writes from any service. Meta's memcache paper describes the same idea (daemons tailing the MySQL commit log to broadcast deletes to other regions).</li>
+        </ul>
+        <div class="callout warn"><p><b>Why delete instead of update on write?</b> If two writers each do "update DB, then set cache", their cache writes can arrive in the opposite order of their DB commits, leaving the older value cached forever (until TTL). Deletes are idempotent and order does not matter: the next reader loads whatever the DB says now.</p></div>
+
+        <h3>5. Protecting the database when the cache fails</h3>
+        <p>A failed node turns its whole key range into misses. With a 95% hit ratio, that slice's database load jumps 20x. Defences: replicas with fast failover; a small <b>gutter pool</b> (Meta's paper: a few idle servers that take over a failed server's keys with short TTLs, so misses do not go straight to the DB); <b>circuit breakers</b> and load shedding in the app; and a cache warm-up plan before you put a new cluster in front of real traffic.</p>
+      

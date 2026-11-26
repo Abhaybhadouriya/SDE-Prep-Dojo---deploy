@@ -1,0 +1,1236 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+<p><code>chat.py</code>, the model and server:</p>
+<pre><code class="language-python">"""Chat application: 1:1 and group chats, per-recipient receipts (State), server as Mediator, devices as Observers."""
+from __future__ import annotations
+
+import itertools
+import threading
+from enum import Enum
+from typing import Dict, List, Optional, Protocol, Tuple
+
+
+class ChatError(Exception):
+    pass
+
+
+class Receipt(Enum):
+    """Per-recipient state. Each state decides what an event does; receipts only move forward."""
+    SENT = 0
+    DELIVERED = 1
+    READ = 2
+
+    def on_delivered(self) -&gt; "Receipt":
+        return Receipt.DELIVERED if self is Receipt.SENT else self
+
+    def on_read(self) -&gt; "Receipt":
+        return Receipt.READ
+
+
+class Message:
+    def __init__(self, mid: str, chat_id: str, sender: str, seq: int, text: str, recipients: List[str]):
+        self.id, self.chat_id, self.sender, self.seq, self.text = mid, chat_id, sender, seq, text
+        self._receipts: Dict[str, Receipt] = {r: Receipt.SENT for r in recipients}
+        self._pushed_in: Dict[str, int] = {}       # recipient -&gt; connection that already got a push
+        self._lock = threading.Lock()
+
+    def claim_push(self, user: str, connection: int) -&gt; bool:
+        """Avoids a duplicate push inside one connection; it is NOT the DELIVERED tick."""
+        with self._lock:
+            if self._receipts.get(user) is not Receipt.SENT:
+                return False                       # already acknowledged
+            prev = self._pushed_in.get(user)
+            self._pushed_in[user] = connection
+            return prev != connection
+
+    def apply(self, user: str, read: bool) -&gt; bool:
+        """One event for one recipient; True only if the state really changed."""
+        with self._lock:
+            old = self._receipts.get(user)
+            if old is None:
+                return False
+            new = old.on_read() if read else old.on_delivered()
+            if new is old:
+                return False
+            self._receipts[user] = new
+            return True
+
+    def receipt_of(self, user: str) -&gt; Optional[Receipt]:
+        with self._lock:
+            return self._receipts.get(user)
+
+    def forget(self, user: str) -&gt; None:
+        with self._lock:
+            self._receipts.pop(user, None)
+
+    def status(self) -&gt; Receipt:
+        """What the sender sees: the lowest receipt over all recipients."""
+        with self._lock:
+            if not self._receipts:
+                return Receipt.SENT
+            return min(self._receipts.values(), key=lambda r: r.value)
+
+    def recipients(self) -&gt; List[str]:
+        with self._lock:
+            return list(self._receipts)
+
+    def __repr__(self) -&gt; str:
+        return f"#{self.seq} {self.sender}: {self.text}"
+
+
+class Chat:
+    def __init__(self, cid: str):
+        self.id = cid
+        self.lock = threading.Lock()
+        self.members: Dict[str, int] = {}   # user -&gt; first seq they may see (dict keeps join order)
+        self.messages: List[Message] = []
+        self._next_seq = 1
+
+    def title(self) -&gt; str:
+        raise NotImplementedError
+
+    def check_can_change_members(self, by: str, target: str, adding: bool) -&gt; None:
+        raise NotImplementedError
+
+    def is_member(self, user: str) -&gt; bool:
+        return user in self.members
+
+    def last_seq(self) -&gt; int:
+        return self._next_seq - 1
+
+    def join(self, user: str) -&gt; None:
+        self.members.setdefault(user, self._next_seq)
+
+    def leave(self, user: str) -&gt; None:
+        self.members.pop(user, None)
+
+    def append(self, mid: str, sender: str, text: str) -&gt; Message:
+        """Caller holds lock: one seq per message, no gaps, no duplicates."""
+        to = [m for m in self.members if m != sender]
+        msg = Message(mid, self.id, sender, self._next_seq, text, to)
+        self._next_seq += 1
+        self.messages.append(msg)
+        return msg
+
+    def by_seq(self, seq: int) -&gt; Optional[Message]:
+        """Caller holds lock: seqs are 1..last with no gaps, so this is an index."""
+        return self.messages[seq - 1] if 1 &lt;= seq &lt;= len(self.messages) else None
+
+    def visible_to(self, user: str) -&gt; List[Message]:
+        start = self.members[user]
+        return [m for m in self.messages if m.seq &gt;= start]
+
+
+class DirectChat(Chat):
+    def __init__(self, cid: str, a: str, b: str):
+        super().__init__(cid)
+        self.join(a)
+        self.join(b)
+
+    def title(self) -&gt; str:
+        return "direct " + "+".join(self.members)
+
+    def check_can_change_members(self, by, target, adding):
+        raise ChatError("a direct chat has exactly two members")
+
+
+class GroupChat(Chat):
+    MAX_MEMBERS = 256
+
+    def __init__(self, cid: str, name: str, creator: str):
+        super().__init__(cid)
+        self.name = name
+        self.admins = {creator}
+        self.join(creator)
+
+    def title(self) -&gt; str:
+        return f"group '{self.name}'"
+
+    def check_can_change_members(self, by, target, adding):
+        self_leave = not adding and by == target
+        if not self_leave and by not in self.admins:
+            raise ChatError(f"{by} is not an admin of {self.name}")
+        if adding and len(self.members) &gt;= self.MAX_MEMBERS:
+            raise ChatError("group is full")
+
+    def leave(self, user: str) -&gt; None:
+        super().leave(user)
+        self.admins.discard(user)
+        if not self.admins and self.members:
+            self.admins.add(next(iter(self.members)))   # oldest member becomes admin
+
+
+class ChatClient(Protocol):
+    def on_message(self, m: Message) -&gt; None: ...
+    def on_receipt(self, m: Message, by: str, now: Receipt) -&gt; None: ...
+
+
+class ChatServer:
+    """Mediator: users never reference each other; every message goes through here."""
+
+    def __init__(self) -&gt; None:
+        self._users: Dict[str, str] = {}
+        self._chats: Dict[str, Chat] = {}
+        self._chats_of: Dict[str, set] = {}
+        self._online: Dict[str, Tuple[int, ChatClient]] = {}   # uid -&gt; (connection id, client)
+        self._conn_ids = itertools.count(1)
+        self._registry = threading.Lock()            # guards the dicts above
+        self._msg_ids = itertools.count(1)
+        self._group_ids = itertools.count(1)
+
+    def register(self, uid: str, name: str) -&gt; None:
+        with self._registry:
+            if uid in self._users:
+                raise ChatError(f"user {uid} exists")
+            self._users[uid] = name
+            self._chats_of[uid] = set()
+
+    def _need_user(self, uid: str) -&gt; None:
+        if uid not in self._users:
+            raise ChatError(f"no user {uid}")
+
+    def chat(self, cid: str) -&gt; Chat:
+        c = self._chats.get(cid)
+        if c is None:
+            raise ChatError(f"no chat {cid}")
+        return c
+
+    def direct(self, a: str, b: str) -&gt; DirectChat:
+        self._need_user(a)
+        self._need_user(b)
+        if a == b:
+            raise ChatError("cannot chat with yourself")
+        key = "d:" + ":".join(sorted((a, b)))
+        with self._registry:
+            c = self._chats.get(key)
+            if c is None:
+                c = self._chats[key] = DirectChat(key, a, b)
+            self._chats_of[a].add(key)
+            self._chats_of[b].add(key)
+        return c
+
+    def group(self, creator: str, name: str, *others: str) -&gt; GroupChat:
+        self._need_user(creator)
+        with self._registry:
+            g = GroupChat(f"g{next(self._group_ids)}", name, creator)
+            self._chats[g.id] = g
+            self._chats_of[creator].add(g.id)
+        for o in others:
+            self.add_member(creator, g.id, o)
+        return g
+
+    def add_member(self, by: str, cid: str, user: str) -&gt; None:
+        self._need_user(user)
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(by):
+                raise ChatError(f"{by} is not in {c.title()}")
+            c.check_can_change_members(by, user, True)   # permission first, even for a no-op
+            if c.is_member(user):
+                return
+            c.join(user)
+        with self._registry:
+            self._chats_of[user].add(cid)
+
+    def remove_member(self, by: str, cid: str, user: str) -&gt; None:
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(by) or not c.is_member(user):
+                raise ChatError("not a member")
+            c.check_can_change_members(by, user, False)
+            c.leave(user)
+            for m in c.messages:
+                if m.receipt_of(user) is not Receipt.READ:
+                    m.forget(user)
+        with self._registry:
+            self._chats_of[user].discard(cid)
+
+    def connect(self, uid: str, client: ChatClient) -&gt; None:
+        """Re-pushes every message this user has not ACKNOWLEDGED (still SENT): at-least-once."""
+        self._need_user(uid)
+        with self._registry:
+            conn = (next(self._conn_ids), client)
+            self._online[uid] = conn
+            my_chats = list(self._chats_of[uid])
+        for cid in my_chats:
+            c = self._chats[cid]
+            with c.lock:
+                if not c.is_member(uid):
+                    continue
+                pending = [m for m in c.visible_to(uid) if m.receipt_of(uid) is Receipt.SENT]
+            for m in pending:                 # outside the lock
+                self._deliver(uid, conn, m)
+
+    def disconnect(self, uid: str) -&gt; None:
+        with self._registry:
+            self._online.pop(uid, None)
+
+    def send(self, sender: str, cid: str, text: str) -&gt; Message:
+        if not text or not text.strip():
+            raise ChatError("empty message")
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(sender):
+                raise ChatError(f"{sender} is not in {c.title()}")
+            m = c.append(f"m{next(self._msg_ids)}", sender, text.strip())
+        for r in m.recipients():              # fan-out after unlock
+            cn = self._online.get(r)
+            if cn is not None:
+                self._deliver(r, cn, m)
+        return m
+
+    def _deliver(self, uid: str, conn: Tuple[int, ChatClient], m: Message) -&gt; None:
+        """Push only; the receipt stays SENT until the device acks. A lost push is re-sent on reconnect."""
+        if m.claim_push(uid, conn[0]):
+            conn[1].on_message(m)
+
+    def ack(self, uid: str, cid: str, seq: int) -&gt; bool:
+        """The device stored message seq: only this moves SENT -&gt; DELIVERED. Idempotent."""
+        c = self.chat(cid)
+        with c.lock:
+            m = c.by_seq(seq) if c.is_member(uid) else None
+            if m is None or not m.apply(uid, read=False):
+                return False
+        self._tell_sender(m, uid)
+        return True
+
+    def _tell_sender(self, m: Message, by: str) -&gt; None:
+        s = self._online.get(m.sender)
+        if s is not None:
+            s[1].on_receipt(m, by, m.receipt_of(by))
+
+    def mark_read(self, uid: str, cid: str, upto_seq: int) -&gt; int:
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(uid):
+                raise ChatError(f"{uid} is not in {c.title()}")
+            changed = [m for m in c.visible_to(uid)
+                       if m.seq &lt;= upto_seq and m.sender != uid and m.apply(uid, read=True)]
+        for m in changed:
+            self._tell_sender(m, uid)
+        return len(changed)
+
+    def unread(self, uid: str, cid: str) -&gt; int:
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(uid):
+                raise ChatError(f"{uid} is not in {c.title()}")
+            return sum(1 for m in c.visible_to(uid) if m.sender != uid and m.receipt_of(uid) is not Receipt.READ)
+
+    def history(self, uid: str, cid: str, before_seq: float = float("inf"), limit: int = 50) -&gt; List[Message]:
+        c = self.chat(cid)
+        with c.lock:
+            if not c.is_member(uid):
+                raise ChatError(f"{uid} is not in {c.title()}")
+            older = [m for m in c.visible_to(uid) if m.seq &lt; before_seq]
+            return older[-limit:] if limit &gt; 0 else []
+
+
+class Device:
+    """A client device: stores a message, drops copies it already has (dedupe by chat + seq), then acks."""
+
+    def __init__(self, server: "ChatServer", owner: str) -&gt; None:
+        self.server, self.owner = server, owner
+        self._have: set = set()
+        self._have_lock = threading.Lock()
+
+    def on_message(self, m: Message) -&gt; None:
+        if not self.arrives(m):               # lost on the wire
+            return
+        with self._have_lock:
+            fresh = (m.chat_id, m.seq) not in self._have
+            self._have.add((m.chat_id, m.seq))
+        if fresh:
+            self.store(m)
+        else:
+            self.duplicate(m)
+        if self.send_ack(m):                  # ack a duplicate too: the first ack may be the lost one
+            self.server.ack(self.owner, m.chat_id, m.seq)
+
+    def arrives(self, m: Message) -&gt; bool:
+        return True
+
+    def store(self, m: Message) -&gt; None:
+        pass
+
+    def duplicate(self, m: Message) -&gt; None:
+        pass
+
+    def send_ack(self, m: Message) -&gt; bool:
+        return True
+
+    def on_receipt(self, m: Message, by: str, now: Receipt) -&gt; None:
+        pass</code></pre>
+<p><code>main.py</code>, the demo driver:</p>
+<pre><code class="language-python">"""Demo driver: the same story as the Java Main."""
+import threading
+
+from chat import ChatError, ChatServer, Device, Receipt
+
+
+def check(cond, msg="check failed"):
+    """Like assert, but never stripped by python -O: the call inside it always runs."""
+    if not cond:
+        raise AssertionError(msg)
+
+
+class ConsoleClient(Device):
+    def store(self, m):
+        print(f"  [{self.owner} device] got {m}")
+
+    def duplicate(self, m):
+        print(f"  [{self.owner} device] duplicate #{m.seq} dropped, acked again")
+
+    def on_receipt(self, m, by, now):
+        print(f"  [{self.owner} device] {m.id} {now.name} by {by} (overall {m.status().name})")
+
+
+class CountingClient(Device):
+    def __init__(self, server, owner):
+        super().__init__(server, owner)
+        self.seen, self.pushes, self._lock = set(), 0, threading.Lock()
+
+    def arrives(self, m):
+        with self._lock:
+            self.pushes += 1
+        return True
+
+    def store(self, m):
+        with self._lock:
+            self.seen.add(m.id)
+
+
+class LossyClient(ConsoleClient):
+    """Loses pushes (drop_push) or acks (drop_ack) on purpose."""
+
+    def __init__(self, server, owner, drop_push, drop_ack):
+        super().__init__(server, owner)
+        self.drop_push, self.drop_ack = drop_push, drop_ack
+
+    def arrives(self, m):
+        return not self.drop_push
+
+    def send_ack(self, m):
+        return not self.drop_ack
+
+
+def expect_error(fn, contains):
+    try:
+        fn()
+    except ChatError as e:
+        print("  rejected:", e)
+        check(contains in str(e), e)
+        return
+    raise AssertionError("expected error: " + contains)
+
+
+def main():
+    s = ChatServer()
+    for uid in ("asha", "ben", "chen", "dev"):
+        s.register(uid, uid.title())
+
+    print("== 1:1 chat, Ben offline")
+    s.connect("asha", ConsoleClient(s, "asha"))
+    d = s.direct("asha", "ben")
+    check(s.direct("ben", "asha") is d)
+    hi = s.send("asha", d.id, "hi Ben, free for a review?")
+    print(f"  {hi.id} status {hi.status().name}")
+    check(hi.status() is Receipt.SENT)
+
+    print("== Ben connects")
+    s.connect("ben", ConsoleClient(s, "ben"))
+    check(hi.status() is Receipt.DELIVERED)
+    print("  ben unread", s.unread("ben", d.id))
+    s.mark_read("ben", d.id, hi.seq)
+    check(hi.status() is Receipt.READ)
+    check(s.mark_read("ben", d.id, hi.seq) == 0)
+
+    print("== group chat, Chen offline")
+    g = s.group("asha", "kernel-hackers", "ben", "chen")
+    patch = s.send("ben", g.id, "patch v2 is up")
+    print(f"  {patch.id} overall {patch.status().name} (chen has not received it)")
+    check(patch.status() is Receipt.SENT)
+    s.connect("chen", ConsoleClient(s, "chen"))
+    s.mark_read("asha", g.id, patch.seq)
+    print("  after asha read: overall", patch.status().name)
+    check(patch.status() is Receipt.DELIVERED)
+    s.mark_read("chen", g.id, patch.seq)
+    check(patch.status() is Receipt.READ)
+
+    print("== Dev joins late, sees only new messages")
+    s.add_member("asha", g.id, "dev")
+    s.send("asha", g.id, "welcome Dev")
+    dev_sees = s.history("dev", g.id)
+    print("  dev history", dev_sees)
+    check(len(dev_sees) == 1)
+
+    print("== rules")
+    expect_error(lambda: s.add_member("ben", g.id, "dev"), "not an admin")
+    expect_error(lambda: s.add_member("asha", d.id, "chen"), "exactly two")
+    expect_error(lambda: s.send("dev", d.id, "hello?"), "not in")
+    expect_error(lambda: s.send("asha", g.id, "   "), "empty")
+    s.remove_member("asha", g.id, "ben")
+    expect_error(lambda: s.send("ben", g.id, "still here?"), "not in")
+    s.remove_member("asha", g.id, "asha")       # the only admin leaves
+    s.add_member("chen", g.id, "ben")           # chen, the oldest member, is admin now
+    check(g.is_member("ben"))
+
+    print("== paging (Ben offline again)")
+    s.disconnect("ben")
+    for i in range(1, 6):
+        s.send("asha", d.id, f"note {i}")
+    print("  ben unread", s.unread("ben", d.id))
+    check(s.unread("ben", d.id) == 5)
+    page = s.history("ben", d.id, limit=2)
+    older = s.history("ben", d.id, before_seq=page[0].seq, limit=2)
+    print("  newest", page, "older", older)
+    check(page[1].seq == d.last_seq() and older[1].seq == page[0].seq - 1)
+
+    print("== lost push and lost ack: DELIVERED only after a device ack")
+    s.mark_read("ben", d.id, d.last_seq())
+    s.connect("ben", LossyClient(s, "ben", drop_push=True, drop_ack=False))
+    lost = s.send("asha", d.id, "did this arrive?")
+    print("  push lost:", lost.id, "is", lost.receipt_of("ben").name)
+    check(lost.receipt_of("ben") is Receipt.SENT)
+    s.disconnect("ben")
+    dev = LossyClient(s, "ben", drop_push=False, drop_ack=True)
+    s.connect("ben", dev)
+    check(lost.receipt_of("ben") is Receipt.SENT)
+    s.disconnect("ben")
+    dev.drop_ack = False
+    s.connect("ben", dev)
+    print("  after reconnect + ack:", lost.receipt_of("ben").name)
+    check(lost.receipt_of("ben") is Receipt.DELIVERED and not s.ack("ben", d.id, lost.seq))
+
+    print("== 4 senders x 250 messages into one group")
+    s2 = ChatServer()
+    for uid in ("u1", "u2", "u3", "u4", "watcher"):
+        s2.register(uid, uid)
+    big = s2.group("u1", "load", "u2", "u3", "u4", "watcher")
+    watcher = CountingClient(s2, "watcher")
+    s2.connect("watcher", watcher)
+
+    def spam(sender):
+        for i in range(250):
+            s2.send(sender, big.id, f"{sender}-{i}")
+
+    threads = [threading.Thread(target=spam, args=(f"u{t}",)) for t in range(1, 5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    msgs = s2.history("watcher", big.id, limit=2000)
+    seqs = {m.seq for m in msgs}
+    print(f"  messages {len(msgs)}, distinct seqs {len(seqs)}, max seq {big.last_seq()}, watcher pushes {watcher.pushes}")
+    check(len(msgs) == 1000 and len(seqs) == 1000 and big.last_seq() == 1000)
+    check(watcher.pushes == 1000 and len(watcher.seen) == 1000)
+    print("All checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p>Tests (<code>python -m unittest test_chat</code>):</p>
+<pre><code class="language-python">import threading
+import unittest
+
+from chat import ChatError, ChatServer, Device, Receipt
+
+
+class Sink(Device):
+    def __init__(self, server, owner, lose_pushes=False):
+        super().__init__(server, owner)
+        self.got, self.receipts, self.lose_pushes = [], [], lose_pushes
+
+    def arrives(self, m):
+        return not self.lose_pushes
+
+    def store(self, m):
+        self.got.append(m.seq)
+
+    def on_receipt(self, m, by, now):
+        self.receipts.append((m.id, by, now))
+
+
+def server(*users):
+    s = ChatServer()
+    for u in users:
+        s.register(u, u)
+    return s
+
+
+class ChatTests(unittest.TestCase):
+    def test_receipt_state_only_moves_forward(self):
+        self.assertIs(Receipt.READ.on_delivered(), Receipt.READ)
+        self.assertIs(Receipt.SENT.on_read(), Receipt.READ)
+        self.assertIs(Receipt.DELIVERED.on_delivered(), Receipt.DELIVERED)
+
+    def test_offline_messages_delivered_on_connect_in_order(self):
+        s = server("a", "b")
+        d = s.direct("a", "b")
+        for i in range(3):
+            s.send("a", d.id, f"x{i}")
+        sink = Sink(s, "b")
+        s.connect("b", sink)
+        self.assertEqual(sink.got, [1, 2, 3])
+
+    def test_sender_gets_delivered_then_read(self):
+        s = server("a", "b")
+        a, b = Sink(s, "a"), Sink(s, "b")
+        s.connect("a", a)
+        s.connect("b", b)
+        d = s.direct("a", "b")
+        m = s.send("a", d.id, "hi")
+        s.mark_read("b", d.id, m.seq)
+        self.assertEqual([r[2] for r in a.receipts], [Receipt.DELIVERED, Receipt.READ])
+
+    def test_group_status_is_lowest_receipt(self):
+        s = server("a", "b", "c")
+        g = s.group("a", "g", "b", "c")
+        s.connect("b", Sink(s, "b"))
+        m = s.send("a", g.id, "hello")
+        self.assertIs(m.status(), Receipt.SENT)          # c is offline
+        s.connect("c", Sink(s, "c"))
+        self.assertIs(m.status(), Receipt.DELIVERED)
+
+    def test_removed_member_does_not_block_ticks(self):
+        s = server("a", "b", "c")
+        g = s.group("a", "g", "b", "c")
+        s.connect("b", Sink(s, "b"))
+        m = s.send("a", g.id, "hello")
+        s.remove_member("a", g.id, "c")
+        self.assertIs(m.status(), Receipt.DELIVERED)
+
+    def test_delivered_needs_an_ack_and_lost_push_is_resent(self):
+        s = server("a", "b")
+        d = s.direct("a", "b")
+        s.connect("b", Sink(s, "b", lose_pushes=True))
+        m = s.send("a", d.id, "hi")
+        self.assertIs(m.receipt_of("b"), Receipt.SENT)    # pushed, never acked: not delivered
+        s.disconnect("b")
+        sink = Sink(s, "b")
+        s.connect("b", sink)                               # reconnect re-sends what was never acked
+        self.assertEqual(sink.got, [1])
+        self.assertIs(m.receipt_of("b"), Receipt.DELIVERED)
+        self.assertFalse(s.ack("b", d.id, m.seq))          # duplicate ack changes nothing
+
+    def test_device_dedupes_a_resent_message(self):
+        s = server("a", "b")
+        d = s.direct("a", "b")
+        s.send("a", d.id, "hi")
+        sink = Sink(s, "b")
+        sink.send_ack = lambda m: False                    # the ack is lost on the way back
+        s.connect("b", sink)
+        s.disconnect("b")
+        del sink.send_ack
+        s.connect("b", sink)                               # same message pushed again
+        self.assertEqual(sink.got, [1])                    # stored once
+        self.assertIs(d.messages[0].receipt_of("b"), Receipt.DELIVERED)
+
+    def test_late_joiner_sees_no_old_history(self):
+        s = server("a", "b")
+        g = s.group("a", "g")
+        s.send("a", g.id, "secret")
+        s.add_member("a", g.id, "b")
+        self.assertEqual(s.history("b", g.id), [])
+
+    def test_only_admin_adds_and_direct_is_closed(self):
+        s = server("a", "b", "c")
+        g = s.group("a", "g", "b")
+        with self.assertRaises(ChatError):
+            s.add_member("b", g.id, "c")
+        with self.assertRaises(ChatError):
+            s.add_member("a", s.direct("a", "b").id, "c")
+
+    def test_non_member_cannot_send_or_read(self):
+        s = server("a", "b", "c")
+        d = s.direct("a", "b")
+        with self.assertRaises(ChatError):
+            s.send("c", d.id, "hi")
+        with self.assertRaises(ChatError):
+            s.history("c", d.id)
+
+    def test_direct_chat_is_idempotent(self):
+        s = server("a", "b")
+        self.assertIs(s.direct("a", "b"), s.direct("b", "a"))
+
+    def test_concurrent_sends_get_unique_contiguous_seqs(self):
+        s = server("a", "b", "c", "d")
+        g = s.group("a", "g", "b", "c", "d")
+
+        def spam(u):
+            for _ in range(200):
+                s.send(u, g.id, "x")
+
+        ts = [threading.Thread(target=spam, args=(u,)) for u in "abcd"]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(sorted(m.seq for m in g.messages), list(range(1, 801)))
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>$ python -m unittest test_chat
+............
+----------------------------------------------------------------------
+Ran 12 tests in 0.007s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Chat application in C++14: same design as the Java version.
+// Locking (three levels, always taken in this order, never the reverse):
+//   ChatServer::mu_  guards users_, chats_, chatsOf_, online_   (Java: ConcurrentHashMap)
+//   Chat::mu         guards members, messages, nextSeq_          (Java: synchronized on the chat)
+//   Message::mu      guards receipts, pushedIn                   (Java: synchronized methods)
+// Every call out to a device (onMessage, onReceipt) happens with NO lock held: a device acks from inside
+// onMessage(), which takes the chat lock again. Id counters are std::atomic&lt;long&gt;.
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;atomic&gt;
+#include &lt;iostream&gt;
+#include &lt;limits&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+using Guard = std::lock_guard&lt;Mutex&gt;;
+// CHECK, not assert: assert() and any call inside it vanish under -DNDEBUG; CHECK always runs.
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed (line %d): %s\n", __LINE__, #x); std::exit(1); } } while (0)
+
+struct ChatError : std::runtime_error {
+    explicit ChatError(const std::string&amp; m) : std::runtime_error(m) {}
+};
+
+// Per-recipient receipt. The transition table plays the role of the State pattern; receipts move forward only.
+enum class Receipt { SENT = 0, DELIVERED = 1, READ = 2 };
+const char* name(Receipt r) { return r == Receipt::SENT ? "SENT" : r == Receipt::DELIVERED ? "DELIVERED" : "READ"; }
+Receipt onDelivered(Receipt r) { return r == Receipt::SENT ? Receipt::DELIVERED : r; }
+Receipt onRead(Receipt) { return Receipt::READ; }
+
+struct Message {
+    std::string id, chatId, sender, text;
+    long seq;
+    std::map&lt;std::string, Receipt&gt; receipts;   // recipient -&gt; state
+    std::map&lt;std::string, long&gt; pushedIn;      // recipient -&gt; connection that already got a push
+    mutable Mutex mu;                          // guards receipts and pushedIn
+
+    // Avoids a second push on the same connection; it is NOT the DELIVERED tick.
+    bool claimPush(const std::string&amp; user, long connection) {
+        Guard g(mu);
+        auto it = receipts.find(user);
+        if (it == receipts.end() || it-&gt;second != Receipt::SENT) return false;   // already acked
+        auto p = pushedIn.find(user);
+        if (p != pushedIn.end() &amp;&amp; p-&gt;second == connection) return false;
+        pushedIn[user] = connection;
+        return true;
+    }
+
+    bool apply(const std::string&amp; user, bool read) {
+        Guard g(mu);
+        auto it = receipts.find(user);
+        if (it == receipts.end()) return false;
+        Receipt next = read ? onRead(it-&gt;second) : onDelivered(it-&gt;second);
+        if (next == it-&gt;second) return false;
+        it-&gt;second = next;
+        return true;
+    }
+    bool has(const std::string&amp; u) const { Guard g(mu); return receipts.count(u) &gt; 0; }
+    Receipt receiptOf(const std::string&amp; u) const { Guard g(mu); return receipts.at(u); }
+    bool pendingFor(const std::string&amp; u) const {   // a recipient that has not acked yet
+        Guard g(mu);
+        auto it = receipts.find(u);
+        return it != receipts.end() &amp;&amp; it-&gt;second == Receipt::SENT;
+    }
+    void dropUnread(const std::string&amp; u) {         // a removed member loses unread receipts
+        Guard g(mu);
+        auto it = receipts.find(u);
+        if (it != receipts.end() &amp;&amp; it-&gt;second != Receipt::READ) receipts.erase(it);
+    }
+    std::vector&lt;std::string&gt; recipients() const {
+        Guard g(mu);
+        std::vector&lt;std::string&gt; v;
+        for (const auto&amp; kv : receipts) v.push_back(kv.first);
+        return v;
+    }
+    Receipt status() const {                    // the lowest receipt over all recipients
+        Guard g(mu);
+        if (receipts.empty()) return Receipt::SENT;
+        Receipt m = Receipt::READ;
+        for (const auto&amp; kv : receipts) if (kv.second &lt; m) m = kv.second;
+        return m;
+    }
+    std::string str() const { return "#" + std::to_string(seq) + " " + sender + ": " + text; }
+};
+using MsgPtr = std::shared_ptr&lt;Message&gt;;
+const long LATEST = std::numeric_limits&lt;long&gt;::max();   // "no upper bound" for history paging
+
+class Chat {
+public:
+    explicit Chat(std::string id) : id(std::move(id)) {}
+    virtual ~Chat() = default;
+    virtual std::string title() const = 0;
+    virtual void checkCanChangeMembers(const std::string&amp; by, const std::string&amp; target, bool adding) const = 0;
+
+    const std::string id;
+    mutable Mutex mu;                                    // the methods below expect the caller to hold it
+    std::vector&lt;std::pair&lt;std::string, long&gt;&gt; members;   // join order kept; second = first visible seq
+    std::vector&lt;MsgPtr&gt; messages;
+
+    bool isMember(const std::string&amp; u) const {
+        for (const auto&amp; m : members) if (m.first == u) return true;
+        return false;
+    }
+    long lastSeq() const { return nextSeq_ - 1; }
+    void join(const std::string&amp; u) { if (!isMember(u)) members.emplace_back(u, nextSeq_); }
+    virtual void leave(const std::string&amp; u) {
+        members.erase(std::remove_if(members.begin(), members.end(),
+                                     [&amp;](const std::pair&lt;std::string, long&gt;&amp; m) { return m.first == u; }),
+                      members.end());
+    }
+    MsgPtr append(const std::string&amp; mid, const std::string&amp; sender, const std::string&amp; text) {
+        auto m = std::make_shared&lt;Message&gt;();
+        m-&gt;id = mid; m-&gt;chatId = id; m-&gt;sender = sender; m-&gt;text = text; m-&gt;seq = nextSeq_++;
+        for (const auto&amp; mem : members) if (mem.first != sender) m-&gt;receipts[mem.first] = Receipt::SENT;
+        messages.push_back(m);
+        return m;
+    }
+    std::vector&lt;MsgPtr&gt; visibleTo(const std::string&amp; u) const {
+        long from = 0;
+        for (const auto&amp; m : members) if (m.first == u) from = m.second;
+        std::vector&lt;MsgPtr&gt; out;
+        for (const auto&amp; m : messages) if (m-&gt;seq &gt;= from) out.push_back(m);
+        return out;
+    }
+
+private:
+    long nextSeq_ = 1;
+};
+
+class DirectChat : public Chat {
+public:
+    DirectChat(const std::string&amp; id, const std::string&amp; a, const std::string&amp; b) : Chat(id) { join(a); join(b); }
+    std::string title() const override { return "direct " + members[0].first + "+" + members[1].first; }
+    void checkCanChangeMembers(const std::string&amp;, const std::string&amp;, bool) const override {
+        throw ChatError("a direct chat has exactly two members");
+    }
+};
+
+class GroupChat : public Chat {
+public:
+    GroupChat(const std::string&amp; id, std::string n, const std::string&amp; creator) : Chat(id), name(std::move(n)) {
+        join(creator);
+        admins.insert(creator);
+    }
+    std::string title() const override { return "group '" + name + "'"; }
+    void checkCanChangeMembers(const std::string&amp; by, const std::string&amp; target, bool adding) const override {
+        bool selfLeave = !adding &amp;&amp; by == target;
+        if (!selfLeave &amp;&amp; !admins.count(by)) throw ChatError(by + " is not an admin of " + name);
+        if (adding &amp;&amp; members.size() &gt;= 256) throw ChatError("group is full");
+    }
+    void leave(const std::string&amp; u) override {
+        Chat::leave(u);
+        admins.erase(u);
+        if (admins.empty() &amp;&amp; !members.empty()) admins.insert(members.front().first);   // oldest member
+    }
+    const std::string name;
+
+private:
+    std::set&lt;std::string&gt; admins;
+};
+
+// Observer: a connected device.
+struct ChatClient {
+    virtual ~ChatClient() = default;
+    virtual void onMessage(const Message&amp; m) = 0;
+    virtual void onReceipt(const Message&amp; m, const std::string&amp; by, Receipt now) = 0;
+};
+
+// Mediator: users never reference each other.
+class ChatServer {
+public:
+    void registerUser(const std::string&amp; id) {
+        Guard g(mu_);
+        if (users_.count(id)) throw ChatError("user " + id + " exists");
+        users_.insert(id);
+        chatsOf_[id];
+    }
+    Chat&amp; chat(const std::string&amp; id) {                      // chats are never erased: the reference stays valid
+        Guard g(mu_);
+        auto it = chats_.find(id);
+        if (it == chats_.end()) throw ChatError("no chat " + id);
+        return *it-&gt;second;
+    }
+    DirectChat&amp; direct(const std::string&amp; a, const std::string&amp; b) {
+        needUser(a); needUser(b);
+        if (a == b) throw ChatError("cannot chat with yourself");
+        std::string key = a &lt; b ? "d:" + a + ":" + b : "d:" + b + ":" + a;
+        Guard g(mu_);
+        if (!chats_.count(key)) chats_[key] = std::make_unique&lt;DirectChat&gt;(key, a, b);
+        chatsOf_[a].insert(key); chatsOf_[b].insert(key);
+        return static_cast&lt;DirectChat&amp;&gt;(*chats_[key]);
+    }
+    GroupChat&amp; group(const std::string&amp; creator, const std::string&amp; name, const std::vector&lt;std::string&gt;&amp; others) {
+        needUser(creator);
+        std::string id = "g" + std::to_string(++groupIds_);
+        GroupChat* gc;
+        {
+            Guard g(mu_);
+            auto made = std::make_unique&lt;GroupChat&gt;(id, name, creator);
+            gc = made.get();
+            chats_[id] = std::move(made);
+            chatsOf_[creator].insert(id);
+        }
+        for (const auto&amp; o : others) addMember(creator, id, o);   // takes the locks itself
+        return *gc;
+    }
+    void addMember(const std::string&amp; by, const std::string&amp; cid, const std::string&amp; user) {
+        needUser(user);
+        Chat&amp; c = chat(cid);
+        {
+            Guard g(c.mu);
+            if (!c.isMember(by)) throw ChatError(by + " is not in " + c.title());
+            c.checkCanChangeMembers(by, user, true);
+            if (c.isMember(user)) return;
+            c.join(user);
+        }
+        Guard g(mu_);
+        chatsOf_[user].insert(cid);
+    }
+    void removeMember(const std::string&amp; by, const std::string&amp; cid, const std::string&amp; user) {
+        Chat&amp; c = chat(cid);
+        {
+            Guard g(c.mu);
+            if (!c.isMember(by) || !c.isMember(user)) throw ChatError("not a member");
+            c.checkCanChangeMembers(by, user, false);
+            c.leave(user);
+            for (auto&amp; m : c.messages) m-&gt;dropUnread(user);     // chat lock, then message lock
+        }
+        Guard g(mu_);
+        chatsOf_[user].erase(cid);
+    }
+    // Re-pushes every message this user has not ACKNOWLEDGED (still SENT): at-least-once.
+    void connect(const std::string&amp; uid, ChatClient* client) {
+        needUser(uid);
+        Conn conn;
+        std::set&lt;std::string&gt; cids;
+        {
+            Guard g(mu_);
+            online_[uid] = std::make_pair(++connIds_, client);
+            conn = online_[uid];
+            cids = chatsOf_[uid];
+        }
+        for (const auto&amp; cid : cids) {
+            Chat&amp; c = chat(cid);
+            std::vector&lt;MsgPtr&gt; pending;
+            {
+                Guard g(c.mu);                                   // collect under the chat lock
+                if (!c.isMember(uid)) continue;
+                for (const auto&amp; m : c.visibleTo(uid))
+                    if (m-&gt;pendingFor(uid)) pending.push_back(m);
+            }
+            for (const auto&amp; m : pending) deliver(uid, conn, *m);     // push with no lock held
+        }
+    }
+    void disconnect(const std::string&amp; uid) { Guard g(mu_); online_.erase(uid); }
+
+    MsgPtr send(const std::string&amp; sender, const std::string&amp; cid, const std::string&amp; text) {
+        if (text.find_first_not_of(' ') == std::string::npos) throw ChatError("empty message");
+        Chat&amp; c = chat(cid);
+        MsgPtr m;
+        {
+            Guard g(c.mu);                                       // member check + seq++ + append: one step
+            if (!c.isMember(sender)) throw ChatError(sender + " is not in " + c.title());
+            m = c.append("m" + std::to_string(++msgIds_), sender, text);
+        }
+        for (const auto&amp; r : m-&gt;recipients()) {                 // fan-out after unlock: O(members)
+            Conn conn;
+            if (onlineConn(r, &amp;conn)) deliver(r, conn, *m);
+        }
+        return m;
+    }
+    // The device stored message seq: only this moves SENT -&gt; DELIVERED. Idempotent.
+    bool ack(const std::string&amp; uid, const std::string&amp; cid, long seq) {
+        Chat&amp; c = chat(cid);
+        MsgPtr m;
+        {
+            Guard g(c.mu);
+            if (!c.isMember(uid) || seq &lt; 1 || seq &gt; static_cast&lt;long&gt;(c.messages.size())) return false;
+            m = c.messages[seq - 1];                            // seqs are 1..n with no gaps
+            if (!m-&gt;apply(uid, false)) return false;
+        }
+        tellSender(*m, uid);                                    // after unlock
+        return true;
+    }
+    int markRead(const std::string&amp; uid, const std::string&amp; cid, long upto) {
+        Chat&amp; c = chat(cid);
+        std::vector&lt;MsgPtr&gt; changed;
+        {
+            Guard g(c.mu);
+            if (!c.isMember(uid)) throw ChatError(uid + " is not in " + c.title());
+            for (const auto&amp; m : c.visibleTo(uid))
+                if (m-&gt;seq &lt;= upto &amp;&amp; m-&gt;sender != uid &amp;&amp; m-&gt;apply(uid, true)) changed.push_back(m);
+        }
+        for (const auto&amp; m : changed) tellSender(*m, uid);
+        return static_cast&lt;int&gt;(changed.size());
+    }
+    int unread(const std::string&amp; uid, const std::string&amp; cid) {
+        Chat&amp; c = chat(cid);
+        Guard g(c.mu);
+        if (!c.isMember(uid)) throw ChatError(uid + " is not in " + c.title());
+        int n = 0;
+        for (const auto&amp; m : c.visibleTo(uid))
+            if (m-&gt;sender != uid &amp;&amp; m-&gt;has(uid) &amp;&amp; m-&gt;receiptOf(uid) != Receipt::READ) n++;
+        return n;
+    }
+    std::vector&lt;MsgPtr&gt; history(const std::string&amp; uid, const std::string&amp; cid, long before, size_t limit) {
+        Chat&amp; c = chat(cid);
+        Guard g(c.mu);
+        if (!c.isMember(uid)) throw ChatError(uid + " is not in " + c.title());
+        std::vector&lt;MsgPtr&gt; vis = c.visibleTo(uid), out;
+        for (auto it = vis.rbegin(); it != vis.rend() &amp;&amp; out.size() &lt; limit; ++it)
+            if ((*it)-&gt;seq &lt; before) out.push_back(*it);
+        std::reverse(out.begin(), out.end());
+        return out;
+    }
+
+private:
+    void needUser(const std::string&amp; id) const { Guard g(mu_); if (!users_.count(id)) throw ChatError("no user " + id); }
+    bool onlineConn(const std::string&amp; uid, std::pair&lt;long, ChatClient*&gt;* out) const {
+        Guard g(mu_);
+        auto it = online_.find(uid);
+        if (it == online_.end()) return false;
+        *out = it-&gt;second;
+        return true;
+    }
+    using Conn = std::pair&lt;long, ChatClient*&gt;;                 // connection id, device
+    // Push only: the receipt stays SENT until the device acks, so a lost push is re-sent on reconnect.
+    void deliver(const std::string&amp; uid, const Conn&amp; conn, Message&amp; m) {
+        if (m.claimPush(uid, conn.first)) conn.second-&gt;onMessage(m);
+    }
+    void tellSender(const Message&amp; m, const std::string&amp; by) {
+        Conn conn;
+        if (onlineConn(m.sender, &amp;conn)) conn.second-&gt;onReceipt(m, by, m.receiptOf(by));   // no lock held
+    }
+    std::set&lt;std::string&gt; users_;
+    std::map&lt;std::string, std::unique_ptr&lt;Chat&gt;&gt; chats_;
+    std::map&lt;std::string, std::set&lt;std::string&gt;&gt; chatsOf_;
+    std::map&lt;std::string, Conn&gt; online_;
+    std::atomic&lt;long&gt; msgIds_{0}, groupIds_{0}, connIds_{0};
+    mutable Mutex mu_;                                          // guards the four maps above
+};
+
+// A device stores a message, drops copies it already has (dedupe by chat + seq), then acks.
+struct Device : ChatClient {
+    Device(ChatServer&amp; s, std::string o) : server(s), owner(std::move(o)) {}
+    void onMessage(const Message&amp; m) override {
+        if (dropPush) return;                                   // lost on the wire
+        bool fresh = have.insert(m.chatId + "#" + std::to_string(m.seq)).second;
+        if (fresh) store(m); else duplicate(m);
+        if (!dropAck) server.ack(owner, m.chatId, m.seq);       // ack a duplicate too
+    }
+    void onReceipt(const Message&amp;, const std::string&amp;, Receipt) override {}
+    virtual void store(const Message&amp;) {}
+    virtual void duplicate(const Message&amp;) {}
+    ChatServer&amp; server;
+    std::string owner;
+    std::set&lt;std::string&gt; have;
+    bool dropPush = false, dropAck = false;
+};
+
+struct ConsoleClient : Device {
+    ConsoleClient(ChatServer&amp; s, std::string o) : Device(s, std::move(o)) {}
+    void store(const Message&amp; m) override { std::cout &lt;&lt; "  [" &lt;&lt; owner &lt;&lt; " device] got " &lt;&lt; m.str() &lt;&lt; "\n"; }
+    void duplicate(const Message&amp; m) override {
+        std::cout &lt;&lt; "  [" &lt;&lt; owner &lt;&lt; " device] duplicate #" &lt;&lt; m.seq &lt;&lt; " dropped, acked again\n";
+    }
+    void onReceipt(const Message&amp; m, const std::string&amp; by, Receipt now) override {
+        std::cout &lt;&lt; "  [" &lt;&lt; owner &lt;&lt; " device] " &lt;&lt; m.id &lt;&lt; " " &lt;&lt; name(now) &lt;&lt; " by " &lt;&lt; by
+                  &lt;&lt; " (overall " &lt;&lt; name(m.status()) &lt;&lt; ")\n";
+    }
+};
+
+struct CountingClient : Device {
+    CountingClient(ChatServer&amp; s, std::string o) : Device(s, std::move(o)) {}
+    std::set&lt;std::string&gt; seen;
+    long pushes = 0;
+    void store(const Message&amp; m) override { pushes++; seen.insert(m.id); }
+};
+
+template &lt;class F&gt;
+void expectError(F f, const std::string&amp; contains) {
+    try { f(); } catch (const ChatError&amp; e) {
+        std::cout &lt;&lt; "  rejected: " &lt;&lt; e.what() &lt;&lt; "\n";
+        CHECK(std::string(e.what()).find(contains) != std::string::npos);
+        return;
+    }
+    throw std::logic_error("expected error: " + contains);
+}
+
+std::string list(const std::vector&lt;MsgPtr&gt;&amp; v) {
+    std::string s = "[";
+    for (size_t i = 0; i &lt; v.size(); i++) s += (i ? ", " : "") + v[i]-&gt;str();
+    return s + "]";
+}
+
+int main() {
+    ChatServer s;
+    for (auto u : {"asha", "ben", "chen", "dev"}) s.registerUser(u);
+    ConsoleClient asha(s, "asha"), ben(s, "ben"), chen(s, "chen");
+
+    std::cout &lt;&lt; "== 1:1 chat, Ben offline\n";
+    s.connect("asha", &amp;asha);
+    DirectChat&amp; d = s.direct("asha", "ben");
+    CHECK(&amp;s.direct("ben", "asha") == &amp;d);
+    MsgPtr hi = s.send("asha", d.id, "hi Ben, free for a review?");
+    std::cout &lt;&lt; "  " &lt;&lt; hi-&gt;id &lt;&lt; " status " &lt;&lt; name(hi-&gt;status()) &lt;&lt; "\n";
+    CHECK(hi-&gt;status() == Receipt::SENT);
+
+    std::cout &lt;&lt; "== Ben connects\n";
+    s.connect("ben", &amp;ben);
+    CHECK(hi-&gt;status() == Receipt::DELIVERED);
+    std::cout &lt;&lt; "  ben unread " &lt;&lt; s.unread("ben", d.id) &lt;&lt; "\n";
+    s.markRead("ben", d.id, hi-&gt;seq);
+    CHECK(hi-&gt;status() == Receipt::READ);
+    CHECK(s.markRead("ben", d.id, hi-&gt;seq) == 0);
+
+    std::cout &lt;&lt; "== group chat, Chen offline\n";
+    GroupChat&amp; g = s.group("asha", "kernel-hackers", {"ben", "chen"});
+    MsgPtr patch = s.send("ben", g.id, "patch v2 is up");
+    std::cout &lt;&lt; "  " &lt;&lt; patch-&gt;id &lt;&lt; " overall " &lt;&lt; name(patch-&gt;status()) &lt;&lt; " (chen has not received it)\n";
+    CHECK(patch-&gt;status() == Receipt::SENT);
+    s.connect("chen", &amp;chen);
+    s.markRead("asha", g.id, patch-&gt;seq);
+    std::cout &lt;&lt; "  after asha read: overall " &lt;&lt; name(patch-&gt;status()) &lt;&lt; "\n";
+    CHECK(patch-&gt;status() == Receipt::DELIVERED);
+    s.markRead("chen", g.id, patch-&gt;seq);
+    CHECK(patch-&gt;status() == Receipt::READ);
+
+    std::cout &lt;&lt; "== Dev joins late, sees only new messages\n";
+    s.addMember("asha", g.id, "dev");
+    s.send("asha", g.id, "welcome Dev");
+    auto devSees = s.history("dev", g.id, LATEST, 50);
+    std::cout &lt;&lt; "  dev history " &lt;&lt; list(devSees) &lt;&lt; "\n";
+    CHECK(devSees.size() == 1);
+
+    std::cout &lt;&lt; "== rules\n";
+    expectError([&amp;] { s.addMember("ben", g.id, "dev"); }, "not an admin");
+    expectError([&amp;] { s.addMember("asha", d.id, "chen"); }, "exactly two");
+    expectError([&amp;] { s.send("dev", d.id, "hello?"); }, "not in");
+    expectError([&amp;] { s.send("asha", g.id, "   "); }, "empty");
+    s.removeMember("asha", g.id, "ben");
+    expectError([&amp;] { s.send("ben", g.id, "still here?"); }, "not in");
+    s.removeMember("asha", g.id, "asha");
+    s.addMember("chen", g.id, "ben");
+    CHECK(g.isMember("ben"));
+
+    std::cout &lt;&lt; "== paging (Ben offline again)\n";
+    s.disconnect("ben");
+    for (int i = 1; i &lt;= 5; i++) s.send("asha", d.id, "note " + std::to_string(i));
+    std::cout &lt;&lt; "  ben unread " &lt;&lt; s.unread("ben", d.id) &lt;&lt; "\n";
+    CHECK(s.unread("ben", d.id) == 5);
+    auto page = s.history("ben", d.id, LATEST, 2);
+    auto older = s.history("ben", d.id, page[0]-&gt;seq, 2);
+    std::cout &lt;&lt; "  newest " &lt;&lt; list(page) &lt;&lt; " older " &lt;&lt; list(older) &lt;&lt; "\n";
+    CHECK(page[1]-&gt;seq == d.lastSeq() &amp;&amp; older[1]-&gt;seq == page[0]-&gt;seq - 1);
+
+    std::cout &lt;&lt; "== lost push and lost ack: DELIVERED only after a device ack\n";
+    s.markRead("ben", d.id, d.lastSeq());
+    ConsoleClient flaky(s, "ben");
+    flaky.dropPush = true;                                      // the socket write is lost
+    s.connect("ben", &amp;flaky);
+    MsgPtr lost = s.send("asha", d.id, "did this arrive?");
+    std::cout &lt;&lt; "  push lost: " &lt;&lt; lost-&gt;id &lt;&lt; " is " &lt;&lt; name(lost-&gt;receiptOf("ben")) &lt;&lt; "\n";
+    CHECK(lost-&gt;receiptOf("ben") == Receipt::SENT);
+    s.disconnect("ben");
+    flaky.dropPush = false; flaky.dropAck = true;               // stored, but the ack is lost
+    s.connect("ben", &amp;flaky);
+    CHECK(lost-&gt;receiptOf("ben") == Receipt::SENT);
+    s.disconnect("ben");
+    flaky.dropAck = false;
+    s.connect("ben", &amp;flaky);                                   // re-sent, deduped, acked
+    std::cout &lt;&lt; "  after reconnect + ack: " &lt;&lt; name(lost-&gt;receiptOf("ben")) &lt;&lt; "\n";
+    CHECK(lost-&gt;receiptOf("ben") == Receipt::DELIVERED &amp;&amp; !s.ack("ben", d.id, lost-&gt;seq));
+
+    std::cout &lt;&lt; "== 4 senders x 250 messages into one group (interleaved, single thread)\n";
+    ChatServer s2;
+    for (auto u : {"u1", "u2", "u3", "u4", "watcher"}) s2.registerUser(u);
+    GroupChat&amp; big = s2.group("u1", "load", {"u2", "u3", "u4", "watcher"});
+    CountingClient watcher(s2, "watcher");
+    s2.connect("watcher", &amp;watcher);
+    for (int i = 0; i &lt; 250; i++)
+        for (int t = 1; t &lt;= 4; t++) s2.send("u" + std::to_string(t), big.id, "x");
+    auto all = s2.history("watcher", big.id, LATEST, 2000);
+    std::set&lt;long&gt; seqs;
+    for (const auto&amp; m : all) seqs.insert(m-&gt;seq);
+    std::cout &lt;&lt; "  messages " &lt;&lt; all.size() &lt;&lt; ", distinct seqs " &lt;&lt; seqs.size() &lt;&lt; ", max seq " &lt;&lt; big.lastSeq()
+              &lt;&lt; ", watcher pushes " &lt;&lt; watcher.pushes &lt;&lt; "\n";
+    CHECK(all.size() == 1000 &amp;&amp; seqs.size() == 1000 &amp;&amp; big.lastSeq() == 1000);
+    CHECK(watcher.pushes == 1000 &amp;&amp; watcher.seen.size() == 1000);
+    std::cout &lt;&lt; "All checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== 1:1 chat, Ben offline
+  m1 status SENT
+== Ben connects
+  [ben device] got #1 asha: hi Ben, free for a review?
+  [asha device] m1 DELIVERED by ben (overall DELIVERED)
+  ben unread 1
+  [asha device] m1 READ by ben (overall READ)
+== group chat, Chen offline
+  [asha device] got #1 ben: patch v2 is up
+  [ben device] m2 DELIVERED by asha (overall SENT)
+  m2 overall SENT (chen has not received it)
+  [chen device] got #1 ben: patch v2 is up
+  [ben device] m2 DELIVERED by chen (overall DELIVERED)
+  [ben device] m2 READ by asha (overall DELIVERED)
+  after asha read: overall DELIVERED
+  [ben device] m2 READ by chen (overall READ)
+== Dev joins late, sees only new messages
+  [ben device] got #2 asha: welcome Dev
+  [asha device] m3 DELIVERED by ben (overall SENT)
+  [chen device] got #2 asha: welcome Dev
+  [asha device] m3 DELIVERED by chen (overall SENT)
+  dev history [#2 asha: welcome Dev]
+== rules
+  rejected: ben is not an admin of kernel-hackers
+  rejected: a direct chat has exactly two members
+  rejected: dev is not in direct asha+ben
+  rejected: empty message
+  rejected: ben is not in group 'kernel-hackers'
+== paging (Ben offline again)
+  ben unread 5
+  newest [#5 asha: note 4, #6 asha: note 5] older [#3 asha: note 2, #4 asha: note 3]
+== lost push and lost ack: DELIVERED only after a device ack
+  [asha device] m4 READ by ben (overall READ)
+  [asha device] m5 READ by ben (overall READ)
+  [asha device] m6 READ by ben (overall READ)
+  [asha device] m7 READ by ben (overall READ)
+  [asha device] m8 READ by ben (overall READ)
+  push lost: m9 is SENT
+  [ben device] stored #7 asha: did this arrive?
+  [ben device] duplicate #7 dropped, acked again
+  [asha device] m9 DELIVERED by ben (overall DELIVERED)
+  after reconnect + ack: DELIVERED
+== 4 senders x 250 messages into one group
+  messages 1000, distinct seqs 1000, max seq 1000, watcher pushes 1000
+All 23 checks passed</code></pre>
+  <div class="callout note"><p>Follow message m2 through the log: Ben sends it to the group, Asha's device gets it at once (overall still SENT, because Chen is offline), Chen connects and gets it (overall DELIVERED), Asha reads it (overall still DELIVERED, one reader is not enough), Chen reads it (overall READ). Then Dev joins and his history holds only the message sent after he joined. The last block is four threads sending 1,000 messages into one group: 1,000 distinct sequence numbers with no gaps, and the watcher device was pushed each message once (no push was lost in this run; when one is lost, the at-least-once path re-pushes it and the device drops the duplicate by seq, as the lost-push block above shows).</p></div>

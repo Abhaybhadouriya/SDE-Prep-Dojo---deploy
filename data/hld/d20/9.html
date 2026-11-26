@@ -1,0 +1,126 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Minute</th><th>Do</th><th>Say</th></tr></thead>
+            <tbody>
+              <tr><td>0-5</td><td>Requirements</td><td>"How many hosts/services? Scrape interval? Retention? Alerting needed? Multi-region?"</td></tr>
+              <tr><td>5-10</td><td>Estimate</td><td>"10M series, ~670k samples/s, ~87 GB/day. Memory per active series is the real limit."</td></tr>
+              <tr><td>10-15</td><td>Data model + API</td><td>Series = name + labels; counters/gauges/histograms; <code>/metrics</code>, remote write, query.</td></tr>
+              <tr><td>15-25</td><td>Diagram</td><td>Discovery → sharded HA scrapers → long-term TSDB → query + rules → Alertmanager.</td></tr>
+              <tr><td>25-38</td><td>Deep dives</td><td>Pull vs push, cardinality, TSDB compression, scaling, alert design.</td></tr>
+              <tr><td>38-45</td><td>Failures</td><td>"Who monitors the monitor?", HA, region isolation, alert storms.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout interview"><p><b>Turn your background into an answer.</b> This design is your world, so translate it out loud (full script on the <a href="{{BASE}}hld/hld-03">interview framework</a> page): "I wrote SNMP pollers for line cards: Prometheus scraping is the same pull model, and <code>rate()</code> on a counter is how I handled <code>ifInOctets</code> wraps." "We moved from polling to gNMI streaming telemetry at scale: that is the pull-vs-push trade-off." "I tuned interrupt coalescing on a NIC: remote-write batching is the same latency-for-throughput trade." Then return to the design.</p></div>
+        <div class="callout interview"><p><b>60-second answer:</b> "Every service exposes counters, gauges and histograms on a /metrics endpoint. Prometheus servers discover targets from the Kubernetes API and scrape them every 15 seconds; targets are sharded across servers and each shard runs as an HA pair. Each sample is a timestamp and a float on a series identified by name plus labels. Locally the TSDB writes a WAL, keeps 2 hours in memory and cuts immutable blocks, with Gorilla-style compression to about 1-2 bytes a sample. For global queries and 13-month retention, servers remote-write into a horizontally scaled store - distributors, replicated ingesters, blocks in object storage - with downsampling. Alert rules run every 30 seconds on symptoms like error rate and latency, and Alertmanager dedups, groups and routes. The two biggest risks are cardinality, which I control with label rules and per-tenant series limits, and monitoring failing with the system, which I cover with a dead-man's-switch alert."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld,monitoring" data-company="Uber,Amazon">
+          <summary>Pull or push - which would you choose for a monitoring system and why?</summary>
+          <div class="answer">
+            <p>Both, with a default. Pull inside the clusters: the monitor controls load so a buggy client cannot flood it, a failed scrape is a free liveness signal, and you can curl any target's <code>/metrics</code> while debugging. Push for short-lived batch jobs, serverless functions and devices behind NAT, via an OpenTelemetry Collector or Pushgateway. Google's Monarch is push-based, Prometheus is pull-based; both work at huge scale, so the choice is about operational fit, not raw capability.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give a default, three reasons, the exceptions, and one real example of each model. Link to SNMP polling vs streaming telemetry if you have that experience.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does pull work across a firewall? (agent inside, push out; or federation)</li><li>How do you detect a dead pusher? (absent() alert / staleness)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,monitoring,cardinality" data-company="Uber,Google">
+          <summary>A developer adds <code>customer_id</code> as a label and Prometheus keeps getting OOM-killed. Explain and fix.</summary>
+          <div class="answer">
+            <p>Series count is the product of label values. With a million customers, every metric carrying that label multiplied by a million; each active series costs memory in the head block and index, so memory exploded. Immediate fix: drop the label with a relabel rule (or drop the metric), restart, and let the bad series go stale. Lasting fixes: <code>sample_limit</code> per job, per-tenant active-series limits at the distributor, CI linting of metric definitions, and an alert on series growth rate. If the business really needs per-customer numbers, emit events to Kafka and aggregate them in an OLAP store.</p>
+            <div class="approach"><h5>How to answer</h5><p>Formula, immediate mitigation, guard rails, and the right tool for the real need.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you find which metric is the culprit? (TSDB status API, series count by metric)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,monitoring" data-company="Google,Microsoft">
+          <summary>How does a TSDB store a sample in 1-2 bytes when a timestamp and a float are 16 bytes?</summary>
+          <div class="answer">
+            <p>Samples of one series are stored together in a chunk. Timestamps are nearly regular, so the chunk stores the first timestamp and then delta-of-delta values, which are usually zero (1 bit). Float values change slowly, so each is XORed with the previous value and only the meaningful bits are stored (Gorilla encoding). The Gorilla paper reported about 1.37 bytes per sample; Prometheus documents roughly 1-2 bytes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the two tricks (delta-of-delta, XOR), explain why the data is predictable, quote one sourced number.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why does a jittery scrape interval hurt compression?</li><li>What is the WAL for?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,monitoring" data-company="Amazon,Walmart">
+          <summary>How would you scale from one Prometheus to 100 clusters with a global view?</summary>
+          <div class="answer">
+            <p>Keep scraping local: each cluster runs its own Prometheus (sharded and in HA pairs if large), so a network partition does not stop local alerting. Every server remote-writes to a central multi-tenant long-term store: distributors hash series to replicated ingesters, ingesters cut blocks and upload them to object storage, store gateways serve old blocks, and a query frontend splits and caches queries. Labels <code>cluster</code> and <code>replica</code> identify the source; replica samples are deduplicated. Downsample after 15 days. Critical alerts are evaluated close to the data (in-cluster) so they do not depend on the central store.</p>
+            <div class="approach"><h5>How to answer</h5><p>Local collection + local critical alerting, central storage for global queries and history. Mention dedup and object storage.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Federation vs remote write?</li><li>What if the central store is down for an hour? (WAL-backed retry queues)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,monitoring,alerting" data-company="Google,Amazon">
+          <summary>What should page an engineer at 3 AM, and what should not?</summary>
+          <div class="answer">
+            <p>Page only on symptoms that hurt users now or very soon: SLO burn rate on error ratio or latency, a critical job not running, data loss risk (Kafka offline partitions, disk about to fill in under an hour). High CPU, a single pod restart, or one node down in a redundant pool are causes - put them on dashboards or tickets. Every page needs an owner, a runbook link, and should be actionable. Group related alerts and inhibit child alerts under a parent outage alert.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Symptoms page, causes inform." Give two examples of each. Mention alert fatigue as the real risk.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is an error budget burn rate?</li><li>How would you test that alerts work? (fire drills, synthetic failures)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,monitoring" data-company="Microsoft,Uber">
+          <summary>Who monitors the monitoring system?</summary>
+          <div class="answer">
+            <p>Three layers. Prometheus HA pairs watch each other's <code>up</code> metric. A Watchdog alert that always fires is sent to an external dead-man's-switch service, which pages if the heartbeat stops - so silence is never mistaken for health. And a small, separate "meta-monitoring" Prometheus in another failure domain scrapes the main monitoring components (ingester memory, remote-write queue length, rule evaluation duration). Monitoring must not share fate with the things it monitors.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "dead-man's switch" and "separate failure domain" early.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the whole region is down? (external probes from another region)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,monitoring" data-company="Amazon,Flipkart">
+          <summary>How do you compute p99 latency across 200 pods?</summary>
+          <div class="answer">
+            <p>Each pod exports a histogram: counters per latency bucket. Because counters can be summed, I add the per-second rate of each bucket across all pods, then estimate the 99th percentile from the summed buckets: <code>histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code>. You cannot average per-pod p99 values - that gives a meaningless number - which is why summaries (pre-computed quantiles) do not aggregate.</p>
+            <div class="approach"><h5>How to answer</h5><p>Histogram, sum buckets, then quantile. Then say why averaging percentiles is wrong.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do bucket boundaries affect accuracy? (choose buckets around your SLO; native histograms help)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,monitoring,kafka" data-company="Walmart,Uber">
+          <summary>Which Kafka metrics would you alert on?</summary>
+          <div class="answer">
+            <p>Offline partitions above zero (outage, page), under-min-ISR partitions (writes with acks=all failing), under-replicated partitions for more than a few minutes, active controller count not exactly 1, request handler idle percent low (broker saturated), produce/fetch p99 latency, disk usage trend, and consumer lag expressed as time behind for each important consumer group. Lag in time is meaningful to the business ("orders are 4 minutes late"); lag in messages is not.</p>
+            <div class="approach"><h5>How to answer</h5><p>Group into availability, durability, saturation, and consumer health.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Lag is growing on one partition only - why? (hot key or stuck consumer)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,monitoring" data-company="Google,Uber">
+          <summary>How do Uber M3 and Google Monarch differ from a single Prometheus?</summary>
+          <div class="answer">
+            <p>Both are horizontally distributed, multi-tenant TSDBs built for a whole company. Uber's 2018 M3 post describes over 6.6 billion time series, aggregating about 500 million metrics per second and persisting about 20 million per second, with quorum writes to 3 replicas per region and retention from 2 days to 5 years using Gorilla-based M3TSZ compression. Monarch (VLDB 2020) is Google's planet-scale, in-memory, push-based system with regional zones and a global query layer. A single Prometheus is a self-contained, pull-based server; these systems separate ingestion, aggregation, storage and query into independent scalable tiers.</p>
+            <div class="approach"><h5>How to answer</h5><p>Quote one or two sourced numbers with the year, then the architectural difference: tiers and multi-tenancy.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why aggregate 500M/s but persist only 20M/s? (pre-aggregation drops labels nobody queries)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,monitoring" data-company="Microsoft,Amazon">
+          <summary>Metrics vs logs vs traces - when do you use which?</summary>
+          <div class="answer">
+            <p>Metrics tell you <i>that</i> something is wrong and how big it is (cheap, aggregated, alertable). Traces tell you <i>where</i> in a request path time was spent. Logs tell you <i>why</i>, with full detail. The usual incident flow: an alert on a metric, a dashboard narrows to one service, an exemplar or trace points to the slow call, and logs for that trace ID show the error.</p>
+            <div class="approach"><h5>How to answer</h5><p>"That, where, why" - then walk one incident through all three.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you link them? (shared labels and trace IDs, exemplars)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Designing a generic database ("store metrics in MySQL") without thinking about time-series compression and retention.</li>
+          <li>Ignoring cardinality - the number-one real-world failure.</li>
+          <li>Averaging percentiles across pods.</li>
+          <li>Paging on causes (CPU) instead of symptoms (errors, latency).</li>
+          <li>Forgetting "who monitors the monitor?".</li>
+          <li>Making alerting depend on the central long-term store across regions.</li>
+        </ul>
+
+        <div class="scenario">
+          <h4>Scenario: dashboards go blank during an outage</h4>
+          <div class="situation"><p>A bad deploy causes the checkout service to crash-loop. Each new pod has a new name, and a library bug puts the full request path (with order IDs) into a label. Within 20 minutes Prometheus is OOM-killed and every dashboard is empty - exactly when the incident team needs them.</p></div>
+          <div class="bad"><p>Weak answer: "Give Prometheus more memory."</p></div>
+          <div class="good"><p>Strong answer: "Two problems stacked: pod churn creates new series every restart, and the path label is unbounded. First, restore visibility: the HA twin and the long-term store still have pre-incident data; I add a relabel rule to drop the <code>path</code> label and raise nothing else. Then I set <code>sample_limit</code> on the job so one bad target gets rejected instead of killing the server, add per-tenant active-series limits at the distributor, and alert on series churn. Long-term, a metrics lint in CI rejects labels that are not in an allow-list, and I add a dead-man's switch so a dead Prometheus pages us instead of looking calm."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you have noticed 15 minutes earlier? (alert on head series growth rate)</li></ul></div>
+        </div>
+      

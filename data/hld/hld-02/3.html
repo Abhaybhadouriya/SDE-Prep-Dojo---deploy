@@ -1,0 +1,62 @@
+
+        <h2>Idempotency keys: make retries safe</h2>
+        <div class="eli5">
+          <h4>Explain like I'm 5</h4>
+          <p>At the fair you drop a numbered raffle ticket in the box. If you drop the same ticket number twice by accident, you are still in the draw once. The number makes the second drop harmless.</p>
+        </div>
+        <p>An operation is <strong><a href="{{BASE}}interview/glossary#idempotent">idempotent</a></strong> if doing it twice has the same effect as doing it once. "Set balance to 500" is idempotent; "add 100 to balance" is not. Networks force retries: the client sends "pay Rs 999", the server charges the card, and the reply is lost. The client cannot tell "never arrived" from "done, reply lost", so it retries. Without protection, the user pays twice.</p>
+        <p>The fix: the client generates a unique <strong>idempotency key</strong> (a UUID) once per <em>logical</em> operation and sends it with every retry of that operation. The server stores the key with the result. A repeat with the same key gets the saved result back, and the card is not charged again. Stripe's API works exactly like this, using an <code>Idempotency-Key</code> header.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Idempotency key: retry returns stored result">
+            <rect class="box client" x="20" y="100" width="150" height="60"/><text class="label" x="95" y="122">Client</text><text class="label small" x="95" y="142">key = 7f3a...</text>
+            <rect class="box svc" x="300" y="100" width="170" height="60"/><text class="label" x="385" y="122">Payment API</text><text class="label small" x="385" y="142">check key first</text>
+            <rect class="box db" x="600" y="20" width="180" height="60"/><text class="label" x="690" y="42">idempotency_keys</text><text class="label small" x="690" y="62">7f3a -&gt; 201 {ch_1}</text>
+            <rect class="box queue" x="600" y="180" width="180" height="60"/><text class="label" x="690" y="202">Card network</text><text class="label small" x="690" y="222">charged ONCE</text>
+            <path class="arrow" d="M170 115 L292 115"/><text class="label small" x="230" y="100">1st try</text>
+            <path class="arrow dashed" d="M292 145 L170 145"/><text class="label bad" x="230" y="165">reply lost</text>
+            <path class="arrow kafka" d="M170 130 L292 130"/>
+            <path class="arrow" d="M470 115 L592 60"/><path class="arrow" d="M470 145 L592 200"/>
+            <text class="label small left" x="300" y="200">retry, same key: found -&gt;</text>
+            <text class="label small left" x="300" y="220">return saved 201, no new charge</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M170 115 L300 115 L600 200"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M170 130 L300 130 L600 55"/></circle>
+          </svg>
+          <figcaption>First try (blue) charges the card and saves the result. The retry (orange) carries the same key, finds it in the table and gets the saved answer.</figcaption>
+        </figure>
+        <h3>How the server implements it</h3>
+        <p>The key insight is to let the database do the duplicate check with a <strong>unique constraint</strong>, not a "SELECT then INSERT" (two concurrent retries could both pass the SELECT).</p>
+<pre><code class="language-sql">CREATE TABLE idempotency_keys (
+  key           text PRIMARY KEY,
+  user_id       bigint NOT NULL,
+  request_hash  text   NOT NULL,          -- same key + different body = client bug
+  status        text   NOT NULL,          -- STARTED | DONE
+  response_code int,
+  response_body jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- Step 1: claim the key. Exactly one concurrent request wins.
+INSERT INTO idempotency_keys (key, user_id, request_hash, status)
+VALUES ('7f3a9c2e-5b1d-4d0e-9a77-1e2f3a4b5c6d', 42, 'sha256:ab12...', 'STARTED')
+ON CONFLICT (key) DO NOTHING
+RETURNING key;
+-- 1 row back  -&gt; we own it: charge the card, then UPDATE status='DONE', save response
+-- 0 rows back -&gt; already seen: read the row and return the saved response
+--                (or 409 Conflict if it is still STARTED, or 422 if request_hash differs)</code></pre>
+        <p class="small">The status codes follow the IETF httpapi Idempotency-Key draft. Stripe itself returns 400 (<code>idempotency_error</code>) when a key is reused with different parameters.</p>
+<pre><code class="language-bash">curl -X POST https://api.example.com/v1/payments \
+  -H "Idempotency-Key: 7f3a9c2e-5b1d-4d0e-9a77-1e2f3a4b5c6d" \
+  -H "Content-Type: application/json" \
+  -d '{"amount_paise": 99900, "currency": "INR", "order_id": "ord_81f2"}'</code></pre>
+        <ul>
+          <li><b>Who makes the key?</b> The client, once per user action ("pay for order 81f2"), and it reuses it for every retry. If the client makes a new key on each retry, the protection is gone - a very common production bug.</li>
+          <li><b>How long to keep it?</b> Long enough to cover all retries. Stripe's docs say keys can be removed after 24 hours.</li>
+          <li><b>Read from the primary.</b> Airbnb's payments team reads and writes idempotency records on the primary database, never a lagging replica, or a retry might not see the first attempt.</li>
+          <li><b>Retries need backoff with jitter</b> (wait 1 s, 2 s, 4 s ... plus a random extra), or every client retries at the same instant and creates a thundering herd. See the AWS Builders' Library article in Resources.</li>
+          <li><b>Consumers too.</b> Kafka consumers are at-least-once by default, so they see duplicates after a rebalance or crash. Use the event ID as the key in an inbox table, or write with an upsert. Details in <a href="{{BASE}}devops/kafka-06">Delivery Semantics &amp; Exactly-Once</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>An idempotency key is a TCP sequence number at the application level. When a segment is retransmitted with the same sequence number, the receiver's TCP stack drops the duplicate and the application reads the bytes once. <b>Where this breaks:</b> TCP state lives for one connection; an idempotency key must survive across connections, server restarts and even different servers, so it lives in a shared database.</p>
+        </div>
+      

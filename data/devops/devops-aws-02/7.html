@@ -1,0 +1,65 @@
+
+  <h2>Security groups vs network ACLs</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>Two firewalls, at two places, with two very different brains. This comparison is one of the most-asked AWS questions in SDE interviews.</p>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th></th><th>Security group (SG)</th><th>Network ACL (NACL)</th></tr></thead>
+      <tbody>
+        <tr><td>Attached to</td><td>ENI (instance, LB node, pod ENI, Lambda ENI)</td><td>Subnet: every packet crossing the subnet boundary</td></tr>
+        <tr><td>State</td><td><b>Stateful</b>: replies to an allowed flow are allowed automatically</td><td><b>Stateless</b>: replies need their own rule (ephemeral ports 1024-65535)</td></tr>
+        <tr><td>Rule types</td><td>Allow only. Default: deny all inbound, allow all outbound</td><td>Allow and deny. Default <a href="{{BASE}}interview/glossary#nacl">NACL</a> allows all; a new custom NACL denies all</td></tr>
+        <tr><td>Evaluation</td><td>All rules considered together</td><td>Numbered rules in ascending order; first match wins</td></tr>
+        <tr><td>Can reference</td><td>Other security groups, prefix lists, CIDRs</td><td>CIDRs only</td></tr>
+        <tr><td>Best for</td><td>The primary control: "app tier accepts 8080 only from the LB's SG"</td><td>Coarse guard rails and explicit denies: block a bad CIDR for a whole subnet</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure class="diagram">
+    <div class="svg-scroll">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Packet passes the route table, then the subnet network ACL at the subnet boundary, then the security group at the instance ENI; the reply is checked again by the NACL but not by the security group">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="20" y="110" width="130" height="60"/>
+      <text class="label" x="85" y="132">ALB node</text>
+      <text class="label small" x="85" y="152">sg-alb</text>
+      <rect class="zone db" x="210" y="30" width="570" height="240"/>
+      <text class="zone-label" x="226" y="54">private subnet 10.10.64.0/19</text>
+      <rect class="box queue" x="190" y="80" width="40" height="120"/>
+      <text class="label small" x="210" y="225">NACL</text>
+      <rect class="box svc" x="430" y="80" width="330" height="120"/>
+      <text class="label" x="595" y="104">EC2 instance 10.10.70.5</text>
+      <rect class="box cache" x="410" y="110" width="40" height="60"/>
+      <text class="label small" x="430" y="225">SG on ENI</text>
+      <rect class="box docker" x="500" y="125" width="220" height="56"/>
+      <text class="label" x="610" y="145">app :8080</text>
+      <text class="label small" x="610" y="165">sg-app: 8080 from sg-alb</text>
+      <path class="arrow dashed" d="M150 130 L496 140"/>
+      <path class="arrow dashed" d="M496 165 L150 155"/>
+      <text class="label small" x="300" y="112">rule 100 allow tcp 8080</text>
+      <text class="label small" x="310" y="190">rule 110 allow 1024-65535 out</text>
+      <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M150 130 L210 132 L430 138 L500 140"/></circle>
+      <circle class="packet alt" r="6"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite" path="M500 165 L430 163 L210 157 L150 155"/></circle>
+    </svg>
+    </div>
+    <figcaption>Request (blue) passes the subnet NACL, then the instance's security group. The reply (orange) is allowed by SG state automatically, but the stateless NACL needs its own outbound rule for the ephemeral port.</figcaption>
+  </figure>
+
+  <pre><code class="language-bash"># app tier accepts 8080 only from whatever is in the ALB's security group
+aws ec2 authorize-security-group-ingress --group-id sg-0app1111 \
+  --protocol tcp --port 8080 --source-group sg-0alb2222
+# database accepts 5432 only from the app tier
+aws ec2 authorize-security-group-ingress --group-id sg-0db3333 \
+  --protocol tcp --port 5432 --source-group sg-0app1111</code></pre>
+  <p>Referencing security groups instead of IPs is the superpower: when the ASG adds ten instances, they join <code>sg-0app1111</code> and are allowed into the database instantly, with no rule change.</p>
+
+  <h3>Connection tracking details that bite in production</h3>
+  <ul>
+    <li><b>Changing an SG rule does not cut existing tracked connections.</b> They live until they time out. To kill traffic immediately, use a NACL deny (stateless, evaluated on every packet).</li>
+    <li><b>Some flows are untracked</b>: if a TCP/UDP rule allows 0.0.0.0/0 inbound and the outbound rule allows all traffic to 0.0.0.0/0, AWS does not track that flow. Removing the rule then drops those connections at once.</li>
+    <li><b>Tracked connections are a per-instance limit.</b> When an instance runs out, new connections are dropped; the ENA metric <code>conntrack_allowance_exceeded</code> tells you. The idle TCP established timeout is configurable per ENI (default 432,000 s - 5 days - on most types, 350 s on Nitro v6 types), so long-lived idle connections need keepalives under 5 minutes on the newer generation.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>A security group is a per-interface stateful firewall - Linux <code>iptables</code>/nftables with <code>-m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT</code> pre-installed, plus allow rules, enforced on the Nitro card instead of your kernel. Referencing another SG is like matching on an <code>ipset</code> that is updated automatically with every member's IP. A NACL is a classic stateless router ACL on the subnet's "interface": numbered ACEs, first match wins, implicit deny at the end (<code>*</code>), and you must open the return ephemeral range yourself, just as on a Cisco extended ACL without <code>established</code>.</p>
+  </div>

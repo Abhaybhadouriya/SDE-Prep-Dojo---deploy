@@ -1,0 +1,77 @@
+
+        <h2>Step 7: create lag, then scale it away</h2>
+        <p>First make the enricher slow on purpose. <code>PROCESSING_DELAY_MS=50</code> makes it sleep 50 ms per record, so one instance handles about 20 records per second.</p>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="bash">
+<pre><code class="language-bash">PROCESSING_DELAY_MS=50 docker compose up -d enricher
+python loadgen/loadgen.py --rps 50 --seconds 120</code></pre>
+          </div>
+          <div class="tab-panel" data-title="PowerShell">
+<pre><code class="language-bash">$env:PROCESSING_DELAY_MS = "50"; docker compose up -d enricher
+python loadgen/loadgen.py --rps 50 --seconds 120</code></pre>
+          </div>
+          <div class="tab-panel" data-title=".env file">
+<pre><code class="language-bash"># edit .env and set:
+PROCESSING_DELAY_MS=50
+# then recreate only the enricher:
+docker compose up -d enricher</code></pre>
+          </div>
+        </div>
+        <p>Compose notices the changed environment and recreates only the enricher container. Now do the arithmetic before you look, as you would in an interview: 50 orders arrive per second, about 20 are processed per second, so lag should grow by roughly 30 per second. After a minute, about 1800 behind. Check:</p>
+<pre><code class="language-bash">docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:19092 --describe --group enricher</code></pre>
+<pre class="terminal"><code>GROUP     TOPIC           PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CONSUMER-ID       HOST         CLIENT-ID
+enricher  orders.created  0          1903            2214            311   e4a1c07d9b22-...  /172.19.0.14 e4a1c07d9b22
+enricher  orders.created  1          1870            2190            320   e4a1c07d9b22-...  /172.19.0.14 e4a1c07d9b22
+enricher  orders.created  2          1925            2231            306   e4a1c07d9b22-...  /172.19.0.14 e4a1c07d9b22
+...</code></pre>
+        <p>The numbers are illustrative; yours depend on timing. The shape is what matters: every partition has lag, and it keeps rising. The postgres-sink lag, meanwhile, is near zero: it is starved, not slow. Lag shows <i>where</i> the bottleneck is.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Lag as a tank: fill rate 50 per second, drain rate 20 per second, scaling to 3 consumers drains it">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="150" height="60"/><text class="label" x="95" y="52">loadgen</text><text class="label small" x="95" y="74">50 orders/s in</text>
+            <rect class="box kafka" x="260" y="20" width="150" height="220"/>
+            <rect class="box kafka solid" x="260" y="120" width="150" height="120">
+              <animate attributeName="y" values="200;60;200" dur="8s" repeatCount="indefinite"/>
+              <animate attributeName="height" values="40;180;40" dur="8s" repeatCount="indefinite"/>
+            </rect>
+            <text class="label" x="335" y="40">lag</text>
+            <text class="label small" x="335" y="256">orders.created backlog</text>
+            <rect class="box svc" x="500" y="30" width="130" height="44"/><text class="label small" x="565" y="52">enricher 1: 20/s</text>
+            <rect class="box ghost" x="500" y="96" width="130" height="44"/><text class="label small" x="565" y="118">enricher 2: 20/s</text>
+            <rect class="box ghost" x="500" y="162" width="130" height="44"/><text class="label small" x="565" y="184">enricher 3: 20/s</text>
+            <path class="arrow" d="M170 60 L256 60"/>
+            <path class="arrow" d="M410 60 L496 52"/>
+            <path class="arrow dashed" d="M410 120 L496 118"/>
+            <path class="arrow dashed" d="M410 180 L496 184"/>
+            <text class="label small left" x="650" y="60">1 instance: 20/s</text>
+            <text class="label small left" x="650" y="80">lag grows ~30/s</text>
+            <text class="label small left" x="650" y="160">3 instances: 60/s</text>
+            <text class="label small left" x="650" y="180">lag drains ~10/s</text>
+            <circle class="packet" r="6"><animateMotion dur="1.2s" repeatCount="indefinite" path="M95 60 L335 60"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M335 60 L565 52"/></circle>
+          </svg>
+          <figcaption>Lag is a water tank: fill rate minus drain rate. Adding consumers raises the drain rate, up to one consumer per partition.</figcaption>
+        </figure>
+
+        <p>Now scale the group to three instances while load is still running:</p>
+<pre><code class="language-bash">PROCESSING_DELAY_MS=50 docker compose up -d --scale enricher=3      # PowerShell: keep $env:PROCESSING_DELAY_MS set
+docker compose logs --since 1m enricher | grep -E "assigned|revoked"   # PowerShell: ... | Select-String "assigned|revoked"</code></pre>
+<pre class="terminal"><code>enricher-1  | ... INFO  enricher revoked ['orders.created[4]', 'orders.created[5]']
+enricher-1  | ... INFO  enricher revoked ['orders.created[2]', 'orders.created[3]']
+enricher-2  | ... INFO  enricher assigned ['orders.created[2]', 'orders.created[3]']
+enricher-3  | ... INFO  enricher assigned ['orders.created[4]', 'orders.created[5]']</code></pre>
+        <p>That is a <b>cooperative <a href="{{BASE}}interview/glossary#rebalance">rebalance</a></b>. The first instance keeps partitions 0 and 1 and gives up only the four that must move (the exact numbers may differ). With the older "eager" protocol, every member would stop and give up everything first. Each new instance gets its own <code>transactional.id</code> from its hostname, so they do not fence each other. Run the describe command again: three CONSUMER-IDs, two partitions each, and the lag shrinking.</p>
+        <div class="callout warn"><p><b>Scaling past the partition count does nothing.</b> <code>--scale enricher=8</code> gives six busy instances and two idle ones. The partition count is the ceiling. Reset with <code>docker compose up -d --scale enricher=1</code> and a normal <code>PROCESSING_DELAY_MS</code> (unset or 0) when you are done.</p></div>
+
+        <h3>Bonus: replay history (a 30-second taste)</h3>
+        <p>Kafka keeps the events for days, so a consumer can read them again. Found a bug in the analytics math? Fix it, then rewind the <code>analytics</code> group to the start of <code>orders.enriched</code> and it recomputes every window. Offsets can only be moved while the group has no running members, so stop it first. These are the same steps as <code>scripts/chaos/05-replay.sh</code>:</p>
+<pre><code class="language-bash">docker compose stop analytics
+docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:19092 \
+  --group analytics --topic orders.enriched --reset-offsets --to-earliest --dry-run
+docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka-1:19092 \
+  --group analytics --topic orders.enriched --reset-offsets --to-earliest --execute
+docker compose start analytics</code></pre>
+        <p>The dry run prints a table with each partition and its NEW-OFFSET (0 for a fresh topic) without changing anything; <code>--execute</code> applies it. Replay is safe here because analytics rebuilds its windows from scratch in memory (a restart starts empty), and the Postgres sink uses <code>ON CONFLICT (order_id) DO UPDATE</code>, so re-reading orders never creates duplicate rows. The full drill, with what to watch for, is on <a href="{{BASE}}devops/pipeline-05#drill-replay">Observability &amp; Failure Drills</a>.</p>
+        <div class="callout warn"><p><b>Watch <code>shopstream_late_events_total</code> during the replay.</b> Our toy processor has one global watermark across all six partitions. A replay reads up to 500 records per fetch, often mostly from one partition, so the watermark races ahead to that partition's newest time and many events from the other partitions are then marked late and dropped. The replayed windows can be smaller than the originals. Real frameworks track a watermark per partition and use the minimum (see <a href="{{BASE}}devops/pipeline-03#windows">windowed analytics</a>).</p></div>
+      

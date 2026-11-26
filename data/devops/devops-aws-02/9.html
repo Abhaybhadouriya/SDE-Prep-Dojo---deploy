@@ -1,0 +1,61 @@
+
+  <h2>Spot vs On-Demand, x86 vs Graviton</h2>
+  <div class="chips"><span class="chip warn">Good to know (SDE-2)</span></div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Purchase option</th><th>Price</th><th>Catch</th><th>Good for</th></tr></thead>
+      <tbody>
+        <tr><td><b>On-Demand</b></td><td>List price, per second</td><td>Most expensive</td><td>The baseline that must never disappear</td></tr>
+        <tr><td><b>Savings Plans / Reserved</b></td><td>Big discount for a 1- or 3-year spend commitment</td><td>You pay even if you do not use it</td><td>Steady 24x7 baseline</td></tr>
+        <tr><td><b>Spot</b></td><td>Spare capacity, up to 90 % off On-Demand</td><td>EC2 can reclaim it with a <b>2-minute warning</b></td><td>Stateless web tiers behind a LB, CI runners, batch, Kubernetes workers for replicated pods</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>A single ASG can mix them with a <b>mixed instances policy</b>: keep a base of On-Demand, fill the rest with Spot across many instance types and all AZs, so a Spot shortage in one pool does not hurt.</p>
+  <pre><code class="language-json">{
+  "LaunchTemplate": {
+    "LaunchTemplateSpecification": { "LaunchTemplateName": "web-lt", "Version": "$Latest" },
+    "Overrides": [
+      { "InstanceType": "m7i.large" }, { "InstanceType": "m6i.large" },
+      { "InstanceType": "m7a.large" }, { "InstanceType": "m6a.large" }, { "InstanceType": "m5.large" }
+    ]
+  },
+  "InstancesDistribution": {
+    "OnDemandBaseCapacity": 2,
+    "OnDemandPercentageAboveBaseCapacity": 20,
+    "SpotAllocationStrategy": "price-capacity-optimized"
+  }
+}</code></pre>
+  <p>Pair it with <b>Capacity Rebalancing</b> on the ASG: when EC2 sends a <i>rebalance recommendation</i> (elevated interruption risk), the ASG proactively launches a replacement before the 2-minute notice arrives. Inside the instance, poll the metadata service (AWS suggests every 5 seconds) and drain when a notice appears:</p>
+  <pre><code class="language-bash">TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/spot/instance-action</code></pre>
+  <pre class="terminal"><code>{"action": "terminate", "time": "2026-11-23T08:22:00Z"}</code></pre>
+  <p>No notice? You get HTTP 404. On Kubernetes, the AWS Node Termination Handler or Karpenter's interruption handling watches the same signal (via EventBridge) and cordons and drains the node so pods move gracefully.</p>
+
+  <h3>Graviton (ARM) vs x86</h3>
+  <p><b>Graviton</b> is AWS's own ARM64 CPU (the <code>g</code> in <code>m7g</code>). AWS states Graviton instances cost up to 20 % less than comparable x86 instances and use up to 60 % less energy for the same performance. Your real gain depends on the workload, so benchmark. The catch is software:</p>
+  <ul>
+    <li>Container images must be <b>multi-arch</b>: one tag, a manifest list pointing at an amd64 and an arm64 image.</li>
+    <li>Every dependency must exist for arm64: native libraries, JNI bits, old Python wheels, sidecar and agent images (monitoring, security scanners).</li>
+    <li>Interpreted and JIT languages (Java 17+, Go, Node, Python) usually just work; C/C++ with x86 intrinsics needs porting.</li>
+    <li>Do not mix architectures in one launch template. Use a separate ASG or Kubernetes node group, and steer pods with <code>nodeSelector: kubernetes.io/arch: arm64</code>.</li>
+  </ul>
+  <pre><code class="language-bash">docker buildx build --platform linux/amd64,linux/arm64 \
+  -t 123456789012.dkr.ecr.ap-south-1.amazonaws.com/web:1.4.0 --push .
+docker buildx imagetools inspect 123456789012.dkr.ecr.ap-south-1.amazonaws.com/web:1.4.0</code></pre>
+  <pre class="terminal"><code>Name:      123456789012.dkr.ecr.ap-south-1.amazonaws.com/web:1.4.0
+MediaType: application/vnd.oci.image.index.v1+json
+Digest:    sha256:4c1e...
+
+Manifests:
+  Name:      ...web:1.4.0@sha256:9a7b...
+  Platform:  linux/amd64
+
+  Name:      ...web:1.4.0@sha256:e21d...
+  Platform:  linux/arm64</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is cross-compiling for a different target, exactly like building a kernel for an ARM line card versus an x86 control card: same source, different toolchain, and any hand-written assembly or architecture-specific intrinsics must be ported. Endianness is not an issue (both are little-endian here), but memory ordering is: ARM is weakly ordered, so racy code that "worked" on x86's stronger ordering can break.</p>
+  </div>

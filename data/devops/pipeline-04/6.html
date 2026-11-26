@@ -1,0 +1,96 @@
+
+        <h2>Steps 6 and 7: images, config and the apps</h2>
+        <h3>Getting images into the cluster without a registry</h3>
+        <p>A real cluster pulls images from a registry. kind can skip that: <code>kind load docker-image</code> copies an image from your laptop's Docker into each node's containerd. The manifests use <code>imagePullPolicy: IfNotPresent</code>, so the kubelet uses the copied image instead of trying to download <code>shopstream/enricher:dev</code> from Docker Hub.</p>
+<pre><code class="language-bash">docker compose build
+for s in order-api enricher postgres-sink analytics; do kind load docker-image shopstream/$s:dev --name shopstream; done
+# PowerShell:
+# foreach ($s in "order-api","enricher","postgres-sink","analytics") { kind load docker-image "shopstream/${s}:dev" --name shopstream }</code></pre>
+
+        <h3>Config and secrets</h3>
+<pre><code class="language-yaml"># k8s/20-config.yaml (excerpt)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shopstream-config
+  namespace: shopstream
+data:
+  KAFKA_BOOTSTRAP: shopstream-kafka-bootstrap.kafka.svc:9092
+  TOPIC_CREATED: orders.created
+  CATALOG_SOURCE: postgres
+  TRANSIENT_FAIL_RATE: "0.0"
+  PROCESSING_DELAY_MS: "0"</code></pre>
+        <p>The Secret named <code>shopstream-db</code> lives in its own file, <code>20-secret.example.yaml</code>, with an obvious placeholder password. Apply that file <b>or</b> create your own Secret with <code>kubectl create secret generic</code> (the command is in the file's comment), never both. The example file is deliberately <em>not</em> listed in <code>kustomization.yaml</code>: otherwise a later <code>kubectl apply -k k8s/</code> would silently reset your real password to the placeholder, and Postgres, which keeps the password it was first initialised with, would start rejecting the apps. It is a placeholder on purpose: a Secret is only base64-encoded in the API, not encrypted, unless the cluster enables encryption at rest. Real clusters create it from a secret manager (External Secrets, Sealed Secrets, a cloud vault). See <a href="{{BASE}}devops/k8s-07">ConfigMaps &amp; Secrets</a>.</p>
+
+        <h3>One Deployment, read slowly</h3>
+        <p>The order-api Deployment shows every production habit in about 50 lines. These are the important parts:</p>
+<pre><code class="language-yaml"># k8s/30-order-api.yaml (excerpt)
+spec:
+  # no replicas: field on purpose - the HPA owns the count (min 2)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 0, maxSurge: 1}
+  template:
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: order-api
+          image: shopstream/order-api:dev
+          envFrom:
+            - configMapRef: {name: shopstream-config}
+          env:
+            - name: HOSTNAME   # pod name =&gt; unique transactional.id / client.id per pod
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+          startupProbe:          # give the producer time to connect at boot
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:         # restart only if the process is stuck
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          readinessProbe:        # stop sending traffic when Kafka is unreachable
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 200m, memory: 128Mi}   # HPA % is computed against requests
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}</code></pre>
+        <ol class="steps">
+          <li><strong>Three different probes, three different jobs.</strong> <code>/healthz</code> only says "the process answers". <code>/readyz</code> asks Kafka for topic metadata. If Kafka is unreachable, the pod is taken out of the Service (no traffic) but <em>not</em> restarted, because restarting would not fix Kafka. Using <code>/readyz</code> as the liveness probe would be a classic mistake: a Kafka blip would restart every API pod at once.</li>
+          <li><strong>No <code>replicas:</code> field.</strong> The HPA owns the replica count. If the manifest said <code>replicas: 2</code>, every <code>kubectl apply</code> would reset the Deployment to 2 and the HPA would have to scale up again: a scale-down in the middle of a load test or an incident. The enricher Deployment leaves it out for the same reason (KEDA owns it there, and a reset would also cause a consumer <a href="{{BASE}}interview/glossary#rebalance">rebalance</a>).</li>
+          <li><strong><code>maxUnavailable: 0, maxSurge: 1</code></strong>: during a rollout, start one new pod, wait until it is ready, then stop one old pod. Capacity never drops.</li>
+          <li><strong>The pod name as <code>HOSTNAME</code></strong> (the Downward API). For the enricher this becomes <code>transactional.id = enricher-&lt;pod name&gt;</code>: unique per pod, as <a href="{{BASE}}interview/glossary#zombie">zombie</a> <a href="{{BASE}}interview/glossary#fencing">fencing</a> needs (see <a href="{{BASE}}devops/pipeline-03">Stream Processing</a>).</li>
+          <li><strong><code>terminationGracePeriodSeconds</code></strong>: on delete, the kubelet sends SIGTERM, waits this long, then SIGKILL. The services' <code>GracefulExit</code> class turns SIGTERM into "finish the batch, commit, close the consumer", so the member leaves the group cleanly and the rebalance is fast. The enricher gets 45 seconds.</li>
+          <li><strong>Memory limit but no CPU limit.</strong> A memory limit protects the node (over it, the kernel OOM-kills the container). No CPU limit avoids <a href="{{BASE}}interview/glossary#throttling">CFS throttling</a> (the kernel's Completely Fair Scheduler pauses a cgroup that used up its CPU quota for the current 100 ms period, even when the node has idle cores); the CPU <em>request</em> still reserves a share and is what the HPA percentage is based on.</li>
+          <li><strong>Locked-down security context.</strong> Non-root user 10001 (the Dockerfile creates it), read-only root filesystem, all Linux capabilities dropped, default seccomp profile.</li>
+        </ol>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Readiness is like BFD pulling a next hop out of an ECMP group while the box stays up; liveness is the hardware watchdog that reboots a hung process. You would never wire the watchdog to "is my upstream neighbour reachable", for the same reason you should not wire liveness to Kafka. The Downward API is like a line card reading its slot number from the backplane at boot. Where it breaks: BFD reacts in milliseconds, but a readiness probe with <code>periodSeconds: 5</code> and <code>failureThreshold: 3</code> needs about 15 s to pull a pod out, and kube-proxy needs a moment more to update every node, so a few requests still reach a pod that has just lost Kafka.</p>
+        </div>
+<pre><code class="language-bash">kubectl apply -f k8s/20-secret.example.yaml   # OR your own: kubectl create secret generic ... (never both)
+kubectl apply -f k8s/20-config.yaml -f k8s/21-postgres.yaml
+kubectl apply -f k8s/30-order-api.yaml -f k8s/31-enricher.yaml -f k8s/32-sinks.yaml -f k8s/40-networkpolicy.yaml
+kubectl -n shopstream get pods</code></pre>
+<pre class="terminal"><code>NAME                             READY   STATUS    RESTARTS   AGE
+analytics-6c9f7d8b5-k2m4n        1/1     Running   0          70s
+enricher-7d8f9c6b4-5tq8w         1/1     Running   0          70s
+order-api-5b7c8d9f6-h3j9k        1/1     Running   0          70s
+order-api-5b7c8d9f6-x8p2m        1/1     Running   0          70s
+postgres-0                       1/1     Running   0          75s
+postgres-sink-6f8d7c5b9-c4v7b    1/1     Running   0          70s
+postgres-sink-6f8d7c5b9-w9z2r    1/1     Running   0          70s
+retry-worker-8c7b6d5f4-n6r3s     1/1     Running   0          70s</code></pre>
+        <p>A few <code>RESTARTS</code> right after the first apply are normal if an app started before Postgres was ready. Then send an order through the NodePort:</p>
+<pre><code class="language-bash">curl -X POST localhost:30080/orders -H 'Content-Type: application/json' \
+  -d '{"customer_id":"C-1","items":[{"product_id":"P-100","quantity":2}]}'</code></pre>
+<pre class="terminal"><code>{"order_id":"3f6c...","status":"ACCEPTED","partition":2,"offset":0}</code></pre>
+      

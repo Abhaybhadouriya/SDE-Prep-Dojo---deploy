@@ -1,0 +1,113 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 290" role="img" aria-label="Booking service writes outbox, relay to Kafka, consumers for tickets, notifications, seat map, analytics">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="840" height="270"/>
+            <text class="zone-label" x="24" y="32">Kubernetes cluster</text>
+            <rect class="box svc" x="30" y="60" width="150" height="56"/>
+            <text class="label" x="105" y="84">booking-svc</text>
+            <text class="label small" x="105" y="104">pre-scaled</text>
+            <rect class="box db" x="30" y="170" width="150" height="56"/>
+            <text class="label" x="105" y="194">Postgres</text>
+            <text class="label small" x="105" y="214">+ outbox table</text>
+            <rect class="box svc" x="230" y="170" width="140" height="56"/>
+            <text class="label small" x="300" y="194">outbox relay</text>
+            <text class="label small" x="300" y="214">(Debezium CDC)</text>
+            <rect class="box kafka" x="420" y="110" width="160" height="70"/>
+            <text class="label" x="500" y="136">Kafka</text>
+            <text class="label small" x="500" y="158">booking.events</text>
+            <text class="label small" x="500" y="174">key = show_id</text>
+            <rect class="box queue" x="640" y="40" width="190" height="44"/>
+            <text class="label small" x="735" y="62">ticket + QR generator</text>
+            <rect class="box queue" x="640" y="95" width="190" height="44"/>
+            <text class="label small" x="735" y="117">notifications</text>
+            <rect class="box cache" x="640" y="150" width="190" height="44"/>
+            <text class="label small" x="735" y="172">seat-map updater</text>
+            <rect class="box queue" x="640" y="205" width="190" height="44"/>
+            <text class="label small" x="735" y="227">analytics / fraud</text>
+            <path class="arrow" d="M105 116 L105 163"/>
+            <path class="arrow" d="M180 198 L223 198"/>
+            <path class="arrow kafka" d="M370 190 L413 160"/>
+            <path class="arrow kafka" d="M580 130 L633 62"/>
+            <path class="arrow kafka" d="M580 140 L633 117"/>
+            <path class="arrow kafka" d="M580 150 L633 172"/>
+            <path class="arrow kafka" d="M580 165 L633 227"/>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M105 116 L105 170 L180 198 L230 198 L370 190 L420 160 L580 140 L640 117"/></circle>
+          </svg>
+          <figcaption>The seat decision is synchronous in Postgres. Everything that follows a decision flows through Kafka, so a slow email provider never slows down a booking.</figcaption>
+        </figure>
+        <h3>Kafka</h3>
+        <ul>
+          <li><b>Not on the hold path.</b> The user is waiting for "you got F7"; that answer comes from the database in milliseconds. (The per-show serialiser in deep dive 5 is the exception, for extreme cases.)</li>
+          <li><b>After the decision:</b> <code>booking.events</code> (held, released, confirmed, cancelled) keyed by <code>show_id</code>, so events for a show stay in order in one partition (<a href="{{BASE}}devops/kafka-02">keys and partitions</a>). Consumers in separate <a href="{{BASE}}devops/kafka-04">consumer groups</a> generate tickets, notify, update the seat map and feed analytics.</li>
+          <li><b>Outbox, not dual writes.</b> Writing to Postgres and then to Kafka from the app can lose one of the two on a crash. Insert an outbox row in the same transaction as the booking, and let a relay or Debezium CDC publish it. Consumers dedupe on <code>booking_id</code> because delivery is at-least-once.</li>
+          <li><b>Waiting room telemetry</b> (queue joins, admissions, drop-offs) is another stream used to tune the admission rate live.</li>
+        </ul>
+        <h3>Kubernetes</h3>
+        <p>On-sale traffic arrives at a known minute, so <b>pre-scale</b> instead of waiting for the HPA: HPA reacts to metrics after they rise, and new pods and nodes take time to start. Raise <code>minReplicas</code> an hour before, with a scheduled job or a KEDA cron trigger, then let the HPA handle the rest (<a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>). Protect the booking pods with a PodDisruptionBudget so a node upgrade does not drain them mid-sale.</p>
+<pre><code class="language-yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: booking-svc
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: booking-svc }
+  minReplicas: 60            # raised from 6 before a big on-sale, lowered after
+  maxReplicas: 200
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: 900 }   # don't shrink during the sale
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: booking-svc
+spec:
+  minAvailable: 90%
+  selector: { matchLabels: { app: booking-svc } }
+---
+apiVersion: batch/v1
+kind: CronJob                 # backup sweeper; the main sweeper is a loop in a Deployment
+metadata:
+  name: hold-sweeper
+spec:
+  schedule: "* * * * *"       # every minute (the smallest CronJob interval)
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: sweep
+              image: registry.example.com/booking-tools:2.3.0
+              args: ["sweep-expired-holds", "--batch=5000"]</code></pre>
+        <h3>Docker</h3>
+        <p>For local practice, a Compose file with Postgres and Redis is enough to reproduce the race above and test the sweeper (<a href="{{BASE}}devops/docker-07">Docker Compose</a>):</p>
+<pre><code class="language-yaml">services:
+  db:
+    image: postgres:17
+    environment: { POSTGRES_PASSWORD: dev, POSTGRES_DB: demo }
+    ports: ["5432:5432"]
+  redis:
+    image: redis:8
+    ports: ["6379:6379"]</code></pre>
+<pre class="terminal"><code>$ docker compose up -d
+[+] Running 3/3
+ ✔ Network tickets_default    Created
+ ✔ Container tickets-db-1     Started
+ ✔ Container tickets-redis-1  Started
+$ docker compose exec redis redis-cli SET seat:1:F7 h_81 NX EX 600
+OK
+$ docker compose exec redis redis-cli SET seat:1:F7 h_99 NX EX 600
+(nil)
+$ docker compose exec redis redis-cli TTL seat:1:F7
+(integer) 594</code></pre>
+        <p>The second <code>SET ... NX</code> returns <code>(nil)</code>: the key exists, so Ben's hold fails, and the key vanishes by itself after 600 seconds. For several seats at once, use a Lua script that checks every key first and sets them all only if all are free, because Redis runs a script atomically.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The conditional UPDATE is a compare-and-swap, the same idea as a <code>cmpxchg</code> on a lock word: "set to HELD only if it is still AVAILABLE", and the hardware (here the row lock) makes it atomic. The hold TTL is a lease, like a DHCP lease: if the client does not renew or confirm in time, the address goes back to the pool. <b>Where it breaks:</b> a CAS on one machine is instant; here the "memory" is a database across a network, so every retry costs a round-trip and contention costs real latency.</p>
+        </div>
+      

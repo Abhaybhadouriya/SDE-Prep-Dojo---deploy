@@ -1,0 +1,87 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 270" role="img" aria-label="Kafka feeds Flink and the data lake; Kubernetes runs trie servers and the builder CronJob">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="840" height="250"/>
+            <text class="zone-label" x="24" y="32">Kubernetes</text>
+            <rect class="box svc" x="30" y="60" width="150" height="56"/>
+            <text class="label small" x="105" y="84">search-svc pods</text>
+            <text class="label small" x="105" y="104">producer</text>
+            <rect class="box kafka" x="230" y="60" width="170" height="56"/>
+            <text class="label small" x="315" y="84">search.queries</text>
+            <text class="label small" x="315" y="104">key = query, lz4</text>
+            <rect class="box queue" x="450" y="40" width="170" height="44"/>
+            <text class="label small" x="535" y="62">Flink trending job</text>
+            <rect class="box db" x="450" y="100" width="170" height="44"/>
+            <text class="label small" x="535" y="122">S3 sink connector</text>
+            <rect class="box svc" x="450" y="180" width="170" height="56"/>
+            <text class="label small" x="535" y="204">trie-builder</text>
+            <text class="label small" x="535" y="224">CronJob (Spark)</text>
+            <rect class="box svc highlight" x="670" y="100" width="160" height="80"/>
+            <text class="label small" x="750" y="126">trie-server pods</text>
+            <text class="label small" x="750" y="146">init: pull snapshot</text>
+            <text class="label small" x="750" y="166">ready after load</text>
+            <path class="arrow kafka" d="M180 88 L223 88"/>
+            <path class="arrow kafka" d="M400 80 L443 62"/>
+            <path class="arrow kafka" d="M400 96 L443 120"/>
+            <path class="arrow" d="M535 144 L535 173"/>
+            <path class="arrow ok" d="M620 205 L700 182"/>
+            <path class="arrow dashed" d="M620 62 L700 102"/>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M180 88 L230 88 L400 96 L450 120 L535 144 L535 180 L620 205 L700 182"/></circle>
+          </svg>
+          <figcaption>Kafka is the collection bus; Kubernetes runs the serving fleet, the stream job and the scheduled builder; every piece ships as a Docker image.</figcaption>
+        </figure>
+        <h3>Kafka</h3>
+        <ul>
+          <li><b>One topic, many readers:</b> <code>search.queries</code> is read by the trending Flink job, an S3 sink (Kafka Connect) for the data lake, and maybe spell-correction and analytics, each in its own <a href="{{BASE}}devops/kafka-04">consumer group</a>. Producers never wait for any of them.</li>
+          <li><b>Key by normalised query</b> so all counts for one query arrive in one partition and can be summed locally (<a href="{{BASE}}devops/kafka-02">keys and partitions</a>). A single viral query becomes a hot partition, so pre-aggregate: count in each producer or in a first Flink stage for a few seconds, then send (query, partial count).</li>
+          <li><b>Losing a few events is acceptable</b> here (popularity is statistical), so this topic can trade durability for cost (for example <code>acks=1</code>), unlike a payments topic. Say this trade-off explicitly: it shows you choose settings per use case. Throughput tuning: compression (lz4), batching (<code>linger.ms</code>), see <a href="{{BASE}}devops/kafka-11">Operations &amp; Tuning</a>.</li>
+          <li>The same "events to Kafka, aggregate in Flink, serve from a fast store" shape is the <a href="{{BASE}}devops/pipeline-01">end-to-end pipeline</a> on this site.</li>
+        </ul>
+        <h3>Kubernetes</h3>
+        <p>Trie servers are read-only and hold a big in-memory snapshot, so the important settings are memory and readiness. A pod must not receive traffic until its snapshot is loaded, or users get empty suggestions (<a href="{{BASE}}devops/k8s-04">Deployments &amp; Rollouts</a>).</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trie-server-shard-07
+spec:
+  replicas: 6
+  selector:
+    matchLabels: { app: trie-server, shard: "07" }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 2 }   # never drop below capacity
+  template:
+    metadata:
+      labels: { app: trie-server, shard: "07" }
+    spec:
+      initContainers:
+        - name: fetch-snapshot
+          image: registry.example.com/snapshot-fetcher:1.2.0
+          args: ["--src=s3://tries/latest/shard-07.bin", "--dst=/data/trie.bin"]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      containers:
+        - name: server
+          image: registry.example.com/trie-server:3.4.1
+          resources:
+            requests: { cpu: "2", memory: 24Gi }
+            limits:   { memory: 24Gi }      # equal: predictable, no surprise OOM kills
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }   # true only after the trie is in RAM
+            periodSeconds: 5
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          emptyDir: {}</code></pre>
+        <p>The builder is a batch job, so a <code>CronJob</code> (or Spark on Kubernetes) fits. New snapshots can either roll out as a new Deployment revision (simple, slow) or be hot-swapped inside running pods when a "new version" message arrives (fast, needs the double-buffer memory headroom).</p>
+        <h3>Docker</h3>
+        <p>Package the trie server as a small image; the snapshot is data, not code, so do <b>not</b> bake it into the image (it changes daily and is tens of GB). Pull it at start-up or mount it (<a href="{{BASE}}devops/docker-03">Writing a Dockerfile</a>).</p>
+<pre><code class="language-dockerfile">FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server/ ./server/
+USER 10001
+EXPOSE 8080
+CMD ["python", "-m", "server", "--trie=/data/trie.bin", "--port=8080"]</code></pre>
+      

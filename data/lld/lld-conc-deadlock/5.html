@@ -1,0 +1,69 @@
+
+  <h2>Finding a deadlock: thread dumps, the JVM, lockdep, the database</h2>
+  <p>Prevention is the design answer. Detection is the "it is 2 a.m. and checkout is hung" answer, and good interviewers ask for both.</p>
+  <h3>Java: take a thread dump</h3>
+  <p>Run <code>jstack &lt;pid&gt;</code> (or <code>jcmd &lt;pid&gt; Thread.print</code>, or <code>kill -3</code> on Linux, which prints to the process's stdout). The JVM walks the wait-for graph of monitors and <code>ReentrantLock</code>s and prints any cycle at the bottom. This is real output from <code>Hang.java</code> in the code folder (JDK 21, a few lambda frames removed):</p>
+<pre class="terminal"><code>Found one Java-level deadlock:
+=============================
+"T1 a-&gt;b":
+  waiting to lock monitor 0x000001ca1b689b30 (object 0x0000000713f74e90, a java.lang.Object),
+  which is held by "T2 b-&gt;a"
+
+"T2 b-&gt;a":
+  waiting to lock monitor 0x000001ca78a600d0 (object 0x0000000713f74e80, a java.lang.Object),
+  which is held by "T1 a-&gt;b"
+
+Java stack information for the threads listed above:
+===================================================
+"T1 a-&gt;b":
+	at Hang.lambda$main$0(Hang.java:4)
+	- waiting to lock &lt;0x0000000713f74e90&gt; (a java.lang.Object)
+	- locked &lt;0x0000000713f74e80&gt; (a java.lang.Object)
+"T2 b-&gt;a":
+	at Hang.lambda$main$1(Hang.java:5)
+	- waiting to lock &lt;0x0000000713f74e80&gt; (a java.lang.Object)
+	- locked &lt;0x0000000713f74e90&gt; (a java.lang.Object)
+
+Found 1 deadlock.</code></pre>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 250" role="img" aria-label="How to read a thread dump: for each BLOCKED thread note what it holds and what it waits for, draw edges, find the cycle">
+      <rect class="box queue" x="20" y="20" width="230" height="96"/>
+      <text class="label" x="135" y="44">1. Find BLOCKED</text>
+      <text class="label small" x="135" y="70">threads in the dump</text>
+      <text class="label small" x="135" y="92">(state BLOCKED / WAITING)</text>
+      <rect class="box queue" x="285" y="20" width="230" height="96"/>
+      <text class="label" x="400" y="44">2. Two lines each</text>
+      <text class="label small mono" x="400" y="70">- locked &lt;0x..98&gt;</text>
+      <text class="label small mono" x="400" y="92">- waiting to lock &lt;0x..a8&gt;</text>
+      <rect class="box queue" x="550" y="20" width="230" height="96"/>
+      <text class="label" x="665" y="44">3. Draw edges</text>
+      <text class="label small" x="665" y="70">waiter -&gt; owner</text>
+      <text class="label small" x="665" y="92">of that address</text>
+      <path class="arrow" d="M252 68 L281 68"/>
+      <path class="arrow" d="M517 68 L546 68"/>
+      <rect class="box client" x="140" y="160" width="160" height="56"/>
+      <text class="label" x="220" y="193">T1 a-&gt;b</text>
+      <rect class="box client" x="500" y="160" width="160" height="56"/>
+      <text class="label" x="580" y="193">T2 b-&gt;a</text>
+      <path class="arrow bad" d="M302 176 L494 176"/>
+      <path class="arrow bad" d="M494 204 L306 204"/>
+      <text class="label small bad" x="400" y="168">waits for 0x..a8</text>
+      <text class="label small bad" x="400" y="232">waits for 0x..98</text>
+      <text class="label small" x="665" y="150">4. A cycle = deadlock;</text>
+      <text class="label small" x="665" y="168">the stack frames show</text>
+      <text class="label small" x="665" y="186">the two code paths to fix</text>
+    </svg>
+    <figcaption>Reading a dump by hand is the same algorithm the JVM uses: every "waiting to lock X" becomes an edge to whoever "locked X". Take two or three dumps a few seconds apart; a thread blocked on the same address in all of them is stuck, not just busy.</figcaption>
+  </figure>
+  <ul>
+    <li><b>In code:</b> <code>ManagementFactory.getThreadMXBean().findDeadlockedThreads()</code> returns the ids of threads in a cycle (monitors and ownable synchronizers like <code>ReentrantLock</code>). Some teams run it from a health check and page on a non-empty result.</li>
+    <li><b>Waiting on a condition is not in the cycle check.</b> A thread parked forever in <code>queue.take()</code> or <code>future.get()</code> with no producer is "stuck" but the JVM will not call it a deadlock, because no lock owner exists. Timeouts on every blocking call are your protection there.</li>
+    <li><b>Thread pool self-deadlock:</b> a task running on a fixed pool of size 4 submits sub-tasks to the same pool and waits on their futures. When all 4 threads are waiting, the sub-tasks never get a thread. No lock is involved, yet nothing moves. Fix: a separate pool for sub-tasks, or non-blocking composition (<code>CompletableFuture.thenCompose</code>).</li>
+  </ul>
+  <h3>Kernel: lockdep</h3>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p><code>CONFIG_PROVE_LOCKING</code> (lockdep) does not wait for a hang. It tracks <b>lock classes</b> (all locks initialised at the same place share a class), records every "took B while holding A" edge, and reports "possible circular locking dependency detected" the first time an acquisition would close a cycle, even if the two paths ran minutes apart on one CPU. It also checks IRQ-safety rules (a lock taken in hard-IRQ context must be taken with IRQs disabled elsewhere). That is the Java lock-order rule enforced by a tool. The C++ tab above is a 60-line toy of that idea; in Java the closest equivalents are static analysers and lock-order checkers in tests, plus documented lock levels in code review.</p>
+  </div>
+  <h3>Databases detect it for you</h3>
+  <p>Relational databases build the wait-for graph of row locks and, when they find a cycle, abort one transaction (PostgreSQL raises error <code>40P01 deadlock_detected</code>; MySQL InnoDB rolls back the cheaper transaction with error 1213). Your code must catch that error and <b>retry the whole transaction</b>. The prevention rule is the same as in memory: update rows in a consistent order (for example <code>ORDER BY id</code> before <code>SELECT ... FOR UPDATE</code>). More on row locks in <a href="{{BASE}}lld/lld-conc-booking#db">the booking lesson</a>.</p>

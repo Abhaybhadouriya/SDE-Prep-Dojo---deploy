@@ -1,0 +1,136 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. "Players around me" and percentiles</h3>
+        <p>Two calls: first <code>r = ZREVRANK lb mallow007</code> (say 360), then <code>ZREVRANGE lb (r-4) (r+4) WITHSCORES</code> (356 to 364). Clamp at 0 for the top players. For a player ranked 3,000,000th out of 25,000,000, show a <b>percentile</b> instead of a scary number: <code>top% = 100 x (r + 1) / ZCARD</code> (the +1 because <code>ZREVRANK</code> is 0-based) = 3,000,001 / 25,000,000 = "top 12%". The <b>percentile</b> is the other side of the same number: 100 - 12 = the 88th percentile (you beat 88% of players). Do not mix the two words. Many real games show "Top 12%" below the top 1,000 because a seven-digit rank is depressing, not useful.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 200" role="img" aria-label="Window of 4 above and 4 below a player's rank">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="28">Rank (0-based, highest first)</text>
+            <g>
+              <rect class="box" x="20" y="50" width="70" height="44"/><text class="label small" x="55" y="77">355</text>
+              <rect class="box cache" x="100" y="50" width="70" height="44"/><text class="label small" x="135" y="77">356</text>
+              <rect class="box cache" x="180" y="50" width="70" height="44"/><text class="label small" x="215" y="77">357</text>
+              <rect class="box cache" x="260" y="50" width="70" height="44"/><text class="label small" x="295" y="77">358</text>
+              <rect class="box cache" x="340" y="50" width="70" height="44"/><text class="label small" x="375" y="77">359</text>
+              <rect class="box hot" x="420" y="50" width="70" height="44"/><text class="label small" x="455" y="77">360 me</text>
+              <rect class="box cache" x="500" y="50" width="70" height="44"/><text class="label small" x="535" y="77">361</text>
+              <rect class="box cache" x="580" y="50" width="70" height="44"/><text class="label small" x="615" y="77">362</text>
+              <rect class="box cache" x="660" y="50" width="70" height="44"/><text class="label small" x="695" y="77">363</text>
+              <rect class="box cache" x="740" y="50" width="70" height="44"/><text class="label small" x="775" y="77">364</text>
+            </g>
+            <path class="arrow both" d="M100 120 L810 120"/>
+            <text class="label small" x="455" y="142">ZREVRANGE lb 356 364 WITHSCORES  (one O(log N + 9) call)</text>
+            <text class="label small" x="455" y="178">step 1: ZREVRANK lb me -&gt; 360      step 2: range r-4 .. r+4</text>
+          </svg>
+          <figcaption>The "around me" window is just a range query centred on your rank. Both calls are O(log N) plus the 9 rows returned.</figcaption>
+        </figure>
+
+        <h3>2. Ties and time windows</h3>
+        <p><b>Ties.</b> Redis orders equal scores by member name: <code>ZRANGE</code> ascending, <code>ZREVRANGE</code> / <code>ZREVRANK</code> descending - so on a high-score board read with ZREV* commands, "zara" always beats "aaron". Either way it is arbitrary and unfair. If the rule is "same score = same rank", compute rank as <code>ZCOUNT lb (score +inf</code> (number of strictly higher scores) instead of <code>ZREVRANK</code>. If the rule is "earlier achiever wins", pack a time component into the score so the number itself is unique:</p>
+<pre><code class="language-python"># Redis scores are IEEE-754 doubles: integers are exact only up to 2**53 (about 9e15).
+# Pack: high part = points, low part = "how early" in this tournament.
+MONTH_SECONDS = 31 * 24 * 3600          # 2,678,400 &lt; 2**22 (4,194,304)
+SHIFT = 2**22
+
+def packed(points: int, achieved_at: int, month_end: int) -&gt; int:
+    earliness = month_end - achieved_at   # bigger = earlier = better
+    assert 0 &lt;= earliness &lt; SHIFT
+    assert points &lt; 2**31                 # 2**31 * 2**22 = 2**53 -&gt; still exact
+    return points * SHIFT + earliness
+
+def points_of(score: float) -&gt; int:
+    return int(score) // SHIFT</code></pre>
+        <p>The catch: with a packed score you can no longer use <code>ZINCRBY</code> blindly (it would add to the time part too). Read the current points, compute the new packed value, and write it with <code>ZADD</code> inside one Lua script. If the board is "best single score" instead of "total", use <code>ZADD lb GT score member</code> (Redis 6.2+): it only updates when the new score is greater - which is also naturally safe to retry.</p>
+        <p><b>Time windows.</b> One key per window: <code>lb:2026-11</code>, <code>lb:2026-11-23</code>, <code>lb:2026-W47</code>. Each score event updates all the windows it belongs to (3 <code>ZINCRBY</code>s in the same Lua script). Set <code>EXPIRE</code> on daily keys so they clean themselves up. When the month ends, a job writes the final top N and every player's final rank to the database, then the old key expires. A "last 7 days" rolling board can be built with <code>ZUNIONSTORE lb:last7 7 lb:day1 ... lb:day7</code>, but that is O(total members) - run it every few minutes in the background, not per request.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 210" role="img" aria-label="One score event updates the daily, weekly and monthly keys">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="80" width="170" height="56"/>
+            <text class="label" x="105" y="103">score event</text>
+            <text class="label small" x="105" y="123">mary +3 at 23 Nov</text>
+            <rect class="box svc" x="250" y="80" width="150" height="56"/>
+            <text class="label" x="325" y="103">Lua script</text>
+            <text class="label small" x="325" y="123">one atomic call</text>
+            <path class="arrow" d="M190 108 L243 108"/>
+            <rect class="box cache" x="470" y="20" width="200" height="44"/><text class="label small" x="570" y="47">lb:2026-11-23 (EXPIRE 3d)</text>
+            <rect class="box cache" x="470" y="86" width="200" height="44"/><text class="label small" x="570" y="113">lb:2026-W47 (EXPIRE 14d)</text>
+            <rect class="box cache" x="470" y="152" width="200" height="44"/><text class="label small" x="570" y="179">lb:2026-11 (monthly)</text>
+            <path class="arrow" d="M400 100 L463 45"/><path class="arrow" d="M400 108 L463 108"/><path class="arrow" d="M400 116 L463 172"/>
+            <rect class="box db" x="700" y="152" width="110" height="44"/><text class="label small" x="755" y="179">history DB</text>
+            <path class="arrow dashed" d="M670 174 L693 174"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M190 108 L325 108 L470 45"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M190 108 L325 108 L470 108"/></circle>
+            <circle class="packet gold" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M190 108 L325 108 L470 172"/></circle>
+          </svg>
+          <figcaption>Time windows are just more keys. One event fans out to every window it belongs to, inside one atomic script; short windows expire on their own; the month-end snapshot goes to the history DB.</figcaption>
+        </figure>
+
+        <h3>3. Scaling past one Redis: 500M DAU</h3>
+        <p>At 65 GB and 250,000 updates/s, one node is not enough. A sorted set is one key, and in Redis Cluster one key lives in one hash slot on one node (slot = CRC16(key) mod 16384), so you cannot just "turn on cluster mode" - you must split the board yourself. Two options:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 330" role="img" aria-label="Range partition by score versus hash partition by user with scatter-gather">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="12" y="12" width="410" height="306"/>
+            <text class="zone-label" x="24" y="34">A. Range partition (by score)</text>
+            <rect class="box cache" x="30" y="56" width="370" height="44"/><text class="label small" x="215" y="83">shard 3: scores 901-1000  &lt;- top 10 is here</text>
+            <rect class="box cache" x="30" y="110" width="370" height="44"/><text class="label small" x="215" y="137">shard 2: scores 501-900</text>
+            <rect class="box cache" x="30" y="164" width="370" height="44"/><text class="label small" x="215" y="191">shard 1: scores 101-500</text>
+            <rect class="box cache" x="30" y="218" width="370" height="44"/><text class="label small" x="215" y="245">shard 0: scores 0-100 (most players)</text>
+            <text class="label small" x="215" y="290">rank = local rank + sizes of all higher shards</text>
+            <text class="label small" x="215" y="308">player crossing 500 must MOVE shards</text>
+
+            <rect class="zone kafka" x="438" y="12" width="410" height="306"/>
+            <text class="zone-label" x="450" y="34">B. Hash partition (by user_id)</text>
+            <rect class="box svc" x="560" y="52" width="170" height="44"/><text class="label small" x="645" y="79">query service</text>
+            <rect class="box cache" x="460" y="160" width="110" height="56"/><text class="label small" x="515" y="184">shard 0</text><text class="label small" x="515" y="203">any scores</text>
+            <rect class="box cache" x="590" y="160" width="110" height="56"/><text class="label small" x="645" y="184">shard 1</text><text class="label small" x="645" y="203">any scores</text>
+            <rect class="box cache" x="720" y="160" width="110" height="56"/><text class="label small" x="775" y="184">shard 2</text><text class="label small" x="775" y="203">any scores</text>
+            <path class="arrow both" d="M600 96 L520 155"/><path class="arrow both" d="M645 96 L645 155"/><path class="arrow both" d="M690 96 L770 155"/>
+            <text class="label small" x="645" y="252">top 10 = top 10 of each shard, merge</text>
+            <text class="label small" x="645" y="272">rank = sum of ZCOUNT(score, +inf) per shard</text>
+            <text class="label small" x="645" y="292">every read touches every shard</text>
+            <circle class="packet" r="5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M645 96 L645 160 L645 96"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M600 96 L520 160 L600 96"/></circle>
+            <circle class="packet gold" r="5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M690 96 L770 160 L690 96"/></circle>
+          </svg>
+          <figcaption>Range partitioning keeps the top 10 on one shard but players migrate as they score and shards get uneven; hash partitioning spreads load evenly but every top-10 or rank read is a scatter-gather.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>A. Range (by score)</th><th>B. Hash (by user)</th></tr></thead>
+            <tbody>
+              <tr><td>Top 10</td><td>1 shard (the highest range)</td><td>Ask all S shards for their top 10, merge S x 10 rows</td></tr>
+              <tr><td>My rank</td><td>Local <code>ZREVRANK</code> + <code>ZCARD</code> of every higher shard (cacheable)</td><td>Sum of <code>ZCOUNT lb (myScore +inf</code> over all shards - S calls of O(log N), run in parallel</td></tr>
+              <tr><td>Update</td><td>May move a user between shards (remove + add); need a user-to-score lookup to find the shard</td><td>Always the same shard; simple</td></tr>
+              <tr><td>Balance</td><td>Skewed: most players have low scores; ranges need tuning as the month goes on</td><td>Even by construction</td></tr>
+              <tr><td>Tail latency</td><td>Good</td><td>Read waits for the slowest shard</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>The pragmatic answer</b> most strong candidates give: keep an <b>exact</b> board for the top players (say the top 10,000 - a small sorted set that only accepts scores above the current cut-off), and give everyone else an <b>approximate rank</b> from a score histogram ("you are in the top 12%"). Nobody needs to know they are exactly 81,234,567th. The histogram is an array of counts per score bucket; rank estimate = sum of counts in higher buckets. That turns a 65 GB problem into a few MB.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Hash partitioning a board by user_id is ECMP: a hash keeps each flow (user) on one path (shard), and load spreads evenly. The pain is the same too: to answer a global question ("total bytes across all paths", "who is the top talker") you must poll every member and merge. Range partitioning is like assigning prefixes to line cards by range - lookups go straight to one card, but a hot range overloads one card. <b>Where it breaks:</b> a flow never "moves" between ECMP members by itself; a player crossing a score boundary does.</p>
+        </div>
+
+        <h3>4. Never count a match twice</h3>
+        <p>Kafka gives <b><a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a></b> delivery to a normal consumer: if the leaderboard service crashes after <code>ZINCRBY</code> but before committing its offset, the event is delivered again after restart. <code>ZINCRBY</code> is not <b><a href="{{BASE}}interview/glossary#idempotent">idempotent</a></b> (running it twice is not the same as once), so mary would get +6. Fix it by recording the <code>match_id</code> in the same atomic step:</p>
+<pre><code class="language-lua">-- score.lua  -  KEYS[1]=board key, KEYS[2]=seen-set key, ARGV[1]=match_id, ARGV[2]=points, ARGV[3]=user
+-- Redis runs a script atomically: no other command runs in the middle.
+if redis.call('SADD', KEYS[2], ARGV[1]) == 1 then
+  redis.call('EXPIRE', KEYS[2], 3024000)         -- keep ids ~35 days (the tournament + margin)
+  return redis.call('ZINCRBY', KEYS[1], ARGV[2], ARGV[3])
+else
+  return false                                    -- duplicate: do nothing
+end</code></pre>
+<pre class="terminal"><code>$ redis-cli --eval score.lua lb:{2026-11} seen:{2026-11} , m-88f2 3 mary
+"122"
+$ redis-cli --eval score.lua lb:{2026-11} seen:{2026-11} , m-88f2 3 mary
+(nil)</code></pre>
+        <p>In Redis Cluster both keys of one script must be in the same slot - give them a hash tag: <code>lb:{2026-11}</code> and <code>seen:{2026-11}</code>. <b>Here the braces are literal Redis syntax</b>, not a placeholder: Cluster hashes only the part inside <code>{...}</code>, so both keys land in the same slot. (That is why the data model above writes placeholders as <code>&lt;boardId&gt;</code>, and why the demo above already uses the tagged names.) A seen-set of 1.5 billion match IDs per month is big; alternatives are a per-match key <code>SET seen:m-88f2 1 NX EX 86400</code> (only needs to cover the retry window), or making the write absolute (<code>ZADD</code> with the total computed from the score DB), which is naturally idempotent.</p>
+
+        <h3>5. Durability: Redis is a view, not the truth</h3>
+        <p>Redis keeps data in RAM. It can snapshot (<b>RDB</b> = a point-in-time dump file) or log every write (<b>AOF</b> = append-only file of commands, replayed on restart) to disk, and it replicates to a replica - but replication is <b>asynchronous</b>, so a write acknowledged by the primary can be lost if the primary dies before the replica copies it. Restarting a large instance from disk also takes a while. So: keep the per-match log in a durable database (or in Kafka with retention longer than a month), treat Redis as a rebuildable index, and write a "rebuild board from the log" job before you need it. With the idempotency check above, replaying the log over a half-built board is safe.</p>
+        <div class="callout note"><p><b>Friends leaderboard.</b> Fetch the player's friend IDs (usually hundreds), call <code>ZMSCORE lb:2026-11 f1 f2 ... fN</code> once, sort in the application. No new data structure needed - small N makes the "dumb" approach the right one. If friend lists are huge (followers on a social game), precompute per-user boards only for the most active users.</p></div>
+      

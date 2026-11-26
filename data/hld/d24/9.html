@@ -1,0 +1,120 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: clarify.</strong> Upload, download, share, auto-sync; max file size (50 GB); availability over consistency; versioning in or out.</li>
+          <li><strong>5-10 min: estimate.</strong> Commits/s (thousands), ingress (GB/s), stored bytes (exabyte order), metadata rows (hundreds of billions). Conclude: split metadata from bytes, shard metadata.</li>
+          <li><strong>10-15 min: API + data.</strong> commit / need-blocks, block PUT/GET by hash, list(cursor), long-poll. Namespaces + journal + block index.</li>
+          <li><strong>15-25 min: high-level flow.</strong> Draw the stepper above: chunk, commit, upload missing, commit, notify, list, fetch.</li>
+          <li><strong>25-40 min: deep dives.</strong> Chunking + dedup, resumable 50 GB upload, notifications at scale, conflicts. Storage internals if asked.</li>
+          <li><strong>40-45 min: wrap-up.</strong> Failure modes, GC, monitoring (commit latency, sync lag per device, upload error rate, notifier connections).</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes</b> (the ones interview write-ups mention most): uploading the whole file on every change; polling metadata every second from millions of clients; putting file bytes in the SQL DB or through API servers; last-writer-wins on concurrent edits; forgetting resumability for big files; deleting a block that other files still reference; forgetting the client sync engine entirely.</p></div>
+
+        <h3>60-second answer</h3>
+        <div class="callout tip"><p>"I split metadata from bytes. The client cuts files into 4 MB blocks and names each by its SHA-256, so a file is a blocklist. To save, it commits the blocklist with the parent revision to a metadata service; the service answers with the blocks it is missing, the client uploads just those directly to block servers backed by a blob store, then commits again, which appends a row to a per-namespace journal in a sharded SQL database. Other devices hold a long-poll on a notification service; when their namespace changes they call list with their cursor, get the new rows, and download only blocks they do not have. Identical blocks are stored once. Big files are resumable because commit tells you what is still missing. If two devices edit the same version, the second commit is rejected and the client keeps a conflicted copy, so nothing is lost. Kafka fans committed changes out to thumbnails, search and notifications."</p></div>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>Why split files into blocks at all?</summary>
+          <div class="answer">
+            <p>Three wins: (1) delta sync - a change re-uploads only the blocks that changed; (2) dedup - identical blocks (across versions, files or users) are stored once because they have the same hash; (3) resumability and parallelism - a 50 GB file is 12,800 independent, idempotent uploads instead of one fragile stream.</p>
+            <div class="approach"><h5>How to answer</h5><p>List the three benefits, then give the concrete size (4 MB, SHA-256) to show you know the real system.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big should a block be, and what changes if it is 64 KB or 64 MB? (64 KB: better dedup and smaller deltas, but 64x more index rows and requests per file; 64 MB: fewer rows and requests, but a one-byte edit re-uploads a huge block. 4 MB balances the two.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>How does a second device learn that a file changed?</summary>
+          <div class="answer">
+            <p>Each device keeps a cursor (last journal ID seen) per namespace and holds a long-poll to a notification service. When a commit lands in that namespace, the service answers "changes: true". The device calls list(cursor), gets the new journal rows, advances the cursor and fetches missing blocks. Notifications carry no data, so losing one only delays sync until the next poll.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast with short polling using numbers (100M devices = about 100M requests/s of "no"). Then the doorbell-vs-parcel separation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Long-poll vs WebSocket vs mobile push? (Long-poll works through any proxy and is cheap when the signal carries no data; a WebSocket saves the reconnect per change and suits desktops; phones use APNs/FCM (Apple's and Google's push services) because the OS kills idle sockets to save battery. All three carry only "something changed" - the data still comes from list(cursor).)</li><li>A device was offline for a month - what happens? (It calls list with its old cursor and pages through every journal row since then. If the journal was compacted past that cursor, the server says "cursor too old" and the client does a full re-list of the namespace and diffs it against its local index.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon">
+          <summary>How do you upload a 50 GB file over unreliable Wi-Fi?</summary>
+          <div class="answer">
+            <p>Chunk into 4 MB blocks, hash each, upload 4-8 blocks in parallel directly to block storage (own block servers or S3 multipart via pre-signed URLs). Each block PUT is idempotent and hash-verified. After any interruption, re-run commit: the server's "need blocks" list is the resume point, so no client-side bookkeeping can drift. Throttle and back off with jitter.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the maths (12,800 blocks), then idempotency + "the server is the checkpoint".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you verify the final file is correct? (The client re-hashes every downloaded block and compares it with the name in the blocklist; a whole-file hash in the journal row gives an end-to-end check after reassembly.)</li><li>What if the file changes while it is uploading? (The client snapshots the blocklist it is committing; if the file's mtime or size changes before commit, it re-chunks and retries. Already uploaded blocks are not wasted - unchanged ones dedup.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Meta">
+          <summary>Two devices edit the same file offline. What happens?</summary>
+          <div class="answer">
+            <p>Both edited revision 41. The first to commit becomes 42. The second commit carries parentRev 41, so the server rejects it (optimistic concurrency). The client keeps the server's version as the file and saves its own as "name (conflicted copy)". Binary files cannot be merged safely in general, and silently picking a winner loses data.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the mechanism (parent revision check), the user-visible result, and why you reject last-writer-wins.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you merge text files automatically? (Sometimes - a three-way merge with the common parent revision works for plain text, but a wrong automatic merge silently corrupts code or config. Dropbox chose conflicted copies because they never lose data; real-time co-editing needs OT/CRDTs instead.)</li><li>What about a rename on one device and an edit on the other? (They touch different things: the rename changes the path, the edit changes the blocklist. Track files by a stable file id, not by path, and both changes apply - the renamed file has the new content.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Where do you store metadata vs file contents, and why?</summary>
+          <div class="answer">
+            <p>Metadata (namespaces, journal rows, blocklists, sharing) in a relational database sharded by namespace: commits need a small transaction (check parent revision, append row), and namespaces keep each transaction on one shard. Contents in a blob store keyed by hash: immutable, huge, cheap per byte, replicated or erasure-coded across zones. Never put bytes in the SQL DB, and never stream them through the metadata servers.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Control plane vs data plane" in one line, then the shard key and the reason.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A shared folder has 100,000 members - is ns-sharding still fine? (Storage is fine - the folder is still one namespace on one shard. The problem is fan-out: one commit notifies 100,000 devices, so notifications go through a pub/sub tier with batching and jitter, and the hot namespace gets read replicas for list calls.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Meta">
+          <summary>How does dedup work, and what are its risks?</summary>
+          <div class="answer">
+            <p>Blocks are content-addressed: the SHA-256 of the bytes is the key, so the commit step can answer "I already have this block" and skip the upload. Risks: (1) privacy - global dedup can reveal that a given file exists somewhere; mitigate by scoping dedup per user/team or requiring proof of possession; (2) garbage collection - a block is shared, so deletes need reference counts or mark-and-sweep with a delay; (3) hash collisions - negligible with SHA-256, but verify bytes on write anyway.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mechanism in one line, then the risks interviewers fish for: privacy and GC.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Fixed vs content-defined chunking for dedup ratio? (Content-defined chunking wins when bytes are inserted in the middle, because cut points move with the content; for appends and in-place edits fixed blocks are almost as good and much simpler to index.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>How do you implement sharing a folder with 50 people?</summary>
+          <div class="answer">
+            <p>Make the shared folder its own namespace and record a mount for each member (user, ns, path, role). Files are written once into that namespace's journal; every member's device subscribes to that namespace's changes. Nothing is copied per user. Revoking access deletes the mount and the member's devices remove the folder on their next list.</p>
+            <div class="approach"><h5>How to answer</h5><p>The namespace idea is the key insight; it also explains why sharding by namespace works.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a member moves the shared folder inside their tree? (Only that member's mount point changes - a row in their own namespace that points at the shared namespace. The shared namespace and other members are untouched.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Flipkart,Amazon">
+          <summary>Where would Kafka help, and where would it hurt?</summary>
+          <div class="answer">
+            <p>Helps: after a commit, publish a file-changed event keyed by namespace id so thumbnails, search indexing, virus scanning, notifications and audit each consume at their own pace (separate consumer groups), and can replay after a bug. Hurts: as the source of truth for the journal - you need transactional "check parent revision and append" and fast "rows after cursor N for namespace X", which a sharded SQL table gives directly. Publish via an outbox or CDC so the DB and Kafka never disagree.</p>
+            <div class="approach"><h5>How to answer</h5><p>Truth in the DB, fan-out in Kafka, outbox to connect them - a pattern that appears in many designs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the <a href="{{BASE}}interview/glossary#dual-write">dual-write</a> problem? (Writing to the DB and then separately to Kafka: a crash between the two leaves them disagreeing - a commit nobody hears about, or an event for a commit that rolled back. Fix: write an outbox row in the same transaction and relay it with CDC, as the CDC Pipeline page shows.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>How do you make sync feel instant for a 100 MB file shared with a colleague?</summary>
+          <div class="answer">
+            <p>Pipeline everything: hash, upload and commit in parallel threads; and let the receiving client start downloading blocks before the uploader's final commit (Dropbox's streaming sync), so the receiver stays about one block behind. Dropbox reported up to 2x faster sync, and a 100 MB example going from about 89 s to 64 s. Add LAN sync or peer transfer when both devices are on the same network.</p>
+            <div class="approach"><h5>How to answer</h5><p>Identify the serial dependency (download waits for commit), then remove it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the upload is abandoned halfway - what did the receiver download? (Nothing: the commit happens only after every block is uploaded, and receivers only see committed journal rows. The orphan blocks are cleaned up by GC after a grace period.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How would you test a sync engine so it never loses data?</summary>
+          <div class="answer">
+            <p>Model the desired end state precisely (every file has a stable ID; invariants like "local tree = remote tree after quiescence"). Make the core logic deterministic (single control thread, injected clock and randomness) and run seeded random simulations of concurrent edits, moves, crashes and network faults, asserting invariants; any failure replays from the seed. This is what Dropbox describes for Nucleus. Add production checks: periodic consistency checks between client and server views.</p>
+            <div class="approach"><h5>How to answer</h5><p>This shows maturity beyond boxes and arrows; cite the deterministic-simulation idea.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What invariant would catch "a move looked like a delete"? (Total bytes and file count per namespace should not drop unless the journal shows deletes; compare client and server tree hashes, and alert on large deletions that arrive without matching adds.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "my phone shows the old version for 10 minutes"</h4>
+          <div class="situation"><p>After a deploy of the notification tier, users say changes from their laptop take about 10 minutes to show up on other devices. Uploads and commits are fine.</p></div>
+          <div class="bad"><p>Weak answer: "Make clients poll more often."</p></div>
+          <div class="good"><p>Strong answer: commits are fine, so the doorbell is broken. Ten minutes smells like devices falling back to a slow periodic list. Check the notifier: open long-poll count (did it drop after the deploy?), subscription fan-out from the commit path (are "ns changed" events still published?), and LB idle timeouts (shorter than the long-poll timeout kills connections silently). Fix, then add an end-to-end canary: a synthetic device commits every minute and measures time until another synthetic device sees it.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you deploy the notifier without dropping 100 million connections at once? (Roll a few pods at a time, drain each one slowly by telling clients to reconnect with random jitter, and rely on the safety list() so a missed signal costs only latency.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: storage cost grows faster than user data</h4>
+          <div class="situation"><p>Logical data grew 10% this quarter but physical storage grew 30%.</p></div>
+          <div class="bad"><p>Weak answer: "Buy more disks."</p></div>
+          <div class="good"><p>Strong answer: physical growing faster means garbage is not being collected or redundancy is higher than intended. Check orphan blocks (uploaded but never committed), GC backlog for deleted versions past retention, whether new data is stuck in the replicated tier instead of being erasure-coded, and whether a client change broke dedup (e.g. a new compression or encryption step changing bytes, so hashes no longer match). Measure each, fix the biggest, alert on the physical/logical ratio.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you GC safely without ever deleting a live block? (Mark from all live blocklists including retained old versions, sweep only blocks left unmarked for two full cycles, keep a grace period longer than the longest upload, and soft-delete first so a mistake can be undone.)</li></ul></div>
+        </div>
+      

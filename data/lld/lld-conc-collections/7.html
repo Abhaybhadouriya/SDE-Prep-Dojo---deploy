@@ -1,0 +1,35 @@
+
+  <h2>Code review drill: a "thread-safe" rate limiter</h2>
+  <p>A <a href="https://leetcode.com/discuss/post/5847847/" target="_blank" rel="noopener">LeetCode Discuss post</a> asked the community to check a fixed-window rate limiter that mixed a <code>ConcurrentHashMap</code>, an <code>AtomicInteger</code> and double-checked locking. Interviewers like handing you code of this shape. Here is our own version of the pattern. Find the bugs before reading on.</p>
+<pre><code class="language-java">class Window { final AtomicInteger left = new AtomicInteger(); long start; }
+
+boolean allow(String key) {
+    Window w = windows.computeIfAbsent(key, k -&gt; new Window());
+    long now = clock.millis();
+    if (now - w.start &gt;= windowMs) {                  // (a)
+        synchronized (w) {
+            if (now - w.start &gt;= windowMs) { w.start = now; w.left.set(limit); }
+        }
+    }
+    return w.left.getAndDecrement() &gt;= 0;             // (b)
+}</code></pre>
+  <ol class="steps">
+    <li><strong>Off by one at (b).</strong> The counter starts at <code>limit</code>, and <code>getAndDecrement() &gt;= 0</code> passes for <code>limit</code>, <code>limit-1</code>, ..., <code>0</code>. That is <code>limit + 1</code> requests. Our demo, limit 1,000, let <b>1,001</b> through.</li>
+    <li><strong>A data race at (a).</strong> <code>start</code> is a plain field read outside the lock. Without <code>volatile</code>, another thread may see a stale value, so the fast path is not reliable.</li>
+    <li><strong>The two fields are not one unit.</strong> A thread can pass check (a) in the old window, get delayed, then decrement after another thread reset the window. The old request spends the new window's budget.</li>
+    <li><strong>Unbounded drift.</strong> Rejected calls keep decrementing, so a flood drives <code>left</code> toward <code>Integer.MIN_VALUE</code>.</li>
+  </ol>
+  <p>The fix is the idea from this whole page: make the state <b>one immutable value</b> and replace it atomically per key.</p>
+<pre><code class="language-java">record Window(long start, int used) {}
+
+boolean allow(String key) {
+    long now = clock.millis();
+    boolean[] ok = {false};
+    windows.compute(key, (k, w) -&gt; {                  // atomic for this key
+        if (w == null || now - w.start() &gt;= windowMs) w = new Window(now, 0);
+        ok[0] = w.used() &lt; limit;
+        return ok[0] ? new Window(w.start(), w.used() + 1) : w;
+    });
+    return ok[0];
+}</code></pre>
+  <p>The fixed version let exactly 1,000 through under the same 800,000-call race. A single <code>synchronized</code> block per window object would also be correct and simple. Say that too, and pick CAS only when profiling says the lock is hot. More rate limiters (token bucket, sliding window) are in the <a href="{{BASE}}hld/d02">Distributed Rate Limiter</a> design.</p>

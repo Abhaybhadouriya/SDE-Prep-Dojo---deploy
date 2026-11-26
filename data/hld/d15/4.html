@@ -1,0 +1,62 @@
+
+        <h2>Data model</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Where</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Raw search logs (query, time, locale, clicked?)</td><td>Kafka topic, then the data lake (S3 / HDFS, Parquet)</td><td>Append-only, huge, read by batch jobs. Never by the serving path.</td></tr>
+              <tr><td>Aggregated counts (query, window, count)</td><td>Data warehouse table, or the batch job's output files</td><td>Input to the trie builder: for example counts per day for the last 30 days, with time decay.</td></tr>
+              <tr><td>Trie snapshot</td><td>Versioned files in object storage (<code>tries/2026-11-23T02/shard-07.bin</code>)</td><td>Built offline, immutable, loaded into RAM by serving nodes. Easy rollback: load the previous version.</td></tr>
+              <tr><td>Serving trie</td><td>In process memory of suggest servers</td><td>Microsecond lookups. Read-only between swaps.</td></tr>
+              <tr><td>Trending counts</td><td>Redis sorted sets or in-memory windows in the stream job</td><td>Small, fast-changing, merged at query time.</td></tr>
+              <tr><td>Blocklist</td><td>Small SQL table, pushed to serving nodes</td><td>Removals must take effect in minutes, not at the next rebuild.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Here is a complete, runnable top-k trie in Python. It precomputes the best K at every node during the build, so a lookup only walks the prefix.</p>
+<pre><code class="language-python">import heapq
+
+K = 3
+
+class Node:
+    __slots__ = ("kids", "top")
+    def __init__(self):
+        self.kids = {}     # char -&gt; Node
+        self.top = []      # precomputed [(count, query)], best first, at most K
+
+def build(counts):
+    root = Node()
+    for q, c in counts.items():
+        node = root
+        for ch in q:
+            node = node.kids.setdefault(ch, Node())
+            node.top.append((c, q))            # every prefix of q sees q
+    stack = [root]
+    while stack:                                # keep only the best K per node
+        n = stack.pop()
+        n.top = heapq.nlargest(K, n.top)
+        stack.extend(n.kids.values())
+    return root
+
+def suggest(root, prefix):
+    node = root
+    for ch in prefix:                           # O(len(prefix)) walk
+        node = node.kids.get(ch)
+        if node is None:
+            return []
+    return [q for _, q in node.top]             # O(1): already sorted
+
+counts = {"harry potter": 900, "harry styles": 700, "hardware store": 300,
+          "harvard": 450, "hari om": 120, "happy birthday": 800}
+root = build(counts)
+for p in ["h", "har", "harr", "hap", "x"]:
+    print(f"{p!r:8} -&gt; {suggest(root, p)}")</code></pre>
+<pre class="terminal"><code>$ python trie_topk.py
+'h'      -&gt; ['harry potter', 'happy birthday', 'harry styles']
+'har'    -&gt; ['harry potter', 'harry styles', 'harvard']
+'harr'   -&gt; ['harry potter', 'harry styles']
+'hap'    -&gt; ['happy birthday']
+'x'      -&gt; []</code></pre>
+        <p>This toy build appends every query to every prefix node, which is fine for a demo. A production builder works bottom-up instead: each node's top-k is merged from its children's top-k lists plus the query ending at that node, so memory stays bounded. Lookup cost is <b>O(length of prefix)</b>, independent of how many queries exist.</p>
+        <div class="callout note"><p><b>Without a hand-made trie:</b> Elasticsearch's <a href="https://www.elastic.co/guide/en/elasticsearch/reference/current/completion.html" target="_blank" rel="noopener">completion suggester</a> keeps an in-memory FST (finite state transducer, a compressed cousin of the trie) with weights. Redis sorted sets can store a ranked list per prefix. Both are good answers if you can say what they do inside.</p></div>
+      

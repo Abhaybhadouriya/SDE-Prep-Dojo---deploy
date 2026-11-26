@@ -1,0 +1,362 @@
+
+  <h2>The code, run</h2>
+  <p>Java races 8 threads on one seat with every strategy: the naive version gives 8 winners (a barrier forces the bad interleaving every time), per-seat locks, striped locks and CAS give exactly one winner in 200 out of 200 rounds, multi-seat booking with sorted locks never deadlocks (which of Alice and Bob wins A2 varies per run), and the TTL hold rejects a late payment. Python shows the three database guards on SQLite. C++14 shows CAS on a packed (version, owner) word, including the ABA case. Files: <code>lld-code/lld-conc-booking/</code>.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongSupplier;
+
+// Four ways to stop two users booking the same seat, raced by 8 threads.
+public class BookingDemo {
+
+    interface SeatBooker { boolean book(List&lt;String&gt; seats, String user); String owner(String seat); }
+
+    // ---------- 0. naive check-then-act (BROKEN). The barrier forces the bad interleaving.
+    static final class NaiveBooker implements SeatBooker {
+        private final Map&lt;String, String&gt; owner = new HashMap&lt;&gt;();
+        private final CyclicBarrier gap;
+        NaiveBooker(CyclicBarrier gap) { this.gap = gap; }
+        public boolean book(List&lt;String&gt; seats, String user) {
+            String seat = seats.get(0);
+            if (owner.get(seat) != null) return false;          // check
+            try { gap.await(); } catch (Exception e) { return false; } // everyone has checked "free"
+            synchronized (owner) { owner.put(seat, user); }     // act (lock here is too late!)
+            return true;
+        }
+        public String owner(String seat) { synchronized (owner) { return owner.get(seat); } }
+    }
+
+    // ---------- 1. pessimistic: one lock per seat, multi-seat in sorted order (no deadlock)
+    static final class PessimisticBooker implements SeatBooker {
+        private final ConcurrentHashMap&lt;String, ReentrantLock&gt; locks = new ConcurrentHashMap&lt;&gt;();
+        private final ConcurrentHashMap&lt;String, String&gt; owner = new ConcurrentHashMap&lt;&gt;();
+        public boolean book(List&lt;String&gt; seats, String user) {
+            List&lt;String&gt; sorted = new ArrayList&lt;&gt;(seats);
+            Collections.sort(sorted);                            // global lock order = seat id
+            List&lt;ReentrantLock&gt; held = new ArrayList&lt;&gt;();
+            try {
+                for (String s : sorted) {
+                    ReentrantLock l = locks.computeIfAbsent(s, k -&gt; new ReentrantLock());
+                    l.lock();
+                    held.add(l);
+                }
+                for (String s : sorted) if (owner.containsKey(s)) return false;  // all or nothing
+                for (String s : sorted) owner.put(s, user);
+                return true;
+            } finally {
+                for (int i = held.size() - 1; i &gt;= 0; i--) held.get(i).unlock();
+            }
+        }
+        public String owner(String seat) { return owner.get(seat); }
+    }
+
+    // ---------- 1b. lock striping: a fixed array of locks, seat -&gt; stripe by hash
+    static final class StripedBooker implements SeatBooker {
+        private final ReentrantLock[] stripes = new ReentrantLock[16];
+        private final ConcurrentHashMap&lt;String, String&gt; owner = new ConcurrentHashMap&lt;&gt;();
+        StripedBooker() { for (int i = 0; i &lt; stripes.length; i++) stripes[i] = new ReentrantLock(); }
+        private int stripe(String seat) { return Math.floorMod(seat.hashCode(), stripes.length); }
+        public boolean book(List&lt;String&gt; seats, String user) {
+            int[] idx = seats.stream().mapToInt(this::stripe).distinct().sorted().toArray(); // order by stripe
+            for (int i : idx) stripes[i].lock();
+            try {
+                for (String s : seats) if (owner.containsKey(s)) return false;
+                for (String s : seats) owner.put(s, user);
+                return true;
+            } finally {
+                for (int i = idx.length - 1; i &gt;= 0; i--) stripes[idx[i]].unlock();
+            }
+        }
+        public String owner(String seat) { return owner.get(seat); }
+    }
+
+    // ---------- 2. optimistic: immutable state + version, compare-and-set, no lock held
+    record SeatState(long version, String owner) {}
+    static final class OptimisticBooker implements SeatBooker {
+        final ConcurrentHashMap&lt;String, SeatState&gt; seats = new ConcurrentHashMap&lt;&gt;();
+        final AtomicInteger conflicts = new AtomicInteger();
+        OptimisticBooker(Collection&lt;String&gt; ids) { for (String id : ids) seats.put(id, new SeatState(0, null)); }
+        public boolean book(List&lt;String&gt; ids, String user) {          // single seat for clarity
+            String id = ids.get(0);
+            while (true) {
+                SeatState cur = seats.get(id);                             // 1. read (with version)
+                if (cur.owner() != null) return false;                     // 2. business check
+                SeatState next = new SeatState(cur.version() + 1, user);   // 3. compute new state
+                if (seats.replace(id, cur, next)) return true;             // 4. CAS: only if unchanged
+                conflicts.incrementAndGet();                               // someone won; re-read
+            }
+        }
+        public String owner(String seat) { return seats.get(seat).owner(); }
+    }
+
+    // ---------- 3. temporary holds with TTL (the BookMyShow / IRCTC flow)
+    record Hold(String id, String user, List&lt;String&gt; seats, long expiresAt) {}
+    static final class HoldService {
+        private final LongSupplier clock;                // injected: tests control time
+        private final long ttl;
+        private final Map&lt;String, Hold&gt; holdBySeat = new HashMap&lt;&gt;();
+        private final Map&lt;String, Hold&gt; holds = new HashMap&lt;&gt;();
+        private final Set&lt;String&gt; booked = new HashSet&lt;&gt;();
+        private final AtomicLong ids = new AtomicLong();
+        HoldService(LongSupplier clock, long ttl) { this.clock = clock; this.ttl = ttl; }
+
+        private boolean free(String seat, long now) {
+            if (booked.contains(seat)) return false;
+            Hold h = holdBySeat.get(seat);
+            return h == null || h.expiresAt() &lt;= now;    // expired hold = free (lazy expiry)
+        }
+        private void dropIfExpired(String seat, long now) {   // lazy cleanup of the seats we touch
+            Hold h = holdBySeat.get(seat);
+            if (h != null &amp;&amp; h.expiresAt() &lt;= now) {
+                holds.remove(h.id());
+                for (String s : h.seats()) holdBySeat.remove(s, h);
+            }
+        }
+        /** Eager cleanup for abandoned checkouts: call from a ScheduledExecutorService
+         *  (in a database: DELETE FROM holds WHERE expires_at &lt; now). Returns holds removed. */
+        synchronized int sweep() {
+            long now = clock.getAsLong();
+            int n = 0;
+            for (Iterator&lt;Hold&gt; it = holds.values().iterator(); it.hasNext(); ) {
+                Hold h = it.next();
+                if (h.expiresAt() &lt;= now) {
+                    it.remove(); n++;
+                    for (String s : h.seats()) holdBySeat.remove(s, h);
+                }
+            }
+            return n;
+        }
+        synchronized int liveHolds() { return holds.size(); }
+        synchronized Optional&lt;Hold&gt; hold(List&lt;String&gt; seats, String user) {   // one lock per show
+            long now = clock.getAsLong();
+            for (String s : seats) dropIfExpired(s, now);
+            for (String s : seats) if (!free(s, now)) return Optional.empty();
+            Hold h = new Hold("H" + ids.incrementAndGet(), user, List.copyOf(seats), now + ttl);
+            for (String s : seats) holdBySeat.put(s, h);
+            holds.put(h.id(), h);
+            return Optional.of(h);
+        }
+        synchronized String confirm(String holdId) {     // called after payment succeeds
+            long now = clock.getAsLong();
+            Hold h = holds.remove(holdId);
+            if (h == null) return "REJECTED (no live hold: expired and cleaned up, or unknown; refund payment)";
+            for (String s : h.seats()) holdBySeat.remove(s, h);   // drop our own entries first
+            if (h.expiresAt() &lt;= now) return "REJECTED (hold expired, refund payment)";
+            for (String s : h.seats()) booked.add(s);
+            return "BOOKED " + h.seats() + " for " + h.user();
+        }
+    }
+
+    // ---------- race harness: 8 users try to book the same seat at the same instant
+    static int race(SeatBooker b, List&lt;String&gt; seats, int users) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(users);
+        CountDownLatch start = new CountDownLatch(1);
+        List&lt;Future&lt;Boolean&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int u = 0; u &lt; users; u++) {
+            String user = "user" + u;
+            fs.add(pool.submit(() -&gt; { start.await(); return b.book(seats, user); }));
+        }
+        start.countDown();
+        int winners = 0;
+        for (Future&lt;Boolean&gt; f : fs) if (f.get(5, TimeUnit.SECONDS)) winners++;
+        pool.shutdown();
+        return winners;
+    }
+
+    public static void main(String[] args) throws Exception {
+        int users = 8;
+        System.out.println("0. naive check-then-act : winners for seat A1 = "
+                + race(new NaiveBooker(new CyclicBarrier(users)), List.of("A1"), users) + "  &lt;- DOUBLE BOOKING");
+
+        int rounds = 200, bad = 0;
+        for (int r = 0; r &lt; rounds; r++) if (race(new PessimisticBooker(), List.of("A1"), users) != 1) bad++;
+        System.out.println("1. per-seat lock        : " + rounds + " rounds, rounds with != 1 winner = " + bad);
+
+        PessimisticBooker multi = new PessimisticBooker();
+        ExecutorService p = Executors.newFixedThreadPool(2);
+        Future&lt;Boolean&gt; x = p.submit(() -&gt; multi.book(List.of("A3", "A1", "A2"), "alice"));
+        Future&lt;Boolean&gt; y = p.submit(() -&gt; multi.book(List.of("A2", "A4"), "bob"));
+        boolean ax = x.get(5, TimeUnit.SECONDS), by = y.get(5, TimeUnit.SECONDS);
+        p.shutdown();
+        System.out.println("   multi-seat sorted    : alice=" + ax + " bob=" + by + " (exactly one gets A2, no deadlock) A2 -&gt; " + multi.owner("A2"));
+
+        bad = 0;
+        for (int r = 0; r &lt; rounds; r++) if (race(new StripedBooker(), List.of("A1"), users) != 1) bad++;
+        System.out.println("1b. striped locks (16)  : " + rounds + " rounds, rounds with != 1 winner = " + bad);
+
+        bad = 0; int conflicts = 0;
+        for (int r = 0; r &lt; rounds; r++) {
+            OptimisticBooker ob = new OptimisticBooker(List.of("A1"));
+            if (race(ob, List.of("A1"), users) != 1) bad++;
+            conflicts += ob.conflicts.get();
+        }
+        System.out.println("2. optimistic CAS       : " + rounds + " rounds, rounds with != 1 winner = " + bad
+                + ", CAS retries seen = " + (conflicts &gt; 0 ? "yes" : "none this run"));
+
+        long[] now = {0};
+        HoldService hs = new HoldService(() -&gt; now[0], 300);              // 300 s hold
+        Hold a = hs.hold(List.of("B5", "B6"), "alice").orElseThrow();
+        System.out.println("3. t=0    alice holds B5,B6 until t=" + a.expiresAt());
+        now[0] = 10;
+        System.out.println("   t=10   bob tries B6       -&gt; " + (hs.hold(List.of("B6"), "bob").isPresent() ? "held" : "seat not available"));
+        now[0] = 301;
+        Optional&lt;Hold&gt; b = hs.hold(List.of("B6"), "bob");
+        System.out.println("   t=301  alice's hold expired; bob tries B6 -&gt; " + (b.isPresent() ? "held as " + b.get().id() : "no"));
+        now[0] = 302;
+        System.out.println("   t=302  alice pays late, confirm(" + a.id() + ") -&gt; " + hs.confirm(a.id()));
+        System.out.println("   t=302  bob pays, confirm(" + b.get().id() + ")   -&gt; " + hs.confirm(b.get().id()));
+        for (int i = 0; i &lt; 5; i++) hs.hold(List.of("C" + i), "u" + i);    // five checkouts, all abandoned
+        now[0] = 700;
+        System.out.println("   t=700  5 abandoned holds; sweep() removed " + hs.sweep() + ", live holds left = " + hs.liveHolds());
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out BookingDemo.java &amp;&amp; java -cp out BookingDemo
+0. naive check-then-act : winners for seat A1 = 8  &lt;- DOUBLE BOOKING
+1. per-seat lock        : 200 rounds, rounds with != 1 winner = 0
+   multi-seat sorted    : alice=true bob=false (exactly one gets A2, no deadlock) A2 -&gt; alice
+1b. striped locks (16)  : 200 rounds, rounds with != 1 winner = 0
+2. optimistic CAS       : 200 rounds, rounds with != 1 winner = 0, CAS retries seen = yes
+3. t=0    alice holds B5,B6 until t=300
+   t=10   bob tries B6       -&gt; seat not available
+   t=301  alice's hold expired; bob tries B6 -&gt; held as H2
+   t=302  alice pays late, confirm(H1) -&gt; REJECTED (no live hold: expired and cleaned up, or unknown; refund payment)
+   t=302  bob pays, confirm(H2)   -&gt; BOOKED [B6] for bob
+   t=700  5 abandoned holds; sweep() removed 5, live holds left = 0</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python (SQL)">
+<pre><code class="language-python">"""Three database-level guards against double booking, shown with SQLite.
+Two app servers (sessions) read the same free seat, then both try to book it.
+(SQLite has no SELECT ... FOR UPDATE; the pessimistic SQL for PostgreSQL/MySQL is on the page.)"""
+import sqlite3
+
+db = sqlite3.connect(":memory:", isolation_level=None)   # autocommit; we use explicit statements
+db.executescript("""
+CREATE TABLE show_seat (
+    show_id  INTEGER NOT NULL,
+    seat_id  TEXT    NOT NULL,
+    status   TEXT    NOT NULL DEFAULT 'FREE',     -- FREE | HELD | BOOKED
+    user_id  TEXT,
+    version  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (show_id, seat_id)
+);
+CREATE TABLE booking (
+    show_id INTEGER NOT NULL,
+    seat_id TEXT    NOT NULL,
+    user_id TEXT    NOT NULL,
+    UNIQUE (show_id, seat_id)                      -- guard 3: the database refuses a second row
+);
+INSERT INTO show_seat (show_id, seat_id) VALUES (7, 'A1'), (7, 'A2');
+""")
+
+
+def read(seat):
+    return db.execute("SELECT status, version FROM show_seat WHERE show_id=7 AND seat_id=?", (seat,)).fetchone()
+
+
+# ---- guard 1: conditional update ("only if still FREE"): the check and the write are ONE statement
+print("guard 1: conditional UPDATE ... WHERE status='FREE'")
+for user in ("alice", "bob"):
+    cur = db.execute("UPDATE show_seat SET status='BOOKED', user_id=? "
+                     "WHERE show_id=7 AND seat_id='A1' AND status='FREE'", (user,))
+    print(f"  {user:5}: rows changed = {cur.rowcount} -&gt; {'booked' if cur.rowcount == 1 else 'seat taken'}")
+
+# ---- guard 2: optimistic locking with a version column
+print("guard 2: version column (optimistic)")
+alice_view = read("A2")          # both servers read version 0 before either writes
+bob_view = read("A2")
+print(f"  alice read {alice_view}, bob read {bob_view}")
+
+
+def book_with_version(user, seen, retries=2):
+    status, version = seen
+    for attempt in range(retries + 1):
+        if status != "FREE":
+            return f"{user}: seat no longer free (attempt {attempt + 1}), show next best seats"
+        cur = db.execute("UPDATE show_seat SET status='BOOKED', user_id=?, version=version+1 "
+                         "WHERE show_id=7 AND seat_id='A2' AND version=?", (user, version))
+        if cur.rowcount == 1:
+            return f"{user}: booked with version {version} -&gt; {version + 1}"
+        status, version = read("A2")  # conflict: someone changed the row; re-read and re-check
+    return f"{user}: gave up after {retries} retries"
+
+
+print("  " + book_with_version("alice", alice_view))
+print("  " + book_with_version("bob", bob_view))
+
+# ---- guard 3: unique constraint as the last line of defence
+print("guard 3: UNIQUE (show_id, seat_id) on booking")
+for user in ("alice", "bob"):
+    try:
+        db.execute("INSERT INTO booking (show_id, seat_id, user_id) VALUES (7, 'A1', ?)", (user,))
+        print(f"  {user:5}: insert ok")
+    except sqlite3.IntegrityError as e:
+        print(f"  {user:5}: rejected by database ({e})")
+
+print("final:", db.execute("SELECT seat_id, status, user_id, version FROM show_seat ORDER BY seat_id").fetchall())</code></pre>
+<pre class="terminal"><code>$ python db_booking.py
+guard 1: conditional UPDATE ... WHERE status='FREE'
+  alice: rows changed = 1 -&gt; booked
+  bob  : rows changed = 0 -&gt; seat taken
+guard 2: version column (optimistic)
+  alice read ('FREE', 0), bob read ('FREE', 0)
+  alice: booked with version 0 -&gt; 1
+  bob: seat no longer free (attempt 2), show next best seats
+guard 3: UNIQUE (show_id, seat_id) on booking
+  alice: insert ok
+  bob  : rejected by database (UNIQUE constraint failed: booking.show_id, booking.seat_id)
+final: [('A1', 'BOOKED', 'alice', 0), ('A2', 'BOOKED', 'alice', 1)]</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ (CAS)">
+<pre><code class="language-cpp">// Optimistic seat booking with one 64-bit word per seat: [version:32 | owner:32].
+// compare_exchange_strong is the C++ spelling of cmpxchg. The interleaving is written out
+// by hand (no std::thread in g++ 6.3 MinGW) so every step is visible.
+#include &lt;atomic&gt;
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+
+static uint64_t pack(uint32_t version, uint32_t owner) { return (uint64_t(version) &lt;&lt; 32) | owner; }
+static uint32_t version_of(uint64_t w) { return uint32_t(w &gt;&gt; 32); }
+static uint32_t owner_of(uint64_t w) { return uint32_t(w); }
+const uint32_t FREE = 0;
+
+// Try to move the seat from the state we SAW to "owned by user". Fails if anyone changed it.
+bool try_book(std::atomic&lt;uint64_t&gt;&amp; seat, uint64_t seen, uint32_t user) {
+    if (owner_of(seen) != FREE) return false;
+    uint64_t want = pack(version_of(seen) + 1, user);
+    return seat.compare_exchange_strong(seen, want);   // on failure, 'seen' gets the current value
+}
+
+int main() {
+    std::atomic&lt;uint64_t&gt; seat(pack(0, FREE));
+    uint64_t alice_saw = seat.load();                    // both read version 0, owner FREE
+    uint64_t bob_saw = seat.load();
+
+    bool a = try_book(seat, alice_saw, 101);             // alice (user 101) commits first
+    std::cout &lt;&lt; "alice CAS v0 -&gt; v1: " &lt;&lt; (a ? "won" : "lost") &lt;&lt; "\n";
+    bool b = try_book(seat, bob_saw, 202);               // bob still holds the stale v0 view
+    std::cout &lt;&lt; "bob   CAS v0 -&gt; v1: " &lt;&lt; (b ? "won" : "lost, seat changed under him") &lt;&lt; "\n";
+
+    uint64_t now = seat.load();                          // bob re-reads and re-checks
+    std::cout &lt;&lt; "bob re-reads: version " &lt;&lt; version_of(now) &lt;&lt; ", owner " &lt;&lt; owner_of(now)
+              &lt;&lt; " -&gt; " &lt;&lt; (try_book(seat, now, 202) ? "booked" : "not free, show other seats") &lt;&lt; "\n";
+
+    // ABA guard: if alice cancels (owner back to FREE) the version still moves forward,
+    // so a third client holding the very first snapshot (v0, FREE) cannot sneak in.
+    uint64_t cur = seat.load();
+    seat.compare_exchange_strong(cur, pack(version_of(cur) + 1, FREE));
+    std::cout &lt;&lt; "alice cancels: version " &lt;&lt; version_of(seat.load()) &lt;&lt; ", owner FREE\n";
+    std::cout &lt;&lt; "carol with old v0 snapshot: " &lt;&lt; (try_book(seat, pack(0, FREE), 303) ? "won (ABA bug!)" : "lost (version protects us)") &lt;&lt; "\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread seat_cas.cpp -o seat_cas &amp;&amp; ./seat_cas
+alice CAS v0 -&gt; v1: won
+bob   CAS v0 -&gt; v1: lost, seat changed under him
+bob re-reads: version 1, owner 101 -&gt; not free, show other seats
+alice cancels: version 2, owner FREE
+carol with old v0 snapshot: lost (version protects us)</code></pre>
+    </div>
+  </div>

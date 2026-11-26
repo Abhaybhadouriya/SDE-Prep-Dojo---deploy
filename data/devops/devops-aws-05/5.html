@@ -1,0 +1,103 @@
+
+  <h2>Pattern 3: Kinesis and SQS with an event source mapping</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>For high, steady volume you usually put a buffer in front: a <strong>Kinesis data stream</strong> (an ordered, replayable log split into <em>shards</em>, very like a Kafka topic with partitions) or an <strong>SQS queue</strong> (a <a href="{{BASE}}interview/glossary#message-queue">message queue</a> where each message is worked on by one consumer and then deleted). Lambda reads them through an <strong>event source mapping</strong> (ESM): a poller run by AWS that builds batches and invokes your function synchronously.</p>
+
+  <h3>The batching knobs</h3>
+  <ul>
+    <li><code>BatchSize</code>: most records per invoke. Kinesis default 100 (max 10,000); SQS default 10.</li>
+    <li><code>MaximumBatchingWindowInSeconds</code>: wait up to this long (max 300 s) to fill a batch. Bigger batches = fewer invocations = lower cost, but more latency.</li>
+    <li>Payload cap: a batch also stops at the 6 MB invocation payload limit.</li>
+    <li><code>FilterCriteria</code>: drop events before they reach your code (you are not billed for invocations that never happen).</li>
+  </ul>
+
+<pre><code class="language-bash">aws lambda create-event-source-mapping \
+  --function-name metrics-extractor \
+  --event-source-arn arn:aws:kinesis:us-east-1:111122223333:stream/app-logs \
+  --starting-position LATEST \
+  --batch-size 500 \
+  --maximum-batching-window-in-seconds 5 \
+  --parallelization-factor 2 \
+  --bisect-batch-on-function-error \
+  --maximum-retry-attempts 3 \
+  --maximum-record-age-in-seconds 3600 \
+  --function-response-types ReportBatchItemFailures \
+  --destination-config '{"OnFailure":{"Destination":"arn:aws:sqs:us-east-1:111122223333:app-logs-failed"}}'</code></pre>
+<pre class="terminal"><code>{
+    "UUID": "2b7c1d3e-....-EXAMPLE",
+    "BatchSize": 500,
+    "MaximumBatchingWindowInSeconds": 5,
+    "ParallelizationFactor": 2,
+    "EventSourceArn": "arn:aws:kinesis:us-east-1:111122223333:stream/app-logs",
+    "FunctionArn": "arn:aws:lambda:us-east-1:111122223333:function:metrics-extractor",
+    "State": "Creating",
+    "BisectBatchOnFunctionError": true,
+    "MaximumRetryAttempts": 3,
+    "MaximumRecordAgeInSeconds": 3600,
+    "FunctionResponseTypes": ["ReportBatchItemFailures"]
+}</code></pre>
+
+  <h3>Watch a failing batch on a Kinesis shard</h3>
+  <p>Kinesis keeps order per shard, so a failing batch <b>blocks its shard</b> until it succeeds, is split, or gives up. Click through to see how the knobs above stop one bad record from freezing the pipeline.</p>
+  <div class="stepper" data-stepper>
+    <div class="svg-scroll">
+    <svg viewBox="0 0 800 340" role="img" aria-label="Kinesis event source mapping: batch read, failure, bisect, isolate poison record, send metadata to on-failure destination">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="zone kafka" x="10" y="20" width="250" height="300"/>
+      <text class="zone-label" x="24" y="42">shard-0 (ordered)</text>
+      <rect class="box kafka" x="30" y="60" width="210" height="34"/><text class="label small" x="135" y="82">records 1-100</text>
+      <rect class="box kafka" x="30" y="104" width="210" height="34"/><text class="label small" x="135" y="126">records 101-200</text>
+      <rect class="box kafka" x="30" y="148" width="210" height="34"/><text class="label small" x="135" y="170">records 201-300</text>
+      <text class="label small" x="135" y="214">record 57 = poison</text>
+
+      <rect class="box svc" x="300" y="60" width="170" height="60"/>
+      <text class="label" x="385" y="84">ESM poller</text>
+      <text class="label small" x="385" y="106">reads, batches</text>
+      <rect class="box docker" x="560" y="60" width="200" height="60"/>
+      <text class="label" x="660" y="84">metrics-extractor</text>
+      <text class="label small" x="660" y="106">your function</text>
+      <rect class="box queue" x="560" y="250" width="200" height="56"/>
+      <text class="label" x="660" y="274">on-failure SQS</text>
+      <text class="label small" x="660" y="294">shard + seq numbers</text>
+
+      <g data-step="2"><path class="arrow" d="M240 77 L295 85"/><text class="label small" x="385" y="146">batch = 1-100</text></g>
+      <g data-step="3"><path class="arrow" d="M470 90 L555 90"/></g>
+      <g data-step-only="4"><path class="arrow bad" d="M555 100 L475 100"/><text class="label bad" x="660" y="150">error on record 57</text><text class="label small" x="385" y="170">shard-0 blocked, IteratorAge grows</text></g>
+      <g data-step-only="5"><text class="label" x="385" y="160">bisect: 1-50 | 51-100</text><text class="label ok" x="660" y="150">1-50 OK</text><text class="label bad" x="660" y="176">51-100 fails again</text></g>
+      <g data-step-only="6"><text class="label" x="385" y="160">bisect down to: 57</text><text class="label small" x="660" y="176">retries 3 / 3 used up</text></g>
+      <g data-step="7"><path class="arrow bad" d="M660 120 L660 245"/><text class="label ok" x="385" y="200">poller moves on: 101-200</text></g>
+    </svg>
+    </div>
+    <ol class="stepper-captions">
+      <li>Records sit in shard-0 in order. Record 57 is malformed and will make the parser throw.</li>
+      <li>The poller reads a batch (here 100 records, or fewer if the batching window ends first).</li>
+      <li>The poller invokes your function synchronously with the whole batch.</li>
+      <li>The function throws on record 57. By default the whole batch is retried, and the shard cannot move forward. The <code>IteratorAge</code> metric (how old the newest record you processed is) starts to climb.</li>
+      <li>With <code>BisectBatchOnFunctionError</code>, Lambda splits the batch in two and retries each half. The good half succeeds.</li>
+      <li>Splitting repeats until the bad record is alone. Each retry counts against <code>MaximumRetryAttempts</code> (and <code>MaximumRecordAgeInSeconds</code> caps how long it can keep trying).</li>
+      <li>When retries run out, Lambda sends a record describing the failed batch (shard ID and sequence number range, not the data itself) to the on-failure destination and moves on. You can re-read the data from the stream later using those sequence numbers, as long as it is still within the stream's retention.</li>
+    </ol>
+  </div>
+
+  <p>With <code>ReportBatchItemFailures</code> your function can do even better: catch the error per record and return the first failing sequence number. Lambda then checkpoints everything before it and retries from that record only.</p>
+<pre><code class="language-python">def handler(event, context):
+    for r in event["Records"]:
+        try:
+            process(r)                      # parse, extract metric
+        except Exception:
+            # Kinesis: return the FIRST failed record; Lambda checkpoints before it
+            return {"batchItemFailures": [{"itemIdentifier": r["kinesis"]["sequenceNumber"]}]}
+    return {"batchItemFailures": []}</code></pre>
+
+  <h3>SQS: the queue owns retries</h3>
+  <p>With SQS, a message picked up by the poller becomes invisible for the queue's <a href="{{BASE}}interview/glossary#visibility-timeout">visibility timeout</a>. If the function succeeds, Lambda deletes the batch. If it fails, the messages reappear after the timeout and are retried. After <code>maxReceiveCount</code> receives, the queue's <b>redrive policy</b> moves the message to the DLQ. Set the visibility timeout well above the function timeout (AWS guidance has long been about six times), otherwise a message can reappear while the first copy is still running and be processed twice.</p>
+<pre><code class="language-bash">aws sqs set-queue-attributes --queue-url https://sqs.us-east-1.amazonaws.com/111122223333/log-jobs \
+  --attributes '{"VisibilityTimeout":"360",
+                 "RedrivePolicy":"{\"deadLetterTargetArn\":\"arn:aws:sqs:us-east-1:111122223333:log-jobs-dlq\",\"maxReceiveCount\":\"5\"}"}'</code></pre>
+  <p>For SQS, partial batch responses use the message ID (any order is fine for a standard queue): return <code>{"batchItemFailures": [{"itemIdentifier": "&lt;messageId&gt;"}]}</code> for each failed message, and only those come back.</p>
+
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>A Kinesis shard is a <b>per-flow receive queue</b>, like an RSS (receive side scaling) queue on a multi-queue NIC: records with the same partition key hash to the same shard, so they stay in order, and each queue is drained by one worker. <code>ParallelizationFactor</code> (1 to 10) is like giving each hardware queue several softirq workers while still keeping order <em>per partition key</em>. A poison record blocking a shard is head-of-line blocking, the same pain you know from a single FIFO with a stuck packet at the front.</p>
+  </div>
+  <p>Compare with Kafka: this is the same consumer-group, offset and poison-pill problem covered in <a href="{{BASE}}devops/kafka-04#dlq">Kafka consumers and DLQs</a> and <a href="{{BASE}}devops/pipeline-03#dlq">the pipeline's retry and DLQ design</a>. Lambda just runs the consumer loop for you.</p>

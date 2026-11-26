@@ -1,0 +1,114 @@
+
+        <h2>Rebalancing: why people say it "stops the world"</h2>
+        <p class="chips level-chips"><span class="chip ok">must know</span></p>
+        <p>A <b>rebalance</b> is the group agreeing on a new partition-to-consumer map. It is triggered when:</p>
+        <ul>
+          <li>a consumer <b>joins</b> (new pod, scale-up, restart),</li>
+          <li>a consumer <b>leaves</b> cleanly (<code>close()</code>) or <b>dies</b> (no heartbeat within the session timeout),</li>
+          <li>a consumer is <b>kicked out</b> because it did not call <code>poll()</code> within <code>max.poll.interval.ms</code> (5 minutes by default) - the most common surprise,</li>
+          <li>the subscribed topics change (partitions added, or a regex subscription matches a new topic).</li>
+        </ul>
+
+        <h3>Eager vs cooperative, as a timeline</h3>
+        <p>In the original <b>eager</b> protocol, every consumer must give up <b>every</b> partition before anyone gets the new assignment. For the length of the rebalance, the whole group consumes nothing. With 200 pods that can be many seconds, during which lag grows. <b>Cooperative</b> rebalancing (KIP-429, Kafka 2.4) keeps everything that is not moving, and only the partitions that change owner pause briefly.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Timeline comparing eager and cooperative rebalancing">
+            <text class="label left" x="20" y="24">Eager (stop the world)</text>
+            <text class="label small left" x="20" y="64">C1</text>
+            <rect class="box svc" x="70" y="48" width="290" height="32"/>
+            <rect class="box fail" x="364" y="48" width="150" height="32"/>
+            <rect class="box svc" x="518" y="48" width="262" height="32"/>
+            <text class="label small left" x="20" y="108">C2</text>
+            <rect class="box svc" x="70" y="92" width="290" height="32"/>
+            <rect class="box fail" x="364" y="92" width="150" height="32"/>
+            <rect class="box svc" x="518" y="92" width="262" height="32"/>
+            <text class="label bad" x="439" y="140">nobody consumes</text>
+
+            <text class="label left" x="20" y="174">Cooperative / incremental</text>
+            <text class="label small left" x="20" y="214">C1</text>
+            <rect class="box svc" x="70" y="198" width="710" height="32"/>
+            <text class="label small" x="215" y="214">keeps P0 the whole time</text>
+            <text class="label small left" x="20" y="258">C2</text>
+            <rect class="box svc" x="70" y="242" width="290" height="32"/>
+            <rect class="box fail" x="364" y="242" width="80" height="32"/>
+            <rect class="box svc" x="448" y="242" width="332" height="32"/>
+            <text class="label small" x="215" y="258">P1 and P2</text>
+            <text class="label small" x="610" y="258">keeps P1, P2 moved to C3</text>
+          </svg>
+          <figcaption>Green-ish bars = consuming, red dashed = paused. Eager pauses the whole group. Cooperative pauses only the partition that moves (P2 here), and only briefly.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A rebalance is <b>routing reconvergence</b>. While OSPF reruns a full SPF, forwarding for affected prefixes is unstable; incremental SPF recomputes only what changed. Eager vs cooperative is exactly full SPF vs incremental SPF. And partition assignment is <b>ECMP bucket assignment</b>: a sticky assignor is "resilient hashing", which moves the fewest flows when a member joins or leaves.</p>
+          <p><b>Where it breaks:</b> a router keeps forwarding on the old FIB during reconvergence. An eager consumer group really stops; there is no "old FIB" to keep using.</p>
+        </div>
+
+        <h3>The classic protocol in 4 messages</h3>
+        <ol class="steps">
+          <li><strong>JoinGroup</strong> Every member sends JoinGroup to the coordinator with the topics it wants and the assignors it supports. The coordinator waits until all known members rejoin (that wait is the barrier).</li>
+          <li><strong>Leader election</strong> The coordinator picks one member (usually the first to join) as the <b>group leader</b> and sends it the full member list. Note: the leader is a <em>consumer</em>, not a broker.</li>
+          <li><strong>SyncGroup</strong> The leader runs the assignor <em>on the client side</em> and sends the result back. Everyone else sends an empty SyncGroup and receives its share.</li>
+          <li><strong>Heartbeat</strong> Members heartbeat (every <code>heartbeat.interval.ms</code> = 3 s). When a rebalance is needed, the heartbeat reply says "rejoin", and the cycle starts again.</li>
+        </ol>
+        <p>Two weak points: the barrier (one slow member delays everyone) and the client-side leader (a bug or an old client version in one pod can break the whole group's assignment).</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p><code>heartbeat.interval.ms</code> / <code>session.timeout.ms</code> (3 s / 45 s on the classic protocol) are the <b>hello interval / dead interval</b> of OSPF, or BFD's tx-interval times its multiplier. Failure detection time is roughly the dead interval, not the hello interval. <b>Where it breaks:</b> Kafka uses seconds, not BFD's milliseconds, because a false "dead" verdict is expensive: it triggers a rebalance that moves partitions and replays uncommitted work.</p>
+        </div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain why rebalances happen and eager vs cooperative, you are fine for most SDE-1 rounds. The KIP-848 protocol details and static membership below are <b>SDE-2 / deep dive</b> material: useful for "how would you avoid rebalance storms on Kubernetes?" follow-ups.</p></div>
+        <h3>The new protocol: KIP-848 (GA in Kafka 4.0) <span class="chip warn">deep dive</span></h3>
+        <p>KIP-848 moves the brain to the broker. There is no JoinGroup/SyncGroup barrier any more. Each consumer only sends a <b>ConsumerGroupHeartbeat</b> (every 5 s by default, set by the broker config <code>group.consumer.heartbeat.interval.ms</code>). The coordinator computes a <b>target assignment</b> with a server-side assignor and then moves each member towards it <b>one member at a time</b>: "please release P2", then later "you now own P2". Members that are not affected never stop.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Classic protocol with client leader versus KIP-848 with broker side assignment">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="10" width="380" height="280"/>
+            <text class="zone-label" x="26" y="32">Classic (client brain)</text>
+            <rect class="box kafka" x="120" y="50" width="160" height="50"/>
+            <text class="label" x="200" y="68">Coordinator</text>
+            <text class="label small" x="200" y="88">collects members</text>
+            <rect class="box svc hot" x="30" y="200" width="100" height="56"/><text class="label" x="80" y="220">C1</text><text class="label small" x="80" y="240">LEADER</text>
+            <rect class="box svc" x="150" y="200" width="100" height="56"/><text class="label" x="200" y="228">C2</text>
+            <rect class="box svc" x="270" y="200" width="100" height="56"/><text class="label" x="320" y="228">C3</text>
+            <path class="arrow" d="M80 200 L170 104"/>
+            <path class="arrow" d="M200 200 L200 104"/>
+            <path class="arrow" d="M320 200 L230 104"/>
+            <text class="label small" x="200" y="150">JoinGroup, wait, SyncGroup</text>
+            <text class="label small" x="200" y="276">C1 computes the plan for all</text>
+
+            <rect class="zone kafka" x="410" y="10" width="380" height="280"/>
+            <text class="zone-label" x="426" y="32">KIP-848 (broker brain)</text>
+            <rect class="box kafka solid" x="510" y="50" width="180" height="56"/>
+            <text class="label white" x="600" y="70">Coordinator</text>
+            <text class="label white" x="600" y="92">runs "uniform"</text>
+            <rect class="box svc" x="430" y="200" width="100" height="56"/><text class="label" x="480" y="228">C1</text>
+            <rect class="box svc" x="550" y="200" width="100" height="56"/><text class="label" x="600" y="228">C2</text>
+            <rect class="box svc" x="670" y="200" width="100" height="56"/><text class="label" x="720" y="228">C3</text>
+            <path class="arrow both dashed" d="M480 200 L570 110"/>
+            <path class="arrow both dashed" d="M600 200 L600 110"/>
+            <path class="arrow both dashed" d="M720 200 L630 110"/>
+            <text class="label small" x="600" y="276">heartbeat in, assignment out</text>
+            <circle class="packet" r="5"><animateMotion dur="2.5s" repeatCount="indefinite" path="M480 200 L570 110"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2.5s" begin="0.8s" repeatCount="indefinite" path="M630 110 L720 200"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="2.5s" begin="1.6s" repeatCount="indefinite" path="M600 200 L600 110"/></circle>
+          </svg>
+          <figcaption>Left: the classic protocol needs every member at a barrier, and a client leader does the math. Right: KIP-848 members just heartbeat; the broker computes the plan and reconciles each member on its own.</figcaption>
+        </figure>
+
+        <p>What you need to know as a developer:</p>
+        <ul>
+          <li>It is <b>on by default on brokers since 4.0</b>, but the <b>client must opt in</b> with <code>group.protocol=consumer</code>. The client default is still <code>classic</code>. The Kafka docs say the plan (KIP-1274) is for the Java consumer to default to the new protocol in Kafka 5.0 and to support only it in 6.0.</li>
+          <li>With <code>group.protocol=consumer</code>, the client settings <code>heartbeat.interval.ms</code>, <code>session.timeout.ms</code> and <code>partition.assignment.strategy</code> are <b>not usable</b>. Timeouts become broker settings (<code>group.consumer.session.timeout.ms</code>, 45 s default), and the assignor is chosen on the broker (<code>uniform</code> by default, or <code>range</code>).</li>
+          <li><code>max.poll.interval.ms</code> still applies: a consumer that stops calling poll still loses its partitions.</li>
+          <li>You can migrate a live group with a <b>rolling restart</b>: when the first new-protocol consumer joins, the group is converted, and old classic members keep working through it (as long as the old assignor does not use custom metadata). Custom client-side assignors are not supported in the new protocol yet.</li>
+        </ul>
+
+        <h3>Static membership: no rebalance for a quick restart <span class="chip accent">SDE-2</span></h3>
+        <p>In Kubernetes, a rolling deploy restarts every consumer pod. With normal (dynamic) members, each restart is a leave plus a join, so two rebalances per pod. Setting <code>group.instance.id</code> (for example to the pod name of a StatefulSet, like <code>billing-0</code>) makes the consumer a <b>static member</b> (KIP-345). If it comes back with the same ID before the session timeout, it simply gets its old partitions back, with no rebalance at all. See <a href="{{BASE}}devops/k8s-04">Deployments</a> for how rolling updates work on the Kubernetes side.</p>
+
+        <div class="callout warn"><p><b>Careful:</b> static membership trades fast restarts for slow failure detection. If a static member really dies, its partitions sit unread until the session timeout expires. Pick a session timeout a bit longer than your typical restart, not "10 minutes just in case".</p></div>
+      

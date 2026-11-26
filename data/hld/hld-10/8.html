@@ -1,0 +1,68 @@
+
+        <h2>Idempotent consumers and idempotency keys</h2>
+        <p>An operation is <strong>idempotent</strong> if doing it twice has the same effect as doing it once. Every at-least-once system (outbox relays, CDC, Kafka consumers, HTTP retries, saga steps) depends on it. There are three common techniques:</p>
+        <ol class="steps">
+          <li><strong>Naturally idempotent writes.</strong> <code>SET status = 'PAID'</code> or an upsert keyed by id is safe to repeat; <code>balance = balance - 10</code> is not.</li>
+          <li><strong>Processed-message table.</strong> Store each handled event id in the same transaction as the business change. A unique constraint turns a duplicate into a no-op.</li>
+          <li><strong>Idempotency keys on APIs.</strong> The client generates a key per logical request and sends it on every retry; the server stores the key with the result and returns the same response for repeats. AWS calls it a <code>ClientToken</code> (EC2 RunInstances returns the same instance on a retry); Stripe uses an <code>Idempotency-Key</code> header.</li>
+        </ol>
+<pre><code class="language-sql">-- consumer: dedup and effect in ONE local transaction
+BEGIN;
+  INSERT INTO processed_events (event_id, consumer)
+       VALUES ('7f3c...e1', 'inventory')
+  ON CONFLICT DO NOTHING;              -- 0 rows inserted =&gt; duplicate, skip
+  -- only if 1 row was inserted:
+  UPDATE stock SET reserved = reserved + 1
+   WHERE sku = 'robot-1' AND reserved &lt; on_hand;
+  -- if 0 rows updated (out of stock): INSERT a ReservationFailed event
+  -- into the outbox in this same transaction, so the saga orchestrator
+  -- learns about it and can compensate (never drop it silently)
+COMMIT;                                -- then commit the Kafka offset</code></pre>
+        <p>Details that separate good answers from great ones (from the AWS Builders' Library and Airbnb's payments team):</p>
+        <ul>
+          <li><b>Record the key and the effect atomically.</b> Never save the token without the change, or the change without the token.</li>
+          <li><b>Return a semantically equivalent response</b> to a retry, not an "already exists" error the caller cannot interpret.</li>
+          <li><b>Same key, different parameters is an error</b> - store the original request fingerprint to detect it.</li>
+          <li><b>Do not mix network calls into DB transactions.</b> Airbnb's Orpheus library splits each request into pre-RPC (record intent in the DB), RPC (call the provider), post-RPC (record the result and whether it is retryable) and wraps only the DB phases in transactions.</li>
+          <li><b>Keep keys long enough</b> to cover every plausible retry, then expire them.</li>
+        </ul>
+        <h3>The idempotent consumer in three steps</h3>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 280" role="img" aria-label="A redelivered message is skipped because its id is already in processed_ids">
+            <rect class="box kafka" x="20" y="100" width="140" height="64"/><text class="label" x="90" y="126">Kafka</text><text class="label small" x="90" y="148">msg id=77</text>
+            <rect class="box svc" x="220" y="100" width="160" height="64"/><text class="label" x="300" y="126">Inventory</text><text class="label small" x="300" y="148">consumer</text>
+            <rect class="zone db" x="440" y="30" width="400" height="190"/><text class="zone-label" x="454" y="52">Inventory DB (one local transaction)</text>
+            <rect class="box db" x="460" y="80" width="170" height="64"/><text class="label" x="545" y="106">processed_ids</text><text class="label small" x="545" y="128">PRIMARY KEY (id)</text>
+            <rect class="box db" x="650" y="80" width="170" height="64"/><text class="label" x="735" y="106">stock</text><text class="label small" x="735" y="128">robot-1</text>
+            <text class="label small" x="90" y="200">committed offset: 76</text>
+            <path class="arrow" d="M160 132 L214 132"/><path class="arrow" d="M380 120 L454 112"/>
+            <g data-step="1">
+              <text class="label small ok" x="545" y="170">+ row 77</text>
+              <text class="label small ok" x="735" y="170">reserved + 1</text>
+              <text class="label small ok" x="640" y="204">COMMIT: both rows or neither</text>
+            </g>
+            <g data-step-only="1">
+              <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M90 132 L300 132 L545 112"/></circle>
+            </g>
+            <g data-step="2">
+              <rect class="box fail" x="220" y="100" width="160" height="64"/><text class="label" x="300" y="126">Inventory</text><text class="label small bad" x="300" y="148">crashed</text>
+              <text class="label small bad" x="90" y="222">offset still 76</text>
+            </g>
+            <g data-step="3">
+              <rect class="box svc" x="220" y="100" width="160" height="64"/><text class="label" x="300" y="126">Inventory</text><text class="label small ok" x="300" y="148">restarted</text>
+              <rect class="box hot" x="460" y="150" width="170" height="28" style="fill-opacity:.5"/><text class="label small" x="545" y="169">77 exists: 0 rows, skip</text>
+              <text class="label small ok" x="90" y="244">now commit offset 77</text>
+              <circle class="packet alt" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M90 132 L300 132 L545 112"/></circle>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Process once.</b> Message id 77 arrives. In one database transaction the consumer inserts 77 into <code>processed_ids</code> and reserves the stock. Both rows commit together.</li>
+            <li><b>Crash before the offset.</b> The consumer dies after the DB commit but before it commits its Kafka offset. Kafka still thinks 76 is the last one handled, so it will deliver 77 again.</li>
+            <li><b>Redelivery is skipped.</b> After restart, 77 arrives again. The insert hits the primary key, <code>ON CONFLICT DO NOTHING</code> reports 0 rows, so the consumer skips the stock update and just commits offset 77. Stock was reserved exactly once.</li>
+          </ol>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is TCP's receive side. A retransmitted segment whose sequence number is already below <code>rcv_nxt</code> is dropped and simply ACKed again; the application never sees it twice. <code>processed_ids</code> is your sequence-number check, and committing the Kafka offset is the ACK. <b>Where this breaks:</b> TCP's sequence numbers are one ordered counter per connection, but message ids are random and arrive out of order across partitions, so you need a real table (with expiry), not a single "highest seen" number.</p>
+        </div>
+      

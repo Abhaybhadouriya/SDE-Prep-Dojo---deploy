@@ -1,0 +1,668 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>The Java driver runs each stage as a block of checks, the way you would demo it in the round; the Python tests are grouped one class per stage, which is how a TDD answer looks at the end of the hour. The same files are in <code>lld-code/lld-case-rating-system/</code> in this repo; each was compiled and run, and the output below is the real output. In C++ one mutex guards both maps: The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>).</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.*;
+import java.util.concurrent.*;
+
+// ---------- model ----------
+/** Immutable running total for one agent (in one period). Never store the average itself. */
+final class Stats {
+    static final Stats EMPTY = new Stats(0, 0);
+    final long sum; final long count;
+    Stats(long sum, long count) { this.sum = sum; this.count = count; }
+    Stats plus(int stars) { return new Stats(sum + stars, count + 1); }
+}
+
+/** One row of a ranking: agent + totals. average() is derived, exact comparison uses cross-multiplication. */
+final class AgentScore {
+    final String agentId; final long sum; final long count;
+    AgentScore(String agentId, Stats s) { this.agentId = agentId; this.sum = s.sum; this.count = s.count; }
+    /** Average rounded half-up to 2 decimals, as text ("4.67"). Integer maths, no floating drift. */
+    String average() {
+        long hundredths = (sum * 200 + count) / (2 * count);
+        return hundredths / 100 + "." + String.format("%02d", hundredths % 100);
+    }
+    @Override public String toString() { return agentId + " " + average() + " (" + count + ")"; }
+}
+
+class RatingException extends IllegalArgumentException {
+    RatingException(String msg) { super(msg); }
+}
+
+// ---------- ranking policy (Strategy as a Comparator) ----------
+final class Rankings {
+    /** Highest average first, compared exactly: a.sum/a.count vs b.sum/b.count  ==  a.sum*b.count vs b.sum*a.count. */
+    static final Comparator&lt;AgentScore&gt; BY_AVERAGE =
+            (a, b) -&gt; Long.compare(b.sum * a.count, a.sum * b.count);
+    /** Default tie-break: more ratings first (more evidence), then agent id A-Z (deterministic output). */
+    static final Comparator&lt;AgentScore&gt; DEFAULT = BY_AVERAGE
+            .thenComparing(Comparator.comparingLong((AgentScore s) -&gt; s.count).reversed())
+            .thenComparing(s -&gt; s.agentId);
+    /** Alternative a product manager may want: ties broken alphabetically only. */
+    static final Comparator&lt;AgentScore&gt; ALPHABETICAL_TIES = BY_AVERAGE.thenComparing(s -&gt; s.agentId);
+    /** Follow-up: Bayesian (damped) average so one lucky 5-star does not top the chart. Same Strategy seam.
+     *  The prior is an exact fraction priorSum / priorCount (3.8 stars worth 10 ratings = 38 / 10), not a long
+     *  mean that would truncate 3.8 to 3. Score = (sum + priorSum) / (count + priorCount), compared by
+     *  cross-multiplication. Overflow: sum &lt;= 5 * count, so a product is about 5 * n^2 and stays inside a long
+     *  up to roughly 10^9 ratings per agent; multiplyExact throws instead of wrapping beyond that. */
+    static Comparator&lt;AgentScore&gt; bayesian(long priorSum, long priorCount) {
+        if (priorCount &lt;= 0 || priorSum &lt; 0) throw new IllegalArgumentException("prior must be a positive weight");
+        return (a, b) -&gt; Long.compare(Math.multiplyExact(b.sum + priorSum, a.count + priorCount),
+                                      Math.multiplyExact(a.sum + priorSum, b.count + priorCount));
+    }
+}
+
+// ---------- export formats (Strategy) ----------
+interface Exporter { String export(List&lt;AgentScore&gt; rows); }
+
+final class CsvExporter implements Exporter {
+    public String export(List&lt;AgentScore&gt; rows) {
+        StringBuilder sb = new StringBuilder("agent,average,ratings\n");
+        for (AgentScore r : rows) sb.append(csv(r.agentId)).append(',').append(r.average()).append(',').append(r.count).append('\n');
+        return sb.toString();
+    }
+    private static String csv(String v) {                 // quote fields with comma / quote / newline
+        return v.matches(".*[\",\\n].*") ? "\"" + v.replace("\"", "\"\"") + "\"" : v;
+    }
+}
+
+final class JsonExporter implements Exporter {
+    public String export(List&lt;AgentScore&gt; rows) {
+        StringJoiner j = new StringJoiner(",", "[", "]");
+        for (AgentScore r : rows)
+            j.add("{\"agent\":\"" + r.agentId.replace("\\", "\\\\").replace("\"", "\\\"") + "\",\"average\":" + r.average() + ",\"ratings\":" + r.count + "}");
+        return j.toString();
+    }
+}
+
+// ---------- service ----------
+final class RatingService {
+    private final ConcurrentHashMap&lt;String, Stats&gt; allTime = new ConcurrentHashMap&lt;&gt;();
+    private final ConcurrentHashMap&lt;YearMonth, ConcurrentHashMap&lt;String, Stats&gt;&gt; byMonth = new ConcurrentHashMap&lt;&gt;();
+    private final Comparator&lt;AgentScore&gt; ranking;
+
+    RatingService(Comparator&lt;AgentScore&gt; ranking) { this.ranking = ranking; }
+    RatingService() { this(Rankings.DEFAULT); }
+
+    /** Stage 1 + 3: record one customer rating. compute() makes each per-agent update atomic. */
+    void rate(String agentId, int stars, LocalDate date) {
+        if (agentId == null || agentId.isBlank()) throw new RatingException("agent id required");
+        if (stars &lt; 1 || stars &gt; 5) throw new RatingException("stars must be 1..5, got " + stars);
+        if (date == null) throw new RatingException("date required");
+        allTime.compute(agentId, (k, s) -&gt; (s == null ? Stats.EMPTY : s).plus(stars));
+        byMonth.computeIfAbsent(YearMonth.from(date), m -&gt; new ConcurrentHashMap&lt;&gt;())
+               .compute(agentId, (k, s) -&gt; (s == null ? Stats.EMPTY : s).plus(stars));
+    }
+
+    /** Stage 1 + 2: all agents with their average, highest first, ties broken by the policy. */
+    List&lt;AgentScore&gt; averages() { return rank(allTime); }
+
+    /** Stage 3: the ranking for one month (empty list when nobody was rated that month). */
+    List&lt;AgentScore&gt; bestOfMonth(YearMonth month) {
+        Map&lt;String, Stats&gt; m = byMonth.get(month);
+        return m == null ? Collections.emptyList() : rank(m);
+    }
+
+    /** Stage 3b: the winners of a month; several agents when they tie exactly on average. */
+    List&lt;String&gt; topAgents(YearMonth month) {
+        List&lt;AgentScore&gt; r = bestOfMonth(month);
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        for (AgentScore s : r) if (Rankings.BY_AVERAGE.compare(s, r.get(0)) == 0) out.add(s.agentId);
+        return out;
+    }
+
+    /** Stage 4: export any ranking in any format. */
+    String export(List&lt;AgentScore&gt; rows, Exporter exporter) { return exporter.export(rows); }
+
+    private List&lt;AgentScore&gt; rank(Map&lt;String, Stats&gt; m) {
+        List&lt;AgentScore&gt; out = new ArrayList&lt;&gt;();
+        for (Map.Entry&lt;String, Stats&gt; e : m.entrySet()) out.add(new AgentScore(e.getKey(), e.getValue()));
+        out.sort(ranking);
+        return out;
+    }
+}
+
+// ---------- demo driver: each stage is a "test" like the Atlassian round ----------
+public class Main {
+    static int passed = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        passed++;
+    }
+    static LocalDate d(String s) { return LocalDate.parse(s); }
+
+    public static void main(String[] args) throws Exception {
+        // Stage 1: accept ratings, show averages highest first
+        RatingService s = new RatingService();
+        s.rate("alice", 5, d("2025-01-10"));
+        s.rate("alice", 4, d("2025-01-20"));
+        s.rate("bob", 3, d("2025-01-11"));
+        s.rate("carol", 5, d("2025-02-02"));
+        s.rate("carol", 4, d("2025-02-03"));
+        s.rate("carol", 5, d("2025-02-04"));
+        System.out.println("stage 1 averages: " + s.averages());
+        check(s.averages().get(0).agentId.equals("carol"), "carol 4.67 first");
+        check(s.averages().get(1).average().equals("4.50"), "alice 4.50, not 4 (integer-division bug)");
+
+        // Stage 2: ties. dave 4.50 with 4 ratings ties alice 4.50 with 2 -&gt; more ratings first
+        s.rate("dave", 5, d("2025-02-10")); s.rate("dave", 4, d("2025-02-11"));
+        s.rate("dave", 5, d("2025-02-12")); s.rate("dave", 4, d("2025-02-13"));
+        System.out.println("stage 2 averages: " + s.averages());
+        check(s.averages().get(1).agentId.equals("dave") &amp;&amp; s.averages().get(2).agentId.equals("alice"), "tie: dave (4 ratings) before alice (2)");
+        RatingService alpha = new RatingService(Rankings.ALPHABETICAL_TIES);
+        alpha.rate("zed", 4, d("2025-01-01")); alpha.rate("amy", 4, d("2025-01-01"));
+        check(alpha.averages().get(0).agentId.equals("amy"), "alphabetical tie policy");
+
+        // Follow-up: one lucky 5-star vs a hundred ratings averaging 4.90; prior 3.8 stars worth 10 ratings
+        RatingService damped = new RatingService(Rankings.bayesian(38, 10).thenComparing(x -&gt; x.agentId));
+        damped.rate("lucky", 5, d("2025-01-01"));
+        for (int k = 0; k &lt; 100; k++) damped.rate("steady", k &lt; 90 ? 5 : 4, d("2025-01-01"));
+        System.out.println("bayesian (prior 3.8 x 10): " + damped.averages());
+        check(damped.averages().get(0).agentId.equals("steady"), "damped average ranks 100 ratings of 4.90 above one 5");
+
+        // Stage 3: best agents per month
+        System.out.println("stage 3 Jan 2025: " + s.bestOfMonth(YearMonth.of(2025, 1)));
+        System.out.println("stage 3 Feb 2025: " + s.bestOfMonth(YearMonth.of(2025, 2)));
+        check(s.bestOfMonth(YearMonth.of(2025, 1)).get(0).agentId.equals("alice"), "alice best in Jan");
+        check(s.topAgents(YearMonth.of(2025, 2)).equals(Arrays.asList("carol")), "carol tops Feb (4.67 &gt; 4.50)");
+        check(s.bestOfMonth(YearMonth.of(2025, 3)).isEmpty(), "no ratings in March");
+
+        // Stage 4: export
+        String csv = s.export(s.averages(), new CsvExporter());
+        String json = s.export(s.bestOfMonth(YearMonth.of(2025, 1)), new JsonExporter());
+        System.out.print("stage 4 csv:\n" + csv);
+        System.out.println("stage 4 json Jan: " + json);
+        check(csv.startsWith("agent,average,ratings\ncarol,4.67,3\n"), "csv header and first row");
+        check(json.equals("[{\"agent\":\"alice\",\"average\":4.50,\"ratings\":2},{\"agent\":\"bob\",\"average\":3.00,\"ratings\":1}]"), "json Jan");
+
+        // Validation
+        for (int bad : new int[]{0, 6}) {
+            try { s.rate("bob", bad, d("2025-01-01")); check(false, "stars " + bad); }
+            catch (RatingException e) { System.out.println("rejected: " + e.getMessage()); passed++; }
+        }
+
+        // Stage 5: concurrency - 8 threads x 1000 ratings, no lost updates
+        RatingService c = new RatingService();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; 8; t++) {
+            final int stars = t % 5 + 1;
+            fs.add(pool.submit(() -&gt; { for (int k = 0; k &lt; 1000; k++) c.rate("agent" + (k % 3), stars, d("2025-05-01")); }));
+        }
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        long total = 0;
+        for (AgentScore a : c.averages()) total += a.count;
+        System.out.println("stage 5 concurrent: " + c.averages());
+        check(total == 8000, "8000 ratings counted");
+        check(c.bestOfMonth(YearMonth.of(2025, 5)).stream().mapToLong(a -&gt; a.count).sum() == 8000, "monthly too");
+
+        System.out.println("All " + passed + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Agent Rating System (Atlassian code design) - grows stage by stage, thread safe."""
+from __future__ import annotations
+
+import json
+import threading
+from datetime import date
+from functools import cmp_to_key
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+
+
+class RatingError(ValueError):
+    pass
+
+
+class Stats(NamedTuple):  # immutable running total; the average is always derived
+    total: int = 0
+    count: int = 0
+
+    def plus(self, stars: int) -&gt; "Stats":
+        return Stats(self.total + stars, self.count + 1)
+
+
+class AgentScore(NamedTuple):
+    agent: str
+    total: int
+    count: int
+
+    def average(self) -&gt; str:
+        """Rounded half-up to 2 decimals with integer maths (no float drift)."""
+        h = (self.total * 200 + self.count) // (2 * self.count)
+        return f"{h // 100}.{h % 100:02d}"
+
+    def __repr__(self) -&gt; str:
+        return f"{self.agent} {self.average()} ({self.count})"
+
+
+# ---------- ranking policies (Strategy as a comparator) ----------
+def by_average(a: AgentScore, b: AgentScore) -&gt; int:
+    """Exact: a.total/a.count vs b.total/b.count  ==  a.total*b.count vs b.total*a.count (highest first)."""
+    left, right = b.total * a.count, a.total * b.count
+    return (left &gt; right) - (left &lt; right)
+
+
+def default_ranking(a: AgentScore, b: AgentScore) -&gt; int:
+    """Highest average, then more ratings, then agent id A-Z."""
+    return by_average(a, b) or (b.count - a.count) or ((a.agent &gt; b.agent) - (a.agent &lt; b.agent))
+
+
+def alphabetical_ties(a: AgentScore, b: AgentScore) -&gt; int:
+    return by_average(a, b) or ((a.agent &gt; b.agent) - (a.agent &lt; b.agent))
+
+
+# ---------- exporters (Strategy) ----------
+def to_csv(rows: List[AgentScore]) -&gt; str:
+    def cell(v: str) -&gt; str:
+        return '"' + v.replace('"', '""') + '"' if any(c in v for c in ',"\n') else v
+    return "agent,average,ratings\n" + "".join(f"{cell(r.agent)},{r.average()},{r.count}\n" for r in rows)
+
+
+def to_json(rows: List[AgentScore]) -&gt; str:
+    # average is emitted as a fixed 2-decimal number, so build it by hand around json.dumps for the name
+    return "[" + ",".join(
+        '{"agent":' + json.dumps(r.agent) + ',"average":' + r.average() + ',"ratings":' + str(r.count) + "}"
+        for r in rows) + "]"
+
+
+Comparator = Callable[[AgentScore, AgentScore], int]
+Month = Tuple[int, int]
+
+
+class RatingService:
+    def __init__(self, ranking: Comparator = default_ranking):
+        self._all: Dict[str, Stats] = {}
+        self._month: Dict[Month, Dict[str, Stats]] = {}
+        self._ranking = ranking
+        self._lock = threading.Lock()  # dict read-modify-write is not atomic across threads
+
+    def rate(self, agent: str, stars: int, on: date) -&gt; None:
+        if not agent:
+            raise RatingError("agent id required")
+        if not isinstance(stars, int) or not 1 &lt;= stars &lt;= 5:
+            raise RatingError(f"stars must be 1..5, got {stars}")
+        if on is None:
+            raise RatingError("date required")
+        key = (on.year, on.month)
+        with self._lock:
+            self._all[agent] = self._all.get(agent, Stats()).plus(stars)
+            m = self._month.setdefault(key, {})
+            m[agent] = m.get(agent, Stats()).plus(stars)
+
+    def averages(self) -&gt; List[AgentScore]:
+        with self._lock:
+            return self._rank(dict(self._all))
+
+    def best_of_month(self, year: int, month: int) -&gt; List[AgentScore]:
+        with self._lock:
+            return self._rank(dict(self._month.get((year, month), {})))
+
+    def top_agents(self, year: int, month: int) -&gt; List[str]:
+        r = self.best_of_month(year, month)
+        return [s.agent for s in r if by_average(s, r[0]) == 0]
+
+    @staticmethod
+    def export(rows: List[AgentScore], exporter: Callable[[List[AgentScore]], str]) -&gt; str:
+        return exporter(rows)
+
+    def _rank(self, m: Dict[str, Stats]) -&gt; List[AgentScore]:
+        rows = [AgentScore(a, s.total, s.count) for a, s in m.items()]
+        return sorted(rows, key=cmp_to_key(self._ranking))
+
+
+def demo() -&gt; None:
+    s = RatingService()
+    for agent, stars, day in [("alice", 5, "2025-01-10"), ("alice", 4, "2025-01-20"), ("bob", 3, "2025-01-11"),
+                              ("carol", 5, "2025-02-02"), ("carol", 4, "2025-02-03"), ("carol", 5, "2025-02-04")]:
+        s.rate(agent, stars, date.fromisoformat(day))
+    print("stage 1 averages:", s.averages())
+    for stars, day in [(5, "2025-02-10"), (4, "2025-02-11"), (5, "2025-02-12"), (4, "2025-02-13")]:
+        s.rate("dave", stars, date.fromisoformat(day))
+    print("stage 2 averages:", s.averages())
+    print("stage 3 Jan 2025:", s.best_of_month(2025, 1))
+    print("stage 3 Feb 2025:", s.best_of_month(2025, 2), "top:", s.top_agents(2025, 2))
+    print("stage 4 csv:\n" + s.export(s.averages(), to_csv), end="")
+    print("stage 4 json Jan:", s.export(s.best_of_month(2025, 1), to_json))
+    try:
+        s.rate("bob", 6, date(2025, 1, 1))
+    except RatingError as e:
+        print("rejected:", e)
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+<p>Tests, one class per stage (<code>python -m unittest test_main</code>):</p>
+<pre><code class="language-python">"""One test class per interview stage, written test-first the way the Atlassian round expects."""
+import threading
+import unittest
+from datetime import date
+
+from main import RatingError, RatingService, alphabetical_ties, to_csv, to_json
+
+JAN, FEB = date(2025, 1, 15), date(2025, 2, 15)
+
+
+class Stage1Averages(unittest.TestCase):
+    def test_highest_first(self):
+        s = RatingService()
+        s.rate("a", 3, JAN)
+        s.rate("b", 5, JAN)
+        self.assertEqual([r.agent for r in s.averages()], ["b", "a"])
+
+    def test_average_is_not_integer_division(self):
+        s = RatingService()
+        s.rate("a", 5, JAN)
+        s.rate("a", 4, JAN)
+        self.assertEqual(s.averages()[0].average(), "4.50")
+
+    def test_rounding_half_up(self):
+        s = RatingService()
+        for stars in (5, 5, 4):  # 14/3 = 4.666..
+            s.rate("a", stars, JAN)
+        self.assertEqual(s.averages()[0].average(), "4.67")
+
+    def test_validation(self):
+        s = RatingService()
+        for bad in (0, 6, 3.5):
+            with self.assertRaises(RatingError):
+                s.rate("a", bad, JAN)
+        with self.assertRaises(RatingError):
+            s.rate("", 3, JAN)
+        self.assertEqual(s.averages(), [])
+
+
+class Stage2Ties(unittest.TestCase):
+    def test_more_ratings_wins_then_name(self):
+        s = RatingService()
+        s.rate("zoe", 4, JAN)
+        s.rate("amy", 4, JAN)
+        for stars in (5, 3):
+            s.rate("max", stars, JAN)  # also 4.00, but 2 ratings
+        self.assertEqual([r.agent for r in s.averages()], ["max", "amy", "zoe"])
+
+    def test_policy_is_pluggable(self):
+        s = RatingService(alphabetical_ties)
+        s.rate("zoe", 4, JAN)
+        for stars in (5, 3):
+            s.rate("max", stars, JAN)
+        self.assertEqual([r.agent for r in s.averages()], ["max", "zoe"])
+
+    def test_exact_compare_not_float(self):
+        s = RatingService()
+        for _ in range(3):
+            s.rate("a", 1, JAN)
+        s.rate("a", 2, JAN)              # 5/4 = 1.25
+        for stars in (1, 1, 1, 1, 2, 2):
+            s.rate("b", stars, JAN)      # b: 8/6 = 1.333.. so b ranks first
+        self.assertEqual([r.agent for r in s.averages()], ["b", "a"])
+
+
+class Stage3Monthly(unittest.TestCase):
+    def test_best_per_month(self):
+        s = RatingService()
+        s.rate("a", 5, JAN)
+        s.rate("b", 3, JAN)
+        s.rate("a", 1, FEB)
+        s.rate("b", 4, FEB)
+        self.assertEqual(s.best_of_month(2025, 1)[0].agent, "a")
+        self.assertEqual(s.best_of_month(2025, 2)[0].agent, "b")
+        self.assertEqual(s.averages()[0].agent, "b")  # 3.50 vs 3.00 all time
+        self.assertEqual(s.best_of_month(2025, 3), [])
+
+    def test_top_agents_returns_all_tied(self):
+        s = RatingService()
+        s.rate("a", 5, JAN)
+        s.rate("b", 5, JAN)
+        s.rate("c", 4, JAN)
+        self.assertEqual(s.top_agents(2025, 1), ["a", "b"])
+
+
+class Stage4Export(unittest.TestCase):
+    def test_csv_and_json(self):
+        s = RatingService()
+        s.rate("smith, j", 5, JAN)
+        s.rate("bob", 3, JAN)
+        self.assertEqual(s.export(s.averages(), to_csv), 'agent,average,ratings\n"smith, j",5.00,1\nbob,3.00,1\n')
+        self.assertEqual(s.export(s.averages(), to_json),
+                         '[{"agent":"smith, j","average":5.00,"ratings":1},{"agent":"bob","average":3.00,"ratings":1}]')
+
+
+class Stage5Concurrency(unittest.TestCase):
+    def test_no_lost_updates(self):
+        s = RatingService()
+
+        def work(stars):
+            for k in range(500):
+                s.rate(f"agent{k % 3}", stars, JAN)
+
+        ts = [threading.Thread(target=work, args=(t % 5 + 1,)) for t in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(sum(r.count for r in s.averages()), 4000)
+        self.assertEqual(sum(r.count for r in s.best_of_month(2025, 1)), 4000)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Agent Rating System - C++14. Build: g++ -std=c++14 -Wall -Wextra main.cpp -o main
+// Locking: one mutex (mu_) guards all_ and month_. rate() updates both maps in one critical section; the readers
+// copy the Stats they need under the lock and sort the copy after unlocking. A C++14 reader-writer lock would be
+// std::shared_timed_mutex (std::shared_mutex is C++17); Java gets the same effect per key with
+// ConcurrentHashMap.compute and immutable Stats.
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+
+struct Stats { long long sum = 0, count = 0; };
+
+struct AgentScore {
+    std::string agent; long long sum, count;
+    std::string average() const {                       // half-up, 2 decimals, integer maths
+        long long h = (sum * 200 + count) / (2 * count);
+        std::string frac = std::to_string(h % 100);
+        return std::to_string(h / 100) + "." + (frac.size() &lt; 2 ? "0" : "") + frac;
+    }
+};
+
+// Ranking policy: "a goes before b". Exact average comparison by cross-multiplication.
+using Ranking = std::function&lt;bool(const AgentScore&amp;, const AgentScore&amp;)&gt;;
+int byAverage(const AgentScore&amp; a, const AgentScore&amp; b) {   // &lt;0: a first
+    long long l = b.sum * a.count, r = a.sum * b.count;
+    return l &lt; r ? -1 : (l &gt; r ? 1 : 0);
+}
+bool defaultRanking(const AgentScore&amp; a, const AgentScore&amp; b) {
+    int c = byAverage(a, b);
+    if (c != 0) return c &lt; 0;
+    if (a.count != b.count) return a.count &gt; b.count;    // more ratings first
+    return a.agent &lt; b.agent;                            // then A-Z
+}
+
+// Export format: Strategy as an interface (a C ops struct with one function pointer).
+struct Exporter {
+    virtual ~Exporter() = default;
+    virtual std::string exportRows(const std::vector&lt;AgentScore&gt;&amp; rows) const = 0;
+};
+struct CsvExporter : Exporter {
+    std::string exportRows(const std::vector&lt;AgentScore&gt;&amp; rows) const override {
+        std::string out = "agent,average,ratings\n";
+        for (auto&amp; r : rows) out += r.agent + "," + r.average() + "," + std::to_string(r.count) + "\n";
+        return out;
+    }
+};
+struct JsonExporter : Exporter {
+    std::string exportRows(const std::vector&lt;AgentScore&gt;&amp; rows) const override {
+        std::string out = "[";
+        for (size_t i = 0; i &lt; rows.size(); ++i)
+            out += std::string(i ? "," : "") + "{\"agent\":\"" + rows[i].agent + "\",\"average\":" +
+                   rows[i].average() + ",\"ratings\":" + std::to_string(rows[i].count) + "}";
+        return out + "]";
+    }
+};
+
+class RatingService {
+    std::map&lt;std::string, Stats&gt; all_;
+    std::map&lt;int, std::map&lt;std::string, Stats&gt;&gt; month_;  // key = year * 100 + month
+    Ranking ranking_;
+    mutable Mutex mu_;                                   // guards all_ and month_
+
+    std::vector&lt;AgentScore&gt; rank(const std::map&lt;std::string, Stats&gt;&amp; m) const {   // m is a private copy
+        std::vector&lt;AgentScore&gt; v;
+        for (auto&amp; e : m) v.push_back({e.first, e.second.sum, e.second.count});
+        std::sort(v.begin(), v.end(), ranking_);
+        return v;
+    }
+
+public:
+    explicit RatingService(Ranking r = defaultRanking) : ranking_(std::move(r)) {}
+
+    void rate(const std::string&amp; agent, int stars, int year, int month) {
+        if (agent.empty()) throw std::invalid_argument("agent id required");
+        if (stars &lt; 1 || stars &gt; 5) throw std::invalid_argument("stars must be 1..5, got " + std::to_string(stars));
+        std::lock_guard&lt;Mutex&gt; g(mu_);                   // both maps change in one step
+        Stats&amp; a = all_[agent]; a.sum += stars; a.count += 1;
+        Stats&amp; m = month_[year * 100 + month][agent]; m.sum += stars; m.count += 1;
+    }
+    std::vector&lt;AgentScore&gt; averages() const {
+        std::map&lt;std::string, Stats&gt; copy;
+        { std::lock_guard&lt;Mutex&gt; g(mu_); copy = all_; }
+        return rank(copy);                               // sort outside the lock
+    }
+    std::vector&lt;AgentScore&gt; bestOfMonth(int year, int month) const {
+        std::map&lt;std::string, Stats&gt; copy;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);
+            auto it = month_.find(year * 100 + month);
+            if (it != month_.end()) copy = it-&gt;second;
+        }
+        return rank(copy);
+    }
+};
+
+static int passed = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++passed;
+}
+void print(const char* label, const std::vector&lt;AgentScore&gt;&amp; v) {
+    std::cout &lt;&lt; label;
+    for (auto&amp; s : v) std::cout &lt;&lt; " " &lt;&lt; s.agent &lt;&lt; " " &lt;&lt; s.average() &lt;&lt; " (" &lt;&lt; s.count &lt;&lt; ")";
+    std::cout &lt;&lt; "\n";
+}
+
+int main() {
+    RatingService s;
+    s.rate("alice", 5, 2025, 1); s.rate("alice", 4, 2025, 1); s.rate("bob", 3, 2025, 1);
+    s.rate("carol", 5, 2025, 2); s.rate("carol", 4, 2025, 2); s.rate("carol", 5, 2025, 2);
+    print("stage 1 averages:", s.averages());
+    check(s.averages()[1].average() == "4.50", "alice 4.50");
+    for (int stars : {5, 4, 5, 4}) s.rate("dave", stars, 2025, 2);
+    print("stage 2 averages:", s.averages());
+    check(s.averages()[1].agent == "dave", "tie: more ratings first");
+    print("stage 3 Jan 2025:", s.bestOfMonth(2025, 1));
+    check(s.bestOfMonth(2025, 1)[0].agent == "alice", "alice best in Jan");
+    check(s.bestOfMonth(2025, 3).empty(), "no ratings in March");
+    std::unique_ptr&lt;Exporter&gt; csv(new CsvExporter()), json(new JsonExporter());
+    std::cout &lt;&lt; "stage 4 csv:\n" &lt;&lt; csv-&gt;exportRows(s.averages());
+    std::cout &lt;&lt; "stage 4 json Jan: " &lt;&lt; json-&gt;exportRows(s.bestOfMonth(2025, 1)) &lt;&lt; "\n";
+    try { s.rate("bob", 6, 2025, 1); check(false, "stars 6"); }
+    catch (const std::invalid_argument&amp; e) { std::cout &lt;&lt; "rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; ++passed; }
+    std::cout &lt;&lt; "All " &lt;&lt; passed &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+stage 1 averages: [carol 4.67 (3), alice 4.50 (2), bob 3.00 (1)]
+stage 2 averages: [carol 4.67 (3), dave 4.50 (4), alice 4.50 (2), bob 3.00 (1)]
+bayesian (prior 3.8 x 10): [steady 4.90 (100), lucky 5.00 (1)]
+stage 3 Jan 2025: [alice 4.50 (2), bob 3.00 (1)]
+stage 3 Feb 2025: [carol 4.67 (3), dave 4.50 (4)]
+stage 4 csv:
+agent,average,ratings
+carol,4.67,3
+dave,4.50,4
+alice,4.50,2
+bob,3.00,1
+stage 4 json Jan: [{"agent":"alice","average":4.50,"ratings":2},{"agent":"bob","average":3.00,"ratings":1}]
+rejected: stars must be 1..5, got 0
+rejected: stars must be 1..5, got 6
+stage 5 concurrent: [agent0 2.63 (2672), agent1 2.63 (2664), agent2 2.63 (2664)]
+All 14 checks passed
+
+$ python main.py &amp;&amp; python -m unittest test_main
+stage 1 averages: [carol 4.67 (3), alice 4.50 (2), bob 3.00 (1)]
+stage 2 averages: [carol 4.67 (3), dave 4.50 (4), alice 4.50 (2), bob 3.00 (1)]
+stage 3 Jan 2025: [alice 4.50 (2), bob 3.00 (1)]
+stage 3 Feb 2025: [carol 4.67 (3), dave 4.50 (4)] top: ['carol']
+stage 4 csv:
+agent,average,ratings
+carol,4.67,3
+dave,4.50,4
+alice,4.50,2
+bob,3.00,1
+stage 4 json Jan: [{"agent":"alice","average":4.50,"ratings":2},{"agent":"bob","average":3.00,"ratings":1}]
+rejected: stars must be 1..5, got 6
+...........
+----------------------------------------------------------------------
+Ran 11 tests in 0.007s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main
+stage 1 averages: carol 4.67 (3) alice 4.50 (2) bob 3.00 (1)
+stage 2 averages: carol 4.67 (3) dave 4.50 (4) alice 4.50 (2) bob 3.00 (1)
+stage 3 Jan 2025: alice 4.50 (2) bob 3.00 (1)
+stage 4 csv:
+agent,average,ratings
+carol,4.67,3
+dave,4.50,4
+alice,4.50,2
+bob,3.00,1
+stage 4 json Jan: [{"agent":"alice","average":4.50,"ratings":2},{"agent":"bob","average":3.00,"ratings":1}]
+rejected: stars must be 1..5, got 6
+All 5 checks passed</code></pre>
+  <div class="callout note"><p>Read stage 2 against stage 1: dave (4.50 from 4 ratings) slots in ahead of alice (4.50 from 2 ratings) because of the tie-break, and carol stays first in February because 14/3 is exactly greater than 18/4. Stage 5 counts all 8,000 concurrent ratings.</p></div>

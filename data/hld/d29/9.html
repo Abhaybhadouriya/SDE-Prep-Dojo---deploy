@@ -1,0 +1,137 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Minute</th><th>Do</th><th>Say</th></tr></thead>
+            <tbody>
+              <tr><td>0-5</td><td>Requirements</td><td>"What is a topic? Which locations? How fresh? Is approximate OK? Spam?"</td></tr>
+              <tr><td>5-10</td><td>Estimate</td><td>"~6k posts/s, ~54k counter updates/s; the answer is ~1 MB, so precompute and cache."</td></tr>
+              <tr><td>10-15</td><td>Define trending</td><td>"Velocity vs baseline, not count. Here is the score."</td></tr>
+              <tr><td>15-25</td><td>Diagram</td><td>Posts topic → filter/extract → keyed term events → windowed counters + scorer → merger → cache → API.</td></tr>
+              <tr><td>25-38</td><td>Deep dives</td><td>Sketch + candidates, sliding windows with event time, hot keys, spam.</td></tr>
+              <tr><td>38-45</td><td>Failures, wrap-up</td><td>Stale-but-available reads, fake spikes on catch-up, monitoring (lag per partition, trend churn, freshness).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout interview"><p><b>60-second answer:</b> "Trending means a term whose rate jumped far above its normal rate for that place and hour, counted by distinct real users. Posts already go to Kafka, so trends is just another consumer group. A filter drops spam and replies, an extractor pulls hashtags and entities, normalises them and emits events keyed by location and term, so one Flink worker owns each key. Each worker keeps one-minute buckets: a count-min sketch for the long tail, exact counts and a HyperLogLog of authors for candidates. Every 30 seconds it scores the last ten minutes against an hour-of-week baseline with a Poisson-style z-score and sends its local top hundred to a merger, which applies policy and writes the top 30 per location into Redis behind a CDN. Reads never compute anything. Hot keys are handled by pre-aggregation and salting; catch-up spikes by event-time windows."</p></div>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>SDE-1 bar (a pass)</th><th>SDE-2 bar (a strong hire)</th></tr></thead>
+            <tbody>
+              <tr><td>Kafka → stream job counts terms per minute → top list in a cache → API.</td><td>Same skeleton, but defines "trending" as <b>rate vs baseline</b> before drawing anything.</td></tr>
+              <tr><td>Uses a hash map of counts per window.</td><td>Bounds memory with a <b>count-min sketch + exact candidate set</b> and explains the over-count error.</td></tr>
+              <tr><td>Sliding window by recounting.</td><td>Sliding window from <b>1-minute buckets</b> on <b>event time</b>, so restarts and catch-up do not create fake spikes.</td></tr>
+              <tr><td>Partitions by term.</td><td>Spots the <b>hot key</b> during big events and fixes it with pre-aggregation and salting; watches per-partition lag.</td></tr>
+              <tr><td>Mentions spam filtering.</td><td>Counts <b>distinct, trusted authors</b> (HyperLogLog, trust weights) and adds a policy layer with a fast kill switch.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details class="qa" data-level="3" data-topic="hld,streaming" data-company="Meta,Amazon">
+          <summary>Why not just sort all hashtags by count in the last hour?</summary>
+          <div class="answer">
+            <p>Two reasons. Correctness: raw counts surface terms that are always popular ("good morning", big celebrities), which are not news. We want terms that are unusually high compared to their own baseline. Cost: "all hashtags" is an unbounded set; keeping and sorting exact counts for every term in every location and window costs gigabytes per bucket and a sort over millions of keys every minute. Use velocity scoring over a bounded candidate set found with a sketch.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split it into "wrong answer" and "too expensive" and fix both.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What baseline would you use for a brand-new hashtag? (It has no history, so b is near 0. Fall back to a prior: the baseline of similar new terms in that location and hour, plus the smoothing constant k and the minimum distinct-user rule, so a brand-new tag needs a real crowd before it scores high.)</li><li>How do you pick K and the candidate threshold? (K is a product choice - the UI shows 10-30, so keep a few hundred candidates per location for headroom. Set the promotion threshold from the sketch error: a term must clearly exceed the sketch's worst-case over-count, and you tune it offline so every past real trend would have been promoted in time.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,algorithms" data-company="Google,Atlassian">
+          <summary>Explain the count-min sketch and size it for ε = 0.001, δ = 0.01.</summary>
+          <div class="answer">
+            <p>It is d rows of w counters with d independent hash functions. An increment adds to one counter per row; a query returns the minimum of those d counters. Collisions only add, so the estimate never undercounts; with w = ⌈e/ε⌉ and d = ⌈ln(1/δ)⌉, the overcount is at most ε x N (N = total increments) with probability 1 - δ. For ε 0.001 and δ 0.01: w = 2,719, d = 5, about 13.6k counters, ~54 KB with 4-byte counters. Note the error is relative to the <b>total</b> stream, so it is great for heavy hitters and bad for rare items.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the grid, show update and query, state "never under", then the sizing formula and the "error relative to N" caveat.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can't it list the top items by itself? (it stores no keys; pair it with a heap)</li><li>Can you merge two sketches? (yes, cell-wise add if same dimensions and hashes)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming,kafka" data-company="Amazon,Uber">
+          <summary>How do you partition the counting so it scales, and what goes wrong?</summary>
+          <div class="answer">
+            <p>Key term events by <code>location|term</code> so each key lands on exactly one partition and one worker - no shared counters, no locks, and the worker's local top-K for its keys is exact for those keys. Then a merger combines local top-Ks per location. What goes wrong: hot keys (one term dominating) overload one partition. I fix it with per-second pre-aggregation in the extractor and salting for known-hot terms, and I watch per-partition lag.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Partition by key, merge local results, then handle skew" - the same three beats as any distributed aggregation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is merging local top-Ks exact? (yes when partitioned by key: each key's full count lives in one place)</li><li>Why not partition by post id? (Then mentions of one term are spread over every worker, no worker has the full count, and you need a second shuffle by term to add them up - partitioning by location|term does that shuffle once, up front.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,streaming" data-company="Google,Microsoft">
+          <summary>The stream job was down for 20 minutes. When it restarts, every term looks like it spiked. Why, and how do you prevent it?</summary>
+          <div class="answer">
+            <p>The job was counting by <b>processing time</b>, so 20 minutes of backlog was processed in 2 minutes and landed in "now". Count by <b>event time</b> (the post's timestamp) with watermarks, so backlog events go into their original minute buckets. Also suppress trend publishing until lag is back under a threshold, and serve the last good list with its <code>as_of</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name event time vs processing time - it is the key concept interviewers are checking.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How late can an event be before you drop it? (allowed lateness; a few minutes here)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,trust-safety" data-company="Meta,Twitter">
+          <summary>A coordinated group of 2,000 accounts is pushing a hashtag. How does your design resist it?</summary>
+          <div class="answer">
+            <p>Layered: count distinct authors, not posts; weight authors by trust (account age, spam score, past behaviour); require diversity (many locations and follower graphs, not one tight cluster); detect near-duplicate text; and for top national slots, a human review step and a kill switch. Accept that a determined campaign can still trend briefly - the goal is to raise the cost and shorten the time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cheap signals first, ML/graph signals second, humans last. Be honest that it is never perfect.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you count distinct authors cheaply? (HyperLogLog, ~12 KB each)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,caching" data-company="Amazon,Flipkart">
+          <summary>How do you serve trends to 200M daily users with low latency?</summary>
+          <div class="answer">
+            <p>Precompute. All lists together are about a megabyte. The merger writes them to Redis every 30-60 seconds with an <code>as_of</code>; the stateless API reads by location key; responses are cached at the CDN for 30-60 seconds. On failure, stale data is acceptable, so the CDN and an in-process copy keep serving. Read QPS is high but the work per read is near zero.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point out the read/write asymmetry from your estimate - it justifies the whole serving design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you add personalisation without losing caching? (cache candidate lists per location; re-rank per user cheaply in the API)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,nlp" data-company="Google,Meta">
+          <summary>"#INDvAUS", "#AUSvIND" and "India vs Australia" all trend separately. Fix it.</summary>
+          <div class="answer">
+            <p>Normalise and cluster. Normalisation (case folding, removing #, splitting camelCase) catches easy variants. For the rest, terms that spike at the same time and co-occur in the same posts belong together: compute co-occurrence among current candidates and merge strongly linked ones into one cluster, then show the most common form as the display name. This runs on the small candidate set, so it can be heavier logic.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cheap normalisation in the stream, clustering only on candidates. Mention it is the same "cheap filter, expensive work on few items" idea as the sketch.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Different languages for the same event? (Use entity linking: map "#IndiaVsAustralia", the Hindi phrase and a hashtag in Tamil to one entity id from a knowledge base, plus co-occurrence on the candidate set; display the form most used in the viewer's language.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,streaming" data-company="Uber,Amazon">
+          <summary>Would you use a Lambda architecture here?</summary>
+          <div class="answer">
+            <p>Only partly. Trends are inherently a real-time, approximate product, so the streaming path is the product. A batch job is still useful for things that need a long view: computing hour-of-week baselines from weeks of history, evaluating the scoring model against labelled past events, and audits. I would not build a full second "exact trends" pipeline - if the streaming logic has a bug, I replay from Kafka (7-day retention) with fixed code, which is the Kappa idea.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say what each path is for. Avoid dogma; tie it to the product's accuracy needs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long does a replay of a day take, and how do you not publish while replaying? (A day is about 54k/s x 86,400 ≈ 4.7 billion events; if the replay job gets 5-10x the live rate, that is roughly 2-5 hours - an estimate you then measure. Run the replay as a separate job with its own consumer group that writes to a shadow output, compare it, and switch the serving pointer only when it has caught up.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,streaming" data-company="Atlassian,Microsoft">
+          <summary>Adapt this to "top-K most viewed Confluence pages in the last 24 hours, excluding pages the user has seen".</summary>
+          <div class="answer">
+            <p>Same skeleton, simpler scoring: count views per page in hourly buckets (a 24-hour <a href="{{BASE}}interview/glossary#window">sliding window</a>), maybe with time decay, partitioned by page id; merge to a global top list of K + buffer (say 200 for K = 20). Per request, filter that candidate list against the user's viewed set (a small set or Bloom filter per user) and return the first K left. The buffer is needed because filtering removes items.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you can reuse the pipeline and spot the new twist (per-user filtering → keep a buffer of extra candidates).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the user has seen all 200? (fall back to the next page of candidates)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Ranking by raw count and calling it "trending".</li>
+          <li>One giant global hash map of exact counts with no memory bound.</li>
+          <li>Computing trends on the read path.</li>
+          <li>Processing-time windows, so restarts create fake spikes.</li>
+          <li>Ignoring hot keys during big events - exactly when the system matters.</li>
+          <li>Forgetting spam and safety: trends are a public, attackable surface.</li>
+        </ul>
+
+        <div class="scenario">
+          <h4>Scenario: the World Cup final</h4>
+          <div class="situation"><p>Posts jump to 15x normal. The trends for India stop updating; Kafka lag on 3 of 48 partitions is millions of messages and growing.</p></div>
+          <div class="bad"><p>Weak answer: "Add more partitions and consumers."</p></div>
+          <div class="good"><p>Strong answer: "Three hot partitions means hot keys, not overall capacity - adding consumers will not help because one key is processed by one worker. Short term: enable per-second pre-aggregation in the extractor (send counts, not events), and salt the top few terms for location IN. Keep serving the last list with its timestamp. After the event: make pre-aggregation always-on, add per-partition lag alerts, and load-test with replayed traffic from past finals."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why does adding partitions not fix it? (a single key still hashes to one partition)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: a bot campaign trends #Fake in Mumbai for 4 minutes</h4>
+          <div class="situation"><p>At 21:10 "#Fake" (a made-up smear tag) appears in the Mumbai top 10 and stays for 4 minutes before the trust-and-safety team pauses it by hand. Screenshots are already on news sites. You lead the post-mortem.</p></div>
+          <div class="bad"><p>Weak answer: "Add the tag to the blocklist and raise the minimum count."</p></div>
+          <div class="good"><p>Strong answer: "First, reconstruct exactly what the scorer saw - replay the 21:00-21:15 term events from Kafka into a shadow job. I expect a few thousand <b>distinct</b> accounts, so the HyperLogLog check passed. Then look at <i>who</i> they were: account age, how many were created last week, how many posted near-identical text, how many share devices or IP blocks. If it is a tight cluster, our <b>trust weights</b> were too generous for new accounts and we lacked a <b>diversity check</b>. Fixes, in order: weight new and low-reputation accounts near zero for trending; require spread across unrelated users (low text similarity, many independent follower graphs); add a short <b>hold</b> for new tags in big locations until they pass checks; and make the pause switch automatic when the spam system flags a large share of a tag's authors. Measure it: re-run last month's real trends to confirm we do not delay genuine news by more than a minute or two."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does a hold delay real breaking news? (A little, so apply it only to brand-new tags in large locations and keep it to a minute or two; established terms skip it.)</li><li>How do you avoid the attackers learning the thresholds? (Keep the exact weights private, add randomness, and change them over time.)</li></ul></div>
+        </div>
+      

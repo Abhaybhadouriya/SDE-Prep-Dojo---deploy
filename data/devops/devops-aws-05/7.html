@@ -1,0 +1,52 @@
+
+  <h2>Retries, DLQs and destinations: never lose a log line silently</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>Every source gives you <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> delivery. So the two rules are: <b>make processing idempotent</b> (same input twice gives the same result, for example by keying writes on the log event ID or the S3 object key + ETag), and <b>always configure somewhere for failures to land</b>.</p>
+  <div class="table-wrap">
+  <table class="table">
+    <thead><tr><th>Model</th><th>Default retry</th><th>How long</th><th>Failure capture</th></tr></thead>
+    <tbody>
+      <tr><td>Async (S3, CW Logs)</td><td>2 retries after a function error (about 1 min, then 2 min wait)</td><td>Throttled events kept up to 6 h (<code>MaximumEventAgeInSeconds</code>)</td><td>On-failure destination (SQS, SNS, S3, Lambda, EventBridge) with request + error details, or a function DLQ (SQS/SNS, payload only)</td></tr>
+      <tr><td>Kinesis ESM</td><td>Infinite by default (-1)</td><td>Until the record expires from the stream</td><td>On-failure destination receives batch metadata; set <code>MaximumRetryAttempts</code>, <code>MaximumRecordAgeInSeconds</code>, bisect</td></tr>
+      <tr><td>SQS ESM</td><td>Message reappears after visibility timeout</td><td>Until <code>maxReceiveCount</code> or queue retention</td><td>Redrive DLQ configured <em>on the source queue</em></td></tr>
+    </tbody>
+  </table>
+  </div>
+<pre><code class="language-bash"># Async sources: fewer retries, shorter age, and a destination with the error details
+aws lambda put-function-event-invoke-config \
+  --function-name auth-log-parser \
+  --maximum-retry-attempts 1 \
+  --maximum-event-age-in-seconds 3600 \
+  --destination-config '{"OnFailure":{"Destination":"arn:aws:sqs:us-east-1:111122223333:auth-parser-failed"}}'</code></pre>
+  <div class="callout tip"><p>Alarm on the DLQ, not just on errors. <code>ApproximateNumberOfMessagesVisible &gt; 0</code> on a DLQ is the "problem letters box is not empty" signal. A DLQ nobody watches is just a slower way of losing data. The <a href="{{BASE}}hld/d20#architecture">metrics and monitoring design</a> shows where those alarms fit.</p></div>
+  <figure class="diagram">
+    <div class="svg-scroll">
+    <svg viewBox="0 0 800 330" role="img" aria-label="Where a failed event goes for each Lambda trigger type: async invoke retries twice then goes to a destination or DLQ; a stream poller retries the batch and blocks the shard until success, expiry or bisect; an SQS poller lets the message reappear after the visibility timeout and redrives it to the queue's DLQ">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="zone-label" x="20" y="24">Async invoke (S3, SNS, EventBridge, CloudWatch Logs)</text>
+      <rect class="box client" x="20" y="36" width="130" height="50"/><text class="label small" x="85" y="65">event</text>
+      <rect class="box queue" x="190" y="36" width="140" height="50"/><text class="label small" x="260" y="58">Lambda's internal</text><text class="label small" x="260" y="74">event queue</text>
+      <rect class="box fail" x="370" y="36" width="120" height="50"/><text class="label small" x="430" y="65">function errors</text>
+      <rect class="box db" x="610" y="36" width="170" height="50"/><text class="label small" x="695" y="58">on-failure destination</text><text class="label small" x="695" y="74">or function DLQ</text>
+      <path class="arrow" d="M150 61 L188 61"/><path class="arrow" d="M330 61 L368 61"/><path class="arrow" d="M490 61 L608 61"/>
+      <text class="label small" x="550" y="100">retried 2x (default), up to 6 h</text>
+      <text class="zone-label" x="20" y="134">Stream poller (Kinesis, DynamoDB Streams, Kafka)</text>
+      <rect class="box client" x="20" y="146" width="130" height="50"/><text class="label small" x="85" y="175">shard</text>
+      <rect class="box queue" x="190" y="146" width="140" height="50"/><text class="label small" x="260" y="175">batch of records</text>
+      <rect class="box fail" x="370" y="146" width="120" height="50"/><text class="label small" x="430" y="175">batch fails</text>
+      <rect class="box db" x="610" y="146" width="170" height="50"/><text class="label small" x="695" y="168">bisect, then on-failure</text><text class="label small" x="695" y="184">destination (metadata)</text>
+      <path class="arrow" d="M150 171 L188 171"/><path class="arrow" d="M330 171 L368 171"/><path class="arrow" d="M490 171 L608 171"/>
+      <text class="label small bad" x="430" y="212">shard BLOCKED: same batch retried until success,</text>
+      <text class="label small bad" x="430" y="226">record expiry, max retries or max age; iterator age climbs</text>
+      <text class="zone-label" x="20" y="254">SQS poller</text>
+      <rect class="box client" x="20" y="266" width="130" height="50"/><text class="label small" x="85" y="295">queue</text>
+      <rect class="box queue" x="190" y="266" width="140" height="50"/><text class="label small" x="260" y="288">batch, messages</text><text class="label small" x="260" y="304">invisible meanwhile</text>
+      <rect class="box fail" x="370" y="266" width="120" height="50"/><text class="label small" x="430" y="295">some fail</text>
+      <rect class="box db" x="610" y="266" width="170" height="50"/><text class="label small" x="695" y="288">queue's redrive DLQ</text><text class="label small" x="695" y="304">after maxReceiveCount</text>
+      <path class="arrow" d="M150 291 L188 291"/><path class="arrow" d="M330 291 L368 291"/><path class="arrow" d="M490 291 L608 291"/>
+      <path class="arrow" d="M430 266 Q 260 236 90 264"/>
+      <text class="label small" x="260" y="250">back to the queue after the visibility timeout</text>
+    </svg>
+    </div>
+    <figcaption>Three trigger types, three failure models. Async: Lambda owns the retry. Stream: order matters, so a bad batch blocks its shard (use bisect-on-error and a max retry or age). SQS: the queue owns the retry; return a partial batch response (<code>batchItemFailures</code>) so only the failed messages come back.</figcaption>
+  </figure>

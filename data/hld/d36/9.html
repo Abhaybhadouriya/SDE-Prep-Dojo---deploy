@@ -1,0 +1,116 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min.</strong> Clarify the API (PUT/GET/DELETE/LIST, multipart, versioning) and NFRs: 11 nines, survive a zone, strong consistency.</li>
+          <li><strong>5-10 min.</strong> Estimate: 100 PB, 100B objects, 30 TB metadata, 3x vs 1.5x, 120 IOPS per disk.</li>
+          <li><strong>10-20 min.</strong> Draw the metadata plane vs data plane; walk a PUT (metadata last) and a GET.</li>
+          <li><strong>20-35 min.</strong> Deep dives: erasure coding + durability math, small objects/packing, multipart + GC.</li>
+          <li><strong>35-45 min.</strong> Consistency, hot prefixes, failure modes, what you monitor (repair backlog, durability at risk, scrub errors, 503 rate).</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"A sharded metadata service maps bucket and key to where the bytes live, storage nodes hold the bytes erasure-coded across three zones, and a PUT writes the bytes first and the metadata row last so a key never points at missing data."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"I do the durability math (repair time drives loss risk, 8+4 across zones survives a zone), pack small objects so a GET is one disk seek, range-partition metadata so LIST is a scan, and explain multipart cleanup and S3's 2020 move to strong consistency."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> storing objects in a relational DB as BLOBs; one file per object on a normal file system; only "3 replicas" with no cost discussion; ignoring disk IOPS; hash-partitioning metadata and then promising fast LIST; writing metadata before data; deleting shards eagerly; quoting "11 nines" without any reasoning.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Why separate metadata from data?</summary>
+          <div class="answer">
+            <p>They have opposite needs. Metadata is tiny (about 300 bytes per object, 30 TB for 100B objects), read on every request, needs per-key strong consistency and ordered scans for LIST. Data is huge (100+ PB), written once, read in big sequential chunks, and is best kept on cheap disks with erasure coding. Separating them lets each scale and evolve independently - you can add disks without touching the metadata cluster, or re-shard metadata without moving petabytes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast size, access pattern and consistency needs; then state the benefit.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which database for metadata, and how is it partitioned?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>Replication or erasure coding? Prove it with numbers.</summary>
+          <div class="answer">
+            <p>3 replicas cost 3x and tolerate 2 failures; RS(8,4) costs 1.5x and tolerates 4. At 100 PB that is 300 PB vs 150 PB raw - 7,500 fewer 20 TB drives. With a 2% annual failure rate and 1-day repair, the chance of losing data after one failure is about 3 x 10<sup>-9</sup> for replicas vs about 3 x 10<sup>-15</sup> for 8+4. The costs of EC: rebuilding one shard reads 8 others (network), large reads touch many disks, and encoding uses CPU. So: replicate hot, tiny or freshly written data; erasure code warm and large data. Facebook's f4 moved warm BLOBs from 3.6x to 2.1x this way.</p>
+            <div class="approach"><h5>How to answer</h5><p>Overhead, tolerance, a durability estimate, then the costs and a hybrid recommendation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you place the 12 shards?</li><li>What dominates real-world data loss? (Correlated failures and bugs.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon">
+          <summary>How do you reach eleven nines of durability?</summary>
+          <div class="answer">
+            <p>No single trick. (1) Enough redundancy: erasure coding with m = 4 or more. (2) Independent placement: shards on different disks, nodes, racks and at least 3 zones. (3) Fast repair: detect failures in minutes and rebuild from many peers in parallel - durability improves sharply as the window shrinks. (4) Integrity: end-to-end checksums from the client, verified on every read, and background scrubbing for bit rot. (5) Protect against yourself: versioning and delete protection, staged per-zone deployments, careful GC, and processes like Amazon's durability reviews and formal verification of the storage node code.</p>
+            <div class="approach"><h5>How to answer</h5><p>List the five levers; spend the most time on correlated failures and repair time, because that is what interviewers probe.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does 11 nines mean for 10 million objects? (Very roughly, one lost object per 10,000 years on average.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>How do you store billions of small objects efficiently?</summary>
+          <div class="answer">
+            <p>Pack them. Append many objects into large volume files (about 100 GB), keep an in-memory index from key to (volume, offset, size), so a read is one seek - Haystack's design, which replaced 3 or more disk ops per photo on NFS. Erasure code at the volume/stripe level with a systematic code so a small object can be read from a single data shard. Compaction reclaims deleted space later.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from the 120 IOPS-per-disk constraint, then show how packing turns metadata seeks into RAM lookups.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you rebuild the in-memory index after a crash? (Checkpointed index file + scan of the volume tail.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Walk me through a multipart upload of a 50 GB file.</summary>
+          <div class="answer">
+            <p>Initiate to get an uploadId. Split into, say, 500 parts of 100 MB (limits: 1-10,000 parts, 5 MiB-5 GiB each). Upload parts in parallel, each with its checksum; retry only failed parts. Complete with the ordered list of part ETags; the server validates and writes one metadata row that maps the object to its parts - no copying of bytes. If the client disappears, a lifecycle rule aborts incomplete uploads after N days and GC frees the parts.</p>
+            <div class="approach"><h5>How to answer</h5><p>Three calls, parallelism and resumability, metadata-only completion, cleanup.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does a browser upload directly without your servers? (Presigned URLs per part.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>How does LIST by prefix work at 100 billion objects?</summary>
+          <div class="answer">
+            <p>Keep the object table ordered by (bucket, key) in a range-partitioned store. A prefix maps to one or a few contiguous ranges, so LIST is a range scan returning 1,000 keys and a continuation token (the last key). Hot ranges are split automatically as traffic grows; while splitting, the service may return 503 Slow Down, so clients back off. With hash partitioning instead, every LIST becomes a scatter-gather across all shards plus a merge sort.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the partitioning choice to the LIST requirement; mention the continuation token and hot-prefix splitting.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you add "list by last-modified time"? (A secondary index or an inventory job, not the primary order.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon">
+          <summary>A client overwrites an object and immediately reads it. How do you guarantee it sees the new version?</summary>
+          <div class="answer">
+            <p>Make the metadata store linearizable per key (writes go through a consensus-replicated shard leader) and make any cache in front of it coherent. S3's approach: a replication component orders operations per object, and a witness service tracks changes in memory and acts as a read barrier, telling a cache whether its entry is stale; stale entries are invalidated and re-read from the persistence tier. Combined with metadata-last writes, a successful PUT response means every later GET and LIST sees it.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the root cause (caches), then the fix (ordering + read barrier), then why it is cheap (in-memory witness).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens if the witness is down? (Fall back to reading the persistence tier; slower, still correct.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>How do deletes and garbage collection work without losing live data?</summary>
+          <div class="answer">
+            <p>DELETE only changes metadata: remove the row or, with versioning, add a delete marker. The bytes stay in append-only volumes until compaction copies live entries forward and frees the old volume. A GC sweep finds shards with no referencing metadata (old versions expired, aborted multipart parts, orphans from crashed PUTs) and deletes them only after a grace period and a second check. GC is rate-limited and staged per zone so a GC bug cannot wipe everything at once.</p>
+            <div class="approach"><h5>How to answer</h5><p>Logical delete first, physical later; stress the safety checks.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle GDPR "really delete" requests? (Prioritized compaction; or per-object encryption keys and delete the key.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>One customer suddenly reads 10 PB as fast as possible. What protects everyone else?</summary>
+          <div class="answer">
+            <p>Wide placement and heat management: each object is spread over many drives, and different objects over different drive sets, so one workload's burst lands on a very large number of spindles and is a small share of each (Vogels describes a single genomics customer bursting across over a million disks). On top: per-tenant request-rate limits per prefix (503 Slow Down), admission control in the API tier, and a CDN for public hot objects.</p>
+            <div class="approach"><h5>How to answer</h5><p>Spread first, limit second, cache third.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you rebalance when new, empty disks are added?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: a rack loses power during a heavy write burst</h4>
+          <div class="situation"><p>One rack (40 nodes) goes dark for 2 hours while clients are uploading at peak. Some PUTs were in flight.</p></div>
+          <div class="bad"><p>Weak answer: "Everything is replicated, so nothing happens."</p></div>
+          <div class="good"><p>Strong answer: placement put at most one shard of any stripe in that rack, so all objects stay readable (decode from the other 11). In-flight PUTs that had not reached write quorum fail and clients retry; PUTs that reached quorum but have a missing shard are recorded as "under-replicated" and queued for repair. Do not start mass rebuild instantly - wait a short timeout to avoid rebuilding petabytes for a 2-hour blip - but prioritize stripes that are now one failure from risk. Monitor the repair backlog.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you wait before declaring the rack lost?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: reads return corrupted bytes for a few objects</h4>
+          <div class="situation"><p>A customer reports that 3 objects have a different checksum than when uploaded.</p></div>
+          <div class="bad"><p>Weak answer: "Ask them to upload again."</p></div>
+          <div class="good"><p>Strong answer: this should never reach a customer - every shard read is checksum-verified and a bad shard is rebuilt from parity. If it did, find which layer skipped verification (a cache, a new code path), rebuild those shards, scan the same disks and the same software version for more, and add end-to-end checksum checks in the failing path. Treat it as a durability incident with a review.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where exactly are checksums computed and verified on the PUT and GET paths?</li></ul></div>
+        </div>
+      

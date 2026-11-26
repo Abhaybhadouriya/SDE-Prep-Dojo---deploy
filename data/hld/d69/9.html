@@ -1,0 +1,144 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (real reports):</p>
+          <ul>
+            <li>Microsoft L61/L62, Aug 2026: a 9-round loop; round 7 was HLD + LLD: design a configuration management service and implement a small component of it. Round 8 was HLD theory (scalability, availability, sharding) plus a DSA question (<a href="https://leetcode.com/discuss/post/8477383/" target="_blank" rel="noopener">post</a>).</li>
+            <li>Microsoft L63/L64, May 2026, hiring-manager round: 25-30 minutes of HLD for a config service that updates configs across N microservices, then LRU cache pseudo-code with concurrency, and how to diagnose a high cache-miss rate (cache size vs eviction policy) (<a href="https://leetcode.com/discuss/post/8300781/" target="_blank" rel="noopener">post</a>).</li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: scope.</strong> Configs and flags? How many services and instances? Propagation target? Rollout and rollback? Secrets in scope? Say: never on the request path; safe change first.</li>
+          <li><strong>5-10 min: numbers.</strong> 1M clients, 0.1 writes/s, 17K idle long-polls/s, 1 GB data. Conclusion: tiny write path, huge fan-out, so a distributor tier.</li>
+          <li><strong>10-15 min: model + API.</strong> Immutable versions, pointers per target, global revision; CAS write; watch with "I have v41".</li>
+          <li><strong>15-25 min: diagram.</strong> Control plane vs data plane; the stepper.</li>
+          <li><strong>25-40 min: deep dives.</strong> Delivery model, SDK with last-known-good, staged rollout with bake and rollback, consistency. If the HM round only gives 25-30 minutes (as in the L63/L64 report), compress to diagram + rollout + SDK.</li>
+          <li><strong>40-45 min: wrap up,</strong> or the coding follow-up: the SDK component, or an LRU cache with a lock.</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>A solid answer sounds like</h4><p>"Configs are versioned and stored in etcd. Services long-poll a config API with the version they have and cache the result in memory, so reads are local. Rollback restores an older version. Access is controlled per team and every change is audited."</p></div>
+          <div class="panel"><h4>A senior (L62+) answer adds</h4><p>"Immutable versions with pointers per target and a global revision; a distributor tier is the only watcher of the store and holds a million long-polls, level-triggered by client version; the SDK validates, swaps atomically and persists last-known-good, and never blocks startup. Rollouts are canary, waves and bake time with alarm-driven automatic rollback, AppConfig-style. Writes are CAS-linearizable, reads eventual but monotonic per client, and every change must be safe to run mixed."</p></div>
+        </div>
+        <div class="callout interview"><p><b>60-second answer:</b> "The config service is off the request path: services read from an in-memory snapshot and keep a last-known-good on disk, so an outage only stops new changes. Writes go through validation, RBAC, approval and audit into a small consensus store as immutable versions, with compare-and-set and a global revision. A stateless distributor tier watches the store and serves long-polls from about a million clients, who always say which version they have, so nothing is missed. A rollout controller moves per-target pointers: canary, waves, bake time, and automatic rollback on alarms, which is just pointing back to the old version."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> clients calling the config service on every request; a million clients watching ZooKeeper directly; mutable versions (rollback by editing); pushing to 100% instantly; no plan for invalid configs at the client; restart-to-apply as the only mechanism; secrets stored as plain config; reconnecting without jitter; ignoring mixed versions during rollout.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft">
+          <summary>How do N microservices get a config update within seconds without polling the service to death?</summary>
+          <div class="answer">
+            <p>Long-poll (or a gRPC stream) to a distributor tier: each client asks "anything newer than v41?" and the distributor holds the request up to about 60 s, answering immediately when v42 exists. Distributors are the only watchers of the consensus store, so the store sees about 50 watchers, not a million. Because the client always sends its version, delivery is level-triggered: a lost notification is corrected by the next request. Idle cost is about clients / timeout requests per second (1M / 60 = 17K/s), spread over the distributors.</p>
+            <div class="approach"><h5>How to answer</h5><p>Compare poll, long-poll, push and direct watches in one line each, then justify the distributor tier with the client count.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not Kafka to every service? (Consumer groups and partitions do not fit a million independent subscribers that each need a different subset; Kafka is the change feed behind the scenes.)</li><li>How do you handle a distributor restart? (Clients reconnect with jitter to another one, stating their version.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>The config service goes down. What happens to the services that depend on it?</summary>
+          <div class="answer">
+            <p>Nothing visible, by design. Reads are from each instance's in-memory snapshot. New instances start from last-known-good on local disk (or a sidecar or node-level cache), and only fall back to compiled-in defaults with an alert if they have nothing. New changes are delayed until the service returns. The exceptions are configs marked "must be fresh" (an emergency kill switch), which can fail closed, and that decision is per config.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "not on the request path" first, then the startup order (service, disk, defaults), then the exception.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where does a brand-new autoscaled pod get config if both the service and the disk are empty? (An image-baked default, or a node-level cache/sidecar that survives pod churn.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>How do you roll out a config change safely and roll it back?</summary>
+          <div class="answer">
+            <p>Versions are immutable; each target group (canary, region waves) has a pointer to a version. A rollout controller moves the canary pointer, waits a bake time while watching alarms (service SLOs plus SDK rejects and crash loops, canary compared with control), then widens in waves. Any alarm moves every pointer back to the previous version through the same delivery path, so rollback takes seconds. AWS AppConfig works the same way: growth steps, a bake time after 100%, and automatic rollback on CloudWatch alarms.</p>
+            <div class="approach"><h5>How to answer</h5><p>Immutable versions + pointers, then the wave plan, then what "healthy" means, then rollback. Mention mixed versions during the rollout.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you choose the canary hosts? (Stable hash per instance; per user for feature flags.)</li><li>What if two configs must change together? (Merge them into one config, or order the rollout and make each step safe alone.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>What consistency do you guarantee? Can two instances run different versions?</summary>
+          <div class="answer">
+            <p>Strong at write: a single linearizable path (Raft leader or single primary), compare-and-set on the version, one total order of revisions, no lost updates. Eventual at read: instances can be a few seconds apart, and during a rollout they are deliberately on different versions, so every change must be safe to run mixed. Per client, reads are monotonic: a client never moves backwards to an older version because it hit a lagging distributor. The author gets read-your-writes in the admin UI by reading from the leader.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split write and read guarantees explicitly, then name monotonic reads, which most candidates forget.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>CAP choice for the store? (CP: under a partition, writes stop; reads continue from caches.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>Why not just use ZooKeeper or etcd watches directly from every service?</summary>
+          <div class="answer">
+            <p>They are the right store, but the wrong fan-out. Every watcher is a session and load on the consensus cluster; a million of them would overwhelm it, and a leader election would make all of them reconnect at once. Data limits (about 1 MB per znode by default in ZooKeeper; etcd's 1.5 MiB request limit and a 2 GB default storage quota) also rule out large configs. ZooKeeper's classic watches are one-shot and must be re-registered; etcd watches fail if their start revision was compacted. Use them behind a distributor tier, which is the path Facebook took when it moved from ZooKeeper-based distribution to its LAD distribution layer.</p>
+            <div class="approach"><h5>How to answer</h5><p>Credit what they do well (linearizable writes, ordered change feed), then the scale limit with numbers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do distributors resume after a restart? (Watch from their last revision; on "compacted", re-read a snapshot.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft">
+          <summary>How do you prevent a bad config from being published at all?</summary>
+          <div class="answer">
+            <p>Layers: a schema per config (types, ranges, required fields); custom validators written by the owning team (for example "every URL must resolve", "rate limit &lt;= 10x current"); validation in CI on the pull request and again at publish time; a required approver for production; a diff view with the reason and ticket. Then the client validates again before applying, and the canary is the final check. Defence in depth, because each layer misses different mistakes.</p>
+            <div class="approach"><h5>How to answer</h5><p>List the layers from earliest to latest. Mention that the client-side check protects against a bug in the service itself.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Who owns validators? (The team that owns the config, stored next to it, run by the platform.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="lld" data-company="Microsoft">
+          <summary>Implement a small component: the client that watches a config and serves reads.</summary>
+          <div class="answer">
+            <p>See the <code>ConfigClient</code> in deep dive 2. Points the interviewer will look for: reads are local and lock-free (an immutable snapshot replaced by one reference assignment); the long-poll sends the current version, so missed notifications self-heal; checksum and validation happen before the swap; last-known-good is written to a temp file and atomically renamed; failures back off exponentially with jitter; an older version is never applied over a newer one.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the interface first (<code>get</code>, <code>version</code>, <code>run</code>), then the loop, then the safety checks. Talk about thread safety as you go.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you test it? (Fake fetch returning sequences: newer, older, corrupt, invalid, exceptions; assert the version only moves forward.)</li><li>Callbacks on change? (A listener list called after the swap, outside any lock.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="lld" data-company="Microsoft">
+          <summary>Follow-up from the same HM round: write an LRU cache that is safe under concurrency.</summary>
+          <div class="answer">
+            <p>A hash map from key to node plus a doubly linked list in recency order: <code>get</code> moves the node to the front, <code>put</code> inserts at the front and evicts from the tail when over capacity; both O(1). For concurrency, the simplest correct version guards both structures with one lock, because even a <code>get</code> mutates the list. For higher throughput, shard into N independent LRUs by key hash (each with its own lock), accepting approximate global recency.</p>
+            <pre><code class="language-python">import threading
+from collections import OrderedDict
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap, self.d, self.lock = capacity, OrderedDict(), threading.Lock()
+        self.hits = self.misses = 0
+
+    def get(self, key):
+        with self.lock:                       # get also mutates recency order
+            if key not in self.d:
+                self.misses += 1
+                return None
+            self.d.move_to_end(key)
+            self.hits += 1
+            return self.d[key]
+
+    def put(self, key, value):
+        with self.lock:
+            self.d[key] = value
+            self.d.move_to_end(key)
+            if len(self.d) &gt; self.cap:
+                self.d.popitem(last=False)    # evict least recently used</code></pre>
+            <div class="approach"><h5>How to answer</h5><p>Data structures and complexity first, then "why get needs the lock", then lock striping as the scale-up. If asked to avoid OrderedDict, write the node class and the four pointer updates.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Read-write lock? (Does not help: get writes the list.)</li><li>Thundering herd on a miss? (Single-flight: one loader per key, others wait on its future.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>The cache shows a high miss rate. How do you tell whether the size or the eviction policy is the problem?</summary>
+          <div class="answer">
+            <p>Measure before changing. Split misses into compulsory (first access ever, which no cache fixes), capacity (the working set is bigger than the cache) and policy-caused (a useful key was evicted to keep a one-time key). Tools: plot hit rate against cache size by replaying a recorded key trace through simulated caches of several sizes (a miss-ratio curve); if the curve keeps rising with size, you need more capacity. Count evictions and how soon evicted keys are requested again: many quick re-requests mean the policy is wrong for the pattern, for example a scan or batch job flushing hot keys out of an LRU, where LFU, 2Q or a scan-resistant policy (like W-TinyLFU) helps. Also check TTLs that are too short, key-cardinality explosions (a timestamp in the key), and uneven sharding.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the three miss types, then one experiment for each hypothesis. This was the exact follow-up in the L63/L64 report.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What would you alert on? (Hit rate, eviction rate, and "re-requested within N seconds of eviction".)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft">
+          <summary>How do feature flags differ from ordinary config in this design?</summary>
+          <div class="answer">
+            <p>A flag is a config whose value depends on the request: rules like "on for 5% of users, all of tenant X, off in country Y". The service delivers the rules; the SDK evaluates them locally per request (hash of user id into 0-99 for percentages), so evaluation is fast and private data never leaves the service. Flags need a short life (alerts on stale flags), an owner, and their own rollout by user percentage rather than by host.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Rules delivered, evaluated locally." Then stable hashing per user, then flag hygiene.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid a user flipping between on and off across services? (Same hash function and salt in every SDK.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: a timeout change caused a fleet-wide outage in 40 seconds</h4>
+          <div class="situation"><p>An engineer changed a shared HTTP timeout from 800 to 80 ms. Within a minute, every service calling the payments API failed. Rollback took 20 minutes because nobody knew which version was good.</p></div>
+          <div class="bad"><p>Weak answer: "Add a review step for config changes."</p></div>
+          <div class="good"><p>Strong answer: three gaps. No validation (a range check would reject 80 ms for this key). No staged rollout (a 10% canary with a bake time would have stopped it at 10% of traffic and rolled back automatically on the error-rate alarm). No one-click rollback (immutable versions and pointers make it a single action). Add all three, plus a diff of "previous vs new" with the blast radius (how many services subscribe) shown before publish.</p></div>
+        </div>
+      

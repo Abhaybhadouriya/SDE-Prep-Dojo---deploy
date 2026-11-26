@@ -1,0 +1,333 @@
+
+  <h2>Code: runnable in Java, Python and C++14</h2>
+  <p>Each example is complete and was compiled and run. The Java file races 32 threads against each variant and counts distinct objects. The deliberately broken lazy variant (no lock, a 5 ms sleep in the constructor to widen the window) gives more than one; every correct variant gives 1. Treat "distinct = 1" as evidence, not proof: a race test that passes says little about DCL without <code>volatile</code>, whose failure needs a weakly ordered CPU and bad luck, not just many threads. Then it runs the serialization and reflection attacks. Files live in <code>lld-code/lld-pat-singleton/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>SingletonDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Eager</td><td><code>EagerConfig</code></td><td>9-13</td><td>built at class init</td></tr>
+    <tr><td>Synchronized accessor</td><td><code>SyncConfig</code></td><td>16-23</td><td>lock on every call</td></tr>
+    <tr><td>Broken on purpose</td><td><code>LazyUnsafe</code></td><td>26-33</td><td>check-then-act race</td></tr>
+    <tr><td>Double-checked locking</td><td><code>DclConfig</code></td><td>36-61</td><td>volatile + two checks</td></tr>
+    <tr><td>Holder idiom</td><td><code>HolderConfig</code></td><td>64-68</td><td>class init does the locking</td></tr>
+    <tr><td>Enum</td><td><code>EnumConfig</code></td><td>71-75</td><td>the JVM guarantees one</td></tr>
+    <tr><td>Race test</td><td><code>distinct</code></td><td>78-90</td><td>32 threads, count objects</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.io.*;
+import java.lang.reflect.Constructor;
+import java.util.Set;
+import java.util.concurrent.*;
+
+public class SingletonDemo {
+
+    // 1. Eager: built when the class is initialised. Simple and thread-safe.
+    static final class EagerConfig {
+        private static final EagerConfig INSTANCE = new EagerConfig();
+        private EagerConfig() { }
+        static EagerConfig get() { return INSTANCE; }
+    }
+
+    // 2. Lazy + synchronized: correct, but every call takes the lock.
+    static final class SyncConfig {
+        private static SyncConfig instance;
+        private SyncConfig() { }
+        static synchronized SyncConfig get() {
+            if (instance == null) instance = new SyncConfig();
+            return instance;
+        }
+    }
+
+    // 2b. BROKEN on purpose: lazy, no lock. The sleep widens the race window.
+    static final class LazyUnsafe {
+        private static LazyUnsafe instance;
+        private LazyUnsafe() { try { Thread.sleep(5); } catch (InterruptedException e) { } }
+        static LazyUnsafe get() {
+            if (instance == null) instance = new LazyUnsafe();   // check-then-act race
+            return instance;
+        }
+    }
+
+    // 3. Double-checked locking: lock only on the first call. volatile is REQUIRED.
+    static final class DclConfig implements Serializable {
+        private static volatile DclConfig instance;
+        private static boolean created;          // guard against reflection
+        private final String region = "ap-south-1";
+
+        private DclConfig() {
+            synchronized (DclConfig.class) {
+                if (created) throw new IllegalStateException("use get()");
+                created = true;
+            }
+        }
+        static DclConfig get() {
+            // &lt;-- the pattern: check, lock, check again, publish through volatile
+            DclConfig local = instance;          // one volatile read on the fast path
+            if (local == null) {
+                synchronized (DclConfig.class) {
+                    local = instance;
+                    if (local == null) instance = local = new DclConfig();
+                }
+            }
+            return local;
+        }
+        // Without this, deserialising creates a second object.
+        private Object readResolve() { return get(); }
+        String region() { return region; }
+    }
+
+    // 4. Holder idiom: lazy and lock-free; the JVM initialises Holder once.
+    static final class HolderConfig {
+        private HolderConfig() { }
+        private static final class Holder { static final HolderConfig I = new HolderConfig(); }
+        static HolderConfig get() { return Holder.I; }
+    }
+
+    // 5. Enum: the JVM guarantees one instance, even against reflection and serialization.
+    enum EnumConfig {
+        INSTANCE;
+        private int hits;
+        synchronized int hit() { return ++hits; }
+    }
+
+    // Start many threads at the same moment and count distinct instances.
+    static int distinct(Callable&lt;Object&gt; getter) throws Exception {
+        int n = 32;
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        CountDownLatch start = new CountDownLatch(1);
+        Set&lt;Object&gt; seen = ConcurrentHashMap.newKeySet();
+        for (int i = 0; i &lt; n; i++) {
+            pool.submit(() -&gt; { start.await(); seen.add(getter.call()); return null; });
+        }
+        start.countDown();
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+        return seen.size();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("unsafe  distinct &gt; 1 = " + (distinct(LazyUnsafe::get) &gt; 1));
+        System.out.println("eager   distinct = " + distinct(EagerConfig::get));
+        System.out.println("sync    distinct = " + distinct(SyncConfig::get));
+        System.out.println("dcl     distinct = " + distinct(DclConfig::get));
+        System.out.println("holder  distinct = " + distinct(HolderConfig::get));
+        System.out.println("enum    distinct = " + distinct(() -&gt; EnumConfig.INSTANCE));
+
+        // Serialization attack: write the object out and read it back.
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) { out.writeObject(DclConfig.get()); }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            Object copy = in.readObject();
+            System.out.println("serialization same object = " + (copy == DclConfig.get()));
+        }
+
+        // Reflection attack: call the private constructor directly.
+        try {
+            Constructor&lt;DclConfig&gt; c = DclConfig.class.getDeclaredConstructor();
+            c.setAccessible(true);
+            c.newInstance();
+            System.out.println("reflection made a second DclConfig!");
+        } catch (Exception e) {
+            System.out.println("reflection blocked: " + e.getCause().getMessage());
+        }
+        try {
+            Constructor&lt;?&gt; c = EnumConfig.class.getDeclaredConstructors()[0];
+            c.setAccessible(true);
+            c.newInstance("SECOND", 1);
+        } catch (IllegalArgumentException e) {
+            System.out.println("enum reflection blocked: " + e.getMessage());
+        }
+        System.out.println("enum hits = " + EnumConfig.INSTANCE.hit() + ", region = " + DclConfig.get().region());
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out SingletonDemo.java &amp;&amp; java -cp out SingletonDemo
+unsafe  distinct &gt; 1 = true
+eager   distinct = 1
+sync    distinct = 1
+dcl     distinct = 1
+holder  distinct = 1
+enum    distinct = 1
+serialization same object = true
+reflection blocked: use get()
+enum reflection blocked: Cannot reflectively create enum objects
+enum hits = 1, region = ap-south-1</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Singleton three ways in Python 3.11, plus a thread race test."""
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+
+# 1. __new__ with double-checked locking.
+class Config:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:                 # fast path, no lock
+            with cls._lock:
+                if cls._instance is None:         # second check, under the lock
+                    obj = super().__new__(cls)
+                    obj.region = "ap-south-1"     # init here, not in __init__
+                    cls._instance = obj
+        return cls._instance
+
+
+# 2. A metaclass: any class that uses it becomes a singleton.
+#    RLock, not Lock: one singleton's __init__ may build another singleton
+#    (Service() calls Logger()). A global non-reentrant lock deadlocks there.
+class SingletonMeta(type):
+    _instances = {}
+    _lock = threading.RLock()
+
+    def __call__(cls, *args, **kwargs):
+        inst = cls._instances.get(cls)            # fast path: no lock once built
+        if inst is not None:
+            return inst
+        with cls._lock:
+            if cls not in cls._instances:         # second check, under the lock
+                cls._instances[cls] = super().__call__(*args, **kwargs)
+        return cls._instances[cls]
+
+
+class Logger(metaclass=SingletonMeta):
+    def __init__(self):
+        self.lines = []
+
+    def log(self, msg):
+        self.lines.append(msg)
+
+
+class Service(metaclass=SingletonMeta):
+    def __init__(self):
+        self.log = Logger()                       # nested singleton construction
+
+
+# 3. The Pythonic way: a module-level object. Importing a module runs it once,
+#    so `from settings import settings` always gives the same object.
+class _Settings:
+    debug = False
+
+
+settings = _Settings()
+
+
+def distinct(factory, n=32):
+    barrier = threading.Barrier(n)
+
+    def work(_):
+        barrier.wait()                            # release all threads together
+        return id(factory())
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        return len(set(pool.map(work, range(n))))
+
+
+if __name__ == "__main__":
+    print("Config  distinct =", distinct(Config))
+    print("Logger  distinct =", distinct(Logger))
+    Logger().log("boot")
+    Logger().log("ready")
+    print("Logger lines =", Logger().lines)
+    print("nested build ok =", Service().log is Logger())
+    print("region:", Config().region, "debug:", settings.debug)</code></pre>
+<pre class="terminal"><code>$ python singleton.py
+Config  distinct = 1
+Logger  distinct = 1
+Logger lines = ['boot', 'ready']
+nested build ok = True
+region: ap-south-1 debug: False</code></pre>
+      <p>In Python the honest answer is usually "use a module". A module body runs once on first import and is cached in <code>sys.modules</code>, so a module-level object is already a singleton. Reach for <code>__new__</code> or a metaclass only when the interviewer wants to see the mechanics. The metaclass uses a fast path (no lock once built) and an <code>RLock</code>: a global non-reentrant lock deadlocks on nested singleton construction, for example a <code>Service</code> whose <code>__init__</code> calls <code>Logger()</code>; the demo builds exactly that. Note that <code>__init__</code> still runs on every <code>Config()</code> call, which is why the <code>__new__</code> version sets its fields inside <code>__new__</code>.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Meyers singleton in C++14. Build: g++ -std=c++14 -Wall singleton.cpp -o singleton
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;map&gt;
+
+class Config {
+public:
+    // C++11 and later: a function-local static is initialised exactly once,
+    // even if many threads call instance() at the same time ("magic statics").
+    static Config&amp; instance() {
+        static Config the_config;          // built on first call, destroyed at exit
+        return the_config;
+    }
+
+    Config(const Config&amp;) = delete;         // no copies
+    Config&amp; operator=(const Config&amp;) = delete;
+    Config(Config&amp;&amp;) = delete;              // no moves
+    Config&amp; operator=(Config&amp;&amp;) = delete;
+
+    void set(const std::string&amp; k, const std::string&amp; v) { values_[k] = v; }
+    std::string get(const std::string&amp; k) const {
+        auto it = values_.find(k);
+        return it == values_.end() ? "" : it-&gt;second;
+    }
+
+private:
+    Config() { std::cout &lt;&lt; "Config constructed once\n"; }
+    ~Config() { std::cout &lt;&lt; "Config destroyed at exit\n"; }
+    std::map&lt;std::string, std::string&gt; values_;
+};
+
+void boot()  { Config::instance().set("mtu", "1500"); }
+void serve() { std::cout &lt;&lt; "mtu = " &lt;&lt; Config::instance().get("mtu") &lt;&lt; "\n"; }
+
+int main() {
+    std::cout &lt;&lt; "main starts (nothing built yet)\n";
+    boot();
+    serve();
+    std::cout &lt;&lt; "same object: " &lt;&lt; std::boolalpha
+              &lt;&lt; (&amp;Config::instance() == &amp;Config::instance()) &lt;&lt; "\n";
+    // Config copy = Config::instance();   // compile error: copy constructor deleted
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall singleton.cpp -o singleton &amp;&amp; ./singleton
+main starts (nothing built yet)
+Config constructed once
+mtu = 1500
+same object: true
+Config destroyed at exit</code></pre>
+      <p>This is the <b>Meyers singleton</b>: a function-local <code>static</code>. Since C++11 the standard requires that its initialisation happens exactly once even under concurrent calls (other threads wait), so you get lazy and thread-safe for free. Delete the copy and move operations so nobody can duplicate it. If you need a heap object instead, <code>std::call_once</code> with a <code>std::once_flag</code> is the direct cousin of <code>pthread_once</code>.</p>
+    </div>
+  </div>
+  <h3>The same idea in C</h3>
+  <p>Singleton in plain C: a file-scope static built once and published with release/acquire, the <code>smp_store_release()</code> / <code>smp_load_acquire()</code> pairing from the DCL section. (This toolchain has no pthreads, so the demo runs single-threaded; with pthreads, <code>pthread_once()</code> does all of this for you.) Illustrative, not real kernel code; it compiles and runs (<code>lld-code/lld-pat-singleton/singleton_sketch.c</code>).</p>
+<pre><code class="language-c">/* Singleton in C: a once-initialised global, published with release/acquire.
+   Illustrative, not real kernel code. GCC __atomic builtins stand in for smp_store_release /
+   smp_load_acquire and a spinlock; with pthreads you would just call pthread_once().
+   Build: gcc -std=c99 -Wall singleton_sketch.c -o singleton_sketch */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+struct config { int mtu; const char *region; };
+
+static struct config *the_cfg;            /* file-scope static: nobody outside can touch it */
+static char cfg_lock;                     /* a tiny spinlock */
+static int builds;
+
+struct config *config_get(void)
+{
+    struct config *c = __atomic_load_n(&amp;the_cfg, __ATOMIC_ACQUIRE);      /* smp_load_acquire */
+    if (c)
+        return c;                                                        /* fast path: no lock */
+    while (__atomic_test_and_set(&amp;cfg_lock, __ATOMIC_ACQUIRE)) { }       /* spin_lock */
+    c = __atomic_load_n(&amp;the_cfg, __ATOMIC_RELAXED);                     /* check again */
+    if (!c) {
+        c = malloc(sizeof *c);
+        c-&gt;mtu = 1500; c-&gt;region = "ap-south-1"; builds++;               /* fill in ALL fields first */
+        __atomic_store_n(&amp;the_cfg, c, __ATOMIC_RELEASE);                 /* then publish: smp_store_release */
+    }
+    __atomic_clear(&amp;cfg_lock, __ATOMIC_RELEASE);                         /* spin_unlock */
+    return c;
+}
+
+int main(void)
+{
+    struct config *a = config_get(), *b = config_get();
+    printf("same object: %s, built %d time(s), mtu %d, region %s\n",
+           a == b ? "yes" : "no", builds, a-&gt;mtu, a-&gt;region);
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ gcc -std=c99 -Wall singleton_sketch.c -o singleton_sketch &amp;&amp; ./singleton_sketch
+same object: yes, built 1 time(s), mtu 1500, region ap-south-1</code></pre>

@@ -1,0 +1,147 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Store each vote as (user, item, direction), update the count asynchronously through a queue, and rank listings with a time-decayed hot score cached in Redis or memcached."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"I partition the vote queue by community so workers do not fight over the same listing lock, make the read-old-write-new step atomic, and store megathread comment trees so one page load is a bounded number of reads."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements.</strong> Post, vote (one per user), listings by hot/new/top, threaded comments, home feed. Read heavy, eventual scores, no double counts.</li>
+          <li><strong>5-10 min: numbers.</strong> ~870 votes/s average, ~12k views/s; show that writes are small but each vote fans out.</li>
+          <li><strong>10-15 min: API and data model.</strong> Vote as state (dir -1/0/1), cursor listings; Postgres for posts and comments, Cassandra for votes and listings.</li>
+          <li><strong>15-25 min: high-level design.</strong> CDN, API, listing service on memcached, vote service + partitioned queue + workers, comment service + tree workers.</li>
+          <li><strong>25-40 min: deep dives.</strong> Hot formula, Wilson "best", lock contention and partitioning, comment trees for megathreads.</li>
+          <li><strong>40-45 min: failure modes and metrics.</strong> Queue depth, p99 vote latency, cache hit rate, listing staleness.</li>
+        </ol>
+        <p>Related designs: <a href="{{BASE}}hld/d05">News Feed</a>, <a href="{{BASE}}hld/d39">Distributed Counter</a>, <a href="{{BASE}}hld/d35">Top-K</a>, <a href="{{BASE}}hld/d38">Post Search</a>, <a href="{{BASE}}hld/d44">Live Comments</a>, <a href="{{BASE}}hld/d58">News Aggregator</a>, <a href="{{BASE}}hld/d02">Rate Limiter</a>, plus the patterns <a href="{{BASE}}hld/p02">Dealing with Contention</a> and <a href="{{BASE}}hld/p05">Scaling Writes</a>. Framework: <a href="{{BASE}}hld/hld-03">45-minute interview framework</a>.</p>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Reddit">
+          <summary>How do you make sure a user can vote only once, can change their vote, and retries do not double count?</summary>
+          <div class="answer">
+            <p>Store the vote as state keyed by (user_id, thing_id) with direction -1, 0 or +1, and make the API "set my vote to X". On each request, read the old direction, upsert the new one, and emit the delta (new minus old) to the counter pipeline. A retry with the same direction produces delta 0. Counters are derived data and can be rebuilt from the vote table.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with the API shape (set state, not increment), then the key, then the delta, then mention rebuildability. Reddit kept a relational copy of votes so Cassandra data could be regenerated.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if two vote requests from the same user race? (Conditional write or version check on the vote row.)</li><li>What if the queue delivers the delta twice? (Carry the vote version, skip if already applied.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Reddit">
+          <summary>Explain Reddit's hot ranking. Why the log, and why does it not need constant rescoring?</summary>
+          <div class="answer">
+            <p>hot = sign(score) x log10(max(|score|, 1)) + (created_seconds - epoch) / 45000. The log makes the first 10 votes worth as much as the next 90, so early engagement matters. The time term gives newer posts a growing head start: 12.5 hours of newness is worth 10x the votes. Because the formula uses creation time, not the current time, a post's value only changes when it is voted on. Old posts sink relative to new ones without any batch job.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the formula, give the 12.5 h = 10x intuition with one example, then make the systems point: no time-based rescoring, so listings can be mutated in place on votes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The numbers grow forever; is that a float precision problem? (Rounded to 7 decimals; rebase the epoch if needed.)</li><li>How would you add "rising"? (Rate of votes in a recent window.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>How should comments be sorted? Why not by score or by percentage of upvotes?</summary>
+          <div class="answer">
+            <p>Net score favours old comments and ignores the ratio (600 up / 400 down beats 6 up / 0 down). Percentage overrates tiny samples (1 up, 0 down = 100%). Use the lower bound of the Wilson score interval: the lowest upvote ratio we are fairly confident about given the votes so far. Reddit's "best" sort uses it at 80% confidence (z ~ 1.28) and caches a lookup table for small counts. Example: 1/0 scores 0.38, 100/1 scores 0.97.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show both failure examples, then name Wilson, explain it in one plain sentence, then note it has no time term because a thread is short-lived.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do new comments get a chance? (Blend in "new", or sample new comments into views.)</li><li>Is it expensive? (Constant time per comment; Reddit precomputes a table.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>How do you serve r/india sorted by hot in under 50 ms at 35,000 page views per second?</summary>
+          <div class="answer">
+            <p>Do not sort on read. Keep a precomputed listing per (community, sort, window): the top ~1,000 (post_id, score) pairs, persisted in Cassandra and served from memcached. A page read is one listing fetch plus one multi-get for 25 post objects. Vote workers mutate listings in place when scores change. Logged-out traffic is served by the CDN.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk Reddit's evolution: SQL sort, cached query, mutate in place, denormalized index. Size the cache (~10 GB for 600k listings) to show it fits.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A user pages past item 1,000? (Fall back to a slower query, or cap like Reddit does.)</li><li>How do you keep it consistent with the DB? (Rebuild jobs, repair tooling.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Reddit">
+          <summary>Votes are waiting hours in the queue at peak. You add more workers and it gets worse. What is happening and how do you fix it?</summary>
+          <div class="answer">
+            <p>Workers are contending on a shared resource, most likely the lock that protects a hot listing. More workers means more lock waiters, more retries and more context switches. Prove it with timers around each phase of vote processing. Fix: partition the queue by the listing key (community ID mod N) so each listing has a single writer. If p99 is still bad, look for cross-partition work, such as a domain or profile listing touched by votes from many communities, and split each vote into separate messages per listing type, each partitioned by its own key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Diagnose before fixing: averages vs p99, timers per phase. This is exactly Reddit's 2012 story; naming it shows you read real postmortems.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you remove the lock entirely? (Single-writer per partition, or lockless structures; Reddit was testing lockless cached queries.)</li><li>How many partitions? (Enough for peak, more than workers, keys hashed evenly.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>How do you store and load a thread with 50,000 comments?</summary>
+          <div class="answer">
+            <p>Store comments with parent_id, sharded by post_id so the thread is on one shard. Keep a precomputed tree structure (parent -&gt; children with sort keys) per post. To render, read the structure, walk it by "best" until a budget (for example 200 comments, depth 8), multi-get only those bodies, and emit "load more" stubs for the rest. Updates to the structure go through a batched queue; megathreads get an isolated queue; every queue has a length quota.</p>
+            <div class="approach"><h5>How to answer</h5><p>Compare adjacency list, materialized path and closure table quickly, pick one, then talk about the page budget and the async tree update.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A reply arrives before its parent is processed? (Order-sensitive; buffer or recompute.)</li><li>Deep links to a comment 20 levels down? (Render its ancestors as context plus its subtree.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>A thread page has 500 comments. How do you show which ones this user has voted on, cheaply?</summary>
+          <div class="answer">
+            <p>Partition votes by user_id with thing_id as the clustering key, then do one read for (user, IN [500 ids]) or a range read for that post if the key includes post_id. Most results are "no vote", so Bloom filters (which Cassandra keeps per SSTable) answer most lookups without touching disk. Cache the user's recent votes for the session.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point out that the common answer is "no", which is exactly what Bloom filters make cheap. Reddit cited this as a reason Cassandra worked well for votes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>False positives? (Only cost an extra read; never a wrong answer.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>How do you build "Top of this week" and "Top of all time"?</summary>
+          <div class="answer">
+            <p>Top is net score inside a time window. For hour and day, maintain windowed counters from the vote stream (tumbling windows in a stream processor, or bucketed counters) and keep a top-K per community per window. For week and all time, a periodic batch job over the vote or post table is fine because these listings change slowly. Store results as precomputed listings like hot.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate fast-changing windows (stream) from slow ones (batch). Link to top-K and windowed aggregation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Exact vs approximate? (Exact per community is cheap; approximate sketches help for global top-K.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit">
+          <summary>Postgres for posts and comments is running out of write capacity. How do you shard it?</summary>
+          <div class="answer">
+            <p>First split by table (vertical partitioning): Reddit early on used separate master databases for links, accounts, subreddits, comments and votes. Then shard big tables horizontally: comments by post_id so threads stay local, posts by post_id. Range sharding helps if range queries dominate (Quora chose range-based sharding for that reason and keeps the shard map in ZooKeeper); hash sharding spreads load more evenly. Migrate with copy + binlog replay, dark reads and dark writes, then cut over, as Quora described.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the shard key from the access pattern, then the migration plan. Interviewers want the plan, not just "shard it".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Queries by author across shards? (Secondary index table or scatter-gather; keep shard count small.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Reddit">
+          <summary>Half your memcached fleet disappears at once. What happens and how do you protect the database?</summary>
+          <div class="answer">
+            <p>Every miss goes to Postgres; replicas saturate and pages time out. This happened to Reddit in 2016 when an autoscaler, pointed at the old ZooKeeper cluster during a migration, saw migrated servers as unhealthy and terminated hundreds, caches included. Protect with: request coalescing (one DB fetch per key), serving stale data, rate-limiting misses, gradual re-warm, and tooling that refuses to act on too many servers at once (Reddit's autoscaler v2 does exactly that).</p>
+            <div class="approach"><h5>How to answer</h5><p>Describe the blast, then mitigations in order of time: immediate (shed, stale), short term (warm), long term (safety checks on destructive automation, separate tooling for stateful services).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do Kubernetes PodDisruptionBudgets help? (They cap voluntary evictions.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Reddit,Quora">
+          <summary>How is Quora different from Reddit in design?</summary>
+          <div class="answer">
+            <p>Same skeleton (content, votes, threads, cache), different ranking and grouping. Quora organises by question and topic, ranks answers with a machine-learned quality model where votes are one feature, and builds a personalized feed from followed topics and people. It stores core data (questions, answers, upvotes, comments) in sharded MySQL, with heavy caching. Reddit organises by community and uses formula-based sorts that are easy to precompute.</p>
+            <div class="approach"><h5>How to answer</h5><p>Map the nouns first, then say what changes in the architecture: the ranking service and feed become an ML pipeline (candidate generation plus ranker).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you dedupe near-identical questions? (Text embeddings plus nearest-neighbour search, merge suggestions.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: a breaking-news thread is slowing the whole site</h4>
+          <div class="situation"><p>A major event; one thread gets tens of thousands of comments in an hour. Comment and vote latency rises everywhere, not just in that thread.</p></div>
+          <div class="bad"><p>Weak answer: "Add more servers to the database."</p></div>
+          <div class="good"><p>Strong answer: the shared tree-update queue is being hogged by one thread. Isolate it on a dedicated queue with its own workers (Reddit's fastlane), batch its tree updates more aggressively, cap the comments rendered per page, and put a length quota on every queue so isolation cannot itself fill the broker. Watch for recompute loops: if inconsistency triggers a recompute on every view, rate-limit recomputes per post.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metrics would have shown this early? (Per-queue depth, top posts by queue messages.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: "Why not just compute hot with SQL and add an index?"</h4>
+          <div class="situation"><p>The interviewer pushes back on your precomputed listings as over-engineering.</p></div>
+          <div class="bad"><p>Weak answer: insist on caches without numbers.</p></div>
+          <div class="good"><p>Strong answer: "For a small site, yes: an expression index on hot(ups, downs, created) per community works, and since hot only changes on a vote, the index update cost is per vote. At ~35k page views/s and 2,600 votes/s, the index updates and sorted reads land on one primary, and every community page is the same query run thousands of times a second. A precomputed list turns that into one key read. Reddit walked exactly this path."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>At what scale would you switch? (When the DB's read CPU or replica lag becomes the bottleneck.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Treating a vote as "increment a counter" from the client: double counts on retry.</li>
+          <li>Running <code>ORDER BY</code> on every page view.</li>
+          <li>Scaling workers on a shared queue without thinking about lock contention.</li>
+          <li>Storing the whole comment tree as one JSON blob that every reply rewrites.</li>
+          <li>Pushing every post into every subscriber's feed in a community of millions.</li>
+          <li>Only watching averages; Reddit's second 2012 slowdown showed only in p99.</li>
+        </ul>
+      

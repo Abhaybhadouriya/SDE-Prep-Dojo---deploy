@@ -1,0 +1,115 @@
+
+        <h2>Architecture</h2>
+        <p>Every node is the same (symmetric): there is no master. Any node can take a client request; it becomes the <b>coordinator</b> for that request. Inside, each node has six parts. Here is one node, one line per part, before we zoom into each:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 330" role="img" aria-label="One storage node and its six parts: coordinator, ring, replication, gossip, anti-entropy, storage engine">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="135" width="110" height="50"/><text class="label" x="75" y="165">client</text>
+            <rect class="zone" x="170" y="15" width="610" height="300"/>
+            <text class="zone-label" x="185" y="38">One node (every node is identical)</text>
+            <rect class="box svc" x="190" y="55" width="280" height="56"/><text class="label" x="330" y="80">1. Coordinator</text><text class="label small" x="330" y="100">takes the request, fans out to replicas</text>
+            <rect class="box k8s" x="490" y="55" width="270" height="56"/><text class="label" x="625" y="80">2. Ring (partitioning)</text><text class="label small" x="625" y="100">hash(key) -&gt; which nodes own it</text>
+            <rect class="box kafka" x="190" y="130" width="280" height="56"/><text class="label" x="330" y="155">3. Replication</text><text class="label small" x="330" y="175">send to N replicas, wait for W / R</text>
+            <rect class="box queue" x="490" y="130" width="270" height="56"/><text class="label" x="625" y="155">4. Gossip</text><text class="label small" x="625" y="175">who is up, who owns which tokens</text>
+            <rect class="box cache" x="190" y="205" width="280" height="56"/><text class="label" x="330" y="230">5. Anti-entropy repair</text><text class="label small" x="330" y="250">Merkle trees find and fix drift</text>
+            <rect class="box db" x="490" y="205" width="270" height="56"/><text class="label" x="625" y="230">6. Storage engine</text><text class="label small" x="625" y="250">LSM tree on local disk</text>
+            <path class="arrow" d="M130 160 L185 90"/>
+            <text class="label small" x="475" y="295">request path: 1 -&gt; 2 -&gt; 3 -&gt; 6 on each replica; 4 and 5 run in the background</text>
+          </svg>
+          <figcaption>The six parts of one Dynamo-style node. The rest of this section walks through the ring (2) and a quorum write (1, 3); the deep dives cover gossip (4), repair (5) and conflicts.</figcaption>
+        </figure>
+
+        <h3>Partitioning: the ring with virtual nodes</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 340" role="img" aria-label="Consistent hash ring with virtual nodes of three physical nodes; key K is stored on the next three distinct physical nodes clockwise">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <circle cx="250" cy="170" r="130" fill="none" stroke="currentColor" stroke-opacity="0.35" stroke-width="3"/>
+            <circle class="box k8s" cx="250" cy="40" r="16"/><text class="label small" x="250" y="20">A1</text>
+            <circle class="box kafka" cx="380" cy="170" r="16"/><text class="label small" x="415" y="175">B1</text>
+            <circle class="box db" cx="250" cy="300" r="16"/><text class="label small" x="250" y="333">C1</text>
+            <circle class="box k8s" cx="120" cy="170" r="16"/><text class="label small" x="85" y="175">A2</text>
+            <circle class="box kafka" cx="158" cy="78" r="16"/><text class="label small" x="130" y="62">B2</text>
+            <circle class="box db" cx="342" cy="78" r="16"/><text class="label small" x="372" y="62">C2</text>
+            <circle class="box kafka" cx="342" cy="262" r="16"/><text class="label small" x="372" y="290">B3</text>
+            <circle class="box db" cx="158" cy="262" r="16"/><text class="label small" x="130" y="290">C3</text>
+            <circle class="packet" r="7" cx="300" cy="50"/>
+            <text class="label small" x="300" y="105">key K</text>
+            <path class="arrow" d="M300 50 C 325 58, 335 65, 340 72"/>
+            <circle class="packet alt" r="6"><animateMotion dur="6s" repeatCount="indefinite" path="M250 40 A130 130 0 0 1 380 170 A130 130 0 0 1 250 300 A130 130 0 0 1 120 170 A130 130 0 0 1 250 40"/></circle>
+            <text class="label left" x="460" y="60">Physical nodes A, B, C each own</text>
+            <text class="label left" x="460" y="82">several points (virtual nodes).</text>
+            <text class="label left" x="460" y="122">hash(K) lands between A1 and C2.</text>
+            <text class="label left" x="460" y="144">Walk clockwise, skipping repeats:</text>
+            <text class="label small left" x="460" y="166">Clockwise: C2 (C), B1 (B), B3 skip,</text>
+            <text class="label small left" x="460" y="186">C1 skip, C3 skip, A2 (A)</text>
+            <text class="label left" x="460" y="216">Preference list for N=3:</text>
+            <text class="label left" x="460" y="238">C, B, A (distinct machines)</text>
+            <text class="label small left" x="460" y="262">Add node D: it takes small slices</text>
+            <text class="label small left" x="460" y="282">from everyone; only ~1/n of keys move.</text>
+          </svg>
+          <figcaption><a href="{{BASE}}interview/glossary#consistent-hashing">Consistent hashing</a> (Dynamo used MD5 to a 128-bit ring). Each physical node owns many virtual nodes, so load evens out and a failed node's work spreads to many peers. The preference list skips virtual nodes of machines already chosen, so N copies land on N different machines (and ideally different racks or AZs; an AZ, availability zone, is an independent data center inside one cloud region).</figcaption>
+        </figure>
+        <p>Read more about the ring itself in <a href="{{BASE}}hld/hld-02">Distributed Building Blocks</a>. Dynamo tried three token strategies and ended with <b>strategy 3</b>: split the ring into Q equal fixed partitions and give each node Q/S of them (S = the number of nodes). It balanced best and shrank membership metadata by three orders of magnitude, and moving a partition became "copy one file". Cassandra learned a similar lesson: version 2.x needed 256 random tokens per node to balance, and from 3.x a deterministic allocator balances with far fewer, because every extra token adds neighbours and makes repairs slower.</p>
+
+        <h3>A write, step by step (N=3, W=2)</h3>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 340" role="img" aria-label="Quorum write: coordinator sends to three replicas, returns after two acks; then a replica is down and a hinted handoff node takes the write">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="140" width="120" height="56"/><text class="label" x="80" y="166">client</text><text class="label small" x="80" y="186">put(cart:42)</text>
+            <g data-step="1">
+              <rect class="box svc" x="220" y="140" width="150" height="56"/><text class="label" x="295" y="166">coordinator</text><text class="label small" x="295" y="186">any node</text>
+              <path class="arrow" d="M140 168 L215 168"/>
+            </g>
+            <g data-step="2">
+              <text class="label small" x="295" y="225">hash -&gt; preference list</text>
+              <text class="label small" x="295" y="245">[C, B, A] + clock bump</text>
+            </g>
+            <g data-step="3">
+              <rect class="box db" x="520" y="30" width="140" height="50"/><text class="label" x="590" y="60">replica C</text>
+              <rect class="box db" x="520" y="140" width="140" height="50"/><text class="label" x="590" y="170">replica B</text>
+              <rect class="box db" x="520" y="250" width="140" height="50"/><text class="label" x="590" y="280">replica A</text>
+              <path class="arrow" d="M370 160 L515 60"/><path class="arrow" d="M370 168 L515 165"/><path class="arrow" d="M370 176 L515 272"/>
+            </g>
+            <g data-step-only="4">
+              <text class="label ok" x="720" y="60">ack 1</text><text class="label ok" x="720" y="170">ack 2</text><text class="label small" x="720" y="280">(slow)</text>
+              <path class="arrow" d="M215 150 L140 150"/>
+              <text class="label ok" x="180" y="120">OK after W=2</text>
+            </g>
+            <g data-step="5">
+              <rect class="box fail" x="520" y="250" width="140" height="50"/><text class="label bad" x="590" y="280">A is down</text>
+            </g>
+            <g data-step="6">
+              <rect class="box cache" x="520" y="310" width="140" height="26"/><text class="label small" x="590" y="328">D holds hint for A</text>
+              <path class="arrow" d="M370 185 L515 320"/>
+            </g>
+            <g data-step-only="7">
+              <path class="arrow" d="M665 323 L700 323 L700 275 L665 275"/>
+              <text class="label ok" x="745" y="300">hand back</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Client sends put.</b> To any node (or, better, straight to a replica using a partition-aware client: Dynamo measured client-driven coordination at 30.4 ms vs 68.9 ms server-driven at p99.9).</li>
+            <li><b>Coordinator finds the preference list.</b> Hash the key, walk the ring, take the first N healthy distinct nodes. It creates the new version (vector clock entry for itself incremented).</li>
+            <li><b>Send to all N replicas in parallel.</b> Each appends to its commit log and memtable.</li>
+            <li><b>Reply after W acks.</b> With W = 2 the client gets OK as soon as two replicas confirm. The third catches up a little later. Latency is set by the 2nd-fastest replica, not the slowest.</li>
+            <li><b>A replica is down.</b> A strict quorum would fail the write if fewer than W of the "home" replicas are up. Dynamo does not want that.</li>
+            <li><b>Sloppy quorum + hinted handoff.</b> The coordinator writes A's copy to the next healthy node D, tagged with a hint "this belongs to A". The write still reaches W nodes.</li>
+            <li><b>Hand back.</b> When gossip shows A is back, D pushes the hinted data to A and deletes its copy. If A never returns, Merkle-tree repair takes over.</li>
+          </ol>
+        </div>
+
+        <h3>Quorum math: R + W &gt; N</h3>
+        <p>Pick N copies. A write waits for W acks, a read waits for R replies. If <b>R + W &gt; N</b>, every read set overlaps every write set in at least one node, so a read sees the latest acknowledged write (when the quorum is strict and there are no concurrent writes). Dynamo's common setting was (N, R, W) = (3, 2, 2).</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Setting</th><th>Behaviour</th><th>Dynamo use</th></tr></thead>
+            <tbody>
+              <tr><td>N=3, R=2, W=2</td><td>Balanced; overlap guaranteed; tolerates 1 slow/dead replica on each path</td><td>Most services</td></tr>
+              <tr><td>N=3, R=1, W=3</td><td>Very fast reads, writes need every replica</td><td>"High-performance read engine" (product catalog, promotions)</td></tr>
+              <tr><td>N=3, R=1, W=1</td><td>Fastest, weakest; reads may be stale</td><td>Only for data where staleness is harmless</td></tr>
+              <tr><td>N=3, R=3, W=1</td><td>Writes always succeed fast; reads slow</td><td>Rare</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Trap:</b> with a <b>sloppy</b> quorum, R + W &gt; N no longer guarantees overlap, because the W writes may have gone to stand-in nodes outside the home set. Riak's docs show this: right after a failure, a fallback node can answer "not found" for R = 1. Riak offers PR/PW (primary-only quorums) to force real overlap. Say this in the interview; it is a favourite follow-up.</p></div>
+      

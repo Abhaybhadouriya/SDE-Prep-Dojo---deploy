@@ -1,0 +1,647 @@
+<h3>C++14</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Task Tracker (Jira / Trello / To-do) in C++14: the same design as the Java version.
+// Windows (MinGW g++ 6.3): g++ -std=c++14 -Wall -Wextra main.cpp -o tracker &amp;&amp; ./tracker
+// Linux (real board locks): g++ -std=c++14 -Wall -Wextra -pthread -DHAVE_STD_MUTEX main.cpp -o tracker
+// MinGW.org g++ 6.3 (win32 thread model) has no std::mutex and -pthread fails to link there, so BoardMutex
+// falls back to a no-op with the same lock()/unlock(): the same locking code builds both ways.
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#if defined(HAVE_STD_MUTEX) || defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+#include &lt;mutex&gt;
+using BoardMutex = std::mutex;
+#else
+struct BoardMutex { void lock() {} void unlock() {} };   // MinGW g++ 6.3 "win32" threads: no std::mutex
+#endif
+#include &lt;cassert&gt;
+
+// RAII lock like std::lock_guard; works with either mutex type above.
+struct LockGuard {
+    BoardMutex&amp; m;
+    explicit LockGuard(BoardMutex&amp; mu) : m(mu) { m.lock(); }
+    ~LockGuard() { m.unlock(); }
+    LockGuard(const LockGuard&amp;) = delete;
+    LockGuard&amp; operator=(const LockGuard&amp;) = delete;
+};
+
+using std::string;
+using std::vector;
+
+enum class IssueType { STORY, TASK, BUG, SUBTASK };
+enum class Priority { LOW, MEDIUM, HIGH, CRITICAL };
+enum class Field { TITLE, DESCRIPTION, PRIORITY };
+enum class SprintState { PLANNED, ACTIVE, CLOSED };
+const char* name(IssueType t) { static const char* n[] = {"STORY", "TASK", "BUG", "SUBTASK"}; return n[(int)t]; }
+const char* name(Priority p) { static const char* n[] = {"LOW", "MEDIUM", "HIGH", "CRITICAL"}; return n[(int)p]; }
+const char* name(Field f) { static const char* n[] = {"TITLE", "DESCRIPTION", "PRIORITY"}; return n[(int)f]; }
+
+struct TrackerError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct TransitionDenied : TrackerError { using TrackerError::TrackerError; };
+struct StaleUpdate : TrackerError { using TrackerError::TrackerError; };
+
+// A workflow is data: states plus allowed moves.
+class Workflow {
+public:
+    string name, initial;
+    Workflow(string n, string init) : name(std::move(n)), initial(std::move(init)) { add(initial); }
+    Workflow&amp; allow(const string&amp; from, std::initializer_list&lt;string&gt; to) {
+        add(from);
+        for (const string&amp; t : to) { next_[from].insert(t); add(t); }
+        return *this;
+    }
+    Workflow&amp; done(const string&amp; s) { done_.insert(s); return *this; }
+    bool allows(const string&amp; from, const string&amp; to) const {
+        auto it = next_.find(from);
+        return it != next_.end() &amp;&amp; it-&gt;second.count(to);
+    }
+    bool isDone(const string&amp; s) const { return done_.count(s) &gt; 0; }
+    const vector&lt;string&gt;&amp; states() const { return order_; }
+    static Workflow todo() { Workflow w("To-do", "TODO"); w.allow("TODO", {"DONE"}).allow("DONE", {"TODO"}).done("DONE"); return w; }
+    static Workflow scrum() {
+        Workflow w("Scrum", "TODO");
+        w.allow("TODO", {"IN_PROGRESS"}).allow("IN_PROGRESS", {"IN_REVIEW", "TODO"})
+         .allow("IN_REVIEW", {"DONE", "IN_PROGRESS"}).allow("DONE", {"TODO"}).done("DONE");
+        return w;
+    }
+private:
+    void add(const string&amp; s) { if (!next_.count(s)) { next_[s]; order_.push_back(s); } }
+    std::map&lt;string, std::set&lt;string&gt;&gt; next_;
+    std::set&lt;string&gt; done_;
+    vector&lt;string&gt; order_;
+};
+
+struct Issue {
+    string key, title, description, status, reporter, assignee, parent, sprint;   // "" means none
+    IssueType type; Priority priority;
+    std::set&lt;string&gt; labels;
+    vector&lt;string&gt; subtasks;
+    int version = 1;
+    long createdAt = 0, updatedAt = 0;
+};
+
+struct IssueView {           // an immutable copy for readers
+    string key, title, description, status, assignee, parent, sprint;
+    IssueType type; Priority priority; bool done; int version;
+    vector&lt;string&gt; labels, subtasks;
+    int number() const { return std::stoi(key.substr(key.find('-') + 1)); }
+    string line() const { return key + " [" + name(priority) + "] " + title + " (" + (assignee.empty() ? "unassigned" : assignee) + ")"; }
+};
+
+struct Event {
+    long seq, at; string actor, issue, action, from, to;
+    string str() const {
+        char buf[200];
+        string detail = from == "-" ? to : from + " -&gt; " + to;
+        std::snprintf(buf, sizeof buf, "#%-2ld t=%02ld %-6s %-6s %-14s %s", seq, at, actor.c_str(), issue.c_str(), action.c_str(), detail.c_str());
+        return buf;
+    }
+};
+
+struct Sprint { string id, name; SprintState state = SprintState::PLANNED; vector&lt;string&gt; issues; };
+
+struct Board;
+using Guard = std::function&lt;string(const Issue&amp;, const string&amp; to, const Board&amp;)&gt;;   // "" = allowed
+
+struct Board {
+    string key, name; Workflow workflow;
+    vector&lt;string&gt; members, order;            // order = insertion order of issue keys
+    vector&lt;Guard&gt; guards;
+    std::map&lt;string, Issue&gt; issues;
+    std::map&lt;string, Sprint&gt; sprints;
+    vector&lt;string&gt; sprintOrder;
+    vector&lt;Event&gt; log;
+    int nextNumber = 1;
+    BoardMutex mu;
+    Board(string k, string n, Workflow w) : key(std::move(k)), name(std::move(n)), workflow(std::move(w)) {}
+    bool member(const string&amp; u) const { return std::find(members.begin(), members.end(), u) != members.end(); }
+};
+
+Guard needsAssignee(string state) {
+    return [state](const Issue&amp; i, const string&amp; to, const Board&amp;) {
+        return to == state &amp;&amp; i.assignee.empty() ? i.key + " needs an assignee before " + state : string();
+    };
+}
+Guard subtasksDone() {
+    return [](const Issue&amp; i, const string&amp; to, const Board&amp; b) {
+        if (!b.workflow.isDone(to)) return string();
+        for (const string&amp; k : i.subtasks)
+            if (!b.workflow.isDone(b.issues.at(k).status)) return i.key + " has an open subtask " + k;
+        return string();
+    };
+}
+
+// Filters (Specification): combine with &amp;, |, !
+struct Spec {
+    std::function&lt;bool(const IssueView&amp;)&gt; fn;
+    bool operator()(const IssueView&amp; v) const { return fn(v); }
+};
+Spec operator&amp;(Spec a, Spec b) { return {[a, b](const IssueView&amp; v) { return a(v) &amp;&amp; b(v); }}; }
+Spec operator|(Spec a, Spec b) { return {[a, b](const IssueView&amp; v) { return a(v) || b(v); }}; }
+Spec operator!(Spec a) { return {[a](const IssueView&amp; v) { return !a(v); }}; }
+namespace Filters {
+Spec open() { return {[](const IssueView&amp; v) { return !v.done; }}; }
+Spec status(string s) { return {[s](const IssueView&amp; v) { return v.status == s; }}; }
+Spec unassigned() { return {[](const IssueView&amp; v) { return v.assignee.empty(); }}; }
+Spec priorityAtLeast(Priority p) { return {[p](const IssueView&amp; v) { return v.priority &gt;= p; }}; }
+Spec label(string l) { return {[l](const IssueView&amp; v) { return std::count(v.labels.begin(), v.labels.end(), l) &gt; 0; }}; }
+Spec type(IssueType t) { return {[t](const IssueView&amp; v) { return v.type == t; }}; }
+Spec inSprint(string s) { return {[s](const IssueView&amp; v) { return v.sprint == s; }}; }
+Spec backlog() { return {[](const IssueView&amp; v) { return v.sprint.empty(); }}; }
+string lower(string s) { std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s; }
+Spec text(string q) {
+    q = lower(q);
+    return {[q](const IssueView&amp; v) { return lower(v.title).find(q) != string::npos || lower(v.description).find(q) != string::npos; }};
+}
+bool byPriority(const IssueView&amp; a, const IssueView&amp; b) {
+    return a.priority != b.priority ? a.priority &gt; b.priority : a.number() &lt; b.number();
+}
+}  // namespace Filters
+
+using Listener = std::function&lt;void(const Event&amp;)&gt;;
+
+class TaskTracker {
+public:
+    explicit TaskTracker(std::function&lt;long()&gt; clock) : clock_(std::move(clock)) {}
+    void addListener(Listener l) { listeners_.push_back(std::move(l)); }
+    void addUser(const string&amp; id) { if (!users_.insert(id).second) throw TrackerError("user " + id + " exists"); }
+    void createBoard(const string&amp; key, const string&amp; nm, Workflow wf, const string&amp; owner) {
+        user(owner);
+        if (boards_.count(key)) throw TrackerError("board " + key + " exists");
+        boards_[key].reset(new Board(key, nm, std::move(wf)));
+        boards_[key]-&gt;members.push_back(owner);
+    }
+    void addMember(const string&amp; bk, const string&amp; actor, const string&amp; uid) {
+        user(uid);
+        write&lt;int&gt;(board(bk), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp;) { if (!b.member(uid)) b.members.push_back(uid); return 0; });
+    }
+    void addGuard(const string&amp; bk, Guard g) { Board&amp; b = board(bk); LockGuard l(b.mu); b.guards.push_back(std::move(g)); }
+
+    string createIssue(const string&amp; bk, const string&amp; actor, IssueType t, const string&amp; title, Priority p) {
+        if (t == IssueType::SUBTASK) throw TrackerError("use addSubtask for subtasks");
+        return write&lt;string&gt;(board(bk), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) { return newIssue(b, out, actor, t, title, p, nullptr); });
+    }
+    string addSubtask(const string&amp; parentKey, const string&amp; actor, const string&amp; title) {
+        return write&lt;string&gt;(boardOf(parentKey), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Issue&amp; parent = issue(b, parentKey);
+            if (parent.type == IssueType::SUBTASK) throw TrackerError("a subtask cannot have subtasks");
+            string key = newIssue(b, out, actor, IssueType::SUBTASK, title, parent.priority, &amp;parent);
+            Issue&amp; p = issue(b, parentKey);        // re-fetch: map nodes are stable, but be explicit
+            p.subtasks.push_back(key);
+            touch(p);
+            log(b, out, actor, parentKey, "SUBTASK_ADDED", "", key);
+            return key;
+        });
+    }
+    void assign(const string&amp; key, const string&amp; actor, const string&amp; assignee) {
+        write&lt;int&gt;(boardOf(key), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            if (!assignee.empty() &amp;&amp; !b.member(assignee)) throw TrackerError(assignee + " is not a member of " + b.key);
+            Issue&amp; i = issue(b, key);
+            if (i.assignee == assignee) return 0;
+            log(b, out, actor, key, "ASSIGNED", i.assignee, assignee);
+            i.assignee = assignee;
+            touch(i);
+            return 0;
+        });
+    }
+    void edit(const string&amp; key, const string&amp; actor, Field f, const string&amp; value, int expected = -1) {
+        write&lt;int&gt;(boardOf(key), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Issue&amp; i = issue(b, key);
+            if (expected &gt;= 0 &amp;&amp; expected != i.version)
+                throw StaleUpdate(key + " changed since you loaded it (you have v" + std::to_string(expected) +
+                                  ", current is v" + std::to_string(i.version) + ")");
+            string old;
+            if (f == Field::TITLE) { old = i.title; i.title = value; }
+            else if (f == Field::DESCRIPTION) { old = i.description; i.description = value; }
+            else { old = name(i.priority); i.priority = parsePriority(value); }
+            touch(i);
+            log(b, out, actor, key, string("EDIT_") + name(f), old, value);
+            return 0;
+        });
+    }
+    void addLabel(const string&amp; key, const string&amp; actor, const string&amp; label) {
+        write&lt;int&gt;(boardOf(key), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Issue&amp; i = issue(b, key);
+            if (i.labels.insert(label).second) { touch(i); log(b, out, actor, key, "LABEL_ADDED", "", label); }
+            return 0;
+        });
+    }
+    void move(const string&amp; key, const string&amp; actor, const string&amp; to) {
+        write&lt;int&gt;(boardOf(key), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Issue&amp; i = issue(b, key);
+            if (i.status == to) return 0;
+            if (!b.workflow.allows(i.status, to))
+                throw TransitionDenied(key + ": " + i.status + " -&gt; " + to + " is not in the " + b.workflow.name + " workflow");
+            for (const Guard&amp; g : b.guards) { string why = g(i, to, b); if (!why.empty()) throw TransitionDenied(why); }
+            log(b, out, actor, key, "MOVED", i.status, to);
+            i.status = to;
+            touch(i);
+            return 0;
+        });
+    }
+    vector&lt;string&gt; remove(const string&amp; key, const string&amp; actor) {
+        return write&lt;vector&lt;string&gt;&gt;(boardOf(key), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Issue&amp; i = issue(b, key);
+            vector&lt;string&gt; gone = i.subtasks;
+            gone.push_back(key);
+            if (!i.parent.empty()) { Issue&amp; p = b.issues.at(i.parent); erase(p.subtasks, key); touch(p); }
+            if (!i.sprint.empty()) erase(b.sprints.at(i.sprint).issues, key);
+            for (const string&amp; k : gone) { b.issues.erase(k); erase(b.order, k); log(b, out, actor, k, "REMOVED", "", "deleted"); }
+            return gone;
+        });
+    }
+    string createSprint(const string&amp; bk, const string&amp; actor, const string&amp; nm) {
+        return write&lt;string&gt;(board(bk), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp;) {
+            string id = "S" + std::to_string(++sprintIds_);
+            b.sprints[id] = Sprint{id, nm, SprintState::PLANNED, {}};
+            b.sprintOrder.push_back(id);
+            sprintBoard_[id] = b.key;
+            return id;
+        });
+    }
+    void addToSprint(const string&amp; sid, const string&amp; actor, const string&amp; key) {
+        write&lt;int&gt;(boardOfSprint(sid), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Sprint&amp; s = b.sprints.at(sid);
+            if (s.state == SprintState::CLOSED) throw TrackerError(s.name + " is closed");
+            Issue&amp; i = issue(b, key);
+            if (i.type == IssueType::SUBTASK) throw TrackerError("subtasks follow their parent " + i.parent);
+            if (i.sprint == sid) return 0;
+            if (!i.sprint.empty()) erase(b.sprints.at(i.sprint).issues, key);
+            s.issues.push_back(key);
+            setSprint(b, out, actor, i, sid);
+            return 0;
+        });
+    }
+    void startSprint(const string&amp; sid, const string&amp; actor) {
+        write&lt;int&gt;(boardOfSprint(sid), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp;) {
+            Sprint&amp; s = b.sprints.at(sid);
+            if (s.state != SprintState::PLANNED) throw TrackerError(s.name + " is not planned");
+            for (auto&amp; kv : b.sprints)
+                if (kv.second.state == SprintState::ACTIVE) throw TrackerError(kv.second.name + " is already active on " + b.key);
+            s.state = SprintState::ACTIVE;
+            return 0;
+        });
+    }
+    vector&lt;string&gt; completeSprint(const string&amp; sid, const string&amp; actor) {
+        return write&lt;vector&lt;string&gt;&gt;(boardOfSprint(sid), actor, [&amp;](Board&amp; b, vector&lt;Event&gt;&amp; out) {
+            Sprint&amp; s = b.sprints.at(sid);
+            if (s.state != SprintState::ACTIVE) throw TrackerError(s.name + " is not active");
+            vector&lt;string&gt; carried;
+            for (const string&amp; k : s.issues)
+                if (!b.workflow.isDone(b.issues.at(k).status)) { carried.push_back(k); setSprint(b, out, actor, b.issues.at(k), ""); }
+            for (const string&amp; k : carried) erase(s.issues, k);
+            s.state = SprintState::CLOSED;
+            return carried;
+        });
+    }
+
+    IssueView get(const string&amp; key) {
+        Board&amp; b = boardOf(key);
+        LockGuard l(b.mu);
+        return view(b, issue(b, key));
+    }
+    vector&lt;IssueView&gt; search(const string&amp; bk, const Spec&amp; spec) {
+        vector&lt;IssueView&gt; all = snapshot(board(bk)), out;
+        for (const IssueView&amp; v : all) if (spec(v)) out.push_back(v);
+        std::stable_sort(out.begin(), out.end(), Filters::byPriority);
+        return out;
+    }
+    vector&lt;Event&gt; history(const string&amp; key) {
+        Board&amp; b = boardOf(key);
+        LockGuard l(b.mu);
+        vector&lt;Event&gt; out;
+        for (const Event&amp; e : b.log) if (e.issue == key) out.push_back(e);
+        return out;
+    }
+    vector&lt;Event&gt; activityOf(const string&amp; uid) {
+        vector&lt;Event&gt; out;
+        for (auto&amp; kv : boards_) {
+            LockGuard l(kv.second-&gt;mu);
+            for (const Event&amp; e : kv.second-&gt;log) if (e.actor == uid) out.push_back(e);
+        }
+        std::sort(out.begin(), out.end(), [](const Event&amp; a, const Event&amp; b) { return a.seq &lt; b.seq; });
+        return out;
+    }
+    SprintState sprintState(const string&amp; sid) { Board&amp; b = boardOfSprint(sid); LockGuard l(b.mu); return b.sprints.at(sid).state; }
+    string render(const string&amp; bk) {
+        Board&amp; b = board(bk);
+        vector&lt;IssueView&gt; all = snapshot(b);
+        string active = "none";
+        {
+            LockGuard l(b.mu);
+            for (const string&amp; id : b.sprintOrder) if (b.sprints.at(id).state == SprintState::ACTIVE) { active = b.sprints.at(id).name; break; }
+        }
+        std::ostringstream os;
+        os &lt;&lt; b.key &lt;&lt; " " &lt;&lt; b.name &lt;&lt; " [" &lt;&lt; b.workflow.name &lt;&lt; "]  active sprint: " &lt;&lt; active &lt;&lt; "\n";
+        char buf[200];
+        for (const string&amp; st : b.workflow.states()) {
+            vector&lt;IssueView&gt; col = search(bk, Filters::status(st));
+            if (col.empty()) { std::snprintf(buf, sizeof buf, "  %-11s | -\n", st.c_str()); os &lt;&lt; buf; }
+            for (size_t k = 0; k &lt; col.size(); k++) {
+                std::snprintf(buf, sizeof buf, "  %-11s | %s\n", k == 0 ? st.c_str() : "", col[k].line().c_str());
+                os &lt;&lt; buf;
+            }
+        }
+        return os.str();
+    }
+
+private:
+    std::function&lt;long()&gt; clock_;
+    std::set&lt;string&gt; users_;
+    std::map&lt;string, std::unique_ptr&lt;Board&gt;&gt; boards_;
+    std::map&lt;string, string&gt; sprintBoard_;
+    vector&lt;Listener&gt; listeners_;
+    long seq_ = 0, sprintIds_ = 0;
+
+    // Every write: membership check and mutation under the board lock; listeners after it is released.
+    template &lt;class T, class F&gt; T write(Board&amp; b, const string&amp; actor, F body) {
+        vector&lt;Event&gt; out;
+        T result;
+        {
+            LockGuard l(b.mu);
+            if (!b.member(actor)) throw TrackerError(actor + " is not a member of " + b.key);
+            result = body(b, out);
+        }
+        for (const Event&amp; e : out) for (const Listener&amp; fn : listeners_) fn(e);
+        return result;
+    }
+    string newIssue(Board&amp; b, vector&lt;Event&gt;&amp; out, const string&amp; actor, IssueType t, const string&amp; title, Priority p, const Issue* parent) {
+        if (title.find_first_not_of(' ') == string::npos) throw TrackerError("title is required");
+        string key = b.key + "-" + std::to_string(b.nextNumber++);
+        Issue i;
+        i.key = key; i.type = t; i.title = title; i.priority = p; i.status = b.workflow.initial; i.reporter = actor;
+        i.createdAt = i.updatedAt = clock_();
+        if (parent) { i.parent = parent-&gt;key; i.sprint = parent-&gt;sprint; }
+        b.issues[key] = i;
+        b.order.push_back(key);
+        log(b, out, actor, key, "CREATED", "", string(name(t)) + " '" + title + "'");
+        return key;
+    }
+    void setSprint(Board&amp; b, vector&lt;Event&gt;&amp; out, const string&amp; actor, Issue&amp; i, const string&amp; sid) {
+        string from = i.sprint.empty() ? "backlog" : b.sprints.at(i.sprint).name;
+        string to = sid.empty() ? "backlog" : b.sprints.at(sid).name;
+        i.sprint = sid;
+        touch(i);
+        log(b, out, actor, i.key, "SPRINT", from, to);
+        for (const string&amp; k : i.subtasks) { b.issues.at(k).sprint = sid; touch(b.issues.at(k)); }
+    }
+    void log(Board&amp; b, vector&lt;Event&gt;&amp; out, const string&amp; actor, const string&amp; key, const string&amp; action, const string&amp; from, const string&amp; to) {
+        Event e{++seq_, clock_(), actor, key, action, from.empty() ? "-" : from, to.empty() ? "-" : to};
+        b.log.push_back(e);
+        out.push_back(e);
+    }
+    void touch(Issue&amp; i) { i.version++; i.updatedAt = clock_(); }
+    static void erase(vector&lt;string&gt;&amp; v, const string&amp; k) { v.erase(std::remove(v.begin(), v.end(), k), v.end()); }
+    static Priority parsePriority(const string&amp; v) {
+        for (int p = 0; p &lt; 4; p++) if (v == name((Priority)p)) return (Priority)p;
+        throw TrackerError("unknown priority " + v);
+    }
+    static IssueView view(const Board&amp; b, const Issue&amp; i) {
+        IssueView v;
+        v.key = i.key; v.title = i.title; v.description = i.description; v.status = i.status; v.assignee = i.assignee;
+        v.parent = i.parent; v.sprint = i.sprint; v.type = i.type; v.priority = i.priority;
+        v.done = b.workflow.isDone(i.status); v.version = i.version;
+        v.labels.assign(i.labels.begin(), i.labels.end()); v.subtasks = i.subtasks;
+        return v;
+    }
+    vector&lt;IssueView&gt; snapshot(Board&amp; b) {
+        LockGuard l(b.mu);
+        vector&lt;IssueView&gt; all;
+        for (const string&amp; k : b.order) all.push_back(view(b, b.issues.at(k)));
+        return all;
+    }
+    void user(const string&amp; id) { if (!users_.count(id)) throw TrackerError("no user " + id); }
+    Board&amp; board(const string&amp; k) { auto it = boards_.find(k); if (it == boards_.end()) throw TrackerError("no board " + k); return *it-&gt;second; }
+    Board&amp; boardOf(const string&amp; key) {
+        size_t d = key.find('-');
+        if (d == string::npos) throw TrackerError("bad issue key " + key);
+        return board(key.substr(0, d));
+    }
+    Board&amp; boardOfSprint(const string&amp; sid) {
+        auto it = sprintBoard_.find(sid);
+        if (it == sprintBoard_.end()) throw TrackerError("no sprint " + sid);
+        return board(it-&gt;second);
+    }
+    static Issue&amp; issue(Board&amp; b, const string&amp; key) {
+        auto it = b.issues.find(key);
+        if (it == b.issues.end()) throw TrackerError("no issue " + key);
+        return it-&gt;second;
+    }
+};
+
+// ------------------------------------------------------------------ demo + tests
+static int checks = 0;
+#define CHECK(cond) do { assert(cond); checks++; } while (0)
+template &lt;class E, class F&gt; void expectFail(F f) {
+    try { f(); } catch (const E&amp;) { checks++; return; }
+    assert(!"expected an exception");
+}
+template &lt;class F&gt; void tryIt(const string&amp; label, F f) {
+    try { f(); std::cout &lt;&lt; "  ok      " &lt;&lt; label &lt;&lt; "\n"; }
+    catch (const TrackerError&amp; e) { std::cout &lt;&lt; "  refused " &lt;&lt; label &lt;&lt; ": " &lt;&lt; e.what() &lt;&lt; "\n"; }
+}
+void show(const string&amp; title, const vector&lt;IssueView&gt;&amp; rows) {
+    std::cout &lt;&lt; "  " &lt;&lt; title &lt;&lt; ":\n";
+    if (rows.empty()) std::cout &lt;&lt; "    (none)\n";
+    for (const IssueView&amp; v : rows) std::cout &lt;&lt; "    " &lt;&lt; v.line() &lt;&lt; " " &lt;&lt; v.status &lt;&lt; "\n";
+}
+string join(const vector&lt;string&gt;&amp; v) {
+    string s = "[";
+    for (size_t i = 0; i &lt; v.size(); i++) s += (i ? ", " : "") + v[i];
+    return s + "]";
+}
+std::function&lt;long()&gt; counterClock() { auto t = std::make_shared&lt;long&gt;(0); return [t] { return ++*t; }; }
+
+void demo() {
+    TaskTracker tt(counterClock());
+    tt.addListener([](const Event&amp; e) {
+        if (e.action == "ASSIGNED" &amp;&amp; e.to != "-") std::cout &lt;&lt; "  [notify] " &lt;&lt; e.to &lt;&lt; ": you were assigned " &lt;&lt; e.issue &lt;&lt; "\n";
+    });
+    for (const char* u : {"alice", "bob", "carol", "dave"}) tt.addUser(u);
+    tt.createBoard("PAY", "Payments", Workflow::scrum(), "alice");
+    tt.addMember("PAY", "alice", "bob");
+    tt.addMember("PAY", "alice", "carol");
+    tt.addGuard("PAY", needsAssignee("IN_PROGRESS"));
+    tt.addGuard("PAY", subtasksDone());
+
+    std::cout &lt;&lt; "== 1. Create issues and subtasks, assign\n";
+    string story = tt.createIssue("PAY", "alice", IssueType::STORY, "UPI refund flow", Priority::HIGH);
+    string bug = tt.createIssue("PAY", "alice", IssueType::BUG, "Double debit on retry", Priority::CRITICAL);
+    string task = tt.createIssue("PAY", "bob", IssueType::TASK, "Write on-call runbook", Priority::LOW);
+    string api = tt.addSubtask(story, "alice", "Refund API");
+    string db = tt.addSubtask(story, "alice", "Refund table migration");
+    tt.assign(bug, "alice", "bob");
+    tt.assign(story, "alice", "carol");
+    tt.assign(api, "carol", "carol");
+    tt.addLabel(story, "alice", "upi");
+    tt.addLabel(bug, "alice", "upi");
+    tryIt("assign " + task + " to dave", [&amp;] { tt.assign(task, "alice", "dave"); });
+    tryIt("dave creates an issue", [&amp;] { tt.createIssue("PAY", "dave", IssueType::TASK, "x", Priority::LOW); });
+
+    std::cout &lt;&lt; "\n== 2. Sprint planning\n";
+    string s1 = tt.createSprint("PAY", "alice", "Sprint 1");
+    tt.addToSprint(s1, "alice", story);
+    tt.addToSprint(s1, "alice", bug);
+    tt.startSprint(s1, "alice");
+    tryIt("add subtask " + db + " to the sprint", [&amp;] { tt.addToSprint(s1, "alice", db); });
+    string s2 = tt.createSprint("PAY", "alice", "Sprint 2");
+    tryIt("start Sprint 2 while Sprint 1 is active", [&amp;] { tt.startSprint(s2, "alice"); });
+
+    std::cout &lt;&lt; "\n== 3. Workflow moves\n";
+    tryIt(task + " TODO -&gt; IN_PROGRESS", [&amp;] { tt.move(task, "bob", "IN_PROGRESS"); });
+    tryIt(task + " TODO -&gt; DONE", [&amp;] { tt.move(task, "bob", "DONE"); });
+    std::vector&lt;std::pair&lt;string, string&gt;&gt; walkers = {{bug, "bob"}, {story, "carol"}, {api, "carol"}};
+    for (auto&amp; kw : walkers)
+        for (const char* st : {"IN_PROGRESS", "IN_REVIEW", "DONE"})
+            tryIt(kw.first + " -&gt; " + st, [&amp;] { tt.move(kw.first, kw.second, st); });
+
+    std::cout &lt;&lt; "\n== 4. Two people edit the same issue\n";
+    int v = tt.get(task).version;
+    tryIt("alice renames " + task + " (she loaded v" + std::to_string(v) + ")",
+          [&amp;] { tt.edit(task, "alice", Field::TITLE, "Write payments on-call runbook", v); });
+    tryIt("bob sets priority HIGH (he also loaded v" + std::to_string(v) + ")",
+          [&amp;] { tt.edit(task, "bob", Field::PRIORITY, "HIGH", v); });
+
+    std::cout &lt;&lt; "\n== 5. Filters\n";
+    using namespace Filters;
+    show("open and HIGH or above", tt.search("PAY", open() &amp; priorityAtLeast(Priority::HIGH)));
+    show("label upi and not done", tt.search("PAY", label("upi") &amp; open()));
+    show("unassigned or LOW", tt.search("PAY", unassigned() | !priorityAtLeast(Priority::MEDIUM)));
+    show("text 'refund' in the active sprint", tt.search("PAY", text("refund") &amp; inSprint(s1)));
+
+    std::cout &lt;&lt; "\n== 6. Board view\n" &lt;&lt; tt.render("PAY");
+
+    std::cout &lt;&lt; "\n== 7. Close the sprint, remove a task\n";
+    std::cout &lt;&lt; "  carried over to the backlog: " &lt;&lt; join(tt.completeSprint(s1, "alice")) &lt;&lt; "\n";
+    vector&lt;string&gt; backlogKeys;
+    for (const IssueView&amp; iv : tt.search("PAY", backlog() &amp; !type(IssueType::SUBTASK))) backlogKeys.push_back(iv.key);
+    std::cout &lt;&lt; "  backlog now: " &lt;&lt; join(backlogKeys) &lt;&lt; "\n";
+    std::cout &lt;&lt; "  removed: " &lt;&lt; join(tt.remove(task, "bob")) &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "\n== 8. Audit history of " &lt;&lt; bug &lt;&lt; "\n";
+    for (const Event&amp; e : tt.history(bug)) std::cout &lt;&lt; "  " &lt;&lt; e.str() &lt;&lt; "\n";
+    std::cout &lt;&lt; "\n== 9. Everything carol did\n";
+    for (const Event&amp; e : tt.activityOf("carol")) std::cout &lt;&lt; "  " &lt;&lt; e.str() &lt;&lt; "\n";
+}
+
+TaskTracker* fresh(Workflow wf) {
+    TaskTracker* tt = new TaskTracker(counterClock());
+    for (const char* u : {"a", "b", "x"}) tt-&gt;addUser(u);
+    tt-&gt;createBoard("T", "Test", std::move(wf), "a");
+    tt-&gt;addMember("T", "a", "b");
+    return tt;
+}
+
+void runTests() {
+    using namespace Filters;
+    std::unique_ptr&lt;TaskTracker&gt; tt(fresh(Workflow::scrum()));
+    tt-&gt;addGuard("T", needsAssignee("IN_PROGRESS"));
+    tt-&gt;addGuard("T", subtasksDone());
+    string k = tt-&gt;createIssue("T", "a", IssueType::TASK, "t1", Priority::MEDIUM);
+    expectFail&lt;TransitionDenied&gt;([&amp;] { tt-&gt;move(k, "a", "DONE"); });
+    expectFail&lt;TransitionDenied&gt;([&amp;] { tt-&gt;move(k, "a", "IN_PROGRESS"); });
+    tt-&gt;assign(k, "a", "b");
+    tt-&gt;move(k, "b", "IN_PROGRESS");
+    CHECK(tt-&gt;get(k).status == "IN_PROGRESS");
+
+    string p = tt-&gt;createIssue("T", "a", IssueType::STORY, "parent", Priority::HIGH);
+    string c = tt-&gt;addSubtask(p, "a", "child");
+    expectFail&lt;TrackerError&gt;([&amp;] { tt-&gt;addSubtask(c, "a", "grandchild"); });
+    tt-&gt;assign(p, "a", "a");
+    tt-&gt;move(p, "a", "IN_PROGRESS");
+    tt-&gt;move(p, "a", "IN_REVIEW");
+    expectFail&lt;TransitionDenied&gt;([&amp;] { tt-&gt;move(p, "a", "DONE"); });
+    tt-&gt;assign(c, "a", "a");
+    for (const char* st : {"IN_PROGRESS", "IN_REVIEW", "DONE"}) tt-&gt;move(c, "a", st);
+    tt-&gt;move(p, "a", "DONE");
+    CHECK(tt-&gt;get(p).done);
+
+    expectFail&lt;TrackerError&gt;([&amp;] { tt-&gt;createIssue("T", "x", IssueType::TASK, "t", Priority::LOW); });
+    expectFail&lt;TrackerError&gt;([&amp;] { tt-&gt;assign(k, "a", "x"); });
+    expectFail&lt;TrackerError&gt;([&amp;] { tt-&gt;move("T-99", "a", "DONE"); });
+    expectFail&lt;TrackerError&gt;([&amp;] { tt-&gt;edit(k, "a", Field::PRIORITY, "URGENT"); });
+
+    int v = tt-&gt;get(k).version;
+    tt-&gt;edit(k, "a", Field::TITLE, "renamed", v);
+    CHECK(tt-&gt;get(k).version == v + 1);
+    expectFail&lt;StaleUpdate&gt;([&amp;] { tt-&gt;edit(k, "b", Field::TITLE, "lost update", v); });
+    CHECK(tt-&gt;get(k).title == "renamed");
+
+    std::unique_ptr&lt;TaskTracker&gt; sp(fresh(Workflow::scrum()));
+    string a1 = sp-&gt;createIssue("T", "a", IssueType::STORY, "s", Priority::HIGH);
+    string a2 = sp-&gt;addSubtask(a1, "a", "sub");
+    string a3 = sp-&gt;createIssue("T", "a", IssueType::TASK, "quick", Priority::LOW);
+    string s1 = sp-&gt;createSprint("T", "a", "S1"), s2 = sp-&gt;createSprint("T", "a", "S2");
+    sp-&gt;addToSprint(s1, "a", a1);
+    sp-&gt;addToSprint(s1, "a", a3);
+    CHECK(sp-&gt;get(a2).sprint == s1);
+    sp-&gt;startSprint(s1, "a");
+    expectFail&lt;TrackerError&gt;([&amp;] { sp-&gt;startSprint(s2, "a"); });
+    for (const char* st : {"IN_PROGRESS", "IN_REVIEW", "DONE"}) sp-&gt;move(a3, "a", st);
+    CHECK(sp-&gt;completeSprint(s1, "a") == vector&lt;string&gt;{a1});
+    CHECK(sp-&gt;get(a1).sprint.empty() &amp;&amp; sp-&gt;get(a2).sprint.empty() &amp;&amp; sp-&gt;get(a3).sprint == s1);
+    CHECK(sp-&gt;sprintState(s1) == SprintState::CLOSED);
+    expectFail&lt;TrackerError&gt;([&amp;] { sp-&gt;addToSprint(s1, "a", a1); });
+
+    std::unique_ptr&lt;TaskTracker&gt; rm(fresh(Workflow::scrum()));
+    string r1 = rm-&gt;createIssue("T", "a", IssueType::STORY, "r", Priority::LOW);
+    string r2 = rm-&gt;addSubtask(r1, "a", "r-sub");
+    string r3 = rm-&gt;addSubtask(r1, "a", "r-sub2");
+    rm-&gt;remove(r3, "a");
+    CHECK(rm-&gt;get(r1).subtasks == vector&lt;string&gt;{r2});
+    CHECK((rm-&gt;remove(r1, "b") == vector&lt;string&gt;{r2, r1}));
+    expectFail&lt;TrackerError&gt;([&amp;] { rm-&gt;get(r1); });
+    vector&lt;Event&gt; h = rm-&gt;history(r1);
+    CHECK(h.front().action == "CREATED" &amp;&amp; h.back().action == "REMOVED");
+
+    std::unique_ptr&lt;TaskTracker&gt; f(fresh(Workflow::todo()));
+    string f1 = f-&gt;createIssue("T", "a", IssueType::TASK, "Buy milk", Priority::LOW);
+    string f2 = f-&gt;createIssue("T", "a", IssueType::TASK, "Pay rent", Priority::CRITICAL);
+    string f3 = f-&gt;createIssue("T", "a", IssueType::TASK, "Pay electricity", Priority::CRITICAL);
+    f-&gt;addLabel(f1, "a", "home");
+    f-&gt;move(f2, "a", "DONE");
+    vector&lt;IssueView&gt; r = f-&gt;search("T", text("pay") &amp; open());
+    CHECK(r.size() == 1 &amp;&amp; r[0].key == f3);
+    r = f-&gt;search("T", label("home") | priorityAtLeast(Priority::HIGH));
+    CHECK(r.size() == 3 &amp;&amp; r[0].key == f2 &amp;&amp; r[1].key == f3 &amp;&amp; r[2].key == f1);
+    CHECK(f-&gt;search("T", !open()).size() == 1);
+    f-&gt;move(f2, "a", "TODO");
+    CHECK(!f-&gt;get(f2).done);
+    vector&lt;Event&gt; hist = f-&gt;history(f2);
+    CHECK(hist.size() == 3 &amp;&amp; hist[1].to == "DONE" &amp;&amp; hist[2].from == "DONE");
+
+    std::unique_ptr&lt;TaskTracker&gt; ls(fresh(Workflow::scrum()));
+    vector&lt;string&gt; seen;
+    ls-&gt;addListener([&amp;seen](const Event&amp; e) { seen.push_back(e.action); });
+    string l1 = ls-&gt;createIssue("T", "a", IssueType::TASK, "l", Priority::LOW);
+    expectFail&lt;TransitionDenied&gt;([&amp;] { ls-&gt;move(l1, "a", "DONE"); });
+    CHECK(seen == vector&lt;string&gt;{"CREATED"});
+}
+
+int main() {
+    demo();
+    runTests();
+    std::cout &lt;&lt; "\nAll " &lt;&lt; checks &lt;&lt; " checks passed.\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>All 30 checks passed.</code>.</p>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> nothing in the demo: it prints exactly the Java demo and then "All 30 checks passed." against Java's 38 (8 of the Java unit tests in <code>runTests</code> are not ported). On MinGW the board lock is a no-op; the Linux <code>-DHAVE_STD_MUTEX</code> build uses a real <code>std::mutex</code> per board (compiled and run, same output).</p></div>
+  <p><code>g++ -std=c++14 -Wall -Wextra main.cpp -o tracker &amp;&amp; ./tracker</code> prints the same demo, then <code>All 30 checks passed.</code></p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The C++ version guards each board with a <code>BoardMutex</code>. With a normal toolchain that is <code>std::mutex</code>; the MinGW g++ 6.3 used to test this page has the "win32" thread model, which ships no <code>std::mutex</code>, so the file falls back to a no-op lock and the 8-thread test lives in the Java and Python versions. It is the same trick as a kernel <code>spinlock_t</code> that compiles to nothing on a uniprocessor build: the call sites stay, the implementation is chosen by configuration.</p>
+  </div>

@@ -1,0 +1,44 @@
+
+  <h2>The senior answer: immutable snapshots (RCU in Java)</h2>
+  <p>The fastest read lock is no lock. Keep the data in an <b>immutable</b> object. Readers grab the current reference with one volatile read and use it as long as they like. A writer copies the object, changes the copy, and <b>publishes</b> it with a single atomic reference swap. Old readers keep their old, still-valid version; new readers see the new one.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 820 300" role="img" aria-label="Copy-on-write snapshot: readers follow an AtomicReference to config v1; writer builds v2 off to the side and swaps the reference; old readers finish on v1, which is reclaimed after they are done">
+      <rect class="box queue" x="320" y="20" width="180" height="50"/><text class="label mono" x="410" y="45">AtomicReference</text>
+      <rect class="box client" x="20" y="20" width="110" height="40"/><text class="label" x="75" y="40">reader 1</text>
+      <rect class="box client" x="20" y="80" width="110" height="40"/><text class="label" x="75" y="100">reader 2</text>
+      <path class="arrow" d="M130 40 L318 45"/>
+      <path class="arrow" d="M130 100 C 230 100, 260 160, 318 170"/>
+      <rect class="box db" x="320" y="140" width="180" height="70"/><text class="label" x="410" y="165">Config v1</text><text class="label small" x="410" y="188">dark-mode = off</text>
+      <g data-step="0">
+        <path class="arrow dashed" d="M410 70 L410 138"/>
+      </g>
+      <rect class="box ok" x="600" y="140" width="200" height="70"/><text class="label" x="700" y="165">Config v2 (copy)</text><text class="label small" x="700" y="188">dark-mode = on</text>
+      <rect class="box svc" x="620" y="20" width="160" height="50"/><text class="label" x="700" y="45">writer</text>
+      <path class="arrow dashed" d="M700 70 L700 138"/><text class="label small left" x="708" y="104">1. copy + change</text>
+      <path class="arrow ok thick" d="M500 45 C 560 45, 600 100, 640 138"/><text class="label small" x="560" y="84">2. CAS: ref → v2</text>
+      <text class="label small" x="410" y="236">3. reader 2 still holds v1 and finishes safely; v1 is freed once nobody holds it</text>
+      <text class="label small" x="410" y="258">(Java: the garbage collector; kernel: after an RCU grace period)</text>
+      <text class="label small" x="410" y="284">readers: one volatile read, no lock, no retry, never blocked by the writer</text>
+    </svg>
+    <figcaption>Readers are wait-free. Writers pay for a copy and must not lose each other's changes, which is why the swap is a CAS.</figcaption>
+  </figure>
+<pre><code class="language-java">record Config(Map&lt;String, String&gt; flags, long version) {
+    Config with(String k, String v) {
+        Map&lt;String, String&gt; copy = new HashMap&lt;&gt;(flags);
+        copy.put(k, v);
+        return new Config(Map.copyOf(copy), version + 1);     // deeply immutable
+    }
+}
+private final AtomicReference&lt;Config&gt; current = new AtomicReference&lt;&gt;(initial);
+
+String flag(String k)          { return current.get().flags().get(k); }        // no lock
+void   setFlag(String k, String v) { current.updateAndGet(c -&gt; c.with(k, v)); } // CAS loop</code></pre>
+  <ul>
+    <li><b>Consistency for free.</b> A reader that does <code>Config c = current.get()</code> once sees one coherent version for its whole request, which an RW-locked map cannot promise across several <code>get</code> calls.</li>
+    <li><b>Writers.</b> <code>updateAndGet</code> retries if two writers race. With a single writer (a config poller), a plain <code>volatile</code> field is enough. With expensive copies and frequent writes, serialise writers with a lock and keep reads lock-free.</li>
+    <li><b>Cost.</b> Each write copies the object. Fine for config, routes and catalogues updated seconds or minutes apart. Wrong for data that changes thousands of times a second.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is RCU with the garbage collector as the grace-period detector. In the kernel, <code>rcu_read_lock()</code> marks a read-side section (nearly free; it may just disable preemption), <code>rcu_dereference(p)</code> is <code>current.get()</code>, and <code>rcu_assign_pointer(p, new)</code> is the publish. The writer must then wait in <code>synchronize_rcu()</code>, or queue <code>call_rcu()</code> / <code>kfree_rcu()</code>, until every CPU has passed a quiescent state before it frees the old version. Java skips that step because the GC frees v1 only when no reader can reach it. <code>CopyOnWriteArrayList</code> is this pattern packaged for lists.</p>
+  </div>

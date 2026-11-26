@@ -1,0 +1,226 @@
+
+        <h2>Deep dives: the hard parts</h2>
+
+        <h3>7.1 Live price fan-out: 1M ticks/s to 5M users in under 500 ms</h3>
+        <p>This was the Paytm SSE prompt, nearly word for word. The candidate there used Redis pub/sub and SSE but was unsure how to ingest the exchange feed. Here is a complete answer, in layers.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Conflation: many ticks per instrument collapse into one latest value every 500 ms, then gateways filter per user">
+            <text class="label small" x="110" y="28">200 ticks/s per instrument</text>
+            <rect class="box kafka" x="20" y="40" width="180" height="40"/><text class="label small" x="110" y="65">INFY 1519.9, 1520.0, 1520.1 ...</text>
+            <rect class="box kafka" x="20" y="90" width="180" height="40"/><text class="label small" x="110" y="115">TCS 3410, 3409.5, 3410.5 ...</text>
+            <rect class="box kafka" x="20" y="140" width="180" height="40"/><text class="label small" x="110" y="165">NIFTY FUT ... x5,000 instr</text>
+            <rect class="box cache" x="270" y="60" width="170" height="100"/>
+            <text class="label" x="355" y="92">Conflator</text>
+            <text class="label small" x="355" y="114">map: instr -&gt; latest</text>
+            <text class="label small" x="355" y="134">flush every 500 ms</text>
+            <path class="arrow" d="M200 60 L262 90"/>
+            <path class="arrow" d="M200 110 L262 110"/>
+            <path class="arrow" d="M200 160 L262 130"/>
+            <text class="label small" x="355" y="190">10,000 updates/s total</text>
+            <rect class="box k8s" x="510" y="40" width="120" height="50"/><text class="label small" x="570" y="70">Gateway 1</text>
+            <rect class="box k8s" x="510" y="110" width="120" height="50"/><text class="label small" x="570" y="140">Gateway 2</text>
+            <rect class="box k8s" x="510" y="180" width="120" height="50"/><text class="label small" x="570" y="210">Gateway 150</text>
+            <path class="arrow" d="M440 100 L502 65"/>
+            <path class="arrow" d="M440 110 L502 135"/>
+            <path class="arrow" d="M440 120 L502 205"/>
+            <rect class="box client" x="680" y="40" width="100" height="40"/><text class="label small" x="730" y="65">user: 20 instr</text>
+            <rect class="box client" x="680" y="100" width="100" height="40"/><text class="label small" x="730" y="125">user: 20 instr</text>
+            <rect class="box client" x="680" y="190" width="100" height="40"/><text class="label small" x="730" y="215">33k users each</text>
+            <path class="arrow" d="M630 65 L672 60"/>
+            <path class="arrow" d="M630 135 L672 120"/>
+            <path class="arrow" d="M630 205 L672 210"/>
+            <text class="label small" x="570" y="270">1 frame per user per 500 ms</text>
+            <circle class="packet" r="5"><animateMotion dur="1.2s" repeatCount="indefinite" path="M200 60 L270 90"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="0.9s" repeatCount="indefinite" path="M200 110 L270 110"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M440 110 L510 135 L630 135 L680 120"/></circle>
+          </svg>
+          <figcaption>Conflation shrinks the stream before fan-out; filtering happens at the gateway, close to the user.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>Ingest (the part people skip).</strong> Exchanges publish market data over UDP multicast from their colocation or via leased lines, with sequence numbers. Run feed handlers on dedicated hosts (not autoscaled pods) with both the A and B feeds; take whichever packet arrives first, detect gaps by sequence number, and recover from the exchange's retransmit or snapshot channel. Normalise into one internal format: <code>{instr_id, exch_seq, exch_ts, ltp_paise, vol, oi, bid1, ask1}</code>.</li>
+          <li><strong>Distribution.</strong> Publish to a bus keyed by instrument. Kafka works (ordered per partition, replayable) and adds a few milliseconds; for the price path many brokers use an in-memory pub/sub (NATS, Redis pub/sub, or their own TCP fan-out) because losing a tick is acceptable here. Say this trade-off out loud.</li>
+          <li><strong>Conflation.</strong> A conflator holds <code>latest[instr]</code> and a dirty bit. Every 250-500 ms it publishes only dirty instruments. Freshness is then at most one interval plus network time.</li>
+          <li><strong>Gateways.</strong> WebSocket servers written in an event-loop style (Go, Netty, Node) hold 50k+ connections each. Zerodha's engineering blog describes its Go ticker serving hundreds of thousands of concurrent WebSocket connections and millions of quotes per second from a single binary. Each gateway gets the full conflated feed and filters per connection.</li>
+          <li><strong>Slow clients.</strong> A phone on a bad network cannot read fast enough. Never queue for it: keep one "pending frame" per connection and overwrite it. If the socket buffer stays full for seconds, drop the connection and let the app reconnect and resnapshot.</li>
+          <li><strong>Reconnect storms.</strong> At 09:14 millions of apps open. Add jitter to client reconnects, put connection limits per gateway, and use the snapshot-then-stream pattern so a reconnect costs one Redis read per instrument (served from the gateway's own copy, really).</li>
+        </ol>
+        <div class="proscons">
+          <div class="pros"><h5>WebSocket</h5><ul><li>Two-way: subscribe and unsubscribe on the same socket.</li><li>Binary frames: 5-10x smaller than JSON.</li><li>What Kite, Groww and most brokers use.</li></ul></div>
+          <div class="cons"><h5>SSE</h5><ul><li>One-way and text only (binary must be base64).</li><li>Changing the watchlist needs a separate HTTP call.</li><li>Fine for a simple "price card" web widget; weaker for a trading app.</li></ul></div>
+        </div>
+
+        <h3>7.2 Order placement within 10 ms</h3>
+        <p>The Groww SDE-II prompt (April 2025): order events arrive on a queue and each must be placed within 10 ms. The candidate discussed sharding, indexing, caching and retries; the feedback was "too basic" and it "should have extended to multiple exchanges and segments". The 10 ms budget forces a specific design.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Step</th><th>Budget</th><th>How</th></tr></thead>
+            <tbody>
+              <tr><td>Auth, validation, dedup</td><td>~1 ms</td><td>Stateless pods; token verified locally (JWT); dedup check on a local + Redis set of recent <code>client_order_id</code>s.</td></tr>
+              <tr><td>Risk check and margin hold</td><td>~1 ms</td><td>In-memory RMS partitioned by user_id; no DB read on the hot path.</td></tr>
+              <tr><td>Durable record</td><td>2-4 ms</td><td>Append the order to a replicated log (Kafka <code>acks=all</code> inside one region, or a Postgres insert on a fast disk). Without this, a crash loses an order the user saw as placed.</td></tr>
+              <tr><td>Send to exchange</td><td>1-3 ms</td><td>Long-lived exchange session in the adapter, leased line, no connection setup.</td></tr>
+              <tr><td>Slack</td><td>~2 ms</td><td>GC pauses, queueing at peak.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The order state machine (every transition is an event in <code>order-events</code>):</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Order state machine from PENDING to OPEN, PARTIAL, FILLED, with REJECTED, CANCELLED and UNKNOWN branches">
+            <rect class="box plain" x="10" y="90" width="110" height="46"/><text class="label" x="65" y="118">PENDING</text>
+            <rect class="box svc" x="170" y="90" width="120" height="46"/><text class="label" x="230" y="118">SENT</text>
+            <rect class="box svc" x="340" y="90" width="100" height="46"/><text class="label" x="390" y="118">OPEN</text>
+            <rect class="box warn" x="490" y="90" width="120" height="46"/><text class="label" x="550" y="118">PARTIAL</text>
+            <rect class="box ok" x="660" y="90" width="120" height="46"/><text class="label" x="720" y="118">FILLED</text>
+            <rect class="box fail" x="170" y="10" width="120" height="44"/><text class="label" x="230" y="37">REJECTED</text>
+            <rect class="box ghost" x="170" y="170" width="120" height="46"/><text class="label" x="230" y="198">UNKNOWN</text>
+            <rect class="box plain" x="490" y="170" width="120" height="46"/><text class="label" x="550" y="198">CANCELLED</text>
+            <path class="arrow" d="M120 113 L162 113"/>
+            <path class="arrow" d="M290 113 L332 113"/>
+            <path class="arrow" d="M440 113 L482 113"/>
+            <path class="arrow" d="M610 113 L652 113"/>
+            <path class="arrow" d="M65 90 L165 40"/>
+            <path class="arrow" d="M290 100 L292 52"/>
+            <path class="arrow dashed" d="M230 136 L230 164"/>
+            <path class="arrow dashed" d="M290 190 L340 130"/>
+            <path class="arrow" d="M420 136 L490 185"/>
+            <path class="arrow" d="M550 136 L550 164"/>
+            <text class="label small" x="110" y="58">RMS fail</text>
+            <text class="label small" x="350" y="170">reconcile</text>
+            <text class="label small" x="140" y="160">timeout</text>
+          </svg>
+          <figcaption>UNKNOWN is the state most candidates forget: the exchange did not answer, so we do not know whether the order exists. Never resend blindly; query the exchange first.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Timeouts:</b> if the exchange does not ack within, say, 500 ms, mark UNKNOWN and query the exchange's order status by our id. Only if the exchange confirms it does not have the order may we resend. Resending blindly can double-buy.</li>
+          <li><b>Stop-loss:</b> exchanges support SL orders natively (a trigger price plus a limit price), so the broker sends them to the exchange and the exchange watches the trigger. The broker only holds triggers that the exchange will not keep, which is exactly GTT.</li>
+          <li><b>Positions and holdings:</b> positions are a fold over today's fills; holdings come from the depository and are updated at end of day (T+1 settlement) with today's delivery buys shown on top. Serve both from Redis, rebuilt from the database.</li>
+        </ul>
+
+        <h3>7.3 GTT orders: consistency and failure states (the Groww 2026 question)</h3>
+        <p>This is the question that sank a candidate: they proposed "keep GTTs in Redis and re-place them with an end-of-day cron", and the interviewer kept asking "what if it fails <em>here</em>?" about every arrow. The fix is a <b>durable per-GTT state machine</b> with conditional updates, not a batch job.</p>
+        <div class="callout note"><p><b>Same core as <a href="{{BASE}}hld/d63">Stock Price Alerts (d63)</a>:</b> rules indexed by trigger price per symbol in two sorted books, so each tick touches only the rules it crosses. That page explains the evaluator in depth; this section adds what changes when the action is a real order instead of a notification.</p></div>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 320" role="img" aria-label="GTT life cycle: create with outbox, load into trigger engine, conditional update to TRIGGERING, place order with idempotency key, mark TRIGGERED, sweeper fixes stuck rows">
+            <rect class="box client" x="10" y="20" width="110" height="50"/><text class="label" x="65" y="50">User</text>
+            <g data-step="1">
+              <path class="arrow" d="M120 45 L172 45"/>
+              <rect class="box db" x="180" y="15" width="200" height="66"/>
+              <text class="label" x="280" y="40">Postgres: gtt ACTIVE</text>
+              <text class="label small" x="280" y="62">+ outbox row, 1 txn</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M380 48 L432 48"/>
+              <rect class="box kafka" x="440" y="15" width="130" height="66"/>
+              <text class="label" x="505" y="42">gtt-changes</text>
+              <text class="label small" x="505" y="62">key = instrument</text>
+              <path class="arrow" d="M570 48 L622 48"/>
+              <rect class="box warn" x="630" y="15" width="160" height="66"/>
+              <text class="label" x="710" y="42">Trigger engine</text>
+              <text class="label small" x="710" y="62">sorted per instr</text>
+            </g>
+            <g data-step="3">
+              <rect class="box kafka" x="630" y="120" width="160" height="50"/>
+              <text class="label small" x="710" y="150">tick: INFY 1399.95</text>
+              <path class="arrow" d="M710 120 L710 88"/>
+              <path class="arrow" d="M630 60 L388 140"/>
+              <rect class="box db" x="180" y="120" width="200" height="66"/>
+              <text class="label small" x="280" y="145">UPDATE ... SET TRIGGERING</text>
+              <text class="label small" x="280" y="167">WHERE status='ACTIVE'</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M280 186 L280 218"/>
+              <rect class="box svc" x="180" y="225" width="200" height="66"/>
+              <text class="label" x="280" y="250">Order service</text>
+              <text class="label small" x="280" y="272">key = gtt_id:version</text>
+              <path class="arrow" d="M380 258 L432 258"/>
+              <rect class="box db" x="440" y="225" width="130" height="66"/>
+              <text class="label" x="505" y="262">Exchange</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow ok" d="M180 258 L120 200"/>
+              <rect class="box ok" x="10" y="140" width="110" height="56"/>
+              <text class="label small" x="65" y="165">TRIGGERED</text>
+              <text class="label small" x="65" y="183">order_id saved</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box fail" x="600" y="225" width="190" height="66"/>
+              <text class="label" x="695" y="250">Sweeper (every 30 s)</text>
+              <text class="label small" x="695" y="272">TRIGGERING &gt; 30 s old?</text>
+              <path class="arrow dashed" d="M600 258 L388 258"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Create.</b> In one database transaction, insert the GTT (status ACTIVE) and an outbox row. The user gets 201 only after commit. The database is the source of truth, not Redis.</li>
+            <li><b>Load.</b> A relay (or Debezium CDC) publishes the outbox row to <code>gtt-changes</code>, keyed by instrument. Trigger-engine shards own a range of instruments; each holds two sorted structures per instrument: "fire when price &le; x" and "fire when price &ge; x". On restart, a shard rebuilds from <code>SELECT ... WHERE status='ACTIVE' AND instrument_id IN (my range)</code>, then resumes the topic.</li>
+            <li><b>Detect and claim.</b> A tick crosses 1,400. The engine pops matching triggers and claims each with a conditional update: <code>UPDATE gtt SET status='TRIGGERING', version=version+1 WHERE gtt_id=? AND status='ACTIVE' AND version=?</code>. If 0 rows change, someone else (another replica, a user cancel) won: do nothing. This is the guard against double firing.</li>
+            <li><b>Place.</b> Call the order service with idempotency key <code>gtt_id:version</code>. If the engine retries after a timeout, the order service returns the same order instead of placing a second one.</li>
+            <li><b>Finish.</b> Store <code>placed_order_id</code> and set TRIGGERED (or FAILED with the reason, for example "rejected: circuit limit" or "insufficient margin"). Notify the user. Kite's GTT API shows the same idea: a triggered GTT records the result of the order it placed, and a triggered GTT does not guarantee a fill.</li>
+            <li><b>Crash in the middle.</b> If the engine dies after the claim but before the order call (or before saving the result), the row sits in TRIGGERING. A sweeper finds rows in TRIGGERING for more than 30 s, asks the order service "do you have an order with key gtt_id:version?", and completes the row either way. Every intermediate state has an owner and a way forward.</li>
+          </ol>
+        </div>
+        <h4>Why "Redis + end-of-day cron" was rejected</h4>
+        <ul>
+          <li><b>Redis is not a source of truth for money.</b> Brokers often run Redis with persistence off (Zerodha's blog says its caches do), and async replication can lose recent writes on failover. A GTT that silently vanishes is a lost customer order.</li>
+          <li><b>A cron is all-or-nothing with no memory.</b> If it dies after placing 400,000 of 1M orders, which ones were placed? Without a per-item state and an idempotency key, rerunning it duplicates orders and skipping it loses them.</li>
+          <li><b>It does the wrong thing.</b> Re-placing GTTs as day orders every morning puts real orders on the exchange that block margin all day and fill at a price the user did not trigger. GTT means "do nothing until the price is hit".</li>
+          <li><b>Thundering herd.</b> One million orders at 09:15 hit exchange rate limits exactly when markets are busiest.</li>
+        </ul>
+        <h4>Kafka to order DB to order history: no dual writes</h4>
+        <p>The interviewer drilled the hop where an event in Kafka becomes a row in the order DB and then a row in history. Rules that answer every "what if it fails here?":</p>
+        <ol class="steps">
+          <li><strong>One writer per fact.</strong> The order service owns the order row. History is derived from <code>order-events</code>, never written separately by the API (a <a href="{{BASE}}interview/glossary#dual-write">dual write</a> loses one side on a crash).</li>
+          <li><strong>Outbox.</strong> State change and event go into the same DB transaction; a relay publishes. See <a href="{{BASE}}interview/glossary#outbox">outbox</a>.</li>
+          <li><strong>Idempotent consumers.</strong> Every event carries <code>(order_id, seq)</code>; consumers upsert and ignore a seq they have already applied. Kafka is <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a>, so duplicates are normal.</li>
+          <li><strong>Ordering.</strong> Key the topic by order_id so all events of one order are in one partition, in order. A fill is never processed before the ack.</li>
+          <li><strong>Reconciliation.</strong> At end of day, compare our trades with the exchange's trade file. Any difference opens an incident. This is the safety net for bugs no design can rule out.</li>
+        </ol>
+        <h4>Market open gap</h4>
+        <p>If INFY closes at 1,420 and opens at 1,380, every "buy at 1,400" trigger fires on the first tick. Expect a burst; push triggered orders through a queue per exchange that respects the exchange's order-rate limits, and process OCO legs so only one leg can win (claim both legs in one conditional update).</p>
+
+        <h3>7.4 Intraday auto square-off</h3>
+        <p>Groww SDE-2 (April 2026): live ticks for thousands of stocks at millions of updates/s; users or admins set rules as a percent move from the previous close (example from the post: previous close 100, upper circuit 120, exit at 118); evaluate in real time, send the Sell or Cover order at once, and notify.</p>
+        <ul>
+          <li><b>Precompute the exit price.</b> "Exit if price moves +18% from previous close" becomes "exit when LTP &ge; 118" at the start of the day. Now it is the same problem as GTT: per instrument, a sorted list of (exit_price, position_id). For loss-based rules (mark-to-market loss &gt; 80% of margin), recompute the exit price whenever the position changes.</li>
+          <li><b>Shard by instrument</b>, the same keying as the tick stream, so one shard sees all ticks of its instruments in order.</li>
+          <li><b>Idempotent exits.</b> Key = <code>(position_id, rule_id, trade_date)</code>. A replayed tick or a second replica cannot square off twice.</li>
+          <li><b>Priority.</b> Square-off orders jump the queue ahead of new user orders for that user, and new MIS orders that would increase exposure are blocked while a square-off is in flight.</li>
+          <li><b>Time-based square-off.</b> Brokers also close all open intraday positions at a fixed time before the close. Zerodha's published equity cut-off moved from 15:20 to 15:25 in a December 2025 update. A scheduler fans this out in batches across shards, but each position is still closed by an idempotent per-position job, not one giant loop.</li>
+          <li><b>Do not use conflated 500 ms prices for risk</b> if you can avoid it: consume the full stream or a 50-100 ms conflation. Display can be lazy; risk should not be.</li>
+        </ul>
+
+        <h3>7.5 OHLC candles: from cache to SQL</h3>
+        <p>Groww SDE-II (August 2025, selected) was asked to design the migration and aggregation of candle data from the cache to SQL; it was planned for one hour and ran two.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Ticks build the current one-minute candle in Redis; closed candles are flushed to SQL and rolled up to larger timeframes">
+            <rect class="box kafka" x="10" y="80" width="120" height="56"/><text class="label" x="70" y="105">ticks</text><text class="label small" x="70" y="124">exch_ts</text>
+            <rect class="box svc" x="180" y="80" width="140" height="56"/><text class="label" x="250" y="105">Aggregator</text><text class="label small" x="250" y="124">1-min windows</text>
+            <rect class="box cache" x="370" y="20" width="160" height="56"/><text class="label" x="450" y="45">Redis</text><text class="label small" x="450" y="64">forming candle</text>
+            <rect class="box db" x="370" y="140" width="160" height="56"/><text class="label" x="450" y="165">SQL candles_1m</text><text class="label small" x="450" y="184">batch upsert</text>
+            <rect class="box db" x="590" y="140" width="190" height="56"/><text class="label" x="685" y="165">5m, 1h, 1D</text><text class="label small" x="685" y="184">rollups</text>
+            <rect class="box client" x="590" y="20" width="190" height="56"/><text class="label" x="685" y="45">Chart API</text><text class="label small" x="685" y="64">history + live bar</text>
+            <path class="arrow" d="M130 108 L172 108"/>
+            <path class="arrow" d="M320 95 L362 55"/>
+            <path class="arrow" d="M320 120 L362 165"/>
+            <path class="arrow" d="M530 168 L582 168"/>
+            <path class="arrow" d="M530 48 L582 48"/>
+            <path class="arrow" d="M685 140 L685 84"/>
+            <circle class="packet" r="5"><animateMotion dur="2.8s" repeatCount="indefinite" path="M130 108 L180 108 L320 120 L370 165 L530 168 L590 168"/></circle>
+          </svg>
+          <figcaption>Hot data in the cache, history in SQL, and the chart API stitches them together.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Windows by exchange time</b>, not by arrival time, so a late packet goes into the right minute. Allow a short grace period (watermark) before closing a minute; a later correction is an upsert of the same key.</li>
+          <li><b>Idempotent writes:</b> primary key <code>(instrument_id, tf, start_ts)</code> and <code>INSERT ... ON CONFLICT DO UPDATE</code>. Replaying a day rebuilds the same candles.</li>
+          <li><b>Batching:</b> 5,000 instruments close a minute together, so write 5,000 rows in one multi-row insert per minute rather than 5,000 round trips.</li>
+          <li><b>Rollups:</b> 5m = aggregate of five 1m rows (open of the first, close of the last, max high, min low, sum volume). TimescaleDB continuous aggregates or a scheduled job do this.</li>
+          <li><b>Migration of existing cache data:</b> copy day by day per instrument with upserts, verify row counts and checksums per (instrument, day), dual-read (SQL first, cache as fallback) for a while, then switch reads and set TTLs on the cache keys. Never delete the source before verification.</li>
+        </ul>
+
+        <h3>7.6 Many exchanges and segments</h3>
+        <ul>
+          <li><b>Instrument master:</b> every tradable thing is <code>(exchange, segment, token)</code> with lot size, tick size, price band and expiry. Download the exchange files every morning before 09:00.</li>
+          <li><b>Adapter per exchange+segment</b> behind one internal interface (<code>place</code>, <code>modify</code>, <code>cancel</code>, event stream). Each has its own session, rate limits and bulkhead (separate thread pools and pods), so an MCX outage does not block NSE orders.</li>
+          <li><b>Risk per segment:</b> cash equity needs full price or intraday margin; F&amp;O uses exchange-published margin files (SPAN plus exposure). The RMS loads segment-specific rules.</li>
+          <li><b>Partition order flow by (exchange, segment)</b> for Kafka topics and engine shards. Market hours differ (commodity trades into the night), so square-off and GTT expiry schedules are per segment.</li>
+        </ul>
+      

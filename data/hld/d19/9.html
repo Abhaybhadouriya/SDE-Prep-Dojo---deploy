@@ -1,0 +1,137 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Minute</th><th>What you do</th><th>What you say</th></tr></thead>
+            <tbody>
+              <tr><td>0-5</td><td>Requirements</td><td>"Who writes, who reads, freshness, retention, can we lose any logs, multi-tenant?"</td></tr>
+              <tr><td>5-10</td><td>Estimation</td><td>"~1M lines/s, ~500 MB/s, ~43 TB/day raw. Write-heavy, rare heavy reads."</td></tr>
+              <tr><td>10-15</td><td>API + data model</td><td>"Apps print to stdout. Labels vs content. Partition by time."</td></tr>
+              <tr><td>15-25</td><td>High-level diagram</td><td>Agent → Kafka → processors → store → object storage; query layer.</td></tr>
+              <tr><td>25-38</td><td>Deep dives (let them pick)</td><td>Backpressure, store choice, cardinality, PII, multi-tenancy.</td></tr>
+              <tr><td>38-45</td><td>Failures + wrap-up</td><td>Walk the failure table; say what you would monitor (agent lag, Kafka lag, ingest rejects, query p99).</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout interview"><p><b>Turn your background into an answer.</b> Logging is your world, so say so (full script on the <a href="{{BASE}}hld/hld-03">interview framework</a> page): "I ran syslog relays for a fleet of routers: this is the same pipeline with a durable buffer instead of UDP." "I tuned interrupt coalescing on a NIC driver: batching in the agent and <code>linger.ms</code> in Kafka is the same latency-for-throughput trade." "Our line cards punted unparseable packets to the CPU: the DLQ is that punt path." One sentence each, then back to the design.</p></div>
+        <div class="callout interview"><p><b>60-second answer:</b> "Apps just log to stdout. A Fluent Bit DaemonSet on every node tails the container log files, adds Kubernetes labels, batches and sends to Kafka with acks=all. Kafka is our durable shock absorber: 3 days, RF 3, so a slow or broken store never loses data or slows the apps. A processor group parses, redacts PII, drops noise and writes big batches to the store, committing offsets only after the write - at-least-once. For a cost-focused design I index only a few low-cardinality labels and keep compressed chunks in S3, like Loki; if we need rich text search I use Elasticsearch with time-based indexes and 10-50 GB shards. Data tiers from hot to warm to cold by age. Queries always carry a time range and labels so we only open the right chunks. I monitor agent lag, consumer lag, ingest rejects and query latency."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld,logging" data-company="Amazon,Microsoft">
+          <summary>Why not have every service send logs directly to Elasticsearch over HTTP?</summary>
+          <div class="answer">
+            <p>Because the store becomes part of every request's critical path and failure domain. When Elasticsearch slows down, thousands of clients retry at once, their memory buffers fill, they drop logs or block app threads, and the retry storm makes the cluster slower still. A node agent plus Kafka decouples the two: apps write to a local file (never blocks), the agent ships asynchronously, Kafka absorbs bursts for days, and processors pull at the rate the store can take.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure mode (retry storm, coupling), then the fix (async local write + durable buffer + pull), then the cost (one more system to run, seconds of latency).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>When is direct shipping fine? (small scale, one consumer)</li><li>What if Kafka itself is down? (agent filesystem buffer)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,logging,kafka" data-company="Uber,Flipkart">
+          <summary>What key would you use when producing logs to Kafka, and why?</summary>
+          <div class="answer">
+            <p>Something like <code>tenant + app + hash(pod) mod N</code>. Logs from one pod stay in one partition, so they stay in order. One very noisy app spreads across N partitions instead of overloading a single one. Using only <code>app</code> risks a hot partition; using a random key loses per-pod ordering (which matters less for logs than for payments, so random is acceptable if ordering is solved by timestamps at query time).</p>
+            <div class="approach"><h5>How to answer</h5><p>State the two forces - ordering and balance - and show a key that satisfies both. Connect it to ECMP flow hashing: keep a flow on one path, spread flows across paths.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to ordering if you add partitions later?</li><li>How do you detect a hot partition? (per-partition lag and bytes-in)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,logging" data-company="Google,Amazon">
+          <summary>Elasticsearch vs Loki vs ClickHouse for 40 TB/day of logs - which and why?</summary>
+          <div class="answer">
+            <p>At that volume cost dominates. I would default to a labels-only design (Loki) with compressed chunks in object storage, because most queries are "this service, this window, contains X". For structured access logs where people ask counting questions, ClickHouse is excellent - Cloudflare reported around 600 bytes per document in Elasticsearch vs about 60 bytes per row in ClickHouse. I would keep Elasticsearch/OpenSearch for a smaller, high-value slice (security/audit) that needs fast arbitrary-field search.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not crown one winner. Map each store to a query shape and a cost profile, pick one default, and say when you would add the others.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does Loki answer a search for a trace ID without indexing it? (filter by labels + time, then parallel scan of chunks)</li><li>How big should an Elasticsearch shard be? (10-50 GB per Elastic's guide)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,logging,cardinality" data-company="Uber,Microsoft">
+          <summary>A team added <code>request_id</code> as a Loki label and ingestion slowed down. Explain and fix.</summary>
+          <div class="answer">
+            <p>Each unique label combination is a separate stream. <code>request_id</code> is unique per request, so every request created a new stream with a tiny chunk: millions of streams, a huge index, high memory on the ingesters, and poor compression. Fix: remove it from labels (keep it in the log line), enforce a label allow-list or a max-streams-per-tenant limit at the distributor, and teach teams to query it with <code>|= "req-123"</code> or <code>| json | request_id="req-123"</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define cardinality in one line, show the multiplication, then give a technical fix and a governance fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the Elasticsearch version of this problem? (mapping explosion)</li><li>How would you find the offending labels? (per-tenant stream counts)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,logging" data-company="Amazon,Walmart">
+          <summary>How do you guarantee audit logs are never lost?</summary>
+          <div class="answer">
+            <p>Audit logs get a stricter path: the agent uses a filesystem buffer, produces with <code>acks=all</code> and idempotence to a dedicated topic with RF 3 and <code>min.insync.replicas=2</code>, the processor commits offsets only after the store confirms, and the audit store keeps replicas plus write-once object storage for long retention. Then I add a <b>reconciliation check</b>: count events per source per hour at the agent and at the store and alert on a gap. Debug logs can be sampled; audit logs are never sampled.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk hop by hop and say how each hop is made durable. End with "and I verify it" - interviewers like a counting check.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the node disk dies before the agent ships? (that window is the remaining risk; keep it small with frequent flushes)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,logging" data-company="Google,Microsoft">
+          <summary>How does a query like "errors containing <code>timeout</code> for payments in the last hour" execute?</summary>
+          <div class="answer">
+            <p>The query frontend splits the hour into smaller time slices (say 5 minutes) and checks a results cache. For each slice, the label index finds the streams matching <code>{app="payments", level="error"}</code> and the chunk references in that time range. Recent data still in ingester memory is queried directly; older chunks are fetched from object storage. Many querier workers scan their chunks in parallel for "timeout", then the frontend merges results sorted by time and applies the limit. The time range and labels decide how much data is touched, which is why both are mandatory.</p>
+            <div class="approach"><h5>How to answer</h5><p>Describe it as prune (time, labels) then scan in parallel, then merge. Mention caching and limits.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you stop one user from running a 30-day full scan? (cost limits, concurrency caps)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,logging,privacy" data-company="Amazon,Microsoft">
+          <summary>Someone logged credit card numbers for a week. What do you do and how do you prevent it?</summary>
+          <div class="answer">
+            <p>Immediate: stop the source (hotfix the app), add a redaction rule in the first processor, then purge: delete or rewrite affected indexes/chunks for that week, including replicas, snapshots and the Kafka topic (lower retention temporarily or delete records). Record the incident for compliance. Prevention: redaction at the agent/processor for patterns like card numbers and tokens, structured logging libraries that mark sensitive fields, CI checks, and tests that scan sample logs.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contain, clean up everywhere the data was copied, then prevent. Mention that copies exist in more places than people think.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is deleting from Kafka hard? (immutable log; rely on retention or compaction with tombstones for keyed data)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,logging,kafka" data-company="Uber,Flipkart">
+          <summary>Consumer lag on <code>logs.raw</code> keeps growing. How do you debug it?</summary>
+          <div class="answer">
+            <p>First, is it all partitions or a few? All partitions: the drain is too slow overall - check the store (rejections, write latency), processor CPU, and whether we are at the max consumers (= partitions). A few partitions: a hot key or one stuck consumer - check bytes-in per partition and that consumer's logs/GC. Then: scale processors up to the partition count, increase batch sizes to the store, add partitions or fix the key, and drop/sample noisy sources. While fixing, retention is my deadline: lag must not reach 3 days.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split "everywhere" vs "some partitions" first. It is the same as asking "is the whole link congested or just one queue?"</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can't you just add 100 more consumers?</li><li>What metric would you alert on? (lag in time, not only in messages)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,logging" data-company="Google,Amazon">
+          <summary>How would you make this work across 5 regions?</summary>
+          <div class="answer">
+            <p>Keep logs in the region where they are produced: each region runs its own agents, Kafka, processors and store. Cross-region transfer is expensive and logs are mostly read locally during incidents. A global query layer fans out a query to the regional query services and merges results. Only small, important slices (audit, security) are replicated to a central store. If one region is down, its logs are unavailable for search but other regions are unaffected.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "data stays local, queries go global". Mention cost and blast radius.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Data residency laws? (another reason to keep logs local)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,logging,k8s" data-company="Microsoft,Walmart">
+          <summary>DaemonSet agent vs sidecar container - which and why?</summary>
+          <div class="answer">
+            <p>DaemonSet by default: one agent per node handles all pods, uses fewer resources, and apps need no change because they log to stdout. A sidecar (an extra container in the same pod) is useful when an app writes to log files inside its own filesystem, or when a tenant needs a special pipeline. The cost of sidecars is one extra container per pod - thousands of extra processes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Default, exception, cost. Link DaemonSet to "a process on every line card".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to logs when a pod is deleted? (agent must read the file before the kubelet cleans it up)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Atlassian,Razorpay,Amazon">
+          <summary>Kibana or Grafana for the log platform's UI? What does an on-call engineer actually use?</summary>
+          <div class="answer">
+            <p>Both, for different jobs. Kibana (or OpenSearch Dashboards on OpenSearch) sits on one search cluster and is best at exploring log text: an index pattern or data view such as <code>logs-*</code> with <code>@timestamp</code> as the time field, Discover for free-form search, saved searches, and dashboards of aggregations like error rate per service. Grafana is source-agnostic and best at time-series: metrics from Prometheus, logs from Loki, and alerting across both. A common flow is a Grafana alert, a dashboard to find when and where, then a link into Discover with the same service and time window to read the lines and pick up a trace ID.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the UI to the store you chose: Elasticsearch/OpenSearch means Kibana/OpenSearch Dashboards; Loki means Grafana. Then describe the alert-to-log drill-down. Mention the cost of heavy dashboards on the cluster.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can't you aggregate on a field marked "conflict"? (Different types across indices; fix with a fixed schema like ECS.)</li><li>How do you keep dashboards from overloading the cluster? (Shorter default ranges, fewer panels, rollup indices.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Starting with "I'll use ELK" without requirements or numbers.</li>
+          <li>Apps calling the log store synchronously.</li>
+          <li>No buffer, so a slow store means lost logs.</li>
+          <li>Indexing <code>user_id</code> / <code>trace_id</code> as labels.</li>
+          <li>Forgetting retention tiers and the cost of 1 year of data.</li>
+          <li>Forgetting PII redaction and per-tenant limits.</li>
+          <li>Claiming exactly-once for logs (unnecessary; say at-least-once and why it is fine).</li>
+        </ul>
+
+        <div class="scenario">
+          <h4>Scenario: Black Friday log storm</h4>
+          <div class="situation"><p>At 9 PM traffic triples, a dependency starts timing out, and every service logs a stack trace per request. Ingest goes from 1M to 8M lines/s. Search is now 10 minutes behind and on-call engineers are blind.</p></div>
+          <div class="bad"><p>Weak answer: "Add more Elasticsearch nodes."</p></div>
+          <div class="good"><p>Strong answer: "First, protect the store and the freshest errors: Kafka is absorbing the burst, so nothing is lost. I apply per-tenant limits and drop rules for DEBUG and duplicate stack traces (keep one per error signature per second), and give priority to the error stream so it is processed first - a separate topic for <code>level=error</code> helps here. I scale processors to the partition count. After the incident, I add stack-trace de-duplication at the agent, set default per-service volume budgets, and add an alert on ingest rate per tenant."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid losing the one important line among the 8M? (separate priority path for errors)</li></ul></div>
+        </div>
+      

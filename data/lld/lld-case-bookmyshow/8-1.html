@@ -1,0 +1,730 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+      <p><b>booking.py</b> - the model, both inventories (Python has no hardware CAS, so <code>_Cell.compare_and_set</code> emulates one with a tiny per-seat lock and a version number), strategies and the service.</p>
+<pre><code class="language-python">"""Movie ticket booking (BookMyShow) - machine-coding reference, Python 3.11. Same design as the Java version."""
+from __future__ import annotations
+
+import itertools
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+
+
+class SeatType(Enum):
+    REGULAR = "REGULAR"
+    PREMIUM = "PREMIUM"
+    RECLINER = "RECLINER"
+
+
+@dataclass(frozen=True)
+class Seat:
+    id: str
+    type: SeatType
+
+
+@dataclass(frozen=True)
+class Screen:
+    id: str
+    theatre: str
+    city: str
+    seats: tuple[Seat, ...]
+
+
+@dataclass(frozen=True)
+class Show:
+    id: str
+    title: str
+    screen: Screen
+    start: datetime
+
+
+# ---- seat state for one show: exactly one of these ----
+@dataclass(frozen=True)
+class Free:
+    pass
+
+
+@dataclass(frozen=True)
+class Held:
+    hold_id: str
+    user_id: str
+    expires_at: datetime
+
+
+@dataclass(frozen=True)
+class Booked:
+    booking_id: str
+
+
+@dataclass(frozen=True)
+class SeatHold:
+    id: str
+    show_id: str
+    user_id: str
+    seat_ids: tuple[str, ...]
+    expires_at: datetime
+
+
+class BookingStatus(Enum):
+    PENDING = "PENDING"
+    CONFIRMED = "CONFIRMED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
+
+
+ALLOWED = {
+    BookingStatus.PENDING: {BookingStatus.CONFIRMED, BookingStatus.EXPIRED, BookingStatus.FAILED},
+    BookingStatus.CONFIRMED: {BookingStatus.CANCELLED},
+}
+
+
+@dataclass
+class Booking:
+    id: str
+    user_id: str
+    show: Show
+    hold: SeatHold
+    amount: int
+    status: BookingStatus = BookingStatus.PENDING
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def move_to(self, nxt: BookingStatus) -&gt; None:
+        if nxt not in ALLOWED.get(self.status, set()):
+            raise ValueError(f"booking {self.id}: {self.status.name} -&gt; {nxt.name} not allowed")
+        self.status = nxt
+
+    def __str__(self) -&gt; str:
+        return f"{self.id} {self.user_id} {list(self.hold.seat_ids)} Rs {self.amount} {self.status.name}"
+
+
+class SeatUnavailableError(Exception):
+    pass
+
+
+class HoldExpiredError(Exception):
+    pass
+
+
+class ManualClock:
+    def __init__(self, start: datetime) -&gt; None:
+        self._now = start
+
+    def now(self) -&gt; datetime:
+        return self._now
+
+    def advance(self, seconds: int) -&gt; None:
+        self._now += timedelta(seconds=seconds)
+
+
+# ---------------- inventory: the Strategy the service depends on ----------------
+class SeatInventory(ABC):
+    def __init__(self, clock: ManualClock, ttl: timedelta) -&gt; None:
+        self.clock, self.ttl = clock, ttl
+        self._hold_seq = itertools.count(1)
+        self._seq_lock = threading.Lock()
+
+    def _next_hold_id(self) -&gt; str:
+        with self._seq_lock:
+            return f"H{next(self._hold_seq)}"
+
+    @staticmethod
+    def _free_now(state, now: datetime) -&gt; bool:
+        return isinstance(state, Free) or (isinstance(state, Held) and now &gt;= state.expires_at)
+
+    @staticmethod
+    def _sorted(seat_ids: list[str]) -&gt; tuple[str, ...]:
+        if not seat_ids:
+            raise ValueError("choose at least one seat")
+        if len(set(seat_ids)) != len(seat_ids):
+            raise ValueError("duplicate seat in request")
+        return tuple(sorted(seat_ids))
+
+    @abstractmethod
+    def register(self, show: Show) -&gt; None: ...
+    @abstractmethod
+    def hold(self, show: Show, seat_ids: list[str], user_id: str) -&gt; SeatHold: ...
+    @abstractmethod
+    def confirm(self, hold: SeatHold, booking_id: str) -&gt; None: ...
+    @abstractmethod
+    def release(self, hold: SeatHold) -&gt; None: ...
+    @abstractmethod
+    def cancel(self, show: Show, seat_ids: tuple[str, ...], booking_id: str) -&gt; None: ...
+    @abstractmethod
+    def available(self, show: Show) -&gt; list[str]: ...
+
+    def occupancy(self, show: Show) -&gt; float:
+        return 1 - len(self.available(show)) / len(show.screen.seats)
+
+
+class PessimisticSeatInventory(SeatInventory):
+    """One lock per show: check all seats and write all seats inside the same critical section."""
+    name = "pessimistic (lock per show)"
+
+    def __init__(self, clock, ttl) -&gt; None:
+        super().__init__(clock, ttl)
+        self._shows: dict[str, tuple[threading.Lock, dict[str, object]]] = {}
+
+    def register(self, show):
+        self._shows[show.id] = (threading.Lock(), {s.id: Free() for s in show.screen.seats})
+
+    def _of(self, show_id):
+        if show_id not in self._shows:
+            raise ValueError(f"unknown show {show_id}")
+        return self._shows[show_id]
+
+    def hold(self, show, seat_ids, user_id):
+        ids = self._sorted(seat_ids)
+        lock, state = self._of(show.id)
+        with lock:
+            now = self.clock.now()
+            for sid in ids:
+                if sid not in state:
+                    raise ValueError(f"no seat {sid}")
+                if not self._free_now(state[sid], now):
+                    raise SeatUnavailableError(f"seat {sid} is not available")
+            hold = SeatHold(self._next_hold_id(), show.id, user_id, ids, now + self.ttl)
+            for sid in ids:
+                state[sid] = Held(hold.id, user_id, hold.expires_at)
+            return hold
+
+    def confirm(self, hold, booking_id):
+        lock, state = self._of(hold.show_id)
+        with lock:
+            now = self.clock.now()
+            for sid in hold.seat_ids:
+                st = state[sid]
+                if not (isinstance(st, Held) and st.hold_id == hold.id and now &lt; st.expires_at):
+                    raise HoldExpiredError(f"hold {hold.id} expired or lost")
+            for sid in hold.seat_ids:
+                state[sid] = Booked(booking_id)
+
+    def release(self, hold):
+        lock, state = self._of(hold.show_id)
+        with lock:
+            for sid in hold.seat_ids:
+                st = state[sid]
+                if isinstance(st, Held) and st.hold_id == hold.id:
+                    state[sid] = Free()
+
+    def cancel(self, show, seat_ids, booking_id):
+        lock, state = self._of(show.id)
+        with lock:
+            for sid in seat_ids:
+                if state[sid] == Booked(booking_id):
+                    state[sid] = Free()
+
+    def available(self, show):
+        lock, state = self._of(show.id)
+        with lock:
+            now = self.clock.now()
+            return sorted(sid for sid, st in state.items() if self._free_now(st, now))
+
+
+class _Cell:
+    """One seat with a version number. compare_and_set mimics a hardware CAS (Python has none)."""
+
+    def __init__(self) -&gt; None:
+        self.state, self.version = Free(), 0
+        self._guard = threading.Lock()      # held for a few instructions only, never across seats
+
+    def read(self):
+        with self._guard:
+            return self.state, self.version
+
+    def compare_and_set(self, seen_version: int, new_state) -&gt; bool:
+        with self._guard:
+            if self.version != seen_version:
+                return False
+            self.state, self.version = new_state, self.version + 1
+            return True
+
+
+class OptimisticSeatInventory(SeatInventory):
+    """No show lock: read a seat's version, then write only if the version is unchanged; roll back on failure."""
+    name = "optimistic (version per seat)"
+
+    def __init__(self, clock, ttl) -&gt; None:
+        super().__init__(clock, ttl)
+        self._shows: dict[str, dict[str, _Cell]] = {}
+
+    def register(self, show):
+        self._shows[show.id] = {s.id: _Cell() for s in show.screen.seats}
+
+    def _cell(self, show_id, sid):
+        if show_id not in self._shows:
+            raise ValueError(f"unknown show {show_id}")
+        if sid not in self._shows[show_id]:
+            raise ValueError(f"no seat {sid}")
+        return self._shows[show_id][sid]
+
+    def _rollback(self, done, expected_type, key, value):
+        for cell in done:
+            st, ver = cell.read()
+            if isinstance(st, expected_type) and getattr(st, key) == value:
+                cell.compare_and_set(ver, Free())
+
+    def hold(self, show, seat_ids, user_id):
+        ids = self._sorted(seat_ids)
+        now = self.clock.now()
+        hold = SeatHold(self._next_hold_id(), show.id, user_id, ids, now + self.ttl)
+        mine = Held(hold.id, user_id, hold.expires_at)
+        done = []
+        for sid in ids:
+            cell = self._cell(show.id, sid)
+            st, ver = cell.read()
+            if not self._free_now(st, now) or not cell.compare_and_set(ver, mine):
+                self._rollback(done, Held, "hold_id", hold.id)
+                raise SeatUnavailableError(f"seat {sid} is not available")
+            done.append(cell)
+        return hold
+
+    def confirm(self, hold, booking_id):
+        if self.clock.now() &gt;= hold.expires_at:
+            raise HoldExpiredError(f"hold {hold.id} expired")
+        done = []
+        for sid in hold.seat_ids:
+            cell = self._cell(hold.show_id, sid)
+            st, ver = cell.read()
+            if not (isinstance(st, Held) and st.hold_id == hold.id) or not cell.compare_and_set(ver, Booked(booking_id)):
+                self._rollback(done, Booked, "booking_id", booking_id)
+                raise HoldExpiredError(f"hold {hold.id} expired or lost")
+            done.append(cell)
+
+    def release(self, hold):
+        for sid in hold.seat_ids:
+            cell = self._cell(hold.show_id, sid)
+            st, ver = cell.read()
+            if isinstance(st, Held) and st.hold_id == hold.id:
+                cell.compare_and_set(ver, Free())
+
+    def cancel(self, show, seat_ids, booking_id):
+        for sid in seat_ids:
+            cell = self._cell(show.id, sid)
+            st, ver = cell.read()
+            if st == Booked(booking_id):
+                cell.compare_and_set(ver, Free())
+
+    def available(self, show):
+        now = self.clock.now()
+        return sorted(sid for sid, c in self._shows[show.id].items() if self._free_now(c.read()[0], now))
+
+
+# ---------------- pricing and payment strategies ----------------
+class PricingStrategy(ABC):
+    @abstractmethod
+    def price(self, show: Show, seat: Seat, occupancy: float) -&gt; int: ...
+
+
+class SeatTypePricing(PricingStrategy):
+    def __init__(self, base: dict[SeatType, int]) -&gt; None:
+        self.base = dict(base)
+
+    def price(self, show, seat, occupancy):
+        return self.base[seat.type]
+
+
+class DemandPricing(PricingStrategy):
+    """Decorator: surcharge once the show is at least `threshold` full."""
+
+    def __init__(self, inner: PricingStrategy, threshold: float, percent: int) -&gt; None:
+        self.inner, self.threshold, self.percent = inner, threshold, percent
+
+    def price(self, show, seat, occupancy):
+        p = self.inner.price(show, seat, occupancy)
+        return p + p * self.percent // 100 if occupancy &gt;= self.threshold else p
+
+
+class PaymentStrategy(ABC):
+    @abstractmethod
+    def pay(self, booking_id: str, amount: int) -&gt; bool: ...
+
+
+class UpiPayment(PaymentStrategy):
+    def pay(self, booking_id, amount):
+        return amount &gt; 0
+
+
+class CardPayment(PaymentStrategy):
+    def __init__(self, declined: bool = False) -&gt; None:
+        self.declined = declined
+
+    def pay(self, booking_id, amount):
+        return not self.declined
+
+
+# ---------------- the service ----------------
+class BookingService:
+    def __init__(self, inventory: SeatInventory, pricing: PricingStrategy, clock: ManualClock) -&gt; None:
+        self.inventory, self.pricing, self.clock = inventory, pricing, clock
+        self._shows: dict[str, Show] = {}
+        self._bookings: dict[str, Booking] = {}
+        self._seq = itertools.count(1)
+        self._lock = threading.Lock()
+        self.listeners: list = []          # callables(booking): the Observer hook
+
+    def add_show(self, show: Show) -&gt; None:
+        self._shows[show.id] = show
+        self.inventory.register(show)
+
+    def _show(self, show_id: str) -&gt; Show:
+        if show_id not in self._shows:
+            raise ValueError(f"unknown show {show_id}")
+        return self._shows[show_id]
+
+    def _publish(self, b: Booking) -&gt; None:
+        for listener in self.listeners:
+            listener(b)
+
+    def start(self, user_id: str, show_id: str, seat_ids: list[str]) -&gt; Booking:
+        show = self._show(show_id)
+        occupancy = self.inventory.occupancy(show)
+        hold = self.inventory.hold(show, seat_ids, user_id)
+        seats = {s.id: s for s in show.screen.seats}
+        amount = sum(self.pricing.price(show, seats[sid], occupancy) for sid in hold.seat_ids)
+        with self._lock:
+            b = Booking(f"B{next(self._seq)}", user_id, show, hold, amount)
+            self._bookings[b.id] = b
+        return b
+
+    def get(self, booking_id: str) -&gt; Booking:
+        if booking_id not in self._bookings:
+            raise ValueError(f"unknown booking {booking_id}")
+        return self._bookings[booking_id]
+
+    def pay(self, booking_id: str, payment: PaymentStrategy) -&gt; Booking:
+        b = self.get(booking_id)
+        with b.lock:
+            if b.status is not BookingStatus.PENDING:
+                raise ValueError(f"booking {booking_id} is {b.status.name}")
+            if self.clock.now() &gt;= b.hold.expires_at:          # check before charging
+                self.inventory.release(b.hold)
+                b.move_to(BookingStatus.EXPIRED)
+                self._publish(b)
+                raise HoldExpiredError(f"hold expired for {booking_id}")
+            if not payment.pay(b.id, b.amount):
+                self.inventory.release(b.hold)
+                b.move_to(BookingStatus.FAILED)
+                self._publish(b)
+                return b
+            try:
+                self.inventory.confirm(b.hold, b.id)
+            except HoldExpiredError:
+                b.move_to(BookingStatus.EXPIRED)               # refund would be triggered here
+                self._publish(b)
+                raise
+            b.move_to(BookingStatus.CONFIRMED)
+            self._publish(b)
+            return b
+
+    def cancel(self, booking_id: str) -&gt; Booking:
+        b = self.get(booking_id)
+        with b.lock:
+            b.move_to(BookingStatus.CANCELLED)
+            self.inventory.cancel(b.show, b.hold.seat_ids, b.id)
+            self._publish(b)
+            return b
+
+    def available_seats(self, show_id: str) -&gt; list[str]:
+        return self.inventory.available(self._show(show_id))</code></pre>
+      <p><b>main.py</b> - demo driver for both inventories.</p>
+<pre><code class="language-python">"""Demo driver: python main.py   (tests: python -m unittest test_booking)"""
+from datetime import datetime, timedelta
+
+from booking import (BookingService, BookingStatus, CardPayment, DemandPricing, HoldExpiredError, ManualClock,
+                     OptimisticSeatInventory, PessimisticSeatInventory, Screen, Seat, SeatType, SeatTypePricing,
+                     SeatUnavailableError, Show, UpiPayment)
+
+BASE = {SeatType.REGULAR: 200, SeatType.PREMIUM: 350, SeatType.RECLINER: 600}
+
+
+def screen() -&gt; Screen:
+    seats = [Seat(f"A{i}", SeatType.REGULAR) for i in range(1, 5)] + [Seat(f"B{i}", SeatType.PREMIUM) for i in range(1, 5)]
+    return Screen("S1", "Dojo Cinemas", "Bengaluru", tuple(seats))
+
+
+def demo(inventory_cls) -&gt; None:
+    clock = ManualClock(datetime(2026, 11, 23, 12, 0))
+    inv = inventory_cls(clock, timedelta(minutes=5))
+    svc = BookingService(inv, SeatTypePricing(BASE), clock)
+    svc.add_show(Show("SH1", "Packet Storm", screen(), datetime(2026, 11, 23, 18, 30)))
+    print(f"######## {inv.name} ########")
+
+    alice = svc.start("alice", "SH1", ["A1", "A2"])
+    print(f"  {alice}")
+    try:
+        svc.start("bob", "SH1", ["A2", "A3"])
+        raise AssertionError("A2 should be held")
+    except SeatUnavailableError as e:
+        print(f"  rejected as expected: {e}")
+    bob = svc.start("bob", "SH1", ["A3", "A4"])
+    svc.pay(alice.id, UpiPayment())
+    print(f"  {alice} | free now: {svc.available_seats('SH1')}")
+    assert alice.status is BookingStatus.CONFIRMED
+
+    clock.advance(6 * 60)                       # TTL is 5 minutes
+    try:
+        svc.pay(bob.id, CardPayment())
+        raise AssertionError("bob's hold should have expired")
+    except HoldExpiredError as e:
+        print(f"  rejected as expected: {e}")
+    assert bob.status is BookingStatus.EXPIRED
+
+    dave = svc.start("dave", "SH1", ["B1", "B2"])
+    svc.pay(dave.id, CardPayment(declined=True))
+    print(f"  {dave}")
+    assert {"B1", "B2"} &lt;= set(svc.available_seats("SH1"))
+
+    svc.cancel(alice.id)
+    svc.pricing = DemandPricing(SeatTypePricing(BASE), 0.5, 20)
+    erin = svc.start("erin", "SH1", ["A1", "A2", "A3", "A4"])
+    svc.pay(erin.id, UpiPayment())
+    frank = svc.start("frank", "SH1", ["B3"])
+    print(f"  {erin}\n  {frank}")
+    assert (erin.amount, frank.amount) == (800, 420)
+    print("  demo OK")
+
+
+if __name__ == "__main__":
+    demo(PessimisticSeatInventory)
+    demo(OptimisticSeatInventory)</code></pre>
+      <p><b>test_booking.py</b> - unit tests, including a 300-thread race on overlapping pairs.</p>
+<pre><code class="language-python">import unittest
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+from booking import (BookingService, BookingStatus, ManualClock, OptimisticSeatInventory, PessimisticSeatInventory,
+                     SeatTypePricing, SeatUnavailableError, Show, UpiPayment)
+from main import BASE, screen
+
+
+def service(inventory_cls):
+    clock = ManualClock(datetime(2026, 11, 23, 12, 0))
+    svc = BookingService(inventory_cls(clock, timedelta(minutes=5)), SeatTypePricing(BASE), clock)
+    svc.add_show(Show("SH1", "Packet Storm", screen(), datetime(2026, 11, 23, 18, 30)))
+    return svc, clock
+
+
+class BookingTest(unittest.TestCase):
+    def each(self):
+        return (PessimisticSeatInventory, OptimisticSeatInventory)
+
+    def test_failed_multi_seat_hold_is_all_or_nothing(self):
+        for cls in self.each():
+            svc, _ = service(cls)
+            svc.start("a", "SH1", ["A2"])
+            with self.assertRaises(SeatUnavailableError):
+                svc.start("b", "SH1", ["A1", "A2"])
+            self.assertIn("A1", svc.available_seats("SH1"), cls.name)
+
+    def test_expired_hold_is_free_again(self):
+        for cls in self.each():
+            svc, clock = service(cls)
+            svc.start("a", "SH1", ["A1"])
+            clock.advance(301)
+            self.assertEqual(svc.start("b", "SH1", ["A1"]).hold.seat_ids, ("A1",))
+
+    def test_cancel_only_after_confirm(self):
+        for cls in self.each():
+            svc, _ = service(cls)
+            b = svc.start("a", "SH1", ["A1"])
+            with self.assertRaises(ValueError):
+                svc.cancel(b.id)
+            svc.pay(b.id, UpiPayment())
+            self.assertIs(svc.cancel(b.id).status, BookingStatus.CANCELLED)
+            self.assertIn("A1", svc.available_seats("SH1"))
+
+    def test_race_one_winner_and_no_double_sale(self):
+        for cls in self.each():
+            svc, _ = service(cls)
+
+            def grab(n):
+                pair = [["B2", "B3"], ["A1", "B2"], ["A1", "A2"], ["A2", "B3"]][n % 4]
+                try:
+                    b = svc.start(f"u{n}", "SH1", pair)
+                    return svc.pay(b.id, UpiPayment())
+                except SeatUnavailableError:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                done = [b for b in pool.map(grab, range(300)) if b and b.status is BookingStatus.CONFIRMED]
+            sold = Counter(s for b in done for s in b.hold.seat_ids)
+            self.assertTrue(done, cls.name)
+            self.assertTrue(all(c == 1 for c in sold.values()), f"{cls.name}: {sold}")
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>######## pessimistic (lock per show) ########
+  B1 alice ['A1', 'A2'] Rs 400 PENDING
+  rejected as expected: seat A2 is not available
+  B1 alice ['A1', 'A2'] Rs 400 CONFIRMED | free now: ['B1', 'B2', 'B3', 'B4']
+  rejected as expected: hold expired for B2
+  B3 dave ['B1', 'B2'] Rs 700 FAILED
+  B4 erin ['A1', 'A2', 'A3', 'A4'] Rs 800 CONFIRMED
+  B5 frank ['B3'] Rs 420 PENDING
+  demo OK
+######## optimistic (version per seat) ########
+  B1 alice ['A1', 'A2'] Rs 400 PENDING
+  rejected as expected: seat A2 is not available
+  B1 alice ['A1', 'A2'] Rs 400 CONFIRMED | free now: ['B1', 'B2', 'B3', 'B4']
+  rejected as expected: hold expired for B2
+  B3 dave ['B1', 'B2'] Rs 700 FAILED
+  B4 erin ['A1', 'A2', 'A3', 'A4'] Rs 800 CONFIRMED
+  B5 frank ['B3'] Rs 420 PENDING
+  demo OK</code></pre>
+<pre class="terminal"><code>....
+----------------------------------------------------------------------
+Ran 4 tests in 0.013s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><b>main.cpp</b> - the hold/confirm/release core with a tagged-union seat state and a pricing vtable.</p>
+<pre><code class="language-cpp">// Movie ticket booking in C++14: seat holds with a TTL, all-or-nothing, single-threaded demo.
+// Build: g++ -std=c++14 -Wall -O2 main.cpp -o booking &amp;&amp; ./booking
+// Multi-threaded version: one std::mutex per Show around hold/confirm/release (marked LOCK),
+// exactly like the Java PessimisticSeatInventory.
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class SeatType { REGULAR, PREMIUM };
+enum class Kind { FREE, HELD, BOOKED };
+
+struct SeatState {                 // a tagged union, the C way: kind says which fields matter
+    Kind kind = Kind::FREE;
+    std::string holdId, userId, bookingId;
+    long expiresAt = 0;            // seconds
+};
+
+struct Hold { std::string id, showId, userId; std::vector&lt;std::string&gt; seats; long expiresAt; };
+
+struct SeatUnavailable : std::runtime_error { using std::runtime_error::runtime_error; };
+struct HoldExpired : std::runtime_error { using std::runtime_error::runtime_error; };
+
+struct PricingStrategy {           // the vtable: one function pointer, many implementations
+    virtual ~PricingStrategy() {}
+    virtual long price(SeatType t, double occupancy) const = 0;
+};
+struct SeatTypePricing : PricingStrategy {
+    long price(SeatType t, double) const override { return t == SeatType::REGULAR ? 200 : 350; }
+};
+struct DemandPricing : PricingStrategy {   // decorator: wraps another strategy
+    std::unique_ptr&lt;PricingStrategy&gt; inner; double threshold; int pct;
+    DemandPricing(std::unique_ptr&lt;PricingStrategy&gt; in, double th, int p) : inner(std::move(in)), threshold(th), pct(p) {}
+    long price(SeatType t, double occ) const override {
+        long p = inner-&gt;price(t, occ);
+        return occ &gt;= threshold ? p + p * pct / 100 : p;
+    }
+};
+
+class Show {
+public:
+    std::string id;
+    std::map&lt;std::string, SeatType&gt; types;
+    std::map&lt;std::string, SeatState&gt; state;          // LOCK: guarded by the show's mutex
+    Show(std::string i, std::map&lt;std::string, SeatType&gt; t) : id(std::move(i)), types(std::move(t)) {
+        for (auto&amp; kv : types) state[kv.first] = SeatState{};
+    }
+    static bool freeNow(const SeatState&amp; s, long now) {
+        return s.kind == Kind::FREE || (s.kind == Kind::HELD &amp;&amp; now &gt;= s.expiresAt);
+    }
+    int freeCount(long now) const {
+        int n = 0;
+        for (auto&amp; kv : state) n += freeNow(kv.second, now) ? 1 : 0;
+        return n;
+    }
+};
+
+class Inventory {
+    long ttl_; long seq_ = 0;
+public:
+    explicit Inventory(long ttlSeconds) : ttl_(ttlSeconds) {}
+
+    Hold hold(Show&amp; show, std::vector&lt;std::string&gt; seats, const std::string&amp; user, long now) {   // LOCK
+        std::sort(seats.begin(), seats.end());
+        for (auto&amp; id : seats) {                                       // 1. check every seat
+            auto it = show.state.find(id);
+            if (it == show.state.end()) throw std::invalid_argument("no seat " + id);
+            if (!Show::freeNow(it-&gt;second, now)) throw SeatUnavailable("seat " + id + " is not available");
+        }
+        Hold h{"H" + std::to_string(++seq_), show.id, user, seats, now + ttl_};
+        for (auto&amp; id : seats) {                                       // 2. then write every seat
+            SeatState s; s.kind = Kind::HELD; s.holdId = h.id; s.userId = user; s.expiresAt = h.expiresAt;
+            show.state[id] = s;
+        }
+        return h;
+    }
+
+    void confirm(Show&amp; show, const Hold&amp; h, const std::string&amp; bookingId, long now) {         // LOCK
+        for (auto&amp; id : h.seats) {
+            const SeatState&amp; s = show.state[id];
+            if (s.kind != Kind::HELD || s.holdId != h.id || now &gt;= s.expiresAt)
+                throw HoldExpired("hold " + h.id + " expired or lost");
+        }
+        for (auto&amp; id : h.seats) { SeatState s; s.kind = Kind::BOOKED; s.bookingId = bookingId; show.state[id] = s; }
+    }
+
+    void release(Show&amp; show, const Hold&amp; h) {                                                 // LOCK
+        for (auto&amp; id : h.seats)
+            if (show.state[id].kind == Kind::HELD &amp;&amp; show.state[id].holdId == h.id) show.state[id] = SeatState{};
+    }
+};
+
+int main() {
+    std::map&lt;std::string, SeatType&gt; seats;
+    for (int i = 1; i &lt;= 4; i++) { seats["A" + std::to_string(i)] = SeatType::REGULAR; seats["B" + std::to_string(i)] = SeatType::PREMIUM; }
+    Show show("SH1", seats);
+    Inventory inv(300);                                   // 5-minute holds
+    std::unique_ptr&lt;PricingStrategy&gt; pricing(new SeatTypePricing());
+    long now = 0;
+
+    Hold alice = inv.hold(show, {"A2", "A1"}, "alice", now);
+    long amount = 0;
+    for (auto&amp; id : alice.seats) amount += pricing-&gt;price(show.types[id], 0.0);
+    std::cout &lt;&lt; "alice holds A1,A2 for Rs " &lt;&lt; amount &lt;&lt; " until t=" &lt;&lt; alice.expiresAt &lt;&lt; "s\n";
+    assert(amount == 400);
+
+    try { inv.hold(show, {"A2", "A3"}, "bob", now); assert(false); }
+    catch (const SeatUnavailable&amp; e) { std::cout &lt;&lt; "rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    assert(show.state["A3"].kind == Kind::FREE);          // all or nothing
+
+    Hold bob = inv.hold(show, {"A3", "A4"}, "bob", now);
+    inv.confirm(show, alice, "B1", now + 60);             // alice pays after 1 minute
+    std::cout &lt;&lt; "alice confirmed; free seats: " &lt;&lt; show.freeCount(now + 60) &lt;&lt; "\n";
+
+    now += 360;                                           // 6 minutes later
+    try { inv.confirm(show, bob, "B2", now); assert(false); }
+    catch (const HoldExpired&amp; e) { std::cout &lt;&lt; "rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    Hold carol = inv.hold(show, {"A3"}, "carol", now);    // expired hold counts as free
+    std::cout &lt;&lt; "carol holds A3 with " &lt;&lt; carol.id &lt;&lt; "\n";
+
+    pricing.reset(new DemandPricing(std::unique_ptr&lt;PricingStrategy&gt;(new SeatTypePricing()), 0.25, 20));
+    double occ = 1.0 - show.freeCount(now) / 8.0;         // A1, A2 booked + A3 held = 3/8
+    std::cout &lt;&lt; "occupancy " &lt;&lt; occ &lt;&lt; ", premium seat now costs Rs " &lt;&lt; pricing-&gt;price(SeatType::PREMIUM, occ) &lt;&lt; "\n";
+    assert(pricing-&gt;price(SeatType::PREMIUM, occ) == 420);
+    inv.release(show, carol);
+    assert(show.state["A3"].kind == Kind::FREE);
+    std::cout &lt;&lt; "C++ demo OK\n";
+    return 0;
+}</code></pre>
+      <p>Build: <code>g++ -std=c++14 -Wall -O2 main.cpp -o booking &amp;&amp; ./booking</code></p>
+<pre class="terminal"><code>alice holds A1,A2 for Rs 400 until t=300s
+rejected as expected: seat A2 is not available
+alice confirmed; free seats: 4
+rejected as expected: hold H2 expired or lost
+carol holds A3 with H3
+occupancy 0.375, premium seat now costs Rs 420
+C++ demo OK</code></pre>
+    </div>
+  </div>

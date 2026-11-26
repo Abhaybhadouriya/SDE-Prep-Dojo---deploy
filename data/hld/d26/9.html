@@ -1,0 +1,127 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> Exchange or broker? Order types needed (limit, market, cancel)? Latency target? One region? Clearing in scope?</li>
+          <li><strong>5-10 min:</strong> Estimate using trading hours (22,500 s), peak at open, hottest symbol, memory for all books. Conclude: everything fits in memory; ordering and determinism are the hard parts.</li>
+          <li><strong>10-18 min:</strong> API (FIX-like, integer prices, client order id) and the order book data structure. Walk one match.</li>
+          <li><strong>18-28 min:</strong> Draw gateway, risk, sequencer, engine, market data, downstream; walk an order through.</li>
+          <li><strong>28-40 min:</strong> Deep dives: determinism + event sourcing + standby; single thread + ring buffer; risk holds; multicast + gaps.</li>
+          <li><strong>40-45 min:</strong> Failures, sharding and hot symbols, auctions, where Kafka/K8s fit (downstream).</li>
+        </ol>
+        <div class="callout danger"><p><b>Common mistakes:</b> the order book in a SQL table; a distributed lock per trade; "Kafka in the middle of matching"; floating-point prices; dividing daily volume by 86,400; eventual consistency for buying power; multiple threads mutating one book; forgetting cancels (most messages are cancels); not saying when an order counts as accepted; letting the engine read its own clock.</p></div>
+        <div class="callout interview"><p><b>60-second answer.</b> "Brokers connect over FIX to stateless gateways that authenticate and throttle. An in-memory risk engine checks limits and price bands. A sequencer gives every accepted input a number and replicates it to a journal before anything is acknowledged; that journal is the source of truth. Each symbol shard has a single-threaded, deterministic matching engine that holds the order book in memory: price levels sorted by price, a FIFO list per level for time priority, and a hash map for O(1) cancels. A hot standby replays the same input, so failover loses nothing. Output events go back as execution reports, out as sequence-numbered multicast market data, and into Kafka for clearing, surveillance and reporting. I scale by sharding symbols, not by adding threads to one book."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Google">
+          <summary>What data structure do you use for the order book, and what are the complexities?</summary>
+          <div class="answer">
+            <p>Per side, a sorted structure of price levels (a balanced tree or sorted map, O(log P) to find or insert a level; or an array indexed by tick within the price band, O(1)). Each level holds a doubly linked FIFO list of orders. A hash map from order id to list node makes cancel O(1). Best bid/ask pointers make top-of-book O(1). Matching an incoming order is O(number of orders it fills). Most traffic is add and cancel, so O(1) for both matters most.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw it: two ladders of prices, a queue at each rung, a side hash map. Then give the complexity of add, cancel, match.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why a linked list and not an array per level? (O(1) removal from the middle on cancel.)</li><li>How do you handle a modify? (Reduce quantity in place keeps priority; price change = cancel + new.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>Why single-threaded? Would multiple threads not be faster?</summary>
+          <div class="answer">
+            <p>For one order book, no. Every order touches the same best price levels, so threads would fight over locks; lock handoffs, cache-line ping-pong and context switches cost far more than the few hundred nanoseconds of matching logic. A single thread with everything in L1/L2 cache, fed by a lock-free ring buffer, is faster and deterministic, which we need anyway for replay and standby. LMAX reported about 6 million orders/s on one thread. Parallelism comes from sharding symbols across cores and machines.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the real costs (contention, cache, determinism), give the LMAX number with its source, then say how you scale instead.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What work is still parallel? (Journalling, replication, gateways, market data encoding, risk per member.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>The matching engine crashes. How do you recover without losing or duplicating trades?</summary>
+          <div class="answer">
+            <p>The state is a pure function of the sequenced input log. A hot standby consumes the same inputs and is at the same sequence number, so we promote it and it continues from N+1. For a cold restart, load the latest snapshot (taken at some sequence S) and replay the journal from S+1. Trades are not duplicated because output events carry the input sequence they came from; downstream consumers deduplicate on it. Nothing acknowledged is lost because acks are sent only after the input is replicated.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Event sourcing + deterministic state machine" in one line, then the two recovery paths, then dedup by sequence.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What makes code non-deterministic? (Clock reads, random, unordered iteration, threads.)</li><li>How often do you snapshot? (Trade-off: replay time vs snapshot cost; LMAX did nightly.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Uber,Amazon">
+          <summary>Could you use Kafka as the sequencer and journal?</summary>
+          <div class="answer">
+            <p>Conceptually yes: a partition per symbol shard is an ordered, replicated log, and the engine would be a consumer replaying it, which is the same architecture. Some crypto exchanges and trading simulators are built this way. The cost is latency: an <code>acks=all</code> produce needs a network round-trip to followers and batching, which is milliseconds, while a professional exchange budgets microseconds. So for a retail-scale or internal crossing engine, Kafka is a fine sequencer. For a national exchange, a purpose-built in-memory sequencer replicated over a dedicated low-latency network is used, and Kafka sits downstream.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you see the structural similarity (log = journal), then decide using the latency requirement you set in the first 5 minutes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which Kafka settings would you need? (One partition per shard, <code>acks=all</code>, <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> producer, <code>min.insync.replicas=2</code>.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>How do you make sure a user cannot buy shares they cannot pay for?</summary>
+          <div class="answer">
+            <p>Pre-trade risk with holds. At order entry, the broker (and the exchange for its member) checks available buying power and blocks the order's maximum cost: price x quantity for a limit buy. Fills consume the hold; cancels release it. The risk state lives in memory in the risk engine and is updated from the same sequenced fill stream, so it is strongly consistent with the book. Checking asynchronously after acceptance is wrong because trades are irreversible.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the "hold" analogy (like a card pre-authorisation), then say why eventual consistency fails here.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about a market order with no price? (Use a price band or collar to bound the hold.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do you scale to 10x more symbols and traffic?</summary>
+          <div class="answer">
+            <p>Shard by symbol: each shard has its own sequenced input stream, engine thread on a pinned core, and standby. Add machines and move shards; the gateway routes by symbol to the right shard. Hot symbols get dedicated shards. Gateways, risk (partitioned by member) and market-data encoders scale horizontally. The only thing that does not scale horizontally is a single symbol's book, and the estimate shows one thread has orders of magnitude of headroom for that.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point back to your estimate (hottest symbol vs single-thread capacity); it proves the plan.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you move a symbol between shards safely? (At a sequence boundary or during a halt / overnight.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Google">
+          <summary>How do thousands of traders receive market data fairly and reliably?</summary>
+          <div class="answer">
+            <p>Publish once with UDP multicast in the colocation network: every receiver gets the same packets at the same time, and cost does not grow with subscribers. Each message has a sequence number; a receiver that sees a gap requests a retransmit, or takes a snapshot (tagged with its last sequence) and applies later messages. Retail users get a conflated feed (latest prices every few hundred ms) from broker WebSocket servers, which scale like any web tier.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the bandwidth math (multicast vs N unicast streams) to justify the choice, then cover loss recovery.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does a client that joins at noon build the book? (Snapshot + incremental from its sequence.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Why integer prices, and what is a tick?</summary>
+          <div class="answer">
+            <p>A tick is the minimum price step (for example Rs 0.05 or $0.01). Storing price as an integer number of ticks or paise makes comparisons exact and fast, and lets the book use an array indexed by tick. Floating point cannot represent many decimal values exactly, so two equal-looking prices may compare unequal, which in an exchange means a wrong match or a missed one.</p>
+            <div class="approach"><h5>How to answer</h5><p>Short and concrete: give the 0.1 + 0.2 example.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Same rule anywhere else? (Payments and ledgers: store minor units.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Uber">
+          <summary>The market opens and 2 million orders arrive in the first minute, many already crossing. What do you do?</summary>
+          <div class="answer">
+            <p>Run an opening call auction. For a few minutes before the open, collect orders without matching. Then compute the single price that maximises executed volume (with tie-break rules), execute all crossing orders at that price, and start continuous matching with the leftover book. This turns a chaotic burst into one deterministic batch, gives a fair opening price, and protects the engine. Gateways also throttle per session, and the sequencer journals in batches to keep up.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show product knowledge (auctions exist for this) plus the systems benefit (batching).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>When else do you use an auction? (Close, and after a circuit-breaker halt.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Flipkart">
+          <summary>Design the broker side instead: price alerts for 10 million users (Zerodha / Robinhood style).</summary>
+          <div class="answer">
+            <p>Consume the exchange feed into a ticks topic in Kafka keyed by symbol. Alert definitions ("INFY above 1,600") live in a DB and are loaded into memory by alert-evaluator pods partitioned by symbol (same keying as the topic), stored per symbol as two sorted structures (thresholds above, below). On each tick, find crossed thresholds in O(log n + k), emit alert events to a notifications topic, and mark them fired (idempotently). Push notification services consume that topic. This part is a normal Kafka + Kubernetes design, with the exchange as the data source.</p>
+            <div class="approach"><h5>How to answer</h5><p>Clarify broker vs exchange, then reuse the pattern: partition by symbol, in-memory sorted thresholds, events out.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A hot symbol has 2 M alerts; one pod overloaded? (Split that symbol's alerts by price range across pods.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: primary and standby disagree</h4>
+          <div class="situation"><p>After a release, the checkpoint hash of the order book on the standby differs from the primary at sequence 41,002,118. Trading is live.</p></div>
+          <div class="bad"><p>Weak answer: "Restart the standby so it copies the primary." You would hide a bug that will strike during the next failover.</p></div>
+          <div class="good"><p>Strong answer: the standby is no longer a safe failover target, so declare reduced redundancy and bring up a fresh standby from the snapshot + journal on the <em>old</em> release if needed. Then replay the journal around 41,002,118 in a container with both builds and diff the outputs. The usual causes are non-determinism: a wall-clock read (for example order expiry using local time), iteration over an unordered map, or uninitialised state. Fix, add a replay test of a full production day to CI, and keep the checksum alarm.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which side is "right"? (Neither is proven; replay with the previous release is the reference.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: latency spikes every few minutes</h4>
+          <div class="situation"><p><a href="{{BASE}}interview/glossary#p99">p99</a> order-ack latency is normally steady but jumps by 50x for about 100 ms every few minutes. The engine is a JVM process.</p></div>
+          <div class="bad"><p>Weak answer: "Add more servers."</p></div>
+          <div class="good"><p>Strong answer: periodic, short spikes on one process smell like garbage-collection pauses, snapshot writes, or OS noise. Check GC logs; LMAX-style engines pre-allocate everything (ring buffer slots, order objects in pools) so the hot path makes no garbage. Check whether snapshotting runs on the engine thread (move it to the standby). Check OS jitter: pin the engine to an isolated core (<code>isolcpus</code>, IRQ affinity away from it), disable frequency scaling, avoid transparent huge page compaction. Measure with a histogram, not an average.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is the average useless here? (The spike is in the tail; the average hides it.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: price alerts fire twice during a feed reconnect (broker side)</h4>
+          <div class="situation"><p>You work at a retail broker. The exchange feed handler publishes ticks to a Kafka topic <code>ticks</code> (key = symbol), and an alert service running as a Kubernetes Deployment sends "INFY crossed 1,500" push notifications. During a feed reconnect at 10:14, thousands of users got the same alert two or three times.</p></div>
+          <div class="bad"><p>Weak answer: "Kafka delivered duplicates; switch to <a href="{{BASE}}interview/glossary#eos">exactly-once</a>." Exactly-once inside Kafka does not cover the push notification, which is an outside side effect.</p></div>
+          <div class="good"><p>Strong answer: on reconnect the feed handler replayed from the last snapshot plus retransmit, so the same exchange sequence numbers were published again; at the same moment an alert pod restart caused a consumer rebalance, so uncommitted ticks were re-read. Both are normal <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> behaviour. Fix it at the edge: (1) carry the exchange <code>seq</code> in every Kafka record and have the feed handler drop any seq at or below the last one it published per symbol; (2) make alerts idempotent: an alert fires on the <b>crossing</b> (previous price below, new price at or above), and the service records <code>(user_id, alert_id, trigger_seq)</code> in <a href="{{BASE}}interview/glossary#redis">Redis</a> with <code>SET NX</code> and a TTL before sending, so a replayed tick finds the key and sends nothing; (3) give the Deployment a preStop hook and graceful shutdown so offsets are committed before a pod leaves.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why key the topic by symbol? (All ticks of one symbol land in one partition, in order, so "previous price" is well defined.)</li><li>What if Redis is down? (Fail closed for alerts: a late alert is better than a storm of duplicates; or fall back to a local LRU of recent alert keys per pod.)</li></ul></div>
+        </div>
+      

@@ -1,0 +1,73 @@
+
+        <h2>Leader epochs, unclean election and ELR</h2>
+        <p class="chips level-chips"><span class="chip warn">deep dive</span></p>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain the ISR, the high watermark, <code>acks=all</code> with <code>min.insync.replicas=2</code>, and what happens when a broker dies, you are ready for most SDE-1 rounds. Leader epochs, unclean election and ELR below are <b>SDE-2 / deep dive</b> material: they answer "how exactly can Kafka lose or keep data in an edge case?"</p></div>
+        <h3>Leader epoch: who was leader when this was written?</h3>
+        <p>Every time a partition gets a new leader, its <b>leader epoch</b> goes up by one. Every record batch is stamped with the epoch of the leader that wrote it, and each replica keeps a small file (<code>leader-epoch-checkpoint</code>) mapping "epoch N started at offset X". This was added by KIP-101 because the older method (truncate to the high watermark after a restart) could lose committed data or leave two replicas with different records at the same offset after quick back-to-back failures.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 205" role="img" aria-label="An old leader truncates its divergent tail using the leader epoch">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label small left" x="20" y="20">B1 (old leader, epoch 5), back from a crash</text>
+            <rect class="cell filled" x="20" y="34" width="70" height="44"/><text class="label" x="55" y="56">0 e5</text>
+            <rect class="cell filled" x="95" y="34" width="70" height="44"/><text class="label" x="130" y="56">1 e5</text>
+            <rect class="cell filled" x="170" y="34" width="70" height="44"/><text class="label" x="205" y="56">2 e5</text>
+            <rect class="box fail" x="245" y="34" width="70" height="44"/><text class="label bad" x="280" y="56">3 e5</text>
+            <rect class="box fail" x="320" y="34" width="70" height="44"/><text class="label bad" x="355" y="56">4 e5</text>
+            <text class="label small left" x="410" y="56">never reached a follower</text>
+
+            <text class="label small left" x="20" y="120">B2 (new leader, epoch 6)</text>
+            <rect class="cell filled" x="20" y="134" width="70" height="44"/><text class="label" x="55" y="156">0 e5</text>
+            <rect class="cell filled" x="95" y="134" width="70" height="44"/><text class="label" x="130" y="156">1 e5</text>
+            <rect class="cell filled" x="170" y="134" width="70" height="44"/><text class="label" x="205" y="156">2 e5</text>
+            <rect class="cell new" x="245" y="134" width="70" height="44"/><text class="label white" x="280" y="156">3 e6</text>
+            <rect class="cell new" x="320" y="134" width="70" height="44"/><text class="label white" x="355" y="156">4 e6</text>
+            <rect class="cell new" x="395" y="134" width="70" height="44"/><text class="label white" x="430" y="156">5 e6</text>
+
+            <path class="arrow both dashed" d="M560 60 L560 150"/>
+            <text class="label small left" x="575" y="80">B1: "where did epoch 5 end?"</text>
+            <text class="label small left" x="575" y="104">B2: "at offset 3"</text>
+            <text class="label small left" x="575" y="128">B1 truncates 3 and 4,</text>
+            <text class="label small left" x="575" y="152">then fetches 3, 4, 5 (e6)</text>
+          </svg>
+          <figcaption>Records 3 and 4 on B1 were never replicated, so they were never committed and no producer using <code>acks=all</code> got an ack for them. Truncating them is correct. Leader epochs make the cut point exact. Same offset, different record = divergence. The epoch tells B1 exactly where to cut.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A leader epoch is a <b>generation number / term</b>, like a Raft term, or the stale-path marking in BGP graceful restart: a node that comes back sees a newer generation and knows its own extra state is stale. Where it breaks: Kafka's data replication is not Raft (no majority vote per record). Only the metadata (KRaft) uses Raft; partition data uses the ISR model.</p>
+        </div>
+
+        <h3>Why not majority quorum like Raft?</h3>
+        <p>A Raft-style log with 2f+1 replicas tolerates f failures. Kafka's ISR model with f+1 replicas can tolerate f failures for committed data, because the leader waits for <b>all</b> in-sync replicas, not a majority. The cost is that one slow follower can delay commits until it is dropped from the ISR (30 s). The Kafka design doc discusses this trade-off: fewer copies for the same safety, in exchange for depending on the ISR being managed well.</p>
+
+        <h3>Unclean leader election: availability vs data</h3>
+        <p>What if <b>every</b> ISR member is dead and only an out-of-sync replica is alive? Two choices:</p>
+        <div class="proscons">
+          <div class="pros"><h5>Wait (default: <code>unclean.leader.election.enable=false</code>)</h5><ul><li>No committed data is lost.</li><li>The partition stays offline until an ISR member returns.</li><li>Right for orders, payments, ledgers.</li></ul></div>
+          <div class="cons"><h5>Elect the stale replica (<code>true</code>)</h5><ul><li>The partition is back online immediately.</li><li>Records it never received are gone for good, and offsets may be reused.</li><li>Sometimes acceptable for logs or metrics.</li></ul></div>
+        </div>
+        <p>This is the CAP trade-off made visible in one config flag. The bridge: promoting a stale standby and accepting a route-table rollback.</p>
+
+        <h3>Eligible Leader Replicas (KIP-966)</h3>
+        <p>Newer Kafka adds a middle ground. When the ISR has dropped below <code>min.insync.replicas</code>, the high watermark cannot advance (no new records become committed), so a replica that leaves the ISR at that point still has every committed record. Kafka remembers such replicas as <b>ELR</b> (eligible leader replicas; the <code>Elr:</code> column in the describe output). On election the controller tries the ISR first, then the ELR, and only then, if unclean election is enabled, the last known leader. ELR is available from 4.0 and on by default for new clusters from 4.1. The Kafka 4.4 docs also say records become visible to consumers only when they are on all in-sync replicas <em>and</em> the min ISR condition is met, whatever the <code>acks</code> setting.</p>
+
+        <h3>Rack awareness and fetching from followers</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Replicas spread over three availability zones and a consumer reading from its local follower">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="15" y="15" width="245" height="210"/><text class="zone-label" x="31" y="37">AZ a</text>
+            <rect class="zone" x="278" y="15" width="245" height="210"/><text class="zone-label" x="294" y="37">AZ b</text>
+            <rect class="zone" x="541" y="15" width="245" height="210"/><text class="zone-label" x="557" y="37">AZ c</text>
+            <rect class="box kafka solid" x="45" y="60" width="185" height="50"/><text class="label white" x="137" y="85">B1: P0 leader</text>
+            <rect class="box kafka" x="308" y="60" width="185" height="50"/><text class="label" x="400" y="85">B2: P0 follower</text>
+            <rect class="box kafka" x="571" y="60" width="185" height="50"/><text class="label" x="663" y="85">B3: P0 follower</text>
+            <rect class="box svc" x="308" y="160" width="185" height="50"/><text class="label" x="400" y="178">Consumer</text><text class="label small" x="400" y="198">client.rack = b</text>
+            <path class="arrow dashed" d="M230 85 L300 85"/>
+            <path class="arrow ok" d="M400 156 L400 116"/>
+            <circle class="packet ok" r="5"><animateMotion dur="1.8s" repeatCount="indefinite" path="M400 110 L400 160"/></circle>
+            <text class="label small" x="560" y="185">no cross-AZ read traffic</text>
+          </svg>
+          <figcaption>Set <code>broker.rack</code> on each broker and Kafka places a partition's replicas in different racks/AZs, so one AZ outage leaves 2 copies. With KIP-392 (<code>client.rack</code> plus a rack-aware replica selector on the brokers) consumers can read from a same-AZ follower, which cuts cross-AZ network charges in the cloud.</figcaption>
+        </figure>
+      

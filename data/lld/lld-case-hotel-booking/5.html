@@ -1,0 +1,59 @@
+
+  <h2>Key relationships and patterns (and why each)</h2>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Pattern</th><th>Where</th><th>Why here (the requirement that pulls it in)</th><th>What we did NOT do</th></tr></thead>
+      <tbody>
+        <tr><td><a href="{{BASE}}lld/lld-pat-strategy">Strategy</a></td><td><code>PricingStrategy</code>, <code>CancellationPolicy</code></td><td>Every hotel prices and refunds differently, and both rules change with seasons and contracts. The service calls <code>hotel.pricing.price(...)</code> and never asks which rule it is.</td><td>No <code>if (hotel.isPremium)</code> or <code>switch (policyName)</code> inside <code>hold</code> or <code>cancel</code>.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-decorator">Decorator</a></td><td><code>WeekendSurcharge</code>, <code>LongStayDiscount</code> wrap a <code>BaseRatePricing</code></td><td>Rules <b>combine</b>: a hotel can have a weekend surcharge and a long-stay discount at once. The Zepto SDE-3 report lists Decorator and Observer; price-rule stacking is the natural place for Decorator. Each decorator adds one rule and calls the inner strategy.</td><td>No class per combination (<code>WeekendAndLongStayPricing</code>), which explodes as rules grow.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-state">State machine</a> (enum version)</td><td><code>BookingStatus.canMoveTo</code></td><td>HELD can become CONFIRMED, CANCELLED or EXPIRED; CONFIRMED can only become CANCELLED; the last two are final. One table of legal moves stops "confirm after expire" and "cancel twice" in one place.</td><td>No full State pattern with a class per state: the states have no different behaviour, only different legal moves.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-observer">Observer</a></td><td><code>BookingListener</code></td><td>Email, SMS, analytics and the hotel's channel manager all care about status changes; Zepto asked for it. The service publishes; it does not know who listens.</td><td>The service does not call an email sender directly.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-facade">Facade</a></td><td><code>BookingService</code></td><td>Callers (REST controller, CLI driver) use five methods and never touch inventory or locks.</td><td>Callers never call <code>inventory.take</code>.</td></tr>
+        <tr><td>Dependency injection</td><td><code>TimeSource</code> passed to the service</td><td>Hold expiry and cancellation deadlines depend on "now"; tests need to move time.</td><td>No <code>LocalDateTime.now()</code> inside the service.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>How the decorator stacks, in one line of setup and one line of use:</p>
+<pre><code class="language-java">PricingStrategy p = new LongStayDiscount(new WeekendSurcharge(new BaseRatePricing(), 20), 7, 10);
+long total = p.price(400000, stay, 2);   // base, then +20% on Fri/Sat nights, then -10% if 7+ nights</code></pre>
+  <p>Order matters and is a good thing to say out loud: discount-after-surcharge takes 10% off the surcharge too. If the business wants the discount on the base only, swap the wrapping order. The point of the pattern is that this is a <b>configuration</b> decision, not a code change.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p><code>PricingStrategy</code> is a one-function ops table: a <code>struct</code> holding a function pointer, like <code>file_operations.read</code>, and each hotel points at its own implementation. The decorators are a <b>stacked driver</b>: think of a block device under device-mapper, where dm-crypt wraps a disk, does its own work, then calls the lower device's request function. Our <code>BookingListener</code> list is a notifier chain (<code>blocking_notifier_call_chain</code>): the core fires an event and every registered callback runs.</p>
+    <p><b>Where this breaks:</b> a kernel driver stack is fixed at setup time and rarely re-ordered; here hotels change rules often, so keep each decorator immutable and swap the whole chain atomically (one reference write) rather than editing a chain in place.</p>
+  </div>
+  <h3>Why the pattern earns its place: the if-ladder it replaces</h3>
+  <p>Without decorators, every price rule is another <code>if</code> in one pricing method, and each combination needs care:</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Before: if / switch">
+<pre><code class="language-java">long price(Hotel h, RoomType t, DateRange stay) {
+    long total = 0;
+    for (LocalDate night : stay.nights()) {
+        long p = h.baseRate(t);
+        if (h.hasWeekendSurcharge &amp;&amp; isWeekend(night)) p = p * 120 / 100;
+        if (h.hasFestivalRate &amp;&amp; festival(night)) p = p * 150 / 100;   // follow-up 1
+        total += p;
+    }
+    if (h.hasLongStayDiscount &amp;&amp; stay.nights().size() &gt;= 7) total = total * 90 / 100;
+    if (h.hasMemberDiscount &amp;&amp; member) total -= 500_00;                // follow-up 2
+    return total;                                                      // order of ifs = order of rules
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="After: an interface">
+<pre><code class="language-java">interface PricingStrategy { long price(RoomType t, DateRange stay); }
+abstract class PricingDecorator implements PricingStrategy {
+    protected final PricingStrategy inner;          // wraps another strategy
+}
+PricingStrategy p = new LongStayDiscount(new WeekendSurcharge(new BaseRatePricing(rates), 20), 7, 10);
+// a festival rate = one new decorator class; the stack is built per hotel</code></pre>
+    </div>
+  </div>
+  <p>With the ladder, the follow-up "festival rates" edits the one pricing method shared by every hotel. With decorators it is one new class in <code>Policies.java</code>, stacked only for the hotels that use it.</p>
+  <div class="bridge">
+    <h4>From your world: the same move in C</h4>
+<pre><code class="language-c">struct pricing { long (*price)(const struct pricing *p, int type, struct range stay); const struct pricing *inner; };
+static long weekend_price(const struct pricing *p, int t, struct range s)
+{ return p-&gt;inner-&gt;price(p-&gt;inner, t, s) + weekend_extra(s); }
+/* like stacked netfilter targets or layered block devices: each layer calls the one below */</code></pre>
+    <p>The "after" version is an ops table: the caller holds a pointer to a struct of function pointers and never asks which implementation it has, exactly as the VFS calls <code>file-&gt;f_op-&gt;read()</code> without a switch on the file system type.</p>
+  </div>

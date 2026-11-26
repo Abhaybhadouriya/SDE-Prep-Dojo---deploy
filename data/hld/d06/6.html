@@ -1,0 +1,136 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain the stepper, the hot/cold data split and the atomic driver lock, that is a solid SDE-1 answer. SDE-2 candidates should also lead the geo index choice and the hot-cell and failure discussions.</p></div>
+
+        <h3>1. The geo index: geohash vs quadtree vs S2 vs H3</h3>
+        <p>"Find points near me" on a 2-D map is hard for normal database indexes, which sort along one dimension. Every option turns 2-D space into cells with ids, so "near" becomes "same or neighbouring cell".</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 270" role="img" aria-label="Three ways to split a map: square geohash cells with 8 neighbours, an adaptive quadtree that splits busy areas, and hexagons with 6 equal-distance neighbours">
+            <rect class="zone" x="10" y="10" width="270" height="250"/>
+            <text class="zone-label" x="26" y="32">Geohash (squares)</text>
+            <rect class="box plain" x="50" y="50" width="60" height="60"/><rect class="box plain" x="110" y="50" width="60" height="60"/><rect class="box plain" x="170" y="50" width="60" height="60"/>
+            <rect class="box plain" x="50" y="110" width="60" height="60"/><rect class="box highlight" x="110" y="110" width="60" height="60"/><rect class="box plain" x="170" y="110" width="60" height="60"/>
+            <rect class="box plain" x="50" y="170" width="60" height="60"/><rect class="box plain" x="110" y="170" width="60" height="60"/><rect class="box plain" x="170" y="170" width="60" height="60"/>
+            <text class="label small" x="140" y="145">me</text>
+            <text class="label small" x="140" y="250">query 9 cells (prefix match)</text>
+
+            <rect class="zone" x="295" y="10" width="270" height="250"/>
+            <text class="zone-label" x="311" y="32">Quadtree (adaptive)</text>
+            <rect class="box plain" x="335" y="50" width="90" height="90"/>
+            <rect class="box plain" x="425" y="50" width="90" height="90"/>
+            <rect class="box plain" x="335" y="140" width="90" height="90"/>
+            <rect class="box hot" x="425" y="140" width="45" height="45"/><rect class="box hot" x="470" y="140" width="45" height="45"/>
+            <rect class="box hot" x="425" y="185" width="45" height="45"/><rect class="box hot" x="470" y="185" width="22" height="22"/><rect class="box hot" x="492" y="185" width="23" height="22"/><rect class="box hot" x="470" y="207" width="22" height="23"/><rect class="box hot" x="492" y="207" width="23" height="23"/>
+            <text class="label small" x="380" y="100">quiet</text>
+            <text class="label small" x="430" y="250">busy areas split into 4</text>
+
+            <rect class="zone kafka" x="580" y="10" width="270" height="250"/>
+            <text class="zone-label" x="596" y="32">H3 (hexagons)</text>
+            <polygon class="box highlight" points="715,110 745,127 745,161 715,178 685,161 685,127"/>
+            <polygon class="box plain" points="715,42 745,59 745,93 715,110 685,93 685,59"/>
+            <polygon class="box plain" points="775,76 805,93 805,127 775,144 745,127 745,93"/>
+            <polygon class="box plain" points="775,144 805,161 805,195 775,212 745,195 745,161"/>
+            <polygon class="box plain" points="715,178 745,195 745,229 715,246 685,229 685,195"/>
+            <polygon class="box plain" points="655,144 685,161 685,195 655,212 625,195 625,161"/>
+            <polygon class="box plain" points="655,76 685,93 685,127 655,144 625,127 625,93"/>
+            <text class="label small" x="715" y="149">me</text>
+          </svg>
+          <figcaption>Geohash squares have 8 neighbours at two different distances; a quadtree adapts cell size to density; H3 hexagons have 6 neighbours whose centres are all the same distance away.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Option</th><th>How it works</th><th>Good at</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td><b>Geohash</b></td><td>Interleave lat/lng bits, base32 string; longer prefix = smaller cell (6 chars is about +-0.61 km)</td><td>Simple; works in any KV store or Redis GEO; prefix queries</td><td>Cells next to a boundary have different prefixes: <b>always query the 8 neighbours</b></td></tr>
+              <tr><td><b>Quadtree</b></td><td>Split a square into 4 when it holds too many points (e.g. &gt;100)</td><td>Adapts to density: Manhattan vs desert</td><td>Usually in memory per server; rebalancing as drivers move</td></tr>
+              <tr><td><b>Google S2</b></td><td>Cube projected onto the sphere, Hilbert curve (a line that visits every cell so nearby cells get nearby ids), 31 levels</td><td>Accurate on a sphere; good range scans</td><td>More complex; Uber's early dispatch (DISCO) used S2 cells</td></tr>
+              <tr><td><b>Uber H3</b></td><td>Hexagons, 16 resolutions (0-15), each finer level about 1/7 the area</td><td>Equal-distance neighbours; great for aggregations like surge</td><td>Hexagons do not nest perfectly; library needed</td></tr>
+              <tr><td><b>PostGIS / Redis GEO</b></td><td>Off-the-shelf spatial index (R-tree / geohash in a sorted set)</td><td>Fast to build; fine for one city</td><td>Write rate per instance is the limit</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-python"># H3 (pip install h3, v4 API): pickup cell plus its ring of neighbours
+import h3
+cell = h3.latlng_to_cell(12.9716, 77.5946, 9)   # resolution 9: a cell is roughly city-block sized
+search = h3.grid_disk(cell, 1)                   # the cell + 6 neighbours = 7 cells
+print(len(search))                               # 7 (for a normal hexagon)
+# widen the search if too few drivers: grid_disk(cell, 2) gives 19 cells</code></pre>
+        <p class="muted">Cell sizes per resolution are listed in the <a href="https://h3geo.org/docs/" target="_blank" rel="noopener">H3 docs</a>; pick the resolution so a cell holds a useful number of drivers in a busy area.</p>
+        <div class="callout interview"><p>Interview line: <b>"I would start with geohash or Redis GEO because it is simple, always query the neighbours to avoid the boundary bug, and move to H3 or S2 if we need uniform neighbours for things like surge pricing."</b> Uber open-sourced H3 in 2018 and computes surge per hexagon.</p></div>
+
+        <h3>2. Matching without double booking</h3>
+        <p>Two riders near each other request at the same moment. Both matching calls find driver D42 as the best. Without care, D42 gets two offers, or worse, two trips. The fix is a <b>state machine with atomic transitions</b> for the driver and the trip:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 240" role="img" aria-label="Driver states: offline, available, offered, on trip, with compare-and-set transitions and timeouts">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box plain" x="15" y="90" width="140" height="56" rx="28"/>
+            <text class="label" x="85" y="123">OFFLINE</text>
+            <rect class="box svc" x="225" y="90" width="160" height="56" rx="28"/>
+            <text class="label" x="305" y="123">AVAILABLE</text>
+            <rect class="box hot" x="465" y="90" width="160" height="56" rx="28"/>
+            <text class="label" x="545" y="123">OFFERED</text>
+            <rect class="box db" x="700" y="90" width="145" height="56" rx="28"/>
+            <text class="label" x="772" y="123">ON_TRIP</text>
+            <path class="arrow" d="M155 110 L218 110"/>
+            <text class="label small" x="187" y="80">go online</text>
+            <path class="arrow" d="M385 110 L458 110"/>
+            <text class="label small" x="422" y="80">CAS</text>
+            <path class="arrow" d="M625 110 L693 110"/>
+            <text class="label small" x="660" y="80">accept</text>
+            <path class="arrow dashed" d="M545 146 C545 200, 305 200, 305 153"/>
+            <text class="label small" x="425" y="220">decline / 15 s timeout</text>
+            <path class="arrow dashed" d="M772 90 C772 30, 305 30, 305 83"/>
+            <text class="label small" x="545" y="40">trip ends</text>
+            <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M155 110 L225 110 L385 110 L465 110 L625 110 L700 110"/></circle>
+          </svg>
+          <figcaption>Every arrow is a conditional write: "change to X only if it is still Y". A loser of the race sees the write fail and moves to the next driver.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Driver reservation</b>: in Redis, a small Lua script that checks <code>state == AVAILABLE</code> and sets <code>OFFERED:ride_id</code> with a short TTL, all in one atomic step. Or route all offers for a city through one matching shard owner (single writer) so there is no race at all.</li>
+          <li><b>Trip commit</b>: the final <code>MATCHED</code> write happens in the SQL trips DB with a conditional update and the unique "one active trip per driver" index. Even if the cache lock had a bug, the database refuses the second trip. Belt and braces.</li>
+          <li><b>Offer expiry</b>: the TTL on <code>OFFERED</code> means a crashed matching server cannot keep a driver locked forever.</li>
+          <li><b>Late accepts</b>: an accept for an expired <code>offer_id</code> is rejected politely; the driver sees "this ride was taken".</li>
+          <li><b>Batch matching</b> (good to know): instead of greedily matching each request, collect requests and drivers for 1-2 seconds in an area and solve an assignment problem that minimises total pickup time. Food-delivery companies use the same idea for riders. It trades a little latency for better global matches.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The driver lock is a <b>compare-and-swap with a lease</b>, like the ownership word on a shared DMA descriptor ring: the producer only writes a descriptor whose owner bit says "free", atomically. The TTL is the lease that protects you from a dead owner, like a watchdog that reclaims a descriptor stuck with a crashed core. Martin Kleppmann's point about locks applies too: a lease alone can be violated by a long pause, which is why the final truth is the database's conditional update (a fencing check: a <b>fencing token</b> is a number that increases with each lock grant, so the database rejects writes from an older lock holder). <i>Where it breaks:</i> a DMA owner bit is flipped by one atomic instruction on shared memory with no delays; a Redis lease travels over a network, the holder can pause (GC, VM stall) past its TTL and still believe it owns the driver, so the cache lock alone is never enough.</p>
+        </div>
+
+        <h3>3. The location firehose and hot cells</h3>
+        <ul>
+          <li><b>Shard by geography</b>: each city (or region of a big city) is owned by a set of location and matching servers. Uber's early dispatch system sharded by S2 cell using Ringpop, its gossip plus consistent-hash-ring library (<b>gossip</b> = each node periodically tells a few random peers what it knows, so membership news spreads like a flooding protocol), so a server "owns" some cells and requests for those cells are forwarded to it.</li>
+          <li><b>Drop, do not queue</b>: if a location server is overloaded, dropping an old ping is fine, because a fresher one arrives in 4 s. Never let a backlog of stale positions build up (keep only the newest per driver).</li>
+          <li><b>Hot cells</b>: when a concert ends, thousands of riders and hundreds of drivers sit in a few cells near the stadium or airport. Fixes: use finer cells there (or a quadtree that splits automatically), cap the candidate list, cache "nearby cars" per cell for a second, and use queue-based pickup zones (airports often run a virtual driver queue).</li>
+          <li><b>Adaptive ping rate</b>: drivers on a trip or moving fast need frequent pings; parked, idle drivers can ping less often. Fewer writes for the same accuracy.</li>
+          <li><b>Smoothing</b>: GPS jumps; snap points to roads ("map matching") before showing them to riders or computing fares.</li>
+        </ul>
+        <div class="callout warn"><p><b>The classic bug:</b> searching only the rider's own geohash cell. A driver 50 metres away across the cell border is invisible, so the app says "no cars" while one is parked across the street. Always search the cell plus all neighbours, and widen the ring if there are too few results.</p></div>
+
+        <h3>4. ETA: why straight-line distance is wrong</h3>
+        <p>A driver 400 m away on the other side of a river or a highway divider may be 15 minutes away by road. So matching ranks the few nearest candidates by a <b>routing ETA</b>: the road network as a weighted graph (edge weight = travel time with live traffic), searched with fast shortest-path algorithms using precomputed shortcuts (<b>contraction hierarchies</b>: offline, add shortcut edges that skip over unimportant roads, so a query explores thousands of nodes instead of millions). ETAs are then corrected by an ML model trained on actual trip times. This is its own big system; see <a href="{{BASE}}hld/d37">Google Maps (Routing &amp; ETA)</a> and <a href="{{BASE}}hld/d50">Surge Pricing &amp; ETA</a>. In the interview, say it exists, give it a latency budget (tens of milliseconds per batch), and call it in batches for the top 10 candidates.</p>
+
+        <h3>5. The trip lifecycle and money</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 170" role="img" aria-label="Trip states from requested to matched, arriving, in trip, completed and paid, with cancel possible early">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="40" width="120" height="50" rx="10"/><text class="label small" x="70" y="70">REQUESTED</text>
+            <rect class="box svc" x="155" y="40" width="115" height="50" rx="10"/><text class="label small" x="212" y="70">MATCHED</text>
+            <rect class="box svc" x="295" y="40" width="115" height="50" rx="10"/><text class="label small" x="352" y="70">ARRIVING</text>
+            <rect class="box k8s" x="435" y="40" width="115" height="50" rx="10"/><text class="label small" x="492" y="70">IN_TRIP</text>
+            <rect class="box db" x="575" y="40" width="130" height="50" rx="10"/><text class="label small" x="640" y="70">COMPLETED</text>
+            <rect class="box cache" x="730" y="40" width="115" height="50" rx="10"/><text class="label small" x="787" y="70">PAID</text>
+            <path class="arrow" d="M130 65 L148 65"/><path class="arrow" d="M270 65 L288 65"/><path class="arrow" d="M410 65 L428 65"/><path class="arrow" d="M550 65 L568 65"/><path class="arrow" d="M705 65 L723 65"/>
+            <rect class="box fail" x="155" y="115" width="255" height="40" rx="10"/><text class="label small" x="282" y="140">CANCELLED (fee rules apply)</text>
+            <path class="arrow dashed" d="M70 90 L190 112"/><path class="arrow dashed" d="M352 90 L340 112"/>
+            <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M70 65 L212 65 L352 65 L492 65 L640 65 L787 65"/></circle>
+          </svg>
+          <figcaption>Each transition is a conditional update in the trips DB plus an event on Kafka (<code>trip-events</code>, keyed by trip id so they stay in order).</figcaption>
+        </figure>
+        <ul>
+          <li><b>Start-trip OTP</b> (common in India): the rider tells the driver a 4-digit code, proving the right person got in.</li>
+          <li><b>Fare</b> is computed from the GPS trace (distance + time) and the upfront price rules, after the trip ends.</li>
+          <li><b>Payment</b> is a separate service fed by <code>TripCompleted</code> events, using an idempotency key per trip so a retried event never charges twice. Cash trips just record a ledger entry. See <a href="{{BASE}}hld/d10">Payment System</a>.</li>
+          <li><b>Driver phone dies mid-trip?</b> The trip stays <code>IN_TRIP</code> in the DB; the rider app keeps showing the last known position; the driver app resumes from server state on reconnect. Durable state lives on the server, not the phone.</li>
+        </ul>
+      

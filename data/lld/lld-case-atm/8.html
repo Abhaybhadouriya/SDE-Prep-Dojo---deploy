@@ -1,0 +1,668 @@
+
+  <h2>Full code</h2>
+  <h3 id="build-steps">Build it in 4 steps</h3>
+  <p>Before the full listing, here is the order to write it in. Each step is a real excerpt from the files below (cut at about 15 lines), so you can see where each idea from the patterns table actually lives.</p>
+  <div class="stepper" data-stepper>
+   <div class="step-frames">
+    <div data-step-only="1">
+<pre><code class="language-java">enum StateName { IDLE, CARD_INSERTED, AUTHENTICATED, DISPENSING, OUT_OF_SERVICE }</code></pre>
+<pre><code class="language-java">interface AtmState {
+    StateName name();
+    default void insertCard(Atm atm, String card) { reject("insert a card"); }   // C: default method = an ops-table slot with a generic body
+    default void enterPin(Atm atm, String pin) { reject("enter a PIN"); }
+    default long balance(Atm atm) { reject("check balance"); return 0; }
+    default Receipt withdraw(Atm atm, long amount) { reject("withdraw"); return null; }
+    default void ejectCard(Atm atm) { reject("eject a card"); }
+    private void reject(String what) { throw new InvalidOperationException("cannot " + what + " while " + name()); }
+}</code></pre>
+    </div>
+    <div data-step-only="2">
+<pre><code class="language-java">final class CardInsertedState implements AtmState {
+    static final int MAX_TRIES = 3;
+    private int tries;
+    public StateName name() { return StateName.CARD_INSERTED; }
+    public void enterPin(Atm atm, String pin) {
+        if (atm.bank().verifyPin(atm.card(), pin)) { atm.moveTo(new AuthenticatedState()); return; }
+        tries++;
+        if (tries &gt;= MAX_TRIES) {
+            atm.retainCard();                       // swallow the card, tell the bank, end the session
+            atm.moveTo(new IdleState());
+            throw new InvalidOperationException("wrong PIN " + tries + " times: card retained");
+        }
+        throw new InvalidOperationException("wrong PIN, tries left: " + (MAX_TRIES - tries));
+    }
+    public void ejectCard(Atm atm) { atm.endSession(); }
+}</code></pre>
+    </div>
+    <div data-step-only="3">
+<pre><code class="language-java">final class DispensingState implements AtmState {
+    public StateName name() { return StateName.DISPENSING; }
+
+    Receipt run(Atm atm, long amount) {
+        String txn = atm.nextTxnId();
+        Map&lt;Integer, Integer&gt; notes = atm.dispenser().reserve((int) amount);     // 1. can we pay it out at all?
+        if (notes == null) throw new TransactionDeclinedException("ATM cannot dispense " + amount + " with the notes it has");
+        DebitResult r;
+        try {
+            r = atm.bank().debit(atm.card(), amount, txn);                       // 2. take the money from the account
+        } catch (RuntimeException bankUnreachable) {                             //    timeout: did the debit land? unknown
+            atm.dispenser().release(notes);                                      //    give the notes back to the cassettes
+            try { atm.bank().reverse(txn); }                                     //    safe either way: tombstone if never seen
+            catch (RuntimeException stillDown) { /* a real ATM queues the reversal and retries it (store-and-forward) */ }
+            throw new TransactionDeclinedException("bank unavailable for " + txn + ": nothing dispensed, reversal sent");
+        }
+        if (r != DebitResult.APPROVED) {
+            atm.dispenser().release(notes);
+            throw new TransactionDeclinedException("bank declined " + txn + ": " + r);
+        }
+        if (!atm.dispenser().eject(notes)) {                                   // 3. push the notes out
+            atm.bank().reverse(txn);                                             //    hardware fault: undo the debit
+            atm.dispenser().release(notes);
+            return new Receipt(txn, "WITHDRAW", amount, atm.bank().balance(atm.card()), Map.of(), "REVERSED (dispense fault)");   // C: immutable literal collection
+        }
+        return new Receipt(txn, "WITHDRAW", amount, atm.bank().balance(atm.card()), notes, "OK");
+    }
+}</code></pre>
+    </div>
+    <div data-step-only="4">
+<pre><code class="language-java">    public static void main(String[] args) throws Exception {
+        LegacyCoreBanking core = new LegacyCoreBanking();
+        core.openAccount("4111-0001", "1234", 10_000, 20_000);
+        core.openAccount("4111-0002", "4321", 500, 20_000);
+        core.openAccount("4111-0003", "0000", 9_000, 20_000);
+        CoreBankingAdapter bank = new CoreBankingAdapter(core);
+        // the stock from a 2022 Microsoft phone-screen question (LeetCode Discuss 1881529): 2000x1, 500x5, 200x4, 100x4
+        Atm atm = new Atm("ATM1", bank, new CashDispenser(notes(2000, 1, 500, 5, 200, 4, 100, 4)), 100);
+
+        System.out.println("== 1. wrong-state actions are rejected by the state object ==");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.withdraw(500), "withdraw with no card");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("1234"), "PIN with no card");
+
+        System.out.println("== 2. card, PIN, balance, withdraw 1700 ==");
+        atm.insertCard("4111-0001");
+        // ... (the rest is in the full code below)</code></pre>
+    </div>
+   </div>
+    <ol class="stepper-captions">
+      <li><b>Enums and data classes.</b> <code>StateName</code>, the <code>Receipt</code> record, and the <code>AtmState</code> interface whose default methods reject every action.</li>
+      <li><b>One implementation.</b> <code>CardInsertedState</code> overrides only what is legal with a card in: PIN entry and eject.</li>
+      <li><b>The core.</b> <code>DispensingState</code> runs reserve notes, debit, eject in that order, and releases and reverses on every failure path, exceptions included.</li>
+      <li><b>The driver.</b> <code>main</code> wires a bank adapter and two ATMs and runs the numbered scenarios.</li>
+    </ol>
+  </div>
+  <h3 id="reading-order">How to read the full code</h3>
+  <p><b>Reading order:</b> Read <code>AtmState</code> and the five states in <code>Atm.java</code>, then <code>CashDispenser.java</code> (the note chain), then <code>Bank.java</code> (<code>postDebit</code>, <code>reversal</code> and the adapter). Skip <code>LostAnswerBank</code> and the joint-account race in <code>Main</code> on a first read.</p>
+  <details class="callout note">
+    <summary><b>Java for C readers</b>: the idioms this page's code uses (open if a line looks strange)</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>x -&gt; x.price</code> (lambda)</td><td>An anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you would hand to <code>qsort</code>.</td></tr>
+        <tr><td><code>record P(int x, int y) {}</code></td><td>An immutable struct: the compiler writes the constructor, the getters <code>x()</code>/<code>y()</code>, <code>equals</code>, <code>hashCode</code> and <code>toString</code>.</td></tr>
+        <tr><td><code>default</code> method in an interface</td><td>An ops-table slot pre-filled with a generic implementation; an implementing class overrides only the slots it cares about.</td></tr>
+        <tr><td><code>lock(); try { ... } finally { unlock(); }</code></td><td>The <code>finally</code> block runs on every exit path, normal return or exception: it is the <code>goto out_unlock;</code> label of kernel C.</td></tr>
+        <tr><td><code>synchronized</code></td><td>Take the object's built-in mutex on entry and release it on every exit. It is reentrant: the owning thread may enter again.</td></tr>
+        <tr><td><code>throw new XException(..)</code></td><td>Unwinds to the nearest <code>catch</code>: an error return that a caller cannot silently ignore.</td></tr>
+        <tr><td><code>static final class Builder</code> inside a class</td><td>A struct type declared inside another type's namespace; it gets no hidden pointer to an outer object.</td></tr>
+        <tr><td><code>List.of(..)</code>, <code>Map.of(..)</code></td><td>Immutable literal collections, like a <code>static const</code> initialiser list; writes to them throw.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The source files mark the first use of each idiom with a short <code>// C: ...</code> comment. The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <p>Complete and runnable: these are the same files that sit in <code>lld-code/lld-case-atm/</code>. Java is primary (four files, no packages, so <code>javac *.java</code> works). Python mirrors it and adds a unittest file. The C++14 version is single-threaded, because the MinGW g++ 6.3 used to build it has no <code>std::thread</code>; a comment at the top says where each mutex goes.</p>
+  <h3>Java (primary)</h3>
+  <ul class="file-roles"><li><code>Atm.java</code>: the state interface, the five states, the receipt and the <code>Atm</code> context.</li><li><code>Bank.java</code>: <code>BankService</code>, the fake legacy core with ISO-8583-style codes, and the adapter.</li><li><code>CashDispenser.java</code>: the note chain with bounded backtracking, and the dispenser that reserves atomically.</li><li><code>Main.java</code>: demo driver with 30 checks: illegal actions, the two Microsoft examples, decline, jam and reversal, idempotent retry, card retention, out-of-service and refill, and a 20-ATM race on one joint account.</li></ul>
+  <p>These files hold several package-private top-level classes each, so <b>compile them together</b>: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>. <code>javac Main.java</code> alone fails, and <code>javac -Xlint:all</code> warns that an "auxiliary class" is used outside its own file. That packing keeps the page short; in a real round, put one top-level type per file or use a package (see <a href="{{BASE}}lld/lld-int-code-layout">code layout</a>).</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Atm.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+
+enum StateName { IDLE, CARD_INSERTED, AUTHENTICATED, DISPENSING, OUT_OF_SERVICE }
+
+record Receipt(String txnId, String type, long amount, long balanceAfter, Map&lt;Integer, Integer&gt; notes, String status) {   // C: record = an immutable struct (equals/hashCode/toString generated)
+    @Override public String toString() {
+        return txnId + " " + type + " " + amount + " -&gt; " + status + (notes.isEmpty() ? "" : " notes " + notes) + ", balance " + balanceAfter;
+    }
+}
+
+class InvalidOperationException extends RuntimeException { InvalidOperationException(String m) { super(m); } }
+class TransactionDeclinedException extends RuntimeException { TransactionDeclinedException(String m) { super(m); } }
+
+/** State pattern: every user action goes to the current state object; illegal actions fail in one place. */
+interface AtmState {
+    StateName name();
+    default void insertCard(Atm atm, String card) { reject("insert a card"); }   // C: default method = an ops-table slot with a generic body
+    default void enterPin(Atm atm, String pin) { reject("enter a PIN"); }
+    default long balance(Atm atm) { reject("check balance"); return 0; }
+    default Receipt withdraw(Atm atm, long amount) { reject("withdraw"); return null; }
+    default void ejectCard(Atm atm) { reject("eject a card"); }
+    private void reject(String what) { throw new InvalidOperationException("cannot " + what + " while " + name()); }
+}
+
+final class IdleState implements AtmState {
+    public StateName name() { return StateName.IDLE; }
+    public void insertCard(Atm atm, String card) {
+        if (atm.isRetained(card)) throw new InvalidOperationException("card " + card + " is blocked");
+        atm.startSession(card);
+        atm.moveTo(new CardInsertedState());
+    }
+}
+
+final class CardInsertedState implements AtmState {
+    static final int MAX_TRIES = 3;
+    private int tries;
+    public StateName name() { return StateName.CARD_INSERTED; }
+    public void enterPin(Atm atm, String pin) {
+        if (atm.bank().verifyPin(atm.card(), pin)) { atm.moveTo(new AuthenticatedState()); return; }
+        tries++;
+        if (tries &gt;= MAX_TRIES) {
+            atm.retainCard();                       // swallow the card, tell the bank, end the session
+            atm.moveTo(new IdleState());
+            throw new InvalidOperationException("wrong PIN " + tries + " times: card retained");
+        }
+        throw new InvalidOperationException("wrong PIN, tries left: " + (MAX_TRIES - tries));
+    }
+    public void ejectCard(Atm atm) { atm.endSession(); }
+}
+
+final class AuthenticatedState implements AtmState {
+    static final long MAX_PER_TXN = 20_000;
+    public StateName name() { return StateName.AUTHENTICATED; }
+    public long balance(Atm atm) { return atm.bank().balance(atm.card()); }
+    public Receipt withdraw(Atm atm, long amount) {
+        if (amount &lt;= 0 || amount % 100 != 0) throw new InvalidOperationException("amount must be a positive multiple of 100");
+        if (amount &gt; MAX_PER_TXN) throw new InvalidOperationException("max " + MAX_PER_TXN + " per withdrawal");
+        DispensingState d = new DispensingState();
+        atm.moveTo(d);
+        try { return d.run(atm, amount); }
+        finally { atm.moveTo(this); }               // back to the menu, success or not
+    }
+    public void ejectCard(Atm atm) { atm.endSession(); }
+}
+
+/** Transient state while money moves. Every user action is rejected here (the default methods). */
+final class DispensingState implements AtmState {
+    public StateName name() { return StateName.DISPENSING; }
+
+    Receipt run(Atm atm, long amount) {
+        String txn = atm.nextTxnId();
+        Map&lt;Integer, Integer&gt; notes = atm.dispenser().reserve((int) amount);     // 1. can we pay it out at all?
+        if (notes == null) throw new TransactionDeclinedException("ATM cannot dispense " + amount + " with the notes it has");
+        DebitResult r;
+        try {
+            r = atm.bank().debit(atm.card(), amount, txn);                       // 2. take the money from the account
+        } catch (RuntimeException bankUnreachable) {                             //    timeout: did the debit land? unknown
+            atm.dispenser().release(notes);                                      //    give the notes back to the cassettes
+            try { atm.bank().reverse(txn); }                                     //    safe either way: tombstone if never seen
+            catch (RuntimeException stillDown) { /* a real ATM queues the reversal and retries it (store-and-forward) */ }
+            throw new TransactionDeclinedException("bank unavailable for " + txn + ": nothing dispensed, reversal sent");
+        }
+        if (r != DebitResult.APPROVED) {
+            atm.dispenser().release(notes);
+            throw new TransactionDeclinedException("bank declined " + txn + ": " + r);
+        }
+        if (!atm.dispenser().eject(notes)) {                                   // 3. push the notes out
+            atm.bank().reverse(txn);                                             //    hardware fault: undo the debit
+            atm.dispenser().release(notes);
+            return new Receipt(txn, "WITHDRAW", amount, atm.bank().balance(atm.card()), Map.of(), "REVERSED (dispense fault)");   // C: immutable literal collection
+        }
+        return new Receipt(txn, "WITHDRAW", amount, atm.bank().balance(atm.card()), notes, "OK");
+    }
+}
+
+final class OutOfServiceState implements AtmState {
+    public StateName name() { return StateName.OUT_OF_SERVICE; }
+}
+
+/** The context. All public methods are synchronized: one customer, one keypad, one state at a time. */
+final class Atm {
+    private static final AtomicLong TXN = new AtomicLong();
+    private final String id;
+    private final CoreBankingAdapter bank;
+    private final CashDispenser dispenser;
+    private final List&lt;String&gt; history = Collections.synchronizedList(new ArrayList&lt;&gt;());
+    private final List&lt;String&gt; retained = new ArrayList&lt;&gt;();
+    private AtmState state = new IdleState();
+    private String card;
+    private final long minCash;
+
+    Atm(String id, CoreBankingAdapter bank, CashDispenser dispenser, long minCash) {
+        this.id = id; this.bank = bank; this.dispenser = dispenser; this.minCash = minCash;
+        if (dispenser.total() &lt; minCash) state = new OutOfServiceState();
+    }
+
+    // ---- user actions: delegate to the state
+    synchronized void insertCard(String c) { state.insertCard(this, c); }
+    synchronized void enterPin(String pin) { state.enterPin(this, pin); }
+    synchronized long balance() { return state.balance(this); }
+    synchronized Receipt withdraw(long amount) { return state.withdraw(this, amount); }
+    synchronized void ejectCard() { state.ejectCard(this); }
+
+    // ---- operator actions
+    synchronized void loadCash(int denom, int n) {
+        dispenser.load(denom, n);
+        if (state.name() == StateName.OUT_OF_SERVICE &amp;&amp; dispenser.total() &gt;= minCash) moveTo(new IdleState());
+    }
+
+    // ---- used by states
+    BankService bank() { return bank; }
+    CashDispenser dispenser() { return dispenser; }
+    String card() { return card; }
+    String nextTxnId() { return id + "-T" + TXN.incrementAndGet(); }
+    void startSession(String c) { card = c; }
+    void endSession() {
+        card = null;
+        moveTo(dispenser.total() &lt; minCash ? new OutOfServiceState() : new IdleState());
+    }
+    void retainCard() { retained.add(card); bank.blockCard(card); card = null; }
+    boolean isRetained(String c) { return retained.contains(c); }
+    void moveTo(AtmState next) {
+        if (next.name() != state.name()) history.add(state.name() + " -&gt; " + next.name());
+        state = next;
+    }
+    synchronized StateName state() { return state.name(); }
+    List&lt;String&gt; history() { return new ArrayList&lt;&gt;(history); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Bank.java">
+<pre><code class="language-java">import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HashMap;
+import java.util.Map;
+
+/** What the ATM needs from a bank, in the ATM's own words (rupees, enums). */
+interface BankService {
+    boolean verifyPin(String cardNumber, String pin);
+    long balance(String cardNumber);
+    DebitResult debit(String cardNumber, long rupees, String txnId);   // idempotent per txnId
+    void reverse(String txnId);                                         // compensation, idempotent
+}
+
+enum DebitResult { APPROVED, INSUFFICIENT_FUNDS, DAILY_LIMIT_EXCEEDED, CARD_BLOCKED, UNKNOWN_CARD, ALREADY_REVERSED, BANK_ERROR }
+
+/**
+ * A pretend vendor core-banking library with an awkward, older API: amounts in paise, ISO-8583-style
+ * two-character response codes, PINs only as hashed "PIN blocks". We cannot change it; we adapt to it.
+ */
+final class LegacyCoreBanking {
+    private static final class Account {
+        final String pinHash; long paise; final long dailyLimitPaise; long withdrawnTodayPaise; boolean blocked;
+        Account(String pinHash, long paise, long dailyLimitPaise) { this.pinHash = pinHash; this.paise = paise; this.dailyLimitPaise = dailyLimitPaise; }
+    }
+    private final Map&lt;String, Account&gt; byPan = new HashMap&lt;&gt;();
+    /** The durable answer for one ref (a txn id). Kept for approvals AND declines, and never removed:
+     *  a reversal marks it REVERSED instead of deleting it (a tombstone). */
+    private static final class Outcome {
+        final String pan; final long paise; final String code; boolean reversed;
+        Outcome(String pan, long paise, String code) { this.pan = pan; this.paise = paise; this.code = code; }
+    }
+    private final Map&lt;String, Outcome&gt; outcomes = new HashMap&lt;&gt;();          // ref -&gt; outcome, guarded by this
+
+    static String pinBlock(String pan, String pin) {
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest((pan + ":" + pin).getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i &lt; 8; i++) sb.append(String.format("%02x", d[i]));
+            return sb.toString();
+        } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    synchronized void openAccount(String pan, String pin, long rupees, long dailyLimitRupees) {
+        byPan.put(pan, new Account(pinBlock(pan, pin), rupees * 100, dailyLimitRupees * 100));
+    }
+
+    /** "00" ok, "55" wrong PIN, "14" unknown card, "62" blocked. */
+    synchronized String authorize(String pan, String pinBlock) {
+        Account a = byPan.get(pan);
+        if (a == null) return "14";
+        if (a.blocked) return "62";
+        return a.pinHash.equals(pinBlock) ? "00" : "55";
+    }
+
+    synchronized long ledgerPaise(String pan) { return byPan.get(pan).paise; }
+
+    /** "00" approved, "51" insufficient funds, "61" over daily limit, "62" blocked, "14" unknown card,
+     *  "94" ref already reversed. Same ref twice = the first answer again, and at most one debit. */
+    synchronized String postDebit(String pan, long paise, String ref) {
+        Outcome known = outcomes.get(ref);
+        if (known != null) return known.reversed ? "94" : known.code;   // retransmit: replay, never re-post
+        String code = decide(pan, paise);
+        if ("00".equals(code)) { Account a = byPan.get(pan); a.paise -= paise; a.withdrawnTodayPaise += paise; }
+        outcomes.put(ref, new Outcome(pan, paise, code));
+        return code;
+    }
+
+    private String decide(String pan, long paise) {
+        Account a = byPan.get(pan);
+        if (a == null) return "14";
+        if (a.blocked) return "62";
+        if (a.withdrawnTodayPaise + paise &gt; a.dailyLimitPaise) return "61";
+        if (a.paise &lt; paise) return "51";
+        return "00";
+    }
+
+    /** "00" reversed (or nothing was taken), "25" original not seen yet: a tombstone is stored so a late
+     *  debit with this ref is declined. Idempotent: reversing twice refunds once. */
+    synchronized String reversal(String ref) {
+        Outcome o = outcomes.get(ref);
+        if (o == null) {                                    // the reversal overtook its debit on the network
+            Outcome tomb = new Outcome(null, 0, "25"); tomb.reversed = true;
+            outcomes.put(ref, tomb);
+            return "25";
+        }
+        if (!o.reversed &amp;&amp; "00".equals(o.code)) {
+            Account a = byPan.get(o.pan);
+            a.paise += o.paise; a.withdrawnTodayPaise -= o.paise;
+        }
+        o.reversed = true;
+        return "00";
+    }
+
+    synchronized void block(String pan) { byPan.get(pan).blocked = true; }
+}
+
+/** Adapter: makes LegacyCoreBanking look like the BankService the ATM was written against. */
+class CoreBankingAdapter implements BankService {
+    private final LegacyCoreBanking core;
+    CoreBankingAdapter(LegacyCoreBanking core) { this.core = core; }
+
+    public boolean verifyPin(String card, String pin) { return "00".equals(core.authorize(card, LegacyCoreBanking.pinBlock(card, pin))); }
+    public long balance(String card) { return core.ledgerPaise(card) / 100; }
+    public DebitResult debit(String card, long rupees, String txnId) {
+        switch (core.postDebit(card, rupees * 100, txnId)) {
+            case "00": return DebitResult.APPROVED;
+            case "51": return DebitResult.INSUFFICIENT_FUNDS;
+            case "61": return DebitResult.DAILY_LIMIT_EXCEEDED;
+            case "62": return DebitResult.CARD_BLOCKED;
+            case "14": return DebitResult.UNKNOWN_CARD;
+            case "94": return DebitResult.ALREADY_REVERSED;
+            default:   return DebitResult.BANK_ERROR;      // never guess "blocked" for a code we do not know
+        }
+    }
+    public void reverse(String txnId) { core.reversal(txnId); }
+    void blockCard(String card) { core.block(card); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="CashDispenser.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Chain of Responsibility: one handler per note denomination, largest first. Each handler takes as many of
+ * its notes as it can and passes the rest to the next. Plain greedy fails on some stocks (600 from
+ * 500x1 + 200x4 with no 100s), so a handler that cannot finish the job retries with one note fewer
+ * (bounded backtracking). With 4-5 denominations and a 40-note cap per withdrawal this stays tiny.
+ */
+final class NoteHandler {
+    final int denomination;
+    private int count;
+    private final NoteHandler next;
+
+    NoteHandler(int denomination, int count, NoteHandler next) { this.denomination = denomination; this.count = count; this.next = next; }
+
+    /** Returns notes to take (denomination -&gt; count) or null if impossible. Does not change stock. */
+    Map&lt;Integer, Integer&gt; plan(int amount, int notesLeft) {
+        int max = Math.min(Math.min(count, amount / denomination), notesLeft);
+        for (int take = max; take &gt;= 0; take--) {
+            int rest = amount - take * denomination;
+            Map&lt;Integer, Integer&gt; tail;
+            if (rest == 0) tail = new LinkedHashMap&lt;&gt;();
+            else if (next == null) continue;
+            else tail = next.plan(rest, notesLeft - take);
+            if (tail == null) continue;
+            Map&lt;Integer, Integer&gt; out = new LinkedHashMap&lt;&gt;();
+            if (take &gt; 0) out.put(denomination, take);
+            out.putAll(tail);
+            return out;
+        }
+        return null;
+    }
+
+    void take(Map&lt;Integer, Integer&gt; notes) { count -= notes.getOrDefault(denomination, 0); if (next != null) next.take(notes); }
+    void giveBack(Map&lt;Integer, Integer&gt; notes) { count += notes.getOrDefault(denomination, 0); if (next != null) next.giveBack(notes); }
+    void load(int denom, int n) {
+        if (denom == denomination) count += n;
+        else if (next != null) next.load(denom, n);
+        else throw new IllegalArgumentException("no cassette for " + denom);
+    }
+    void stock(Map&lt;Integer, Integer&gt; out) { out.put(denomination, count); if (next != null) next.stock(out); }
+}
+
+final class CashDispenser {
+    static final int MAX_NOTES = 40;
+    private final NoteHandler head;
+    private boolean failNext;                 // simulates a jammed note feeder
+
+    /** denominations must be given largest first, e.g. {2000:1, 500:5, 200:4, 100:4} */
+    CashDispenser(Map&lt;Integer, Integer&gt; stock) {
+        List&lt;Integer&gt; denoms = new ArrayList&lt;&gt;(stock.keySet());
+        denoms.sort((a, b) -&gt; b - a);   // C: a lambda = a function pointer plus its captured context
+        NoteHandler h = null;
+        for (int i = denoms.size() - 1; i &gt;= 0; i--) h = new NoteHandler(denoms.get(i), stock.get(denoms.get(i)), h);
+        head = h;
+    }
+
+    /** Plan AND set aside the notes in one step, so nothing else can promise the same notes. */
+    synchronized Map&lt;Integer, Integer&gt; reserve(int amount) {
+        Map&lt;Integer, Integer&gt; plan = head.plan(amount, MAX_NOTES);
+        if (plan != null) head.take(plan);
+        return plan;
+    }
+    synchronized void release(Map&lt;Integer, Integer&gt; notes) { head.giveBack(notes); }   // notes never left the cassette
+    synchronized void load(int denom, int n) { head.load(denom, n); }
+    synchronized Map&lt;Integer, Integer&gt; stock() { Map&lt;Integer, Integer&gt; m = new LinkedHashMap&lt;&gt;(); head.stock(m); return m; }
+    synchronized long total() { long t = 0; for (Map.Entry&lt;Integer, Integer&gt; e : stock().entrySet()) t += (long) e.getKey() * e.getValue(); return t; }
+
+    void jamNext() { failNext = true; }
+    /** Physically push the notes out. Returns false on a hardware fault (the notes stay inside). */
+    synchronized boolean eject(Map&lt;Integer, Integer&gt; notes) {
+        if (failNext) { failNext = false; return false; }
+        return true;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Main.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Test double: the core posts the debit, then the answer is lost on the way back (a timeout). */
+final class LostAnswerBank extends CoreBankingAdapter {
+    LostAnswerBank(LegacyCoreBanking core) { super(core); }
+    @Override public DebitResult debit(String card, long rupees, String txnId) {
+        super.debit(card, rupees, txnId);
+        throw new IllegalStateException("timeout waiting for the bank");
+    }
+}
+
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static void expectThrows(Class&lt;? extends RuntimeException&gt; type, Runnable r, String what) {
+        try { r.run(); }
+        catch (RuntimeException e) {
+            check(type.isInstance(e), what + " (got " + e.getClass().getSimpleName() + ": " + e.getMessage() + ")");
+            System.out.println("  rejected as expected: " + e.getMessage());
+            return;
+        }
+        throw new AssertionError("FAILED: expected " + type.getSimpleName() + " for " + what);
+    }
+    static Map&lt;Integer, Integer&gt; notes(int... pairs) {
+        Map&lt;Integer, Integer&gt; m = new LinkedHashMap&lt;&gt;();
+        for (int i = 0; i &lt; pairs.length; i += 2) m.put(pairs[i], pairs[i + 1]);
+        return m;
+    }
+
+    public static void main(String[] args) throws Exception {
+        LegacyCoreBanking core = new LegacyCoreBanking();
+        core.openAccount("4111-0001", "1234", 10_000, 20_000);
+        core.openAccount("4111-0002", "4321", 500, 20_000);
+        core.openAccount("4111-0003", "0000", 9_000, 20_000);
+        CoreBankingAdapter bank = new CoreBankingAdapter(core);
+        // the stock from a 2022 Microsoft phone-screen question (LeetCode Discuss 1881529): 2000x1, 500x5, 200x4, 100x4
+        Atm atm = new Atm("ATM1", bank, new CashDispenser(notes(2000, 1, 500, 5, 200, 4, 100, 4)), 100);
+
+        System.out.println("== 1. wrong-state actions are rejected by the state object ==");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.withdraw(500), "withdraw with no card");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("1234"), "PIN with no card");
+
+        System.out.println("== 2. card, PIN, balance, withdraw 1700 ==");
+        atm.insertCard("4111-0001");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("9999"), "one wrong PIN");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.withdraw(500), "withdraw before PIN");
+        atm.enterPin("1234");
+        check(atm.balance() == 10_000, "balance 10000");
+        Receipt r1 = atm.withdraw(1700);
+        System.out.println("  " + r1);
+        check(r1.notes().equals(notes(500, 3, 200, 1)), "1700 = 500x3 + 200x1 (2000 is too big)");
+        check(r1.balanceAfter() == 8_300, "balance now 8300");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.withdraw(250), "not a multiple of 100");
+        expectThrows(TransactionDeclinedException.class, () -&gt; atm.withdraw(4500), "ATM holds only 4000 now");
+        check(bank.balance("4111-0001") == 8_300, "a failed dispense plan never touches the account");
+        atm.ejectCard();
+        check(atm.state() == StateName.IDLE, "back to IDLE");
+
+        System.out.println("== 3. greedy is not enough: 600 from 2000x1, 500x1, 200x4, no 100s ==");
+        Atm atm2 = new Atm("ATM2", bank, new CashDispenser(notes(2000, 1, 500, 1, 200, 4, 100, 0)), 100);
+        atm2.insertCard("4111-0001"); atm2.enterPin("1234");
+        Receipt r2 = atm2.withdraw(600);
+        System.out.println("  " + r2);
+        check(r2.notes().equals(notes(200, 3)), "greedy takes 500 and gets stuck at 100; the chain backtracks to 200x3");
+        atm2.ejectCard();
+
+        System.out.println("== 4. bank declines: insufficient funds, notes go back ==");
+        Map&lt;Integer, Integer&gt; before = atm.dispenser().stock();
+        atm.insertCard("4111-0002"); atm.enterPin("4321");
+        expectThrows(TransactionDeclinedException.class, () -&gt; atm.withdraw(1000), "balance is only 500");
+        check(atm.dispenser().stock().equals(before), "reserved notes were released");
+        atm.ejectCard();
+
+        System.out.println("== 5. dispenser jams after the debit: the bank debit is reversed ==");
+        atm.insertCard("4111-0001"); atm.enterPin("1234");
+        atm.dispenser().jamNext();
+        Receipt r3 = atm.withdraw(1000);
+        System.out.println("  " + r3);
+        check(r3.status().startsWith("REVERSED") &amp;&amp; r3.balanceAfter() == 7_700, "money is back (8300 - 600 taken at ATM2)");
+        check(atm.dispenser().stock().equals(before), "notes are back in the cassettes");
+        atm.ejectCard();
+
+        System.out.println("== 6. idempotent debit: the same txn id twice debits once ==");
+        check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult.APPROVED, "first post");
+        check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult.APPROVED, "retry answered from memory");
+        check(bank.balance("4111-0003") == 8_000, "debited once, not twice");
+        bank.reverse("RETRY-1"); bank.reverse("RETRY-1");
+        check(bank.balance("4111-0003") == 9_000, "reversed once, not twice");
+        check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult.ALREADY_REVERSED, "reverse then retry: declined");
+        check(bank.balance("4111-0003") == 9_000, "reverse then retry debit -&gt; no second debit");
+        bank.reverse("LATE-1");                                               // the reversal overtakes its debit
+        check(bank.debit("4111-0003", 1000, "LATE-1") == DebitResult.ALREADY_REVERSED, "reversal before debit -&gt; late debit declined");
+        check(bank.balance("4111-0003") == 9_000, "the late debit took nothing");
+        check(bank.debit("4111-0002", 15_000, "NOFUNDS-1") == DebitResult.INSUFFICIENT_FUNDS
+              &amp;&amp; bank.debit("4111-0002", 15_000, "NOFUNDS-1") == DebitResult.INSUFFICIENT_FUNDS, "declines are remembered too");
+        check(bank.debit("4111-9999", 100, "NOCARD-1") == DebitResult.UNKNOWN_CARD, "code 14 is UNKNOWN_CARD, not CARD_BLOCKED");
+
+        System.out.println("== 6b. the bank times out AFTER posting the debit: notes released, debit reversed ==");
+        Atm flaky = new Atm("ATM4", new LostAnswerBank(core), new CashDispenser(notes(500, 4)), 100);
+        Map&lt;Integer, Integer&gt; full = flaky.dispenser().stock();
+        flaky.insertCard("4111-0003"); flaky.enterPin("0000");
+        expectThrows(TransactionDeclinedException.class, () -&gt; flaky.withdraw(1000), "bank unavailable");
+        check(flaky.dispenser().stock().equals(full), "reserved notes released after a bank exception");
+        check(bank.balance("4111-0003") == 9_000, "the debit that did land was reversed");
+        flaky.ejectCard();
+
+        System.out.println("== 7. three wrong PINs: card retained ==");
+        atm.insertCard("4111-0002");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("1111"), "wrong 1");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("2222"), "wrong 2");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.enterPin("3333"), "wrong 3");
+        check(atm.state() == StateName.IDLE, "session over");
+        expectThrows(InvalidOperationException.class, () -&gt; atm.insertCard("4111-0002"), "retained card refused");
+        check(!bank.verifyPin("4111-0002", "4321"), "bank blocked the card too");
+
+        System.out.println("== 8. empty ATM goes out of service; loading cash brings it back ==");
+        Atm small = new Atm("ATM3", bank, new CashDispenser(notes(500, 2)), 500);
+        small.insertCard("4111-0001"); small.enterPin("1234");
+        System.out.println("  " + small.withdraw(1000));
+        small.ejectCard();
+        check(small.state() == StateName.OUT_OF_SERVICE, "no cash left -&gt; OUT_OF_SERVICE");
+        expectThrows(InvalidOperationException.class, () -&gt; small.insertCard("4111-0001"), "no cards while out of service");
+        small.loadCash(500, 10);
+        check(small.state() == StateName.IDLE, "operator refill -&gt; IDLE");
+        System.out.println("  ATM1 history: " + atm.history().subList(0, 6) + " ...");
+
+        System.out.println("== 9. concurrency: 20 ATMs, one joint account of 10000, each withdraws 1000 ==");
+        core.openAccount("4111-JOINT", "2468", 10_000, 50_000);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger ok = new AtomicInteger(), declined = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 20; i++) {
+            Atm a = new Atm("J" + i, bank, new CashDispenser(notes(500, 4)), 100);
+            fs.add(pool.submit(() -&gt; {
+                try {
+                    go.await();
+                    a.insertCard("4111-JOINT"); a.enterPin("2468");
+                    try { a.withdraw(1000); ok.incrementAndGet(); }
+                    catch (TransactionDeclinedException e) { declined.incrementAndGet(); }
+                    a.ejectCard();
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                return null;
+            }));
+        }
+        go.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("  approved " + ok.get() + ", declined " + declined.get() + ", balance " + bank.balance("4111-JOINT"));
+        check(ok.get() == 10 &amp;&amp; declined.get() == 10 &amp;&amp; bank.balance("4111-JOINT") == 0, "never overdrawn");
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Build and run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code></p>
+<pre class="terminal"><code>$ javac -d out *.java &amp;&amp; java -cp out Main
+== 1. wrong-state actions are rejected by the state object ==
+  rejected as expected: cannot withdraw while IDLE
+  rejected as expected: cannot enter a PIN while IDLE
+== 2. card, PIN, balance, withdraw 1700 ==
+  rejected as expected: wrong PIN, tries left: 2
+  rejected as expected: cannot withdraw while CARD_INSERTED
+  ATM1-T1 WITHDRAW 1700 -&gt; OK notes {500=3, 200=1}, balance 8300
+  rejected as expected: amount must be a positive multiple of 100
+  rejected as expected: ATM cannot dispense 4500 with the notes it has
+== 3. greedy is not enough: 600 from 2000x1, 500x1, 200x4, no 100s ==
+  ATM2-T3 WITHDRAW 600 -&gt; OK notes {200=3}, balance 7700
+== 4. bank declines: insufficient funds, notes go back ==
+  rejected as expected: bank declined ATM1-T4: INSUFFICIENT_FUNDS
+== 5. dispenser jams after the debit: the bank debit is reversed ==
+  ATM1-T5 WITHDRAW 1000 -&gt; REVERSED (dispense fault), balance 7700
+== 6. idempotent debit: the same txn id twice debits once ==
+== 6b. the bank times out AFTER posting the debit: notes released, debit reversed ==
+  rejected as expected: bank unavailable for ATM4-T6: nothing dispensed, reversal sent
+== 7. three wrong PINs: card retained ==
+  rejected as expected: wrong PIN, tries left: 2
+  rejected as expected: wrong PIN, tries left: 1
+  rejected as expected: wrong PIN 3 times: card retained
+  rejected as expected: card 4111-0002 is blocked
+== 8. empty ATM goes out of service; loading cash brings it back ==
+  ATM3-T7 WITHDRAW 1000 -&gt; OK notes {500=2}, balance 6700
+  rejected as expected: cannot insert a card while OUT_OF_SERVICE
+  ATM1 history: [IDLE -&gt; CARD_INSERTED, CARD_INSERTED -&gt; AUTHENTICATED, AUTHENTICATED -&gt; DISPENSING, DISPENSING -&gt; AUTHENTICATED, AUTHENTICATED -&gt; DISPENSING, DISPENSING -&gt; AUTHENTICATED] ...
+== 9. concurrency: 20 ATMs, one joint account of 10000, each withdraws 1000 ==
+  approved 10, declined 10, balance 0
+ALL 39 CHECKS PASSED</code></pre>
+    </div>
+  </div>
+  

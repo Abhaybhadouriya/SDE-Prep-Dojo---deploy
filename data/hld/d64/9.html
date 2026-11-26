@@ -1,0 +1,130 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (recent LeetCode Discuss reports; links only):</p>
+          <ul>
+            <li>Groww SDE-2, 2026-09: design a GTT order service on top of an existing order service; about 1M GTT orders a day; consistency critical; drilled on intermediate states and failures from Kafka to order DB to order history; Redis plus end-of-day cron rejected. <a href="https://leetcode.com/discuss/post/8539548/" target="_blank" rel="noopener">post 8539548</a></li>
+            <li>Paytm SSE, 2026-09: live prices, about 1M ticks/s across about 5,000 instruments to 5M users watching about 20 each, at most 500 ms old; then order placement, positions and holdings. <a href="https://leetcode.com/discuss/post/8503494/" target="_blank" rel="noopener">post 8503494</a></li>
+            <li>Goldman Sachs Associate, 2026-06: design a stock broker like Zerodha handling 20M orders a day, plus LLD of order processing. <a href="https://leetcode.com/discuss/post/8348727/" target="_blank" rel="noopener">post 8348727</a></li>
+            <li>Groww SDE-2, 2026-04: automated intraday auto square-off when price crosses a threshold (percent from previous close). <a href="https://leetcode.com/discuss/post/8021077/" target="_blank" rel="noopener">post 8021077</a></li>
+            <li>Groww SDE-II, 2025-08 (selected): migrate and aggregate candle data from cache to SQL. <a href="https://leetcode.com/discuss/post/7046387/" target="_blank" rel="noopener">post 7046387</a></li>
+            <li>Groww SDE-II, 2025-04: buy, sell and stop-loss orders placed within 10 ms; feedback said it should extend to multiple exchanges and segments. <a href="https://leetcode.com/discuss/post/6683943/" target="_blank" rel="noopener">post 6683943</a></li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> Broker, not exchange. Which parts: prices, orders, GTT, square-off, charts? Which exchanges and segments? Numbers: ticks/s, users, watchlist size, freshness, order SLA.</li>
+          <li><strong>5-10 min:</strong> Estimate. Conflation math (20 billion/s naive to 10M frames/s), order rate with 22,500 trading seconds, GTT active set fits in memory.</li>
+          <li><strong>10-15 min:</strong> APIs with <code>client_order_id</code> and 202 Accepted; data model with integer prices.</li>
+          <li><strong>15-25 min:</strong> Draw both paths: feed handler, conflator, gateways; order service, RMS, adapter, events.</li>
+          <li><strong>25-40 min:</strong> Deep dive on what the interviewer cares about: GTT state machine (Groww), fan-out (Paytm), 10 ms budget, square-off. Walk failures arrow by arrow.</li>
+          <li><strong>40-45 min:</strong> Multi-exchange and segment extension, reconciliation, observability (feed lag, order ack latency <a href="{{BASE}}interview/glossary#p99">p99</a>, GTT stuck count).</li>
+        </ol>
+        <div class="callout danger"><p><b>Common mistakes:</b> designing a matching engine (that is the exchange); pushing every tick to every user; JSON ticks; Redis as the only copy of GTTs; a cron that re-places 1M orders at 09:15; resending an order after a timeout without checking the exchange; writing history and order tables separately from the API; dividing daily volume by 86,400; floats for prices; ignoring multiple exchanges when asked to "scale".</p></div>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Groww">
+          <summary>Walk me through every state of a GTT order. What happens if your service crashes in the middle of triggering?</summary>
+          <div class="answer">
+            <p>ACTIVE -&gt; TRIGGERING -&gt; TRIGGERED or FAILED, plus CANCELLED and EXPIRED. The trigger engine claims a GTT with a conditional update (<code>WHERE status='ACTIVE' AND version=?</code>), which is the only way to leave ACTIVE, so two engines or an engine racing a user cancel cannot both win. It then places the order with idempotency key <code>gtt_id:version</code> and records the order id. If it crashes after the claim, the row stays in TRIGGERING; a sweeper picks up rows stuck for more than 30 s, asks the order service whether an order with that key exists, and finishes the row (TRIGGERED with that id, or places it now). No state is a dead end and no retry can create a second order.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the state machine first, then for each arrow say who moves it, what makes it atomic, and how a crash right after it is repaired. That is literally what this interviewer kept asking.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The order is rejected by the exchange (circuit limit, no margin). State? (FAILED with reason, notify the user; do not re-arm automatically.)</li><li>OCO: both legs cross on one gap? (Claim the GTT once; place only the leg that matches the direction of the move.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Groww">
+          <summary>Why not store GTTs in Redis and have an end-of-day cron re-place them on the exchange every morning?</summary>
+          <div class="answer">
+            <p>Three problems. Durability: Redis with async replication or persistence off can lose acknowledged writes on failover, and a GTT must live for up to a year. Semantics: re-placing as day orders puts real resting orders on the exchange that block margin and may fill without the trigger ever being hit. Failure handling: a cron that dies half-way has no record of which of the 1M orders it placed; rerunning duplicates, skipping loses. Instead: Postgres as the source of truth, an in-memory sorted index per instrument rebuilt from it, and a per-GTT state machine with idempotent order placement.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not just say "Redis is bad". Name the failure each part causes and offer the replacement.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can Redis still be used? (Yes, as a cache or as the trigger index, as long as it can be rebuilt from the DB.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Groww,Paytm">
+          <summary>An order event goes Kafka to the order DB to order history. Where can it be lost or duplicated, and how do you prevent it?</summary>
+          <div class="answer">
+            <p>Lost if a producer writes the DB and then crashes before publishing (dual write), or if a consumer commits its offset before applying the event. Duplicated whenever a consumer applies and crashes before committing (Kafka is at-least-once). Fixes: the order service writes the state change and an outbox row in one transaction, and a relay publishes; consumers apply the event first and commit the offset after; every event has <code>(order_id, seq)</code> and consumers ignore a seq they already applied (an upsert with a version check); history is derived from the event stream, never written separately. Topic keyed by order_id keeps events of one order in order. End-of-day reconciliation with the exchange trade file catches anything left.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the three failure points (produce, consume, commit), then the three tools (outbox, idempotent consumer, reconciliation).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would Kafka exactly-once fix it? (Only inside Kafka; the DB write and the push notification are outside effects.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Paytm">
+          <summary>How do you ingest the exchange feed? Where do the ticks come from?</summary>
+          <div class="answer">
+            <p>From the exchange's market-data feed, delivered as sequenced UDP multicast in colocation or over leased lines, usually as two redundant feeds (A and B). Feed handlers on dedicated hosts receive both, keep whichever copy of each sequence number arrives first, detect gaps and recover from the retransmit or snapshot service, and normalise exchange-specific messages into one internal tick with integer prices and the exchange timestamp. They then publish to an internal bus keyed by instrument. Feed handler health metrics: last sequence per channel, gap count, and lag between exchange timestamp and our timestamp.</p>
+            <div class="approach"><h5>How to answer</h5><p>This is exactly where the Paytm candidate was unsure. Say "multicast, A/B feeds, sequence numbers, gap recovery, normalise", and you have closed the gap.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not run feed handlers as normal autoscaled pods? (They need the leased-line network, a registered IP and kernel tuning; autoscaling them adds nothing.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Paytm">
+          <summary>1M ticks/s, 5,000 instruments, 5M users with 20 each, 500 ms freshness. Size the fan-out.</summary>
+          <div class="answer">
+            <p>Naive push is 5M x 20 x 200 ticks/s = 20 billion messages/s, so we conflate: latest value per instrument every 500 ms means the whole market is 10,000 updates/s, about 1 MB/s. Send that to every WebSocket gateway; each gateway builds one binary frame per user per 500 ms with that user's 20 instruments: 10M frames/s overall. At about 200 bytes per LTP frame that is about 2 GB/s of egress; with full quotes about 9 GB/s, so depth goes only to the open stock page. At 50,000 connections per node we need about 100 nodes, 150 with headroom. Slow clients get overwrite-not-queue semantics.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the naive number, then cut it with one idea (conflation), then size the edge. Numbers beat boxes here.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Redis pub/sub in the middle? (Fine for 10k msg/s, but every gateway subscribing to everything makes Redis a single fan-out point; a simple TCP broadcast tier or Kafka works too.)</li><li>Freshness proof? (Measure exchange timestamp to client render at p99 with client-side sampling.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Groww">
+          <summary>Each order must be placed within 10 ms. Where does the time go, and what do you remove from the hot path?</summary>
+          <div class="answer">
+            <p>Budget: about 1 ms for auth and validation (stateless, local JWT check), 1 ms for risk (in-memory margins partitioned by user, no DB read), 2-4 ms to durably record the order (replicated log append or a fast DB insert), 1-3 ms to send over an already-open exchange session, and slack for pauses. Everything else is moved off the hot path: notifications, history, analytics and position rebuilds consume <code>order-events</code> asynchronously. Pre-warm instrument master and user limits in memory before 09:15. Measure p99, not average.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give a budget table. "Too basic" feedback usually means no numbers and no failure path, so include the UNKNOWN state on timeout too.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you skip the durable write? (Only if you can rebuild from exchange order status after a crash, which is slower and riskier; most brokers journal first.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Groww,Goldman Sachs">
+          <summary>Extend the design to multiple exchanges and segments.</summary>
+          <div class="answer">
+            <p>Instrument identity becomes (exchange, segment, token). One adapter per exchange+segment behind a common interface, each with its own session, rate limiter and bulkhead. Kafka topics and engine shards are partitioned by exchange+segment so one venue's trouble stays local. The RMS loads segment-specific margin rules (cash vs F&amp;O margin files). Schedules (market hours, square-off time, GTT expiry handling, settlement) are per segment; commodity trades late. Feed handlers per exchange normalise into the same tick format so everything downstream is unchanged. Optionally, smart routing chooses NSE or BSE for a stock listed on both by best price.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that the design was built with an "adapter" seam and that isolation (bulkheads) is the main benefit. This was the missing piece in the 2025 feedback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you add a new exchange without downtime? (New adapter and feed handler, instrument master rows behind a feature flag, then enable per user cohort.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Groww">
+          <summary>Design auto square-off: close a user's intraday position the moment price crosses their risk threshold.</summary>
+          <div class="answer">
+            <p>Turn each rule into an absolute exit price at the start of the day (previous close 100, rule +18% -&gt; exit at 118). Keep, per instrument, a sorted structure of (exit_price, position_id), sharded by instrument like the tick stream. On each tick, pop all crossed entries in O(log n + k), and for each send a market or protected-limit Sell or Cover through the order service with key <code>(position_id, rule_id, date)</code>, then notify. Recompute the exit price when a position changes (partial exit, add-on). Block new exposure-increasing orders for that user while the exit is in flight. A separate scheduled job squares off all remaining MIS positions at the broker's cut-off time, per position and idempotent.</p>
+            <div class="approach"><h5>How to answer</h5><p>Point out that it is the same engine as GTT with a different source of thresholds. Reuse wins points.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Millions of updates per second? (Shard by instrument; the per-tick work is a sorted-set peek, so one core handles hundreds of thousands of ticks/s.)</li><li>Price hits the upper circuit and no sellers exist? (Order rests; retry or escalate to the risk desk; that is why the exit is set below the circuit.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Groww">
+          <summary>Candle data sits in a cache. Design moving it to SQL and aggregating it to larger timeframes.</summary>
+          <div class="answer">
+            <p>Live: a stream processor keyed by instrument builds 1-minute candles by exchange timestamp; the forming candle stays in Redis; when the minute closes (plus a small grace period) it is upserted to SQL with key (instrument, tf, start_ts) in one batch per minute. Rollups to 5m, 15m, 1h and 1D are computed from 1m rows by a scheduled job or continuous aggregates. One-time migration: copy per instrument per day with idempotent upserts, verify counts and checksums, dual-read for a while, then switch reads and expire cache keys. Storage is small (about 94 MB/day), so the hard parts are correctness and cut-over, not size.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "live pipeline" from "one-time migration"; interviewers often mean both. State the idempotent key early.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A late tick changes a closed candle? (Upsert the same key; rollups that include it are recomputed.)</li><li>Which database? (Postgres partitioned by month, or TimescaleDB; both handle this volume.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Goldman Sachs">
+          <summary>Scale to 20M orders a day. What is the peak rate and how do you store orders?</summary>
+          <div class="answer">
+            <p>20M over 22,500 trading seconds is about 900/s average and about 9,000/s at the open or on expiry day, with 3-5 events per order. Store orders in Postgres sharded by user_id (all of a user's orders on one shard for the order book screen), partitioned by trade_date so old days can move to cheaper storage. Order events go to Kafka and an append-only history table. Hot views (today's orders, positions) are served from Redis. About 20 GB/day, 5 TB/year.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use trading hours, not 24 hours, and say why the shard key is user_id (the main reads are per user).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why SQL and not NoSQL? (State transitions need conditional updates and transactions with the outbox; the volume is modest.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Groww">
+          <summary>Stop-loss orders: does the broker watch the price or the exchange?</summary>
+          <div class="answer">
+            <p>For a regular SL order the exchange does: the broker sends an order with a trigger price and a limit price, and the exchange activates it when the trigger is reached. The broker only holds triggers that the exchange will not keep, such as GTT orders that must last beyond today, or broker-side features like trailing stops. Delegating to the exchange is simpler and more reliable because the exchange sees every trade.</p>
+            <div class="approach"><h5>How to answer</h5><p>Short answer, then use it to explain why GTT is the special case that needs our own engine.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can a stop-loss limit order still not fill? (The price can gap through the limit.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: 09:15, the market opens 3% down</h4>
+          <div class="situation"><p>200,000 GTT buy triggers and 150,000 square-off rules cross on the first tick. Exchange order-rate limits apply per session.</p></div>
+          <div class="bad"><p>Weak answer: "Fire them all in parallel; autoscale the order service."</p></div>
+          <div class="good"><p>Strong answer: claims are cheap and happen at once; order placement goes through per-adapter queues that respect exchange rate limits, with square-off (risk) at higher priority than GTT buys. Every item is idempotent, so a slow queue only delays, never duplicates. Users see "triggered, placing" quickly. Add more exchange sessions in advance on known heavy days.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which GTTs first? (Fair order by trigger time, or by how far price moved; state the rule and keep it deterministic.)</li></ul></div>
+        </div>
+      

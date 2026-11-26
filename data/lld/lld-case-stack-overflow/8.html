@@ -1,0 +1,539 @@
+
+  <h2>Full code</h2>
+  <p>Java is primary (one file with a driver and 27 checks). Python splits the library (<code>qa.py</code>) from the demo and has a <code>unittest</code> suite. The C++14 version uses the same locking as Java (a mutex per post, an atomic reputation with a compare-exchange loop, one mutex for the maps); The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>).</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java">
+      <p><code>lld-code/lld-case-stack-overflow/java/Main.java</code></p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+// ---------- model ----------
+class QaException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    QaException(String msg) { super(msg); }
+}
+
+enum VoteType { UP, DOWN }
+
+enum Action { ASK, ANSWER, COMMENT, UPVOTE, DOWNVOTE, ACCEPT }
+
+final class User {
+    final String id, name;
+    final Set&lt;String&gt; topics = ConcurrentHashMap.newKeySet();
+    private final AtomicInteger reputation = new AtomicInteger(1);    // never below 1
+    User(String id, String name) { this.id = id; this.name = name; }
+    int reputation() { return reputation.get(); }
+    // updateAndGet = a compare-and-swap retry loop (atomic_cmpxchg in C) around "max(1, r + delta)"
+    int addReputation(int delta) { return reputation.updateAndGet(r -&gt; Math.max(1, r + delta)); }
+}
+
+final class Comment {
+    final String id; final User author; final String text; final long at;
+    Comment(String id, User author, String text, long at) { this.id = id; this.author = author; this.text = text; this.at = at; }
+}
+
+abstract class Post {
+    final String id; final User author; final String body; final long createdAt;
+    final ReentrantLock lock = new ReentrantLock();             // guards votes
+    private final Map&lt;String, VoteType&gt; votes = new HashMap&lt;&gt;(); // voter id -&gt; vote
+    final List&lt;Comment&gt; comments = new CopyOnWriteArrayList&lt;&gt;();
+    Post(String id, User author, String body, long at) { this.id = id; this.author = author; this.body = body; this.createdAt = at; }
+    abstract Question question();                                // the thread this post belongs to
+    boolean isQuestion() { return this instanceof Question; }
+
+    /** Records the vote and returns the previous one (null if none). Caller holds lock. */
+    VoteType putVote(String voterId, VoteType v) { return votes.put(voterId, v); }
+    VoteType removeVote(String voterId) { return votes.remove(voterId); }
+    int score() {
+        lock.lock();
+        try {
+            int s = 0;
+            for (VoteType v : votes.values()) s += v == VoteType.UP ? 1 : -1;
+            return s;
+        } finally { lock.unlock(); }
+    }
+}
+
+final class Question extends Post {
+    final String title; final Set&lt;String&gt; tags;
+    final List&lt;Answer&gt; answers = new CopyOnWriteArrayList&lt;&gt;();
+    final Set&lt;String&gt; followers = ConcurrentHashMap.newKeySet();
+    volatile Answer accepted;                                    // changed under lock
+    Question(String id, User author, String title, String body, Set&lt;String&gt; tags, long at) {
+        super(id, author, body, at); this.title = title; this.tags = Collections.unmodifiableSet(new TreeSet&lt;&gt;(tags));
+    }
+    Question question() { return this; }
+    boolean answered() { return !answers.isEmpty(); }
+}
+
+final class Answer extends Post {
+    final Question parent;
+    Answer(String id, User author, Question parent, String body, long at) { super(id, author, body, at); this.parent = parent; }
+    Question question() { return parent; }
+}
+
+// ---------- strategies and policies ----------
+/** Strategy: how many points each event is worth. */
+interface ReputationPolicy {
+    int forAuthor(boolean question, VoteType v);   // the post's author when a vote lands
+    int forVoter(boolean question, VoteType v);    // the voter (a downvote on an answer costs 1)
+    int forAccepted();
+    int forAcceptor();
+}
+
+class StackOverflowReputation implements ReputationPolicy {
+    public int forAuthor(boolean q, VoteType v) { return v == VoteType.UP ? 10 : -2; }
+    public int forVoter(boolean q, VoteType v) { return (!q &amp;&amp; v == VoteType.DOWN) ? -1 : 0; }
+    public int forAccepted() { return 15; }
+    public int forAcceptor() { return 2; }
+}
+
+/** One rule about who may do what. Several rules run in a row; any one can say no. */
+interface PermissionRule { void check(User u, Action a, Set&lt;String&gt; tags); }
+
+class ReputationPrivileges implements PermissionRule {           // Stack Overflow style
+    private final Map&lt;Action, Integer&gt; minRep = new EnumMap&lt;&gt;(Action.class);
+    ReputationPrivileges() { minRep.put(Action.UPVOTE, 15); minRep.put(Action.DOWNVOTE, 125); }
+    public void check(User u, Action a, Set&lt;String&gt; tags) {
+        Integer need = minRep.get(a);
+        if (need != null &amp;&amp; u.reputation() &lt; need)
+            throw new QaException(u.name + " needs " + need + " reputation to " + a.name().toLowerCase());
+    }
+}
+
+class TopicSubscriptionRule implements PermissionRule {           // Flipkart Overflow style
+    public void check(User u, Action a, Set&lt;String&gt; tags) {
+        if (a == Action.ACCEPT) return;
+        for (String t : tags) if (u.topics.contains(t)) return;
+        throw new QaException(u.name + " is not subscribed to any of " + new TreeSet&lt;&gt;(tags));
+    }
+}
+
+/** Specification-style filters for the feed and for search. */
+final class Filters {
+    private Filters() {}
+    static Predicate&lt;Question&gt; anyTopic(Collection&lt;String&gt; topics) {
+        Set&lt;String&gt; want = new HashSet&lt;&gt;(topics);
+        return q -&gt; q.tags.stream().anyMatch(want::contains);   // want::contains = pointer to want.contains(); true if any tag is wanted
+    }
+    static Predicate&lt;Question&gt; answered(boolean yes) { return q -&gt; q.answered() == yes; }
+    static Predicate&lt;Question&gt; all() { return q -&gt; true; }
+}
+
+/** Default answer order (Flipkart bonus): accepted first, then votes, then oldest first. */
+final class AnswerOrder {
+    private AnswerOrder() {}
+    static List&lt;Answer&gt; sort(Question q) {
+        Answer acc = q.accepted;
+        List&lt;Answer&gt; r = new ArrayList&lt;&gt;(q.answers);
+        r.sort(Comparator.comparing((Answer a) -&gt; a != acc)
+                .thenComparing(a -&gt; -a.score())
+                .thenComparingLong(a -&gt; a.createdAt));
+        return r;
+    }
+}
+
+interface QaListener { void onEvent(String userName, String message); }
+
+// ---------- service (facade) ----------
+final class QaService {
+    private final ReputationPolicy reputation;
+    private final List&lt;PermissionRule&gt; rules;
+    private final Map&lt;String, User&gt; users = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Question&gt; questions = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Post&gt; posts = new ConcurrentHashMap&lt;&gt;();       // questions and answers
+    private final Map&lt;String, Set&lt;String&gt;&gt; wordIndex = new ConcurrentHashMap&lt;&gt;(); // word -&gt; question ids
+    private final List&lt;QaListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final AtomicLong clock = new AtomicLong();                     // logical time: 1, 2, 3...
+    private final AtomicInteger nextUser = new AtomicInteger(1), nextQ = new AtomicInteger(1),
+            nextA = new AtomicInteger(1), nextC = new AtomicInteger(1);
+
+    QaService(ReputationPolicy reputation, List&lt;PermissionRule&gt; rules) {
+        this.reputation = reputation; this.rules = rules;
+    }
+
+    void addListener(QaListener l) { listeners.add(l); }
+
+    String register(String name) {
+        String id = "U" + nextUser.getAndIncrement();
+        users.put(id, new User(id, name));
+        return id;
+    }
+
+    void subscribe(String userId, String... topics) { user(userId).topics.addAll(Arrays.asList(topics)); }
+    void unsubscribe(String userId, String topic) { user(userId).topics.remove(topic); }
+    void bonus(String userId, int points) { user(userId).addReputation(points); }   // e.g. association bonus
+
+    String ask(String userId, String title, String body, String... tags) {
+        User u = user(userId);
+        if (title == null || title.trim().isEmpty()) throw new QaException("title is empty");
+        if (tags.length == 0) throw new QaException("a question needs at least one tag");
+        Set&lt;String&gt; tagSet = new HashSet&lt;&gt;(Arrays.asList(tags));
+        allow(u, Action.ASK, tagSet);                        // validate before taking an id
+        Question q = new Question("Q" + nextQ.getAndIncrement(), u, title.trim(), body, tagSet, clock.incrementAndGet());
+        q.followers.add(u.id);
+        questions.put(q.id, q);
+        posts.put(q.id, q);
+        // computeIfAbsent: look up w, create an empty set if missing (atomically), then add the id
+        for (String w : words(q.title + " " + q.body)) wordIndex.computeIfAbsent(w, k -&gt; ConcurrentHashMap.newKeySet()).add(q.id);
+        return q.id;
+    }
+
+    String answer(String userId, String questionId, String body) {
+        User u = user(userId);
+        Question q = question(questionId);
+        if (body == null || body.trim().isEmpty()) throw new QaException("answer is empty");
+        allow(u, Action.ANSWER, q.tags);
+        Answer a = new Answer("A" + nextA.getAndIncrement(), u, q, body.trim(), clock.incrementAndGet());
+        posts.put(a.id, a);
+        q.answers.add(a);
+        q.followers.add(u.id);
+        List&lt;String[]&gt; events = new ArrayList&lt;&gt;();
+        for (String f : new TreeSet&lt;&gt;(q.followers))          // sorted: stable output
+            if (!f.equals(u.id)) events.add(new String[]{f, u.name + " answered " + q.id + ": " + q.title});
+        fire(events);
+        return a.id;
+    }
+
+    String comment(String userId, String postId, String text) {
+        User u = user(userId);
+        Post p = post(postId);
+        allow(u, Action.COMMENT, p.question().tags);
+        Comment c = new Comment("C" + nextC.getAndIncrement(), u, text, clock.incrementAndGet());
+        p.comments.add(c);
+        if (!p.author.id.equals(u.id)) fire(Collections.singletonList(new String[]{p.author.id, u.name + " commented on " + p.id}));
+        return c.id;
+    }
+
+    /** Cast or change a vote. Same vote twice is rejected; UP after DOWN reverses the old effect first. */
+    void vote(String userId, String postId, VoteType v) {
+        User u = user(userId);
+        Post p = post(postId);
+        if (p.author.id.equals(u.id)) throw new QaException(u.name + " cannot vote on own post");
+        allow(u, v == VoteType.UP ? Action.UPVOTE : Action.DOWNVOTE, p.question().tags);
+        p.lock.lock();
+        try {
+            VoteType old = p.putVote(u.id, v);
+            if (old == v) throw new QaException(u.name + " already voted " + v + " on " + p.id);
+            if (old != null) applyVote(u, p, old, -1);       // undo the old vote's points
+            applyVote(u, p, v, +1);
+        } finally { p.lock.unlock(); }
+    }
+
+    void retractVote(String userId, String postId) {
+        User u = user(userId);
+        Post p = post(postId);
+        p.lock.lock();
+        try {
+            VoteType old = p.removeVote(u.id);
+            if (old == null) throw new QaException(u.name + " has no vote on " + p.id);
+            applyVote(u, p, old, -1);
+        } finally { p.lock.unlock(); }
+    }
+
+    /** Only the asker accepts; accepting another answer moves the +15 to the new answerer. */
+    void accept(String userId, String answerId) {
+        User u = user(userId);
+        Post p = post(answerId);
+        if (p.isQuestion()) throw new QaException(answerId + " is not an answer");
+        Answer a = (Answer) p;
+        Question q = a.parent;
+        if (!q.author.id.equals(u.id)) throw new QaException("only " + q.author.name + " can accept answers on " + q.id);
+        allow(u, Action.ACCEPT, q.tags);
+        List&lt;String[]&gt; events = new ArrayList&lt;&gt;();
+        q.lock.lock();
+        try {
+            Answer old = q.accepted;
+            if (old == a) return;
+            boolean oldPaid = old != null &amp;&amp; !old.author.id.equals(u.id);   // own answers earn nothing
+            boolean newPays = !a.author.id.equals(u.id);
+            if (oldPaid) old.author.addReputation(-reputation.forAccepted());
+            u.addReputation(reputation.forAcceptor() * ((newPays ? 1 : 0) - (oldPaid ? 1 : 0)));
+            q.accepted = a;
+            if (newPays) {
+                a.author.addReputation(reputation.forAccepted());
+                events.add(new String[]{a.author.id, "your answer " + a.id + " was accepted on " + q.id});
+            }
+        } finally { q.lock.unlock(); }
+        fire(events);
+    }
+
+    List&lt;Question&gt; feed(String userId, Predicate&lt;Question&gt; filter) {
+        User u = user(userId);
+        Predicate&lt;Question&gt; mine = Filters.anyTopic(u.topics);
+        // C: for each q { if (mine(q) &amp;&amp; filter(q)) append(out, q); } then qsort(out) newest first
+        return questions.values().stream().filter(mine.and(filter))
+                .sorted(Comparator.comparingLong((Question q) -&gt; -q.createdAt)).collect(Collectors.toList());
+    }
+
+    /** Keyword search (all words must match) plus an optional filter; best score first, then newest. */
+    List&lt;Question&gt; search(String text, Predicate&lt;Question&gt; filter) {
+        Set&lt;String&gt; ids = null;
+        for (String w : words(text)) {
+            Set&lt;String&gt; hit = wordIndex.getOrDefault(w, Collections.emptySet());
+            if (ids == null) ids = new HashSet&lt;&gt;(hit); else ids.retainAll(hit);
+        }
+        // no words: every question; else look each matching id up (a loop: for id in ids, append(questions[id]))
+        Collection&lt;Question&gt; pool = ids == null ? questions.values()
+                : ids.stream().map(questions::get).collect(Collectors.toList());
+        // keep matches, sort by score (high first) then newest, collect into a new list
+        return pool.stream().filter(filter)
+                .sorted(Comparator.comparingInt((Question q) -&gt; -q.score()).thenComparingLong(q -&gt; -q.createdAt))
+                .collect(Collectors.toList());
+    }
+
+    String show(String questionId) {
+        Question q = question(questionId);
+        StringBuilder sb = new StringBuilder();
+        sb.append(q.id).append(" [").append(q.score()).append("] ").append(q.title).append(" ").append(q.tags)
+          .append(" by ").append(q.author.name).append('\n');
+        for (Answer a : AnswerOrder.sort(q)) {
+            sb.append("   ").append(a == q.accepted ? "* " : "  ").append(a.id).append(" [").append(a.score()).append("] ")
+              .append(a.body).append(" - ").append(a.author.name).append('\n');
+            for (Comment c : a.comments) sb.append("        ").append(c.author.name).append(": ").append(c.text).append('\n');
+        }
+        return sb.toString().trim();
+    }
+
+    int reputationOf(String userId) { return user(userId).reputation(); }
+    int scoreOf(String postId) { return post(postId).score(); }
+
+    // ----- helpers -----
+    private void applyVote(User voter, Post p, VoteType v, int sign) {
+        p.author.addReputation(sign * reputation.forAuthor(p.isQuestion(), v));
+        voter.addReputation(sign * reputation.forVoter(p.isQuestion(), v));
+    }
+
+    private void allow(User u, Action a, Set&lt;String&gt; tags) { for (PermissionRule r : rules) r.check(u, a, tags); }
+
+    private void fire(List&lt;String[]&gt; events) {                 // called with no lock held
+        for (String[] e : events) for (QaListener l : listeners) l.onEvent(users.get(e[0]).name, e[1]);
+    }
+
+    static List&lt;String&gt; words(String text) {
+        List&lt;String&gt; r = new ArrayList&lt;&gt;();
+        for (String w : text.toLowerCase(Locale.ROOT).split("[^a-z0-9+#]+")) if (w.length() &gt; 1) r.add(w);
+        return r;
+    }
+
+    private User user(String id) {
+        User u = users.get(id);
+        if (u == null) throw new QaException("unknown user " + id);
+        return u;
+    }
+
+    private Question question(String id) {
+        Question q = questions.get(id);
+        if (q == null) throw new QaException("unknown question " + id);
+        return q;
+    }
+
+    private Post post(String id) {
+        Post p = posts.get(id);
+        if (p == null) throw new QaException("unknown post " + id);
+        return p;
+    }
+}
+
+// ---------- demo driver with checks ----------
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static String ids(List&lt;Question&gt; qs) { return qs.stream().map(q -&gt; q.id).collect(Collectors.toList()).toString(); }
+
+    static boolean fails(Runnable r, String label) {
+        try { r.run(); return false; }
+        catch (QaException e) { System.out.println(label + " -&gt; rejected: " + e.getMessage()); return true; }
+    }
+
+    public static void main(String[] args) throws Exception {
+        List&lt;String&gt; inbox = new CopyOnWriteArrayList&lt;&gt;();
+        QaListener console = (u, m) -&gt; { System.out.println("  [notify " + u + "] " + m); inbox.add(u + ": " + m); };
+
+        System.out.println("== Flipkart Overflow: topics, feed, filters ==");
+        QaService flip = new QaService(new StackOverflowReputation(), Arrays.asList(new TopicSubscriptionRule()));
+        flip.addListener(console);
+        String u1 = flip.register("asha"), u2 = flip.register("bala"), u3 = flip.register("chen");
+        flip.subscribe(u1, "java", "hadoop", "jdk");
+        String q1 = flip.ask(u1, "What are new open source JDKs?", "Looking beyond Oracle.", "java", "jdk");
+        String q2 = flip.ask(u1, "Does Hadoop work on JDK 11?", "Cluster upgrade.", "hadoop", "jdk");
+        System.out.println("feed asha              " + ids(flip.feed(u1, Filters.all())));
+        System.out.println("feed asha [java]       " + ids(flip.feed(u1, Filters.anyTopic(Arrays.asList("java")))));
+        System.out.println("feed asha [jdk]        " + ids(flip.feed(u1, Filters.anyTopic(Arrays.asList("jdk")))));
+        System.out.println("feed asha answered     " + ids(flip.feed(u1, Filters.answered(true))));
+        check(flip.feed(u1, Filters.all()).size() == 2, "both questions in feed");
+        check(flip.feed(u1, Filters.anyTopic(Arrays.asList("java"))).size() == 1, "topic filter");
+        check(flip.feed(u1, Filters.answered(true)).isEmpty(), "nothing answered yet");
+        flip.subscribe(u2, "apache", "hadoop");
+        System.out.println("feed bala              " + ids(flip.feed(u2, Filters.all())));
+        check(ids(flip.feed(u2, Filters.all())).equals("[" + q2 + "]"), "bala sees only the hadoop question");
+        check(fails(() -&gt; flip.ask(u2, "Best JVM flags?", "", "java"), "bala asks in [java]"), "ask needs a subscribed topic");
+        String q3 = flip.ask(u2, "Does Apache Spark stream from HDFS?", "", "apache", "hadoop");
+        check(fails(() -&gt; flip.answer(u2, q1, "Try Temurin."), "bala answers " + q1), "answer needs subscription");
+        String a1 = flip.answer(u2, q2, "Yes, Hadoop 3 and above supports it.");
+        System.out.println("feed bala              " + ids(flip.feed(u2, Filters.all())));
+        System.out.println("feed asha answered     " + ids(flip.feed(u1, Filters.answered(true))));
+        check(flip.feed(u1, Filters.answered(true)).size() == 1, "one answered question");
+        check(inbox.contains("asha: bala answered " + q2 + ": Does Hadoop work on JDK 11?"), "asker notified of answer");
+        flip.subscribe(u3, "apache", "hadoop", "java");
+        System.out.println("feed chen              " + ids(flip.feed(u3, Filters.all())));
+        check(flip.feed(u3, Filters.all()).size() == 3, "chen sees three");
+        flip.vote(u3, q2, VoteType.UP);
+        flip.vote(u3, a1, VoteType.UP);
+        check(fails(() -&gt; flip.vote(u3, a1, VoteType.UP), "chen upvotes " + a1 + " again"), "no duplicate votes");
+        check(fails(() -&gt; flip.vote(u2, a1, VoteType.UP), "bala upvotes own " + a1), "no self votes");
+        String a2 = flip.answer(u3, q2, "Only from Hadoop 3.3 for runtime.");
+        flip.vote(u2, a2, VoteType.UP);
+        flip.vote(u1, a2, VoteType.UP);
+        flip.comment(u1, a1, "Which minor version?");
+        System.out.println(flip.show(q2));
+        check(flip.scoreOf(a2) == 2 &amp;&amp; flip.scoreOf(a1) == 1, "scores");
+        flip.accept(u1, a1);
+        System.out.println("after asha accepts " + a1 + ":");
+        System.out.println(flip.show(q2));
+        check(flip.show(q2).contains("* " + a1), "accepted answer comes first");
+        check(fails(() -&gt; flip.accept(u3, a2), "chen accepts " + a2), "only the asker accepts");
+        flip.unsubscribe(u3, "hadoop");
+        flip.unsubscribe(u3, "apache");
+        check(fails(() -&gt; flip.vote(u3, q3, VoteType.UP), "chen votes after unsubscribe"), "unsubscribe takes effect");
+
+        System.out.println();
+        System.out.println("== Stack Overflow: reputation and privileges ==");
+        QaService so = new QaService(new StackOverflowReputation(), Arrays.asList(new ReputationPrivileges()));
+        so.addListener(console);
+        String ann = so.register("ann"), ben = so.register("ben"), cat = so.register("cat"), dev = so.register("dev");
+        String sq = so.ask(ann, "Why does my C struct have padding?", "sizeof is bigger than the sum", "c", "memory");
+        String sa = so.answer(ben, sq, "Alignment: each field starts at a multiple of its size.");
+        check(fails(() -&gt; so.vote(cat, sa, VoteType.UP), "cat (rep 1) upvotes"), "upvote needs 15 rep");
+        so.bonus(cat, 100);
+        so.bonus(dev, 200);
+        so.vote(cat, sa, VoteType.UP);
+        so.vote(dev, sa, VoteType.UP);
+        so.vote(cat, sq, VoteType.UP);
+        System.out.println("ben rep after 2 upvotes: " + so.reputationOf(ben));
+        check(so.reputationOf(ben) == 21, "1 + 10 + 10");
+        check(so.reputationOf(ann) == 11, "question upvote +10");
+        check(fails(() -&gt; so.vote(cat, sa, VoteType.DOWN), "cat (rep 101) downvotes"), "downvote needs 125 rep");
+        so.vote(dev, sa, VoteType.DOWN);                       // dev changes UP -&gt; DOWN
+        System.out.println("dev flips to DOWN: ben " + so.reputationOf(ben) + ", dev " + so.reputationOf(dev));
+        check(so.reputationOf(ben) == 9 &amp;&amp; so.reputationOf(dev) == 200, "undo +10, apply -2; voter pays 1");
+        so.retractVote(dev, sa);
+        check(so.reputationOf(ben) == 11 &amp;&amp; so.reputationOf(dev) == 201, "retract gives both back");
+        so.accept(ann, sa);
+        System.out.println("ann accepts: ben " + so.reputationOf(ben) + ", ann " + so.reputationOf(ann));
+        check(so.reputationOf(ben) == 26 &amp;&amp; so.reputationOf(ann) == 13, "+15 answerer, +2 acceptor");
+        String sa2 = so.answer(cat, sq, "Use offsetof to see each field's position.");
+        so.accept(ann, sa2);
+        check(so.reputationOf(ben) == 11 &amp;&amp; so.reputationOf(cat) == 116 &amp;&amp; so.reputationOf(ann) == 13,
+              "moving the accept moves the +15, acceptor bonus once");
+        System.out.println("search 'struct padding': " + ids(so.search("struct padding", Filters.all())));
+        check(ids(so.search("struct padding", Filters.all())).equals("[" + sq + "]"), "keyword search");
+        check(so.search("kubernetes", Filters.all()).isEmpty(), "no match");
+
+        System.out.println();
+        System.out.println("== Concurrency: 100 voters, and one voter clicking 20 times ==");
+        QaService rush = new QaService(new StackOverflowReputation(), Collections.&lt;PermissionRule&gt;emptyList());
+        String asker = rush.register("asker"), author = rush.register("author");
+        String rq = rush.ask(asker, "Hot question", "", "c");
+        String ra = rush.answer(author, rq, "Hot answer");
+        List&lt;String&gt; voters = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 100; i++) voters.add(rush.register("v" + i));
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger dup = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (String v : voters) fs.add(pool.submit(() -&gt; { go.await(); rush.vote(v, ra, VoteType.UP); return null; }));
+        for (int i = 0; i &lt; 20; i++)
+            fs.add(pool.submit(() -&gt; {
+                go.await();
+                try { rush.vote(voters.get(0), rq, VoteType.UP); } catch (QaException e) { dup.incrementAndGet(); }
+                return null;
+            }));
+        go.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("answer score=" + rush.scoreOf(ra) + " author rep=" + rush.reputationOf(author)
+                + " | question score=" + rush.scoreOf(rq) + " duplicates rejected=" + dup.get());
+        check(rush.scoreOf(ra) == 100 &amp;&amp; rush.reputationOf(author) == 1001, "no lost votes");
+        check(rush.scoreOf(rq) == 1 &amp;&amp; dup.get() == 19, "one vote per user under contention");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+      <p>Output:</p>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== Flipkart Overflow: topics, feed, filters ==
+feed asha              [Q2, Q1]
+feed asha [java]       [Q1]
+feed asha [jdk]        [Q2, Q1]
+feed asha answered     []
+feed bala              [Q2]
+bala asks in [java] -&gt; rejected: bala is not subscribed to any of [java]
+bala answers Q1 -&gt; rejected: bala is not subscribed to any of [java, jdk]
+  [notify asha] bala answered Q2: Does Hadoop work on JDK 11?
+feed bala              [Q3, Q2]
+feed asha answered     [Q2]
+feed chen              [Q3, Q2, Q1]
+chen upvotes A1 again -&gt; rejected: chen already voted UP on A1
+bala upvotes own A1 -&gt; rejected: bala cannot vote on own post
+  [notify asha] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] asha commented on A1
+Q2 [1] Does Hadoop work on JDK 11? [hadoop, jdk] by asha
+     A2 [2] Only from Hadoop 3.3 for runtime. - chen
+     A1 [1] Yes, Hadoop 3 and above supports it. - bala
+        asha: Which minor version?
+  [notify bala] your answer A1 was accepted on Q2
+after asha accepts A1:
+Q2 [1] Does Hadoop work on JDK 11? [hadoop, jdk] by asha
+   * A1 [1] Yes, Hadoop 3 and above supports it. - bala
+        asha: Which minor version?
+     A2 [2] Only from Hadoop 3.3 for runtime. - chen
+chen accepts A2 -&gt; rejected: only asha can accept answers on Q2
+chen votes after unsubscribe -&gt; rejected: chen is not subscribed to any of [apache, hadoop]
+
+== Stack Overflow: reputation and privileges ==
+  [notify ann] ben answered Q1: Why does my C struct have padding?
+cat (rep 1) upvotes -&gt; rejected: cat needs 15 reputation to upvote
+ben rep after 2 upvotes: 21
+cat (rep 101) downvotes -&gt; rejected: cat needs 125 reputation to downvote
+dev flips to DOWN: ben 9, dev 200
+  [notify ben] your answer A1 was accepted on Q1
+ann accepts: ben 26, ann 13
+  [notify ann] cat answered Q1: Why does my C struct have padding?
+  [notify ben] cat answered Q1: Why does my C struct have padding?
+  [notify cat] your answer A2 was accepted on Q1
+search 'struct padding': [Q1]
+
+== Concurrency: 100 voters, and one voter clicking 20 times ==
+answer score=100 author rep=1001 | question score=1 duplicates rejected=19
+All 27 checks passed</code></pre>
+    </div>
+  </div>
+  

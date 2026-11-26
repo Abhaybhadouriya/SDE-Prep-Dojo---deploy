@@ -1,0 +1,1094 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+<p><code>autocomplete.py</code>, the engine and the router:</p>
+<pre><code class="language-python">"""Autocomplete (trie + top-k + ranking Strategy) and a wildcard path router (trie by segment)."""
+from __future__ import annotations
+
+import heapq
+import re
+import threading
+from typing import Dict, Generic, List, Optional, Tuple, TypeVar
+
+
+# ---------------- Part 1: autocomplete ----------------
+
+class Entry:
+    __slots__ = ("text", "count", "last_used")
+
+    def __init__(self, text: str):
+        self.text, self.count, self.last_used = text, 0, 0
+
+
+class RankingStrategy:
+    """Strategy: a sort key, smaller is better. Scores may only go UP when a phrase is recorded."""
+    name = "abstract"
+
+    def key(self, e: Entry) -&gt; Tuple:
+        raise NotImplementedError
+
+
+class ByFrequency(RankingStrategy):
+    name = "frequency"
+
+    def key(self, e):
+        return (-e.count, e.text)          # ties: alphabetical (LeetCode 642 rule)
+
+
+class ByRecency(RankingStrategy):
+    name = "recency"
+
+    def key(self, e):
+        return (-e.last_used, e.text)
+
+
+class TrieNode:
+    __slots__ = ("children", "entry", "top_k")
+
+    def __init__(self):
+        self.children: Dict[str, TrieNode] = {}
+        self.entry: Optional[Entry] = None
+        self.top_k: Optional[List[Entry]] = None
+
+
+def normalize(s: Optional[str], trim_end: bool) -&gt; str:
+    t = re.sub(r"\s+", " ", (s or "").lower()).lstrip(" ")
+    return t.strip() if trim_end else t
+
+
+class RWLock:
+    """Many readers or one writer (the stdlib has none). Writer-preferring: once a writer waits,
+    new readers queue behind it, so a steady stream of readers cannot starve writers."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0                 # new readers yield to a queued writer
+
+    def acquire_read(self):
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self):
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self):
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+
+    def release_write(self):
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
+class AutocompleteEngine:
+    def __init__(self, rank: RankingStrategy, k: int, cache_top_k: bool):
+        if k &lt; 1:
+            raise ValueError("k must be &gt;= 1")
+        self.rank, self.k, self.cache = rank, k, cache_top_k
+        self._root = TrieNode()
+        self._lock = RWLock()
+        self._clock = 0
+
+    def describe(self) -&gt; str:
+        return f"{self.rank.name}, k={self.k}, " + ("cached top-k" if self.cache else "scan")
+
+    def record(self, phrase: str, times: int = 1) -&gt; None:
+        p = normalize(phrase, True)
+        if not p:
+            raise ValueError("empty phrase")
+        if times &lt; 1:
+            raise ValueError("times must be &gt;= 1")
+        self._lock.acquire_write()
+        try:
+            n, path = self._root, [self._root]
+            for ch in p:
+                n = n.children.setdefault(ch, TrieNode())
+                path.append(n)
+            if n.entry is None:
+                n.entry = Entry(p)
+            n.entry.count += times
+            self._clock += 1
+            n.entry.last_used = self._clock
+            if self.cache:
+                for node in path:
+                    self._offer(node, n.entry)
+        finally:
+            self._lock.release_write()
+
+    def _offer(self, node: TrieNode, e: Entry) -&gt; None:
+        # e's score only went up and nobody else's changed: move it in, re-sort, drop the (k+1)th.
+        lst = node.top_k if node.top_k is not None else []
+        lst = [x for x in lst if x is not e] + [e]
+        lst.sort(key=self.rank.key)
+        node.top_k = lst[: self.k]
+
+    def remove(self, phrase: str) -&gt; bool:
+        p = normalize(phrase, True)
+        self._lock.acquire_write()
+        try:
+            n, path = self._root, [self._root]
+            for ch in p:
+                n = n.children.get(ch)
+                if n is None:
+                    return False
+                path.append(n)
+            if n.entry is None:
+                return False
+            n.entry = None
+            for i in range(len(path) - 1, 0, -1):          # prune empty leaves
+                child = path[i]
+                if child.entry is None and not child.children:
+                    del path[i - 1].children[p[i - 1]]
+                else:
+                    break
+            if self.cache:                                 # removal breaks "only up": rebuild bottom-up
+                for node in reversed(path):
+                    self._rebuild(node)
+            return True
+        finally:
+            self._lock.release_write()
+
+    def _rebuild(self, node: TrieNode) -&gt; None:
+        pool = [node.entry] if node.entry else []
+        for ch in node.children.values():
+            pool.extend(ch.top_k or [])
+        pool.sort(key=self.rank.key)
+        node.top_k = pool[: self.k]
+
+    def suggest(self, prefix: str) -&gt; List[Tuple[str, int]]:
+        p = normalize(prefix, False)
+        self._lock.acquire_read()
+        try:
+            n = self._root
+            for ch in p:
+                n = n.children.get(ch)
+                if n is None:
+                    return []
+            best = (n.top_k or []) if self.cache else self._scan(n)
+            return [(e.text, e.count) for e in best]
+        finally:
+            self._lock.release_read()
+
+    def _scan(self, start: TrieNode) -&gt; List[Entry]:
+        found, stack = [], [start]
+        while stack:
+            n = stack.pop()
+            if n.entry is not None:
+                found.append(n.entry)
+            stack.extend(n.children.values())
+        return heapq.nsmallest(self.k, found, key=self.rank.key)
+
+    def session(self) -&gt; "TypingSession":
+        return TypingSession(self)
+
+
+class TypingSession:
+    """LeetCode 642 style: characters one by one; '#' ends the sentence and records it."""
+
+    def __init__(self, engine: AutocompleteEngine):
+        self._engine, self._typed = engine, []
+
+    def type(self, c: str) -&gt; List[Tuple[str, int]]:
+        if c == "#":
+            self._engine.record("".join(self._typed))
+            self._typed.clear()
+            return []
+        self._typed.append(c)
+        return self._engine.suggest("".join(self._typed))
+
+
+def fmt(sugs: List[Tuple[str, int]]) -&gt; str:
+    return "[" + ", ".join(f"{t}({c})" for t, c in sugs) + "]"
+
+
+# ---------------- Part 2: wildcard router ----------------
+
+V = TypeVar("V")
+
+
+class RouteMatch(Generic[V]):
+    def __init__(self, value: V, pattern: str, params: Dict[str, str]):
+        self.value, self.pattern, self.params = value, pattern, params
+
+    def __repr__(self) -&gt; str:
+        ps = "" if not self.params else " {" + ", ".join(f"{k}={v}" for k, v in self.params.items()) + "}"
+        return f"{self.value} via {self.pattern}{ps}"
+
+
+class _Node:
+    __slots__ = ("literal", "param", "param_name", "star", "globstar", "value", "pattern")
+
+    def __init__(self):
+        self.literal: Dict[str, _Node] = {}
+        self.param: Optional[_Node] = None
+        self.param_name: Optional[str] = None
+        self.star: Optional[_Node] = None
+        self.globstar: Optional[_Node] = None
+        self.value = None
+        self.pattern: Optional[str] = None
+
+
+def segments(path: Optional[str]) -&gt; List[str]:
+    if not path or not path.startswith("/"):
+        raise ValueError(f"path must start with /: {path}")
+    return [s for s in path.split("/") if s]            # "/a//b/" == "/a/b"
+
+
+class PathTrie(Generic[V]):
+    """put(pattern): literal, ':name', '*' (one segment), '**' (rest, last only).
+    match(path): literal beats :param beats * beats **, with backtracking.
+    find_all(query): '*' in the QUERY over plain stored keys (the KV follow-up)."""
+
+    def __init__(self):
+        self._root = _Node()
+        self._lock = RWLock()
+
+    def put(self, pattern: str, value: V) -&gt; None:
+        segs = segments(pattern)
+        norm = "/" + "/".join(segs)
+        self._lock.acquire_write()
+        try:
+            n = self._root
+            for i, s in enumerate(segs):
+                if s == "**":
+                    if i != len(segs) - 1:
+                        raise ValueError(f"** must be the last segment: {pattern}")
+                    n.globstar = n.globstar or _Node()
+                    n = n.globstar
+                elif s == "*":
+                    n.star = n.star or _Node()
+                    n = n.star
+                elif s.startswith(":"):
+                    name = s[1:]
+                    if not name:
+                        raise ValueError(f"empty parameter name: {pattern}")
+                    if n.param is None:
+                        n.param, n.param_name = _Node(), name
+                    elif n.param_name != name:
+                        raise ValueError(f"conflict: :{name} vs :{n.param_name} in {pattern}")
+                    n = n.param
+                else:
+                    n = n.literal.setdefault(s, _Node())
+            if n.value is not None:
+                raise ValueError(f"duplicate route {norm} (already {n.pattern})")
+            n.value, n.pattern = value, norm
+        finally:
+            self._lock.release_write()
+
+    def match(self, path: str) -&gt; Optional[RouteMatch[V]]:
+        segs = segments(path)
+        self._lock.acquire_read()
+        try:
+            params: Dict[str, str] = {}
+            hit = self._match(self._root, segs, 0, params)
+            return None if hit is None else RouteMatch(hit.value, hit.pattern, params)
+        finally:
+            self._lock.release_read()
+
+    def _match(self, n: _Node, segs: List[str], i: int, params: Dict[str, str]) -&gt; Optional[_Node]:
+        if i == len(segs):
+            if n.value is not None:
+                return n
+            if n.globstar is not None and n.globstar.value is not None:
+                params["**"] = ""
+                return n.globstar
+            return None
+        s = segs[i]
+        lit = n.literal.get(s)
+        if lit is not None:
+            r = self._match(lit, segs, i + 1, params)
+            if r is not None:
+                return r
+        if n.param is not None:
+            params[n.param_name] = s
+            r = self._match(n.param, segs, i + 1, params)
+            if r is not None:
+                return r
+            del params[n.param_name]
+        if n.star is not None:
+            r = self._match(n.star, segs, i + 1, params)
+            if r is not None:
+                return r
+        if n.globstar is not None and n.globstar.value is not None:
+            params["**"] = "/".join(segs[i:])
+            return n.globstar
+        return None
+
+    def find_all(self, query: str) -&gt; List[str]:
+        segs = segments(query)
+        out: List[str] = []
+        self._lock.acquire_read()
+        try:
+            self._collect(self._root, segs, 0, out)
+        finally:
+            self._lock.release_read()
+        return out
+
+    def _collect(self, n: _Node, segs: List[str], i: int, out: List[str]) -&gt; None:
+        if i == len(segs):
+            if n.value is not None:
+                out.append(f"{n.pattern}={n.value}")
+            return
+        s = segs[i]
+        if s == "*":
+            for key in sorted(n.literal):
+                self._collect(n.literal[key], segs, i + 1, out)
+        elif s in n.literal:
+            self._collect(n.literal[s], segs, i + 1, out)</code></pre>
+<p><code>main.py</code>, the demo driver:</p>
+<pre><code class="language-python">"""Demo driver: the same story as the Java Main."""
+import random
+import threading
+
+from autocomplete import AutocompleteEngine, ByFrequency, ByRecency, PathTrie, fmt
+
+
+def check(cond, msg="check failed"):
+    """Like assert, but never stripped by python -O: the call inside it always runs."""
+    if not cond:
+        raise AssertionError(msg)
+
+
+def expect_error(fn, contains):
+    try:
+        fn()
+    except ValueError as e:
+        print("  rejected:", e)
+        check(contains in str(e), e)
+        return
+    raise AssertionError("expected error: " + contains)
+
+
+def seed(e):
+    e.record("linux kernel", 5)
+    e.record("linked list", 3)
+    e.record("lint rules", 3)
+    e.record("linus torvalds", 2)
+    e.record("LRU   Cache", 4)              # normalised to "lru cache"
+    e.record("linux kernel modules", 1)
+
+
+def show(m):
+    return "404" if m is None else repr(m)
+
+
+def main():
+    print("== autocomplete")
+    freq = AutocompleteEngine(ByFrequency(), 3, True)
+    recent = AutocompleteEngine(ByRecency(), 3, True)
+    seed(freq)
+    seed(recent)
+    print(f"  [{freq.describe()}] 'lin' -&gt; {fmt(freq.suggest('lin'))}")
+    print(f"  [{recent.describe()}] 'lin' -&gt; {fmt(recent.suggest('lin'))}")
+    check(fmt(freq.suggest("lin")) == "[linux kernel(5), linked list(3), lint rules(3)]")
+    check(recent.suggest("lin")[0][0] == "linux kernel modules")
+    print(f"  'LI' -&gt; {fmt(freq.suggest('LI'))}   'xyz' -&gt; {fmt(freq.suggest('xyz'))}")
+    check(freq.suggest("xyz") == [])
+
+    print("== typing session (LeetCode 642 style)")
+    t = freq.session()
+    for c in "lru cache#":
+        s = t.type(c)
+        if c in "lr#":
+            print(f"  typed '{c}' -&gt; {fmt(s)}")
+    print(f"  'l' now -&gt; {fmt(freq.suggest('l'))}")
+    check(freq.suggest("l")[1] == ("lru cache", 5))
+
+    print("== remove 'linux kernel'")
+    check(freq.remove("linux kernel"))
+    check(not freq.remove("linux kernel"))
+    print(f"  'lin' -&gt; {fmt(freq.suggest('lin'))}   'linux' -&gt; {fmt(freq.suggest('linux'))}")
+    check(fmt(freq.suggest("linux")) == "[linux kernel modules(1)]")
+
+    print("== cached top-k equals full scan (random workload)")
+    rnd = random.Random(7)
+    vocab = ["a", "ab", "abc", "abd", "b", "ba", "bab", "bad", "c", "ca", "cab", "cad", "dab", "dad"]
+    cached = AutocompleteEngine(ByFrequency(), 3, True)
+    scan = AutocompleteEngine(ByFrequency(), 3, False)
+    mismatches, ops = 0, 2000
+    for _ in range(ops):
+        w = rnd.choice(vocab)
+        if rnd.randrange(10) == 0:
+            cached.remove(w)
+            scan.remove(w)
+        else:
+            cached.record(w)
+            scan.record(w)
+        for p in ("", "a", "b", "ba", "c", "d"):
+            if cached.suggest(p) != scan.suggest(p):
+                mismatches += 1
+    print(f"  {ops} ops, {mismatches} mismatches")
+    check(mismatches == 0)
+
+    print("== router")
+    r = PathTrie()
+    r.put("/users", "listUsers")
+    r.put("/users/:id", "getUser")
+    r.put("/users/me", "currentUser")
+    r.put("/users/:id/orders/*", "ordersByStatus")
+    r.put("/static/**", "staticFiles")
+    r.put("/a/b/x", "abx")
+    r.put("/a/*/c", "anyC")
+    for p in ["/users/me", "/users/42", "/users/42/orders/open", "/static/css/site.css", "/static",
+              "/a/b/c", "//users//", "/nope"]:
+        print(f"  {p} -&gt; {show(r.match(p))}")
+    check(r.match("/users/me").value == "currentUser")
+    check(r.match("/users/42").params["id"] == "42")
+    check(r.match("/a/b/c").value == "anyC")
+    check(r.match("/static").value == "staticFiles")
+    check(r.match("/nope") is None)
+    expect_error(lambda: r.put("/users/:id", "again"), "duplicate")
+    expect_error(lambda: r.put("/users/:uid/cart", "cart"), "conflict")
+    expect_error(lambda: r.put("/x/**/y", "bad"), "last segment")
+    expect_error(lambda: r.match("users"), "must start with /")
+
+    print("== wildcard get over plain keys (KV follow-up)")
+    kv = PathTrie()
+    kv.put("/team/alpha/lead", "asha")
+    kv.put("/team/alpha/dev", "ben")
+    kv.put("/team/beta/lead", "chen")
+    print("  /team/*/lead  -&gt;", "[" + ", ".join(kv.find_all("/team/*/lead")) + "]")
+    print("  /team/alpha/* -&gt;", "[" + ", ".join(kv.find_all("/team/alpha/*")) + "]")
+    print(f"  /*/*/*        -&gt; {len(kv.find_all('/*/*/*'))} keys")
+    check(len(kv.find_all("/team/*/lead")) == 2 and len(kv.find_all("/*/*/*")) == 3)
+
+    print("== 4 writers x 500 records while 2 readers suggest")
+    shared = AutocompleteEngine(ByFrequency(), 3, True)
+
+    def writer():
+        for _ in range(500):
+            shared.record("load test")
+
+    def reader():
+        for _ in range(500):
+            shared.suggest("lo")
+
+    ts = [threading.Thread(target=writer) for _ in range(4)] + [threading.Thread(target=reader) for _ in range(2)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join()
+    print(f"  'lo' -&gt; {fmt(shared.suggest('lo'))}")
+    check(shared.suggest("lo")[0][1] == 2000)
+    print("All checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p>Tests (<code>python -m unittest test_autocomplete</code>):</p>
+<pre><code class="language-python">import unittest
+
+import threading
+
+from autocomplete import RWLock, AutocompleteEngine, ByFrequency, ByRecency, PathTrie
+
+
+class AutocompleteTests(unittest.TestCase):
+    def engine(self, cache=True, rank=None, k=3):
+        return AutocompleteEngine(rank or ByFrequency(), k, cache)
+
+    def test_top_k_by_frequency_ties_alphabetical(self):
+        e = self.engine()
+        e.record("bb", 2)
+        e.record("ba", 2)
+        e.record("bc", 5)
+        e.record("bd", 1)
+        self.assertEqual(e.suggest("b"), [("bc", 5), ("ba", 2), ("bb", 2)])
+
+    def test_recency_strategy(self):
+        e = self.engine(rank=ByRecency())
+        for w in ("x1", "x2", "x3", "x1"):
+            e.record(w)
+        self.assertEqual([t for t, _ in e.suggest("x")], ["x1", "x3", "x2"])
+
+    def test_normalisation_and_case(self):
+        e = self.engine()
+        e.record("  Hello   World ")
+        self.assertEqual(e.suggest("HELLO w"), [("hello world", 1)])
+
+    def test_unknown_prefix_and_empty_phrase(self):
+        e = self.engine()
+        self.assertEqual(e.suggest("zz"), [])
+        with self.assertRaises(ValueError):
+            e.record("   ")
+
+    def test_remove_rebuilds_cache(self):
+        e = self.engine(k=1)
+        e.record("abc", 3)
+        e.record("abd", 2)
+        self.assertEqual(e.suggest("ab"), [("abc", 3)])
+        self.assertTrue(e.remove("abc"))
+        self.assertEqual(e.suggest("ab"), [("abd", 2)])
+        self.assertFalse(e.remove("abc"))
+
+    def test_prefix_that_is_itself_a_phrase(self):
+        e = self.engine()
+        e.record("ab")
+        e.record("abc", 2)
+        self.assertEqual(e.suggest("ab"), [("abc", 2), ("ab", 1)])
+
+    def test_typing_session_records_on_hash(self):
+        e = self.engine()
+        s = e.session()
+        for c in "hi#":
+            s.type(c)
+        self.assertEqual(e.suggest("h"), [("hi", 1)])
+
+
+class RouterTests(unittest.TestCase):
+    def setUp(self):
+        self.r = PathTrie()
+        for p, v in [("/users/:id", "get"), ("/users/me", "me"), ("/a/b/x", "abx"), ("/a/*/c", "ac"),
+                     ("/files/**", "files")]:
+            self.r.put(p, v)
+
+    def test_precedence_literal_over_param(self):
+        self.assertEqual(self.r.match("/users/me").value, "me")
+        self.assertEqual(self.r.match("/users/7").params, {"id": "7"})
+
+    def test_backtracking(self):
+        self.assertEqual(self.r.match("/a/b/c").value, "ac")
+        self.assertIsNone(self.r.match("/a/b"))
+
+    def test_globstar_rest_and_zero(self):
+        self.assertEqual(self.r.match("/files/x/y.txt").params["**"], "x/y.txt")
+        self.assertEqual(self.r.match("/files").value, "files")
+
+    def test_conflicts_and_bad_patterns(self):
+        for bad in ("/users/:id", "/users/:uid", "/x/**/y", "nope"):
+            with self.assertRaises(ValueError):
+                self.r.put(bad, "v")
+
+    def test_find_all_with_wildcard_query(self):
+        kv = PathTrie()
+        kv.put("/a/1/x", 1)
+        kv.put("/a/2/x", 2)
+        kv.put("/a/2/y", 3)
+        self.assertEqual(kv.find_all("/a/*/x"), ["/a/1/x=1", "/a/2/x=2"])
+        self.assertEqual(kv.find_all("/b/*"), [])
+
+
+class RWLockTests(unittest.TestCase):
+    def test_new_reader_waits_behind_a_queued_writer(self):
+        import time
+        rw = RWLock()
+        order = []
+        rw.acquire_read()                                   # reader 1 holds the lock
+
+        def writer():
+            rw.acquire_write()
+            order.append("writer")
+            rw.release_write()
+
+        def reader2():
+            rw.acquire_read()
+            order.append("reader2")
+            rw.release_read()
+
+        w = threading.Thread(target=writer)
+        w.start()
+        while rw._waiting_writers == 0:                     # the writer is queued
+            time.sleep(0.001)
+        r = threading.Thread(target=reader2)
+        r.start()
+        time.sleep(0.05)
+        self.assertEqual(order, [])                         # reader 2 did not overtake the writer
+        rw.release_read()
+        w.join(2)
+        r.join(2)
+        self.assertEqual(order, ["writer", "reader2"])
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>$ python -m unittest test_autocomplete
+.............
+----------------------------------------------------------------------
+Ran 13 tests in 0.052s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Autocomplete (trie + cached top-k + ranking Strategy) and a wildcard path router, C++14.
+// Locking: one mutex per AutocompleteEngine and per PathTrie, taken by every public method (std::lock_guard).
+// Java uses a read-write lock so suggest()/match() run in parallel; the C++14 equivalent is
+// std::shared_timed_mutex (std::shared_mutex is C++17) with std::shared_lock for readers. Pick a
+// writer-preferring lock, or a steady stream of suggest() calls can starve record().
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;random&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+// CHECK, not assert: assert() and any call inside it vanish under -DNDEBUG; CHECK always runs.
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed (line %d): %s\n", __LINE__, #x); std::exit(1); } } while (0)
+
+// ---------------- Part 1: autocomplete ----------------
+struct Entry {
+    std::string text;
+    long count = 0;
+    long lastUsed = 0;
+};
+using EntryPtr = std::shared_ptr&lt;Entry&gt;;
+
+// Strategy: "a is better than b". Scores may only go UP when a phrase is recorded.
+struct RankingStrategy {
+    virtual ~RankingStrategy() = default;
+    virtual std::string name() const = 0;
+    virtual bool better(const Entry&amp; a, const Entry&amp; b) const = 0;
+};
+struct ByFrequency : RankingStrategy {
+    std::string name() const override { return "frequency"; }
+    bool better(const Entry&amp; a, const Entry&amp; b) const override {
+        if (a.count != b.count) return a.count &gt; b.count;
+        return a.text &lt; b.text;                       // ties: alphabetical (LeetCode 642 rule)
+    }
+};
+struct ByRecency : RankingStrategy {
+    std::string name() const override { return "recency"; }
+    bool better(const Entry&amp; a, const Entry&amp; b) const override {
+        if (a.lastUsed != b.lastUsed) return a.lastUsed &gt; b.lastUsed;
+        return a.text &lt; b.text;
+    }
+};
+
+struct TrieNode {
+    std::map&lt;char, std::unique_ptr&lt;TrieNode&gt;&gt; children;
+    EntryPtr entry;                // set when a phrase ends here
+    std::vector&lt;EntryPtr&gt; topK;    // cached best k of this subtree
+};
+
+std::string normalize(const std::string&amp; s, bool trimEnd) {
+    std::string out;
+    for (char c : s) {
+        char l = static_cast&lt;char&gt;(std::tolower(static_cast&lt;unsigned char&gt;(c)));
+        if (std::isspace(static_cast&lt;unsigned char&gt;(l))) {
+            if (!out.empty() &amp;&amp; out.back() != ' ') out += ' ';
+        } else {
+            out += l;
+        }
+    }
+    if (!s.empty() &amp;&amp; std::isspace(static_cast&lt;unsigned char&gt;(s.back())) &amp;&amp; !out.empty() &amp;&amp; out.back() != ' ') out += ' ';
+    if (trimEnd &amp;&amp; !out.empty() &amp;&amp; out.back() == ' ') out.pop_back();
+    return out;
+}
+
+using Suggestions = std::vector&lt;std::pair&lt;std::string, long&gt;&gt;;
+
+std::string fmt(const Suggestions&amp; v) {
+    std::string s = "[";
+    for (size_t i = 0; i &lt; v.size(); i++) s += (i ? ", " : "") + v[i].first + "(" + std::to_string(v[i].second) + ")";
+    return s + "]";
+}
+
+class AutocompleteEngine {
+public:
+    AutocompleteEngine(std::shared_ptr&lt;RankingStrategy&gt; r, size_t k, bool cache) : rank_(std::move(r)), k_(k), cache_(cache) {
+        if (k &lt; 1) throw std::invalid_argument("k must be &gt;= 1");
+    }
+    std::string describe() const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        return rank_-&gt;name() + ", k=" + std::to_string(k_) + (cache_ ? ", cached top-k" : ", scan");
+    }
+    void record(const std::string&amp; phrase, long times = 1) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::string p = normalize(phrase, true);
+        if (p.empty()) throw std::invalid_argument("empty phrase");
+        if (times &lt; 1) throw std::invalid_argument("times must be &gt;= 1");
+        std::vector&lt;TrieNode*&gt; path{&amp;root_};
+        TrieNode* n = &amp;root_;
+        for (char c : p) {
+            auto&amp; ch = n-&gt;children[c];
+            if (!ch) ch.reset(new TrieNode());
+            n = ch.get();
+            path.push_back(n);
+        }
+        if (!n-&gt;entry) { n-&gt;entry = std::make_shared&lt;Entry&gt;(); n-&gt;entry-&gt;text = p; }
+        n-&gt;entry-&gt;count += times;
+        n-&gt;entry-&gt;lastUsed = ++clock_;
+        if (cache_) for (TrieNode* node : path) offer(*node, n-&gt;entry);
+    }
+    bool remove(const std::string&amp; phrase) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::string p = normalize(phrase, true);
+        std::vector&lt;TrieNode*&gt; path{&amp;root_};
+        TrieNode* n = &amp;root_;
+        for (char c : p) {
+            auto it = n-&gt;children.find(c);
+            if (it == n-&gt;children.end()) return false;
+            n = it-&gt;second.get();
+            path.push_back(n);
+        }
+        if (!n-&gt;entry) return false;
+        n-&gt;entry.reset();
+        size_t keep = path.size();
+        for (size_t i = path.size() - 1; i &gt;= 1; i--) {          // prune empty leaves
+            if (!path[i]-&gt;entry &amp;&amp; path[i]-&gt;children.empty()) { path[i - 1]-&gt;children.erase(p[i - 1]); keep = i; }
+            else break;
+        }
+        if (cache_) for (size_t i = keep; i-- &gt; 0;) rebuild(*path[i]);   // removal breaks "only up"
+        return true;
+    }
+    Suggestions suggest(const std::string&amp; prefix) const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::string p = normalize(prefix, false);
+        const TrieNode* n = &amp;root_;
+        for (char c : p) {
+            auto it = n-&gt;children.find(c);
+            if (it == n-&gt;children.end()) return {};
+            n = it-&gt;second.get();
+        }
+        std::vector&lt;EntryPtr&gt; best = cache_ ? n-&gt;topK : scan(*n);
+        Suggestions out;
+        for (const auto&amp; e : best) out.emplace_back(e-&gt;text, e-&gt;count);
+        return out;
+    }
+
+private:
+    bool cmp(const EntryPtr&amp; a, const EntryPtr&amp; b) const { return rank_-&gt;better(*a, *b); }
+    void offer(TrieNode&amp; node, const EntryPtr&amp; e) {
+        auto&amp; v = node.topK;
+        v.erase(std::remove(v.begin(), v.end(), e), v.end());
+        v.push_back(e);
+        std::sort(v.begin(), v.end(), [this](const EntryPtr&amp; a, const EntryPtr&amp; b) { return cmp(a, b); });
+        if (v.size() &gt; k_) v.resize(k_);
+    }
+    void rebuild(TrieNode&amp; node) {
+        std::vector&lt;EntryPtr&gt; pool;
+        if (node.entry) pool.push_back(node.entry);
+        for (const auto&amp; kv : node.children) pool.insert(pool.end(), kv.second-&gt;topK.begin(), kv.second-&gt;topK.end());
+        std::sort(pool.begin(), pool.end(), [this](const EntryPtr&amp; a, const EntryPtr&amp; b) { return cmp(a, b); });
+        if (pool.size() &gt; k_) pool.resize(k_);
+        node.topK = pool;
+    }
+    std::vector&lt;EntryPtr&gt; scan(const TrieNode&amp; start) const {
+        std::vector&lt;EntryPtr&gt; found;
+        std::vector&lt;const TrieNode*&gt; stack{&amp;start};
+        while (!stack.empty()) {
+            const TrieNode* n = stack.back();
+            stack.pop_back();
+            if (n-&gt;entry) found.push_back(n-&gt;entry);
+            for (const auto&amp; kv : n-&gt;children) stack.push_back(kv.second.get());
+        }
+        auto c = [this](const EntryPtr&amp; a, const EntryPtr&amp; b) { return cmp(a, b); };
+        size_t m = std::min(k_, found.size());
+        std::partial_sort(found.begin(), found.begin() + m, found.end(), c);
+        found.resize(m);
+        return found;
+    }
+    TrieNode root_;
+    std::shared_ptr&lt;RankingStrategy&gt; rank_;
+    size_t k_;
+    bool cache_;
+    long clock_ = 0;
+    mutable Mutex mu_;                     // guards the whole trie (children, entries, cached top-k) and clock_
+};
+
+class TypingSession {   // LeetCode 642 style: '#' ends the sentence and records it
+public:
+    explicit TypingSession(AutocompleteEngine&amp; e) : engine_(e) {}
+    Suggestions type(char c) {
+        if (c == '#') { engine_.record(typed_); typed_.clear(); return {}; }
+        typed_ += c;
+        return engine_.suggest(typed_);
+    }
+private:
+    AutocompleteEngine&amp; engine_;
+    std::string typed_;
+};
+
+// ---------------- Part 2: wildcard router ----------------
+std::vector&lt;std::string&gt; segments(const std::string&amp; path) {
+    if (path.empty() || path[0] != '/') throw std::invalid_argument("path must start with /: " + path);
+    std::vector&lt;std::string&gt; out;
+    std::stringstream ss(path);
+    std::string s;
+    while (std::getline(ss, s, '/')) if (!s.empty()) out.push_back(s);   // "/a//b/" == "/a/b"
+    return out;
+}
+std::string join(const std::vector&lt;std::string&gt;&amp; v, size_t from) {
+    std::string s;
+    for (size_t i = from; i &lt; v.size(); i++) s += (i &gt; from ? "/" : "") + v[i];
+    return s;
+}
+
+struct RouteMatch {
+    std::string value, pattern;
+    std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt; params;
+    std::string str() const {
+        std::string s = value + " via " + pattern;
+        if (!params.empty()) {
+            s += " {";
+            for (size_t i = 0; i &lt; params.size(); i++) s += (i ? ", " : "") + params[i].first + "=" + params[i].second;
+            s += "}";
+        }
+        return s;
+    }
+};
+
+class PathTrie {
+    struct Node {
+        std::map&lt;std::string, std::unique_ptr&lt;Node&gt;&gt; literal;
+        std::unique_ptr&lt;Node&gt; param, star, globstar;
+        std::string paramName, value, pattern;
+        bool has = false;
+    };
+
+public:
+    void put(const std::string&amp; pattern, const std::string&amp; value) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        auto segs = segments(pattern);
+        std::string norm = "/" + join(segs, 0);
+        Node* n = &amp;root_;
+        for (size_t i = 0; i &lt; segs.size(); i++) {
+            const std::string&amp; s = segs[i];
+            if (s == "**") {
+                if (i != segs.size() - 1) throw std::invalid_argument("** must be the last segment: " + pattern);
+                if (!n-&gt;globstar) n-&gt;globstar.reset(new Node());
+                n = n-&gt;globstar.get();
+            } else if (s == "*") {
+                if (!n-&gt;star) n-&gt;star.reset(new Node());
+                n = n-&gt;star.get();
+            } else if (s[0] == ':') {
+                std::string name = s.substr(1);
+                if (name.empty()) throw std::invalid_argument("empty parameter name: " + pattern);
+                if (!n-&gt;param) { n-&gt;param.reset(new Node()); n-&gt;paramName = name; }
+                else if (n-&gt;paramName != name)
+                    throw std::invalid_argument("conflict: :" + name + " vs :" + n-&gt;paramName + " in " + pattern);
+                n = n-&gt;param.get();
+            } else {
+                auto&amp; ch = n-&gt;literal[s];
+                if (!ch) ch.reset(new Node());
+                n = ch.get();
+            }
+        }
+        if (n-&gt;has) throw std::invalid_argument("duplicate route " + norm + " (already " + n-&gt;pattern + ")");
+        n-&gt;has = true; n-&gt;value = value; n-&gt;pattern = norm;
+    }
+    bool match(const std::string&amp; path, RouteMatch&amp; out) const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        auto segs = segments(path);
+        out.params.clear();
+        const Node* hit = match(&amp;root_, segs, 0, out.params);
+        if (!hit) return false;
+        out.value = hit-&gt;value; out.pattern = hit-&gt;pattern;
+        return true;
+    }
+    std::vector&lt;std::string&gt; findAll(const std::string&amp; query) const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::vector&lt;std::string&gt; out;
+        collect(&amp;root_, segments(query), 0, out);
+        return out;
+    }
+
+private:
+    using Params = std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;;
+    const Node* match(const Node* n, const std::vector&lt;std::string&gt;&amp; segs, size_t i, Params&amp; ps) const {
+        if (i == segs.size()) {
+            if (n-&gt;has) return n;
+            if (n-&gt;globstar &amp;&amp; n-&gt;globstar-&gt;has) { ps.emplace_back("**", ""); return n-&gt;globstar.get(); }
+            return nullptr;
+        }
+        const std::string&amp; s = segs[i];
+        auto it = n-&gt;literal.find(s);
+        if (it != n-&gt;literal.end()) if (const Node* r = match(it-&gt;second.get(), segs, i + 1, ps)) return r;
+        if (n-&gt;param) {
+            ps.emplace_back(n-&gt;paramName, s);
+            if (const Node* r = match(n-&gt;param.get(), segs, i + 1, ps)) return r;
+            ps.pop_back();
+        }
+        if (n-&gt;star) if (const Node* r = match(n-&gt;star.get(), segs, i + 1, ps)) return r;
+        if (n-&gt;globstar &amp;&amp; n-&gt;globstar-&gt;has) { ps.emplace_back("**", join(segs, i)); return n-&gt;globstar.get(); }
+        return nullptr;
+    }
+    void collect(const Node* n, const std::vector&lt;std::string&gt;&amp; segs, size_t i, std::vector&lt;std::string&gt;&amp; out) const {
+        if (i == segs.size()) { if (n-&gt;has) out.push_back(n-&gt;pattern + "=" + n-&gt;value); return; }
+        if (segs[i] == "*") {
+            for (const auto&amp; kv : n-&gt;literal) collect(kv.second.get(), segs, i + 1, out);
+        } else {
+            auto it = n-&gt;literal.find(segs[i]);
+            if (it != n-&gt;literal.end()) collect(it-&gt;second.get(), segs, i + 1, out);
+        }
+    }
+    Node root_;
+    mutable Mutex mu_;                     // guards every node
+};
+
+// ---------------- demo ----------------
+template &lt;class F&gt;
+void expectError(F f, const std::string&amp; contains) {
+    try { f(); } catch (const std::invalid_argument&amp; e) {
+        std::cout &lt;&lt; "  rejected: " &lt;&lt; e.what() &lt;&lt; "\n";
+        CHECK(std::string(e.what()).find(contains) != std::string::npos);
+        return;
+    }
+    throw std::logic_error("expected error: " + contains);
+}
+
+void seed(AutocompleteEngine&amp; e) {
+    e.record("linux kernel", 5);
+    e.record("linked list", 3);
+    e.record("lint rules", 3);
+    e.record("linus torvalds", 2);
+    e.record("LRU   Cache", 4);
+    e.record("linux kernel modules", 1);
+}
+
+std::string list(const std::vector&lt;std::string&gt;&amp; v) {
+    std::string s = "[";
+    for (size_t i = 0; i &lt; v.size(); i++) s += (i ? ", " : "") + v[i];
+    return s + "]";
+}
+
+int main() {
+    std::cout &lt;&lt; "== autocomplete\n";
+    AutocompleteEngine freq(std::make_shared&lt;ByFrequency&gt;(), 3, true);
+    AutocompleteEngine recent(std::make_shared&lt;ByRecency&gt;(), 3, true);
+    seed(freq);
+    seed(recent);
+    std::cout &lt;&lt; "  [" &lt;&lt; freq.describe() &lt;&lt; "] 'lin' -&gt; " &lt;&lt; fmt(freq.suggest("lin")) &lt;&lt; "\n";
+    std::cout &lt;&lt; "  [" &lt;&lt; recent.describe() &lt;&lt; "] 'lin' -&gt; " &lt;&lt; fmt(recent.suggest("lin")) &lt;&lt; "\n";
+    CHECK(fmt(freq.suggest("lin")) == "[linux kernel(5), linked list(3), lint rules(3)]");
+    CHECK(recent.suggest("lin")[0].first == "linux kernel modules");
+    std::cout &lt;&lt; "  'LI' -&gt; " &lt;&lt; fmt(freq.suggest("LI")) &lt;&lt; "   'xyz' -&gt; " &lt;&lt; fmt(freq.suggest("xyz")) &lt;&lt; "\n";
+    CHECK(freq.suggest("xyz").empty());
+
+    std::cout &lt;&lt; "== typing session (LeetCode 642 style)\n";
+    TypingSession t(freq);
+    for (char c : std::string("lru cache#")) {
+        Suggestions s = t.type(c);
+        if (c == 'l' || c == 'r' || c == '#') std::cout &lt;&lt; "  typed '" &lt;&lt; c &lt;&lt; "' -&gt; " &lt;&lt; fmt(s) &lt;&lt; "\n";
+    }
+    std::cout &lt;&lt; "  'l' now -&gt; " &lt;&lt; fmt(freq.suggest("l")) &lt;&lt; "\n";
+    CHECK(freq.suggest("l")[1] == std::make_pair(std::string("lru cache"), 5L));
+
+    std::cout &lt;&lt; "== remove 'linux kernel'\n";
+    CHECK(freq.remove("linux kernel"));
+    CHECK(!freq.remove("linux kernel"));
+    std::cout &lt;&lt; "  'lin' -&gt; " &lt;&lt; fmt(freq.suggest("lin")) &lt;&lt; "   'linux' -&gt; " &lt;&lt; fmt(freq.suggest("linux")) &lt;&lt; "\n";
+    CHECK(fmt(freq.suggest("linux")) == "[linux kernel modules(1)]");
+
+    std::cout &lt;&lt; "== cached top-k equals full scan (random workload)\n";
+    std::mt19937 rnd(7);
+    std::vector&lt;std::string&gt; vocab{"a", "ab", "abc", "abd", "b", "ba", "bab", "bad", "c", "ca", "cab", "cad", "dab", "dad"};
+    AutocompleteEngine cached(std::make_shared&lt;ByFrequency&gt;(), 3, true), scan(std::make_shared&lt;ByFrequency&gt;(), 3, false);
+    int mismatches = 0, ops = 2000;
+    for (int i = 0; i &lt; ops; i++) {
+        const std::string&amp; w = vocab[rnd() % vocab.size()];
+        if (rnd() % 10 == 0) { cached.remove(w); scan.remove(w); }
+        else { cached.record(w); scan.record(w); }
+        for (const char* p : {"", "a", "b", "ba", "c", "d"})
+            if (cached.suggest(p) != scan.suggest(p)) mismatches++;
+    }
+    std::cout &lt;&lt; "  " &lt;&lt; ops &lt;&lt; " ops, " &lt;&lt; mismatches &lt;&lt; " mismatches\n";
+    CHECK(mismatches == 0);
+
+    std::cout &lt;&lt; "== router\n";
+    PathTrie r;
+    r.put("/users", "listUsers");
+    r.put("/users/:id", "getUser");
+    r.put("/users/me", "currentUser");
+    r.put("/users/:id/orders/*", "ordersByStatus");
+    r.put("/static/**", "staticFiles");
+    r.put("/a/b/x", "abx");
+    r.put("/a/*/c", "anyC");
+    RouteMatch m;
+    for (const char* p : {"/users/me", "/users/42", "/users/42/orders/open", "/static/css/site.css", "/static",
+                          "/a/b/c", "//users//", "/nope"})
+        std::cout &lt;&lt; "  " &lt;&lt; p &lt;&lt; " -&gt; " &lt;&lt; (r.match(p, m) ? m.str() : "404") &lt;&lt; "\n";
+    CHECK(r.match("/users/me", m) &amp;&amp; m.value == "currentUser");
+    CHECK(r.match("/users/42", m) &amp;&amp; m.params[0].second == "42");
+    CHECK(r.match("/a/b/c", m) &amp;&amp; m.value == "anyC");
+    CHECK(r.match("/static", m) &amp;&amp; m.value == "staticFiles");
+    CHECK(!r.match("/nope", m));
+    expectError([&amp;] { r.put("/users/:id", "again"); }, "duplicate");
+    expectError([&amp;] { r.put("/users/:uid/cart", "cart"); }, "conflict");
+    expectError([&amp;] { r.put("/x/**/y", "bad"); }, "last segment");
+    expectError([&amp;] { r.match("users", m); }, "must start with /");
+
+    std::cout &lt;&lt; "== wildcard get over plain keys (KV follow-up)\n";
+    PathTrie kv;
+    kv.put("/team/alpha/lead", "asha");
+    kv.put("/team/alpha/dev", "ben");
+    kv.put("/team/beta/lead", "chen");
+    std::cout &lt;&lt; "  /team/*/lead  -&gt; " &lt;&lt; list(kv.findAll("/team/*/lead")) &lt;&lt; "\n";
+    std::cout &lt;&lt; "  /team/alpha/* -&gt; " &lt;&lt; list(kv.findAll("/team/alpha/*")) &lt;&lt; "\n";
+    std::cout &lt;&lt; "  /*/*/*        -&gt; " &lt;&lt; kv.findAll("/*/*/*").size() &lt;&lt; " keys\n";
+    CHECK(kv.findAll("/team/*/lead").size() == 2 &amp;&amp; kv.findAll("/*/*/*").size() == 3);
+
+    std::cout &lt;&lt; "== 2000 records of one phrase (single thread here; Java runs 4 writers + 2 readers)\n";
+    AutocompleteEngine shared(std::make_shared&lt;ByFrequency&gt;(), 3, true);
+    for (int i = 0; i &lt; 2000; i++) shared.record("load test");
+    std::cout &lt;&lt; "  'lo' -&gt; " &lt;&lt; fmt(shared.suggest("lo")) &lt;&lt; "\n";
+    CHECK(shared.suggest("lo")[0].second == 2000);
+    std::cout &lt;&lt; "All checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== autocomplete
+  [frequency, k=3, cached top-k] 'lin' -&gt; [linux kernel(5), linked list(3), lint rules(3)]
+  [recency, k=3, cached top-k] 'lin' -&gt; [linux kernel modules(1), linus torvalds(2), lint rules(3)]
+  'LI' -&gt; [linux kernel(5), linked list(3), lint rules(3)]   'xyz' -&gt; []
+== typing session (LeetCode 642 style)
+  typed 'l' -&gt; [linux kernel(5), lru cache(4), linked list(3)]
+  typed 'r' -&gt; [lru cache(4)]
+  typed '#' -&gt; []
+  'l' now -&gt; [linux kernel(5), lru cache(5), linked list(3)]
+== remove 'linux kernel'
+  'lin' -&gt; [linked list(3), lint rules(3), linus torvalds(2)]   'linux' -&gt; [linux kernel modules(1)]
+== cached top-k equals full scan (random workload)
+  2000 ops, 0 mismatches
+== router
+  /users/me -&gt; currentUser via /users/me
+  /users/42 -&gt; getUser via /users/:id {id=42}
+  /users/42/orders/open -&gt; ordersByStatus via /users/:id/orders/* {id=42}
+  /static/css/site.css -&gt; staticFiles via /static/** {**=css/site.css}
+  /static -&gt; staticFiles via /static/** {**=}
+  /a/b/c -&gt; anyC via /a/*/c
+  //users// -&gt; listUsers via /users
+  /nope -&gt; 404
+  rejected: duplicate route /users/:id (already /users/:id)
+  rejected: conflict: :uid vs :id in /users/:uid/cart
+  rejected: ** must be the last segment: /x/**/y
+  rejected: path must start with /: users
+== wildcard get over plain keys (KV follow-up)
+  /team/*/lead  -&gt; [/team/alpha/lead=asha, /team/beta/lead=chen]
+  /team/alpha/* -&gt; [/team/alpha/dev=ben, /team/alpha/lead=asha]
+  /*/*/*        -&gt; 3 keys
+== 4 writers x 500 records while 2 readers suggest
+  'lo' -&gt; [load test(2000)]
+All 19 checks passed</code></pre>
+  <div class="callout note"><p>Read the two "lin" lines together: the same records, two strategies, two different answers. Then follow "lru cache": 4 searches, typed once more and recorded by <code>#</code>, now tied with "linux kernel" at 5 and placed second by the alphabetical tie-break. In the router block, <code>/a/b/c</code> is the backtracking case and <code>//users//</code> shows that empty segments are ignored.</p></div>

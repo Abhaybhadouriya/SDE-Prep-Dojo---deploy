@@ -1,0 +1,126 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope.</strong> Hotel or Airbnb? Overbooking? Is search in scope? Say "no double booking" and "search may be stale".</li>
+          <li><strong>5-10 min: numbers.</strong> Show that booking is ~3 TPS, but views are ~100x that. Conclude: one SQL database per shard is enough for writes, and caches handle reads.</li>
+          <li><strong>10-20 min: API + data model.</strong> Inventory per (hotel, room_type, date), the reservation table, and the idempotency key.</li>
+          <li><strong>20-35 min: the booking transaction.</strong> Race, conditional update, holds with TTL, state machine, payment webhook.</li>
+          <li><strong>35-45 min: scale and failure.</strong> CDC to search, sharding by hotel_id, hot hotels, PSP failure, reconciliation.</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Inventory is one row per hotel, room type and night; a booking runs one conditional UPDATE over its nights inside a transaction, writes a HELD reservation with a 10-minute expiry, and the POST carries an idempotency key so a double click books once."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"The booking transaction expires stale holds inline so correctness never waits for the sweeper, CDC to Kafka feeds the search index and Redis, sharding by hotel_id keeps every booking on one shard, PSP webhooks are reconciled, and a waiting room protects a viral hotel."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger"><p><b>Common mistakes:</b> checking availability in Redis and booking without a database check; using a distributed lock without a <a href="{{BASE}}interview/glossary#fencing">fencing token</a> or a DB constraint; modelling rooms instead of room types; one row per reservation and an O(n) overlap scan; calling the PSP inside a DB transaction; forgetting that a 3-night stay touches 3 rows.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Walmart">
+          <summary>Two users try to book the last room at the same time. Walk me through exactly what prevents a double booking.</summary>
+          <div class="answer">
+            <p>The booking runs one transaction on the shard that owns the hotel. Inside it, a single conditional <code>UPDATE ... SET reserved = reserved + n WHERE ... AND reserved + n &lt;= cap</code> touches every night of the stay. The database row lock makes the two updates run one after the other. The first changes N rows and commits. The second finds that the condition is false for the last night, changes fewer than N rows, and rolls back. Behind that, a CHECK or EXCLUDE constraint is the last line of defence.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the race first (read 99, read 99, write 100, write 100). Then show the fix as one SQL statement. Mention row-count verification for multi-night stays. Finish with the constraint as defence in depth.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not SELECT FOR UPDATE?</li><li>What isolation level do you need?</li><li>How does this change if the inventory is in Redis?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Flipkart">
+          <summary>Optimistic vs pessimistic locking for reservations: which and why?</summary>
+          <div class="answer">
+            <p>Optimistic, by default. Hotel booking is a few TPS per chain, so conflicts are rare and a retry is cheap. Pessimistic locks hold row locks while the user or the network is slow. They risk deadlocks when two stays lock overlapping nights in different orders, and they cut throughput. Switch to pessimistic only for a very hot row with short transactions (lock nights in date order), or put a queue in front when contention is extreme.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the choice to the contention level from your estimate. Name the failure mode of each: retries storm vs deadlocks and blocking.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why version numbers rather than timestamps? (Clock drift.)</li><li>What does the user see when the optimistic retry fails?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>How do you hold a room while the user pays, without locking it forever?</summary>
+          <div class="answer">
+            <p>Write a HELD reservation and increment the counters, with <code>hold_expires_at = now() + 10 min</code>. Lazy expiry has two halves: availability queries treat expired holds as free, and the next booking transaction for those nights flips them to EXPIRED and decrements the counters inline. A sweeper job only cleans up the rest. Payment success moves the status from HELD to CONFIRMED with a conditional update, so a late success on an expired hold fails and triggers a refund. Extend the hold when payment starts, to make that rare.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the state machine. Stress that correctness does not depend on the sweeper's timing.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Redis TTL lock vs a SQL row: which do you trust?</li><li>How long should the hold be? (A business choice, usually 10-15 min.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>The client timed out after clicking Pay and retried. How do you guarantee one charge and one booking?</summary>
+          <div class="answer">
+            <p>The client sends the same idempotency key (the reservation id) on the retry. The server stores the key with a lease and the final response. If the first attempt finished, it returns the stored response. If it is still in flight, it returns 409 / "processing" until the lease expires. The PSP call also passes the key, so the PSP deduplicates too. Idempotency data is read from the primary, as Airbnb's Orpheus does, because replica lag could hide the first success.</p>
+            <div class="approach"><h5>How to answer</h5><p>Exactly-once = <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> (retries) + at-most-once (idempotency). Then give the pre-RPC / RPC / post-RPC split.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep idempotency keys?</li><li>What if the same key arrives with a different body?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft">
+          <summary>Design flight booking instead. What changes?</summary>
+          <div class="answer">
+            <p>The inventory unit becomes a seat class or fare bucket per flight leg, not a room type per night. A multi-leg trip must hold several legs atomically. Often they are on different airline systems (GDS), so you hold each leg, then confirm all of them or release all of them: a saga with compensation. Seat maps add a per-seat lock. Prices change quickly and come from external systems, so the cache TTL and "price changed" flows matter more.</p>
+            <div class="approach"><h5>How to answer</h5><p>Map the concepts one to one (night -&gt; leg, room type -&gt; fare class), then point out the new cross-system atomicity problem.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Saga vs 2PC across airlines?</li><li>How do you show a price that is honoured at checkout?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>How does search show availability for 3 nights across 50,000 listings fast?</summary>
+          <div class="answer">
+            <p>Keep approximate availability in the search index: a bitmap of free nights per listing, or a "min free count per room type" for each date. The query filters on all bits in [checkin, checkout) being set, together with geo and price filters. CDC from the inventory database updates it within seconds. The detail page re-checks the cache, and the booking transaction is the final word.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate the AP read path from the CP write path. Name the freshness lag and how the user experiences it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid dual writes to the DB and the index? (Outbox / CDC.)</li><li>Geo index choice? See geo-proximity.</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Should reservation and inventory be separate microservices?</summary>
+          <div class="answer">
+            <p>Usually no. Booking must change inventory and create the reservation atomically. In one service with one database, that is one local ACID transaction. Splitting them needs a saga: reserve inventory, create the reservation, and compensate on failure. The system is then briefly inconsistent and has more failure paths. ByteByteGo's design keeps them together on purpose. Split them only when separate teams or very different scaling needs justify the cost.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show that you know the textbook "database per service" and when to break that rule. Pragmatism scores well.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not 2PC? (It blocks and is slow when a participant fails.)</li><li>Where does payment sit then?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Can you use a Redis distributed lock per room and skip the database checks?</summary>
+          <div class="answer">
+            <p>Not safely. A Redis lock with a TTL can expire while the holder is paused (GC, network), and then two writers both think they own it. Failover can also lose the key. Kleppmann's point is that you need a fencing token that the storage checks, and at that point the database constraint does the real work. Use Redis as a fast first filter for hot items, and keep the conditional update or constraint in SQL.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "a lock is an optimisation, a constraint is correctness". Mention fencing tokens.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is Redlock and why is it controversial?</li><li>How do you lock multiple nights in Redis atomically? (A Lua script on one slot.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Microsoft,Flipkart">
+          <summary>Scale to an OTA with 1,000x the traffic and supplier-owned inventory. What breaks first?</summary>
+          <div class="answer">
+            <p>Read traffic and supplier quotas break first, not our database. Suppliers rate-limit price and availability calls, so we cache answers per itinerary with a TTL and pre-fetch the itineraries most likely to convert, as Agoda's PriceAggregator does. Our own inventory DB shards by hotel_id. 30,000 QPS over 16 shards is about 1,875 QPS each. Bookings against external suppliers become a two-step "hold at supplier, then confirm", with timeouts and reconciliation.</p>
+            <div class="approach"><h5>How to answer</h5><p>Identify the real bottleneck from the numbers. Owning the inventory vs aggregating it changes everything.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The supplier confirms after our hold expired: what now?</li><li>How do you detect cached price drift?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>A host blocks dates on another site at the same time a guest books on ours. How do you handle double booking across platforms?</summary>
+          <div class="answer">
+            <p>You cannot have a transaction across companies. Calendars sync by pull (iCal) or push (channel-manager APIs), so a window of inconsistency always exists. Shrink it with push webhooks and frequent pulls. Detect conflicts on sync. Then resolve them by policy: the earliest confirmed booking wins, the other is cancelled with compensation, and the host gets a penalty or warning. This is an eventual-consistency problem solved by business rules.</p>
+            <div class="approach"><h5>How to answer</h5><p>Admit the CAP limit, then show detection + compensation. Interviewers want to see that you know when not to over-engineer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How often would you poll external calendars?</li><li>What metrics would you alert on?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: New Year's Eve, one boutique hotel goes viral</h4>
+          <div class="situation"><p>A celebrity posts about a 20-room hotel. 50,000 people open it in 5 minutes and 5,000 click Reserve in the first minute. The inventory shard's CPU hits 100% and unrelated hotels on that shard slow down.</p></div>
+          <div class="bad"><p>Weak answer: "Add more database replicas." Replicas do not take writes, and the problem is contention on 20 rows, not read capacity.</p></div>
+          <div class="good"><p>Strong answer: (1) serve the detail page from cache and rate-limit Reserve per user; (2) put a waiting room or queue in front of this hotel's reservation path, so that only a few booking transactions per second reach the shard; (3) fail fast when Redis says 0 left, while the DB still decides; (4) move the hot hotel to its own shard if this repeats; (5) watch lock wait time and rollback rate.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you keep the waiting room fair?</li><li>Would pessimistic locking help here?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: guests report "charged but no booking"</h4>
+          <div class="situation"><p>Support sees 40 tickets a day: the card was charged, but the reservation shows EXPIRED.</p></div>
+          <div class="bad"><p>Weak answer: "Make the hold longer." That hides the symptom and blocks inventory.</p></div>
+          <div class="good"><p>Strong answer: the PSP webhook arrives after the hold TTL, so the conditional confirm fails. Fix it with: an extended hold at payment start; on confirm failure, try to re-take inventory, and refund automatically if that is impossible; a reconciliation job that matches PSP captures to reservations daily; and an alert on webhook lag.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where does reconciliation get its data?</li><li>How do you make the refund idempotent?</li></ul></div>
+        </div>
+      

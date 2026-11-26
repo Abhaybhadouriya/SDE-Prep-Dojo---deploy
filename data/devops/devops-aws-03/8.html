@@ -1,0 +1,53 @@
+
+  <h2>Multipart and resumable uploads (recap)</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>A single PUT can carry at most 5 GiB, and AWS suggests switching to multipart from about 100 MB. A <b>multipart upload</b> has three calls: <code>CreateMultipartUpload</code> returns an <code>UploadId</code>; <code>UploadPart</code> sends numbered parts (1 to 10,000, each 5 MiB to 5 GiB except the last, uploaded in any order and in parallel); <code>CompleteMultipartUpload</code> sends the list of part numbers + ETags and S3 stitches the object. The largest object you can build this way is 48.8 TiB.</p>
+  <p>This is what makes uploads <b>resumable</b>: if the connection drops on part 37, the client calls <code>ListParts</code>, sees 1-36 are done, and re-sends only 37 onwards. Each part is an independent, <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> PUT, so retries are safe. Pre-sign each <code>UploadPart</code> URL and a browser can do all of this without AWS credentials. The full design of a resumable chunked uploader, and how S3 itself stores parts, are in <a href="{{BASE}}hld/p06#ladder">Pattern: Handling Large Blobs</a> and <a href="{{BASE}}hld/d36#deep-dives">S3-like Object Storage</a>.</p>
+    <div class="stepper" data-stepper>
+    <div class="svg-scroll">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Multipart upload: create returns an upload ID, parts upload in parallel each returning an ETag, one part is retried, complete sends the ETag list, and the object appears">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="20" y="120" width="130" height="60"/><text class="label" x="85" y="146">client</text><text class="label small" x="85" y="166">big.tar, 2.1 GB</text>
+      <rect class="box db" x="620" y="120" width="160" height="60"/><text class="label" x="700" y="146">S3 bucket</text><text class="label small" x="700" y="166">object not visible yet</text>
+      <g data-step="1"><path class="arrow" d="M150 130 L618 60"/><text class="label small" x="385" y="72">CreateMultipartUpload -&gt; UploadId</text></g>
+      <g data-step="2"><rect class="box docker" x="240" y="110" width="80" height="34"/><text class="label small" x="280" y="132">part 1</text>
+        <rect class="box docker" x="340" y="110" width="80" height="34"/><text class="label small" x="380" y="132">part 2</text>
+        <rect class="box docker" x="440" y="110" width="80" height="34"/><text class="label small" x="480" y="132">part 3 ...</text>
+        <path class="arrow" d="M520 127 L618 140"/><text class="label small" x="380" y="104">UploadPart in parallel, each returns an ETag</text></g>
+      <g data-step-only="2"><circle class="packet" r="6"><animateMotion dur="1.4s" repeatCount="indefinite" path="M150 150 L618 150"/></circle></g>
+      <g data-step="3"><rect class="box fail" x="340" y="160" width="80" height="34"/><text class="label small bad" x="380" y="182">part 2 failed</text><text class="label small" x="380" y="212">retry only part 2</text></g>
+      <g data-step="4"><path class="arrow" d="M150 170 L618 230"/><text class="label small" x="385" y="252">CompleteMultipartUpload [1:ETag1, 2:ETag2, ...]</text></g>
+      <g data-step="5"><rect class="box ok" x="620" y="190" width="160" height="44"/><text class="label small" x="700" y="216">object visible, ETag "...-21"</text></g>
+      <g data-step="6"><text class="label small bad" x="400" y="286">never completed? parts stay stored and billed until AbortIncompleteMultipartUpload</text></g>
+    </svg>
+    </div>
+    <ol class="stepper-captions">
+      <li><code>CreateMultipartUpload</code> returns an <code>UploadId</code>. Nothing is visible in the bucket yet.</li>
+      <li>The client sends parts (5 MiB to 5 GiB each, up to 10,000) in parallel with <code>UploadPart</code>. Each response carries that part's ETag.</li>
+      <li>One part fails on a flaky link. Only that part is re-sent; the others are already stored. This is what makes uploads resumable.</li>
+      <li><code>CompleteMultipartUpload</code> sends the list of part numbers and ETags. S3 stitches the parts in order.</li>
+      <li>Now the object appears, atomically. Its ETag is a hash of the part hashes plus "-N", not the file's MD5.</li>
+      <li>If the client dies and never completes or aborts, the parts stay invisible in listings but billed. A lifecycle rule with <code>AbortIncompleteMultipartUpload</code> cleans them up.</li>
+    </ol>
+  </div>
+  <p>For the internals (how a storage system tracks parts and assembles them), see <a href="{{BASE}}hld/d36#deep-dives">S3-like Object Storage deep dives</a>.</p>
+  <pre><code class="language-bash">split -b 100M big.tar part-
+UPLOAD_ID=$(aws s3api create-multipart-upload --bucket dojo-uploads-surbhi \
+  --key backups/big.tar --query UploadId --output text)
+aws s3api upload-part --bucket dojo-uploads-surbhi --key backups/big.tar \
+  --upload-id "$UPLOAD_ID" --part-number 1 --body part-aa
+# ... parts 2..N (in parallel), then:
+aws s3api complete-multipart-upload --bucket dojo-uploads-surbhi --key backups/big.tar \
+  --upload-id "$UPLOAD_ID" --multipart-upload file://parts.json</code></pre>
+  <pre class="terminal"><code>{
+    "ETag": "\"7a1e4c2b9f0d3e8a5c6b1f2e9d0a4c7b\""
+}
+...
+{
+    "Location": "https://dojo-uploads-surbhi.s3.ap-south-1.amazonaws.com/backups/big.tar",
+    "Bucket": "dojo-uploads-surbhi",
+    "Key": "backups/big.tar",
+    "ETag": "\"5f0b2a1e7c4d...-21\""
+}</code></pre>
+  <p>Note the <code>-21</code> at the end of the final ETag: a multipart object's ETag is a hash of the parts' hashes plus the part count, <b>not</b> the MD5 of the file. Do not compare it to <code>md5sum</code>; use S3 checksums (CRC32/CRC64NVME/SHA-256) instead. In practice <code>aws s3 cp</code> and the SDK transfer managers do multipart automatically (the CLI default threshold and part size are 8 MB) - you hand-roll it only for browser or mobile resumable uploads.</p>
+  <div class="callout danger"><p>An upload that is started but never completed or aborted keeps its parts stored <b>and billed</b>, and they do not appear in <code>aws s3 ls</code>. The <code>AbortIncompleteMultipartUpload</code> lifecycle rule above is the fix; put it on every bucket.</p></div>

@@ -1,0 +1,86 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Predicting the issue from recent orders</h3>
+        <p>This is the Amazon-specific twist ("predicts a customer's issue from past orders"). Do not jump to "use an ML model". Build it in layers:</p>
+        <ol class="steps">
+          <li><strong>Context first.</strong> If the chat was started from an order page, you already know the order. Most of the prediction is free.</li>
+          <li><strong>Rules on order state.</strong> Read the last ~10 orders (cached per customer). Shipment past its promised date -> LATE_DELIVERY. Return picked up but no refund after N days -> REFUND_STATUS. Delivered in the last 48 h + a photo attachment -> DAMAGED_ITEM. Payment failed -> PAYMENTS.</li>
+          <li><strong>Model on top.</strong> A classifier trained on past contacts (features: order states, days since delivery, category, past contact reasons, first message text) gives probabilities per intent. Labels come free from agents' disposition codes on closed contacts - that is why step 8 streams them to Kafka.</li>
+          <li><strong>Confidence threshold.</strong> Above it, route straight to the skill queue and pre-load that order on the agent's screen. Below it, show the customer the top 3 guesses as buttons ("Is this about order #881?"), or let a bot ask one question.</li>
+          <li><strong>Deflection.</strong> Some intents can be answered without an agent: "Where is my parcel?" shows live tracking. Every deflected chat is one fewer in the queue during a spike.</li>
+        </ol>
+        <p>The predictor must be <b>fast and optional</b>: give it a strict timeout (say 300 ms). If it fails, route to the general queue. Never block contact creation on a model.</p>
+
+        <h3>2. Matching contacts to agents (the "Uber" part)</h3>
+        <p>One Amazon candidate described a hybrid of WhatsApp-style messaging and Uber-style agent matching; the interviewer said it was acceptable but could be improved. The improvement is to be precise about <em>how</em> matching works and why it is safe.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 260" role="img" aria-label="Router picks the oldest contact and the longest-idle eligible agent then does an atomic reservation">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="10" width="250" height="240"/>
+            <text class="zone-label" x="24" y="32">Queue: refunds</text>
+            <rect class="box queue" x="30" y="50" width="210" height="36"/><text class="label small" x="135" y="73">c-17 waiting 4m10s (VIP)</text>
+            <rect class="box queue" x="30" y="100" width="210" height="36"/><text class="label small" x="135" y="123">c-12 waiting 3m55s</text>
+            <rect class="box queue" x="30" y="150" width="210" height="36"/><text class="label small" x="135" y="173">c-21 waiting 0m40s</text>
+            <rect class="box svc" x="330" y="95" width="160" height="70"/>
+            <text class="label" x="410" y="122">Router</text>
+            <text class="label small" x="410" y="145">best pair</text>
+            <rect class="zone k8s" x="560" y="10" width="250" height="240"/>
+            <text class="zone-label" x="574" y="32">Eligible agents</text>
+            <rect class="box ok" x="580" y="50" width="210" height="36"/><text class="label small" x="685" y="73">A1: 0/3 used, idle 6m</text>
+            <rect class="box ok" x="580" y="100" width="210" height="36"/><text class="label small" x="685" y="123">A2: 1/3 used, idle 1m</text>
+            <rect class="box warn" x="580" y="150" width="210" height="36"/><text class="label small" x="685" y="173">A3: 3/3 used - skip</text>
+            <path class="arrow" d="M240 68 L323 115"/>
+            <path class="arrow" d="M573 68 L497 115"/>
+            <text class="label small" x="410" y="205">BEGIN; UPDATE agent SET used=used+1</text>
+            <text class="label small" x="410" y="225">WHERE id='A1' AND used &lt; max AND status='AVAILABLE';</text>
+            <text class="label small" x="410" y="245">UPDATE contact SET state='OFFERED' ...; COMMIT</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M240 68 L330 120 L490 120 L580 68"/></circle>
+          </svg>
+          <figcaption>Pick the oldest (or highest-priority) contact and the best eligible agent - longest idle with a free slot - then reserve both in one transaction. If the conditional update touches 0 rows, someone else won; pick again.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Event-driven, not polling.</b> The router runs only when a contact is enqueued or an agent slot frees (accept, close, status change). That gives sub-second offers without hammering the DB.</li>
+          <li><b>Who goes first.</b> The common contact-centre default is "most idle agent" among those with the required skill. Patents on skill routing note the catch: the best agents get more contacts and burn out, so real systems also cap <b>occupancy</b> (share of time busy). Mention both.</li>
+          <li><b>Skill levels and fallback.</b> Prefer proficiency 5 agents; if a contact waits longer than T seconds, widen to proficiency 3, then to an overflow queue. Amazon Connect models this with routing profiles: each agent has a profile listing queues, priorities and channel concurrency.</li>
+          <li><b>Capacity per channel.</b> Voice uses 1 slot and blocks chats; chat uses 1 of N slots. Amazon Connect documents a hard limit of <b>10 active chats per agent</b>.</li>
+          <li><b>One router per queue.</b> Make each queue owned by exactly one router instance (a <a href="{{BASE}}interview/glossary#lease">lease</a> in etcd/ZooKeeper/DynamoDB, or a Kafka partition per queue). This removes most races. The conditional SQL update is the safety net if two ever overlap (for example during a lease handover).</li>
+        </ul>
+        <div class="callout warn"><p><b>Uber is a weak analogy for one thing:</b> riders can be matched to many nearby drivers and the cost is distance. Here the "cost" is skill fit and wait time, there is no geography, and agents have multiple slots. Say "Uber-like dispatch, but the score is skill and idle time, and supply is capacity slots, not cars."</p></div>
+
+        <h3>3. "No call may be dropped" - durability end to end</h3>
+        <p>The Flipkart interviewer's one hard rule. Walk through each place a contact could vanish:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Where it could be lost</th><th>Fix</th></tr></thead>
+            <tbody>
+              <tr><td>Client request lost after the server created the contact</td><td>Idempotency key; client retries get the same contact_id.</td></tr>
+              <tr><td>Redis queue node dies</td><td>Redis is only an index. A rebuild job re-reads <code>state='QUEUED'</code> rows from SQL ordered by <code>enqueued_at</code>.</td></tr>
+              <tr><td>Router crashes after reserving the agent but before sending the offer</td><td>Offer has an <code>expires_at</code>. A <b>reaper</b> scans OFFERED rows past expiry, frees the slot, and re-queues at the front.</td></tr>
+              <tr><td>Agent's browser dies mid-chat</td><td>Heartbeat timeout (say 30 s) marks the agent OFFLINE; their ACTIVE contacts get a short grace period, then re-queue with high priority to another agent with full transcript.</td></tr>
+              <tr><td>Queue wait gets too long</td><td>Do not drop - offer a <b>callback</b> or "we will email you", and keep position. For voice, this is the standard "press 1 for a callback" feature.</td></tr>
+              <tr><td>Concurrent-contact limit reached</td><td>Admission control at creation: show "high volume, wait ~20 min, or get a callback". Amazon Connect counts waiting chats toward its instance limit and fails new ones with a quota error - so your design must decide what the customer sees.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>For the <b>voice</b> variant the media path is a telephony platform (SIP trunk, IVR, media servers), and the routing layer is the same. "Not dropped" also means: hold music keeps the call up while the contact sits in QUEUED; a media-server failure must not delete the contact row.</p>
+
+        <h3>4. Real-time messaging and ordering</h3>
+        <ul>
+          <li><b>WebSocket gateways</b> hold connections. A connection registry (Redis: <code>user -&gt; gateway</code>) tells the chat service where to push. Slack's design is the same shape: gateway servers hold WebSocket subscriptions, channel servers own channels by consistent hashing and fan out to the gateways.</li>
+          <li><b>Ordering</b> matters only <em>within</em> one contact. The chat service assigns a monotonic <code>seq</code> per contact (owner of the contact by hash, or an atomic counter in the message row's partition). Clients render by seq.</li>
+          <li><b>At-least-once + dedupe.</b> Clients resend until they get <code>ack(client_msg_id, seq)</code>; the server dedupes on <code>client_msg_id</code>. On reconnect the client calls history with <code>after_seq</code> to fill gaps.</li>
+          <li><b>Only two (or a few) participants</b> per conversation. This is far simpler than group chat fan-out - see <a href="{{BASE}}hld/d04">WhatsApp</a> and <a href="{{BASE}}hld/d51">Slack / Teams</a> for the hard fan-out cases. Amazon Connect allows up to 6 participants on a conference chat (customer, agent, others).</li>
+          <li><b>Supervisor monitor/barge</b> is just another subscriber to the contact's message stream.</li>
+        </ul>
+
+        <h3>5. Sudden spikes: what actually scales</h3>
+        <p>The Amazon follow-up was "scale the chat service for sudden spikes" and then "auto-scaling". Separate the layers:</p>
+        <ol class="steps">
+          <li><strong>Stateless services</strong> (contact, predictor, chat service): horizontal autoscale on CPU/RPS. Easy.</li>
+          <li><strong>WebSocket gateways</strong>: scale on open connections, not CPU. Scale-in must drain connections gracefully (tell clients to reconnect elsewhere), or you cause a reconnect storm.</li>
+          <li><strong>Queues</strong> absorb the gap between arrivals and agents. They must be durable and show honest wait estimates.</li>
+          <li><strong>Agents cannot autoscale.</strong> So reduce demand: deflect with self-service (tracking, refund status), proactive notifications ("your order is delayed, no need to contact us"), bots for top intents, callbacks, and overflow to partner sites.</li>
+          <li><strong>Protect the core.</strong> Rate-limit contact creation per customer; shed optional features (typing indicators, read receipts) first.</li>
+        </ol>
+      

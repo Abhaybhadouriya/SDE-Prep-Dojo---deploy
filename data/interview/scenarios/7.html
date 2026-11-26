@@ -1,0 +1,202 @@
+
+        <h2>System design drills (H1 - H7)</h2>
+        <p>These come up inside HLD rounds as "what happens when..." follow-ups, and in hiring-manager rounds as "tell me how you would handle...". They join the pieces together: caches, databases, queues and the cluster. Background: <a href="{{BASE}}hld/hld-11">Resilience patterns</a>, <a href="{{BASE}}hld/hld-10">Distributed transactions</a>, <a href="{{BASE}}hld/hld-13">Multi-region and DR</a>, <a href="{{BASE}}hld/p04">Scaling reads</a>.</p>
+
+        <p>Many of these incidents are <b>feedback loops</b>: a small failure causes retries, retries cause more load, more load causes more failure. The picture shows a retry storm, and where the <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a> cuts the loop.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Retry storm: clients retry against a slow service which slows the database further; a circuit breaker with backoff and jitter breaks the loop">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="110" width="140" height="60"/>
+            <text class="label" x="90" y="136">Clients</text>
+            <text class="label small" x="90" y="156">retry x3, no jitter</text>
+            <rect class="box svc" x="250" y="110" width="140" height="60"/>
+            <text class="label" x="320" y="136">Order service</text>
+            <text class="label small" x="320" y="156">threads all busy</text>
+            <rect class="box cache" x="430" y="110" width="110" height="60"/>
+            <text class="label" x="485" y="136">Circuit</text>
+            <text class="label small" x="485" y="156">breaker</text>
+            <rect class="box db" x="620" y="110" width="150" height="60"/>
+            <text class="label" x="695" y="136">Database</text>
+            <text class="label small bad" x="695" y="156">slow, 100% CPU</text>
+            <path class="arrow" d="M160 140 L245 140"/>
+            <path class="arrow" d="M390 140 L425 140"/>
+            <path class="arrow" d="M540 140 L615 140"/>
+            <path class="arrow bad dashed" d="M695 110 C 695 30, 90 30, 90 105"/>
+            <text class="label small bad" x="400" y="40">timeouts cause retries, retries add load: the loop</text>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M90 140 L695 140 C 695 30, 90 30, 90 140"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M90 140 L695 140 C 695 30, 90 30, 90 140"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M90 140 L695 140 C 695 30, 90 30, 90 140"/></circle>
+            <rect class="zone" x="20" y="200" width="760" height="80"/>
+            <text class="label small" x="400" y="226">Breaking the loop: timeouts shorter than the caller's, retries with exponential backoff + jitter,</text>
+            <text class="label small" x="400" y="248">a retry budget, a circuit breaker that fails fast, load shedding (429) and bulkheads per dependency.</text>
+          </svg>
+          <figcaption>A retry storm. The red dots keep coming back as retries. The circuit breaker (yellow) opens and fails fast, giving the database time to recover.</figcaption>
+        </figure>
+
+        <div class="scenario" id="h1">
+          <h4>Scenario H1: the database hits 100% CPU two minutes into a flash sale</h4>
+          <div class="situation">
+            <p>At 12:00 a sale starts. Product page latency goes from 100 ms to 6 seconds. The primary database is at 100% CPU, mostly running the same "get product and stock" query.</p>
+            <p><span class="chip">HLD</span> <span class="chip">caching, hot keys</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Walmart, Flipkart</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Buy a bigger database." Vertical scaling takes time, has a ceiling, and does not stop the same few rows from being hammered.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Mitigate in minutes.</strong> Turn on a waiting room or rate limit at the edge for the sale page, serve product details from cache or CDN, and shed non-critical traffic (recommendations, reviews) with feature flags.</li>
+              <li><strong>Separate reads from writes.</strong> Product details rarely change: cache them aggressively (CDN plus Redis) and send leftover reads to read replicas. Only stock changes on the hot path.</li>
+              <li><strong>Handle the hot rows.</strong> Keep stock counters for sale items in Redis and decrement atomically (a Lua script or <code>DECR</code>), then write orders to the DB asynchronously through a queue. Or split one item's stock into several sub-counters.</li>
+              <li><strong>Check the query.</strong> Slow query log and <code>EXPLAIN</code>: a missing index can turn a 1 ms query into a full scan.</li>
+              <li><strong>Prevent.</strong> Load-test with the expected sale traffic beforehand, pre-warm caches, and pre-scale. Flipkart has described running large-scale chaos experiments before its Big Billion Days sale.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>How do you avoid overselling if stock lives in Redis? (Atomic decrement that refuses below zero, reservation with a timeout, and the DB as the final source of truth with reconciliation.)</li>
+            <li>Full design: <a href="{{BASE}}hld/d09">Flash sale</a>.</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h2">
+          <h4>Scenario H2: Redis restarted and the database fell over a minute later</h4>
+          <div class="situation">
+            <p>A cache node restarted with an empty memory. Within 60 seconds the database behind it was overloaded and the whole site slowed down, even though Redis was back.</p>
+            <p><span class="chip">HLD</span> <span class="chip"><a href="{{BASE}}interview/glossary#thundering-herd">cache stampede</a></span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Microsoft</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Redis should not restart." Everything restarts eventually; design for it.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> this is a <b>cache stampede</b> (also called thundering herd or dog-piling). With an empty cache, every request misses, and thousands of requests for the same popular key all hit the DB at once.</p>
+            <ol class="steps">
+              <li><strong>Mitigate.</strong> Rate limit traffic to the DB (a connection pool cap protects it), serve stale or default data for non-critical parts.</li>
+              <li><strong>Request coalescing.</strong> Only one request per key rebuilds the value; others wait for it (a short lock or "single flight").</li>
+              <li><strong>Jitter the TTLs.</strong> If all keys expire at the same time, you create your own stampede every hour. Add random spread to TTLs.</li>
+              <li><strong>Serve stale while revalidating.</strong> Keep a slightly old value and refresh it in the background.</li>
+              <li><strong>Prevent.</strong> Replicas and persistence for the cache so a restart is not a cold start, and warm hot keys before sending traffic.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Cache-aside vs write-through vs write-behind: which did this system use, and what would change?</li>
+            <li>How do you handle one key that is too hot for one Redis node? (Replicate it to several keys or a local in-process cache.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h3">
+          <h4>Scenario H3: a slow dependency takes down every service (retry storm)</h4>
+          <div class="situation">
+            <p>The recommendations service became slow (3 s instead of 50 ms). Soon the product page, the cart and checkout all failed, even though they do not need recommendations to work.</p>
+            <p><span class="chip">HLD</span> <span class="chip">resilience</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Microsoft, Uber</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Increase the timeout to 10 seconds so calls succeed." Longer timeouts hold threads longer and spread the failure faster.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> a non-critical dependency used up shared resources (threads, connections) of critical paths. That is a <b>cascading failure</b>.</p>
+            <ol class="steps">
+              <li><strong>Mitigate.</strong> Turn off the recommendations widget with a feature flag; the page loads without it.</li>
+              <li><strong>Timeouts.</strong> Every remote call gets a timeout based on that dependency's normal latency (for example a little above its p99), and shorter than the caller's own timeout.</li>
+              <li><strong>Retries done right.</strong> Few retries, exponential backoff with <a href="{{BASE}}interview/glossary#backoff">jitter</a>, only for safe (idempotent) operations, and a retry budget so retries can never multiply traffic.</li>
+              <li><strong>Circuit breaker.</strong> After many failures, stop calling for a while and return a fallback immediately.</li>
+              <li><strong>Bulkheads.</strong> Separate thread pools or connection pools per dependency, so one slow dependency cannot eat everyone's threads.</li>
+              <li><strong>Prevent.</strong> Chaos tests that inject latency (not just failure) into dependencies.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>How would a queue (Kafka) between services change this failure? (The caller no longer waits; lag grows instead of threads blocking.)</li>
+            <li>What is load shedding and how do you choose what to drop?</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h4">
+          <h4>Scenario H4: users get the same push notification three times</h4>
+          <div class="situation">
+            <p>A notification service reads from Kafka and calls a push provider. After a provider slowdown, many users received the same "Your order has shipped" message three times.</p>
+            <p><span class="chip">HLD</span> <span class="chip">dedup, at-least-once</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Flipkart, Swiggy</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Use exactly-once in Kafka." Same mistake as F7: the push provider is outside Kafka.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Find the duplication point.</strong> The provider was slow, the HTTP call timed out on our side, but the provider had actually sent it. Our retry sent it again. Possibly a rebalance re-delivered too.</li>
+              <li><strong>Dedup by notification ID.</strong> Each notification gets a stable ID when it is created. Before sending, do an atomic "set if not exists" with a TTL in Redis (or a unique row in the DB). If the key is already there, skip.</li>
+              <li><strong>Use the provider's idempotency features</strong> where they exist (collapse keys or IDs).</li>
+              <li><strong>Tune retries.</strong> Retry timeouts with backoff, and do not retry when the provider says the message was accepted.</li>
+              <li><strong>Prevent.</strong> Track a "duplicate sends" metric and alert on it.</li>
+            </ol>
+<pre><code class="language-bash"># Redis: claim the notification ID for 24 hours; only the first worker succeeds
+SET notif:9f3c2a sent NX EX 86400</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>How would you add per-user rate limits ("no more than 3 marketing pushes a day")?</li>
+            <li>Full design: <a href="{{BASE}}hld/d03">Notification system</a>.</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h5">
+          <h4>Scenario H5: the order exists in the database but no event was ever published</h4>
+          <div class="situation">
+            <p>Some orders are saved, but the warehouse never hears about them. The code saves the order to the DB, then publishes <code>OrderCreated</code> to Kafka. Rarely, the pod dies between the two steps.</p>
+            <p><span class="chip">HLD</span> <span class="chip"><a href="{{BASE}}interview/glossary#dual-write">dual write</a>, outbox</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Walmart, Uber</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "Publish to Kafka first, then save." Now you can publish an event for an order that was never saved.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> this is the <b>dual-write problem</b>: two systems, no shared transaction, so one write can succeed while the other fails.</p>
+            <ol class="steps">
+              <li><strong>Mitigate.</strong> Find orders with no matching event (a reconciliation query) and republish them.</li>
+              <li><strong>Use the transactional outbox.</strong> In the same DB transaction that saves the order, insert a row into an <code>outbox</code> table. Either both commit or neither does.</li>
+              <li><strong>Relay the outbox.</strong> A CDC connector (Debezium) or a small poller reads new outbox rows and publishes them to Kafka. It may publish twice after a crash, so consumers dedup by event ID.</li>
+              <li><strong>Prevent.</strong> A periodic reconciliation job and a metric for "orders without events older than N minutes".</li>
+            </ol>
+<pre><code class="language-sql">BEGIN;
+INSERT INTO orders (id, user_id, total, status) VALUES (:id, :user, :total, 'CREATED');
+INSERT INTO outbox (event_id, aggregate_id, type, payload)
+VALUES (:eventId, :id, 'OrderCreated', :json);
+COMMIT;</code></pre>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Outbox vs Kafka transactions vs a saga: when do you use which?</li>
+            <li>How does the warehouse cancel if payment later fails? (A saga with compensating events.)</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h6">
+          <h4>Scenario H6: a whole cloud region goes down</h4>
+          <div class="situation">
+            <p>Your main region has a major outage. The company says the service must be back within 15 minutes and lose at most 1 minute of data.</p>
+            <p><span class="chip">HLD</span> <span class="chip">DR, <a href="{{BASE}}interview/glossary#multi-region">multi-region</a></span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Amazon, Walmart, Microsoft</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "We have backups, we will restore them." Restoring a large database from backup rarely fits in 15 minutes, and backups may be hours old.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b> translate the business words into numbers first: <b>RTO 15 minutes</b> (time to recover), <b><a href="{{BASE}}interview/glossary#rpo-rto">RPO</a> 1 minute</b> (data you may lose).</p>
+            <ol class="steps">
+              <li><strong>Design to the target.</strong> An RPO of 1 minute needs <b>continuous asynchronous replication</b> to a second region (database replicas, Kafka MirrorMaker 2, object storage replication). An RTO of 15 minutes needs a <b>warm standby</b>: the second region runs a scaled-down copy of the services, already deployed.</li>
+              <li><strong>Failover steps.</strong> Promote the standby database, scale up the services, switch traffic with DNS or a global load balancer, point consumers at the mirrored Kafka with translated offsets.</li>
+              <li><strong>Explain the trade-off.</strong> Active-passive is simpler and cheaper but you lose the replication lag. Active-active gives near-zero RTO but forces you to handle write conflicts (region-pinned users, CRDTs, or one region owning each record).</li>
+              <li><strong>Prevent surprise.</strong> Practise failover on a schedule (game days). An untested DR plan is a hope, not a plan.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Why are synchronous cross-region writes usually avoided? (Every write pays the round-trip latency between regions.)</li>
+            <li>Full topic: <a href="{{BASE}}hld/hld-13">Reliability, multi-region and DR</a>.</li>
+          </ul></div>
+        </div>
+
+        <div class="scenario" id="h7">
+          <h4>Scenario H7: p99 latency doubled after a "harmless" deploy</h4>
+          <div class="situation">
+            <p>A deploy changed only logging and a library version. Error rate is flat, but p99 latency of the search API went from 200 ms to 450 ms.</p>
+            <p><span class="chip">HLD</span> <span class="chip">performance regression</span> <span class="chip">level: SDE-2</span> <span class="chip company">commonly reported at: Microsoft, Uber, Google</span></p>
+          </div>
+          <div class="bad"><p><b>Weak answer:</b> "It is probably the network." No evidence, no test.</p></div>
+          <div class="good">
+            <p><b>Strong answer:</b></p>
+            <ol class="steps">
+              <li><strong>Mitigate.</strong> The timing matches the deploy, so roll back first and confirm latency recovers. That alone proves the deploy is the cause.</li>
+              <li><strong>Compare old and new.</strong> Run a canary of the new version beside the old one and compare traces: which span got slower?</li>
+              <li><strong>Usual suspects for "harmless" changes:</strong> synchronous logging on the request path (disk or network flush per line), a new library that changed connection pool sizes or timeouts, a different JSON or TLS implementation, more memory allocation causing longer GC pauses.</li>
+              <li><strong>Profile.</strong> A CPU or allocation profile (a flame graph) of the new version under the same load shows where time goes.</li>
+              <li><strong>Prevent.</strong> Automated canary analysis that compares p99 latency (not only errors) between canary and baseline before a full rollout.</li>
+            </ol>
+          </div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul>
+            <li>Why look at p99 and not the average? (Averages hide the slow tail that users feel, and one page load may call many services, so tails add up.)</li>
+            <li>What is tail-latency amplification in fan-out requests?</li>
+          </ul></div>
+        </div>
+      

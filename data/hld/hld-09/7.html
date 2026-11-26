@@ -1,0 +1,61 @@
+
+        <h2>Leases, distributed locks and fencing tokens</h2>
+        <p>A <strong>lease</strong> is a lock with a timer: "you own this for 10 seconds unless you renew it." If the owner crashes, the lease simply expires and someone else can take over, so nobody waits forever. Leases are how ZooKeeper sessions, etcd leases and Chubby's sessions work: clients send keep-alive messages to renew. The owner must use a <em>monotonic</em> clock to measure its remaining time - a wall clock can be stepped by NTP.</p>
+        <p>Martin Kleppmann's famous essay splits locks into two kinds. An <b>efficiency lock</b> stops two workers doing the same job twice; if it fails now and then, you pay for a duplicate email. A <b>correctness lock</b> stops two writers corrupting data; if it fails once, you have a real bug. Most interview problems (seat booking, wallet debit, a single cron runner) need the second kind.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 320" role="img" aria-label="Fencing tokens stop a paused client from writing with an expired lock">
+            
+            <rect class="box svc" x="20" y="40" width="150" height="56"/><text class="label" x="95" y="65">Client 1</text><text class="label small" x="95" y="85">worker</text>
+            <rect class="box svc" x="20" y="220" width="150" height="56"/><text class="label" x="95" y="245">Client 2</text><text class="label small" x="95" y="265">worker</text>
+            <rect class="box queue" x="355" y="130" width="160" height="56"/><text class="label" x="435" y="155">Lock service</text><text class="label small" x="435" y="175">ZooKeeper / etcd</text>
+            <rect class="box db" x="680" y="130" width="160" height="56"/><text class="label" x="760" y="155">Storage</text><text class="label small" x="760" y="175">max token seen</text>
+            <g data-step-only="1">
+              <path class="arrow" d="M170 70 L350 145"/>
+              <text class="label ok" x="290" y="80">lease granted, token 33</text>
+            </g>
+            <g data-step="2">
+              <rect class="box fail" x="20" y="40" width="150" height="56"/><text class="label bad" x="95" y="65">Client 1 paused</text><text class="label small" x="95" y="85">GC / VM stall</text>
+            </g>
+            <g data-step-only="2">
+              <text class="label small" x="435" y="115">lease expires while client 1 sleeps</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M170 245 L350 172"/>
+              <text class="label ok" x="290" y="250">lease granted, token 34</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow ok" d="M170 255 L674 172"/>
+              <text class="label small" x="600" y="225">write(data, token=34)</text>
+              <text class="label ok" x="760" y="210">max = 34</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow bad" d="M170 60 L674 140"/>
+              <text class="label small" x="560" y="80">write(data, token=33)</text>
+              <text class="label bad" x="760" y="115">33 &lt; 34: REJECT</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Client 1 gets the lock.</b> The lock service grants a lease and a <em>fencing token</em> - a number that grows every time the lock is granted. Client 1 gets 33.</li>
+            <li><b>Client 1 freezes.</b> A stop-the-world GC, a VM migration or a page fault pauses it longer than the lease. It does not know time has passed. Checking "is my lease still valid?" right before writing does not help, because the pause can land just after the check.</li>
+            <li><b>Client 2 gets the lock.</b> The lease expired, so the service grants it to client 2 with token 34.</li>
+            <li><b>Client 2 writes.</b> Storage records 34 as the highest token it has seen.</li>
+            <li><b>Zombie write blocked.</b> Client 1 wakes up and writes with token 33. Storage sees 33 &lt; 34 and rejects it. Safety now lives in the storage check, not in timing.</li>
+          </ol>
+        </div>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Lock implementation</th><th>How it works</th><th>Fencing token?</th><th>Use for</th></tr></thead>
+            <tbody>
+              <tr><td>Redis <code>SET key val NX PX 10000</code></td><td>Single node, release with compare-and-delete script</td><td>No (add your own counter)</td><td>Efficiency locks; accept rare double work</td></tr>
+              <tr><td>Redlock (5 independent Redis)</td><td>Majority of Redis nodes within a time budget</td><td>No</td><td>Debated: safety depends on clocks and bounded pauses</td></tr>
+              <tr><td>ZooKeeper ephemeral sequential znode</td><td>Lowest sequence number holds the lock; others watch their predecessor; session expiry deletes the node</td><td>Yes: zxid or znode version</td><td>Correctness locks, leader election</td></tr>
+              <tr><td>etcd lease + revision</td><td>Key attached to a lease with TTL; create revision orders waiters</td><td>Yes: revision number</td><td>Correctness locks in Kubernetes-land</td></tr>
+              <tr><td>Database row lock / conditional update</td><td><code>SELECT ... FOR UPDATE</code> or <code>UPDATE ... WHERE version = ?</code></td><td>Version column acts as one</td><td>When the data already lives in one DB - often the simplest answer</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout interview"><p>Say this: "A lock alone cannot be safe because the holder can pause past its lease. I'd use a consensus-backed lock (etcd or ZooKeeper) that hands out a monotonically increasing fencing token, and make the storage reject writes with an older token. If the protected data lives in one database, I'd skip the distributed lock and use a conditional write on a version column."</p></div>
+        <p>Google's <b>Chubby</b> is the classic lock service: a 5-replica Paxos cell offering coarse-grained, advisory locks through a file-system-like API, with client caching and server-driven invalidation. Google used it to elect GFS and Bigtable primaries, and it ended up serving mostly as a name service. Building one is design <a href="{{BASE}}hld/d55">d55 Distributed Lock Service</a>; the wider family of techniques is in <a href="{{BASE}}hld/p02">Pattern: Dealing with Contention</a>.</p>
+      

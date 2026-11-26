@@ -1,0 +1,120 @@
+
+        <h2>Zero-copy: read()/write() vs sendfile()</h2>
+        <p class="chips level-chips"><span class="chip accent">good to know</span></p>
+        <p>Imagine a broker serving a consumer the naive way: read a chunk of the log file into a user-space buffer, then write that buffer to the consumer's socket. Walk through what the hardware and kernel actually do. Click through both paths.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 380" role="img" aria-label="Traditional read and write path with four copies versus sendfile path">
+            <line class="line" x1="20" y1="120" x2="780" y2="120"/>
+            <text class="label small left" x="24" y="108">USER SPACE</text>
+            <text class="label small left" x="24" y="136">KERNEL SPACE</text>
+
+            <rect class="box db" x="30" y="300" width="150" height="56"/><text class="label" x="105" y="328">Disk</text>
+            <rect class="box cache" x="230" y="190" width="170" height="56"/><text class="label" x="315" y="210">Page cache</text><text class="label small" x="315" y="230">kernel buffer</text>
+            <rect class="box queue" x="450" y="190" width="170" height="56"/><text class="label" x="535" y="210">Socket buffer</text><text class="label small" x="535" y="230">kernel</text>
+            <rect class="box client" x="640" y="300" width="140" height="56"/><text class="label" x="710" y="328">NIC</text>
+            <rect class="box kafka" x="330" y="30" width="200" height="56"/><text class="label" x="430" y="50">Broker JVM buffer</text><text class="label small" x="430" y="70">user space</text>
+
+            <g data-step-only="1">
+              <path class="arrow ok" d="M105 300 L270 248"/>
+              <text class="label small ok" x="140" y="262">1. DMA copy</text>
+              <text class="label small" x="560" y="150">read(): switch user to kernel</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow bad" d="M315 190 L390 88"/>
+              <text class="label small bad" x="270" y="150">2. CPU copy</text>
+              <text class="label small" x="620" y="150">read() returns: kernel to user</text>
+            </g>
+            <g data-step-only="3">
+              <path class="arrow bad" d="M470 88 L535 190"/>
+              <text class="label small bad" x="560" y="150">3. CPU copy (write)</text>
+              <text class="label small" x="600" y="104">write(): user to kernel</text>
+            </g>
+            <g data-step-only="4">
+              <path class="arrow ok" d="M560 246 L700 300"/>
+              <text class="label small ok" x="690" y="270">4. DMA copy</text>
+              <rect class="box fail" x="200" y="300" width="400" height="56"/>
+              <text class="label bad" x="400" y="320">4 copies (2 by CPU), 4 context switches</text>
+              <text class="label small" x="400" y="340">and the data crossed into user space for nothing</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow ok" d="M105 300 L270 248"/>
+              <path class="arrow ok thick" d="M400 218 L445 218"/>
+              <path class="arrow ok" d="M560 246 L700 300"/>
+              <rect class="box ghost" x="330" y="30" width="200" height="56"/>
+              <text class="label small ok" x="430" y="104">sendfile(sock, file, off, len): one syscall</text>
+            </g>
+            <g data-step="6">
+              <circle class="packet ok" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M105 300 L315 218 L535 218 L710 300"/></circle>
+              <rect class="box svc highlight" x="200" y="300" width="400" height="56"/>
+              <text class="label ok" x="400" y="320">Data never enters user space</text>
+              <text class="label small" x="400" y="340">2 DMA copies, 2 context switches (with SG-DMA NICs)</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>read() step 1.</b> The broker calls <code>read()</code>. That is a switch into the kernel. If the page is not cached, the disk controller DMAs it into the page cache.</li>
+            <li><b>read() step 2.</b> The kernel copies the bytes from the page cache into the broker's user-space buffer with the CPU, then returns to user space (second switch).</li>
+            <li><b>write() step 3.</b> The broker calls <code>write()</code> on the socket (third switch). The CPU copies the same bytes again, from the user buffer into the kernel socket buffer.</li>
+            <li><b>write() step 4.</b> The NIC DMAs from the socket buffer to the wire and <code>write()</code> returns (fourth switch). Two pointless CPU copies through user space, polluting the CPU caches, and Kafka never even looked at the bytes.</li>
+            <li><b>sendfile().</b> Kafka instead calls Java's <code>FileChannel.transferTo()</code>, which on Linux becomes <code>sendfile()</code>. One system call says "move these bytes of this file to that socket".</li>
+            <li><b>Result.</b> The bytes go page cache to NIC inside the kernel. With a NIC that supports scatter-gather DMA, the socket buffer only gets descriptors pointing at the page-cache pages, so no CPU copy is left at all. Hot data comes straight from RAM; the disk is not touched.</li>
+          </ol>
+        </div>
+
+        <p>Now multiply this by fan-out. If five consumer groups read the same topic, the data is read from disk at most once into the page cache, then <code>sendfile()</code>d five times. The design doc makes exactly this point: one copy in the cache serves every consumer.</p>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="C (what the kernel sees)">
+<pre><code class="language-c">/* Naive copy loop: 2 CPU copies + 4 mode switches per chunk */
+char buf[65536];
+ssize_t n;
+while ((n = read(file_fd, buf, sizeof buf)) &gt; 0)
+    write(sock_fd, buf, n);
+
+/* Zero-copy: the kernel moves page-cache pages to the socket */
+off_t off = segment_pos;              /* from the .index lookup   */
+size_t left = bytes_to_send;
+while (left &gt; 0) {
+    ssize_t sent = sendfile(sock_fd, file_fd, &amp;off, left);
+    if (sent &lt;= 0) break;             /* EAGAIN on a full socket  */
+    left -= sent;
+}</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Java (what Kafka calls)">
+<pre><code class="language-java">// Simplified from the idea in Kafka's FileRecords / network layer.
+// FileChannel.transferTo() maps to sendfile(2) on Linux.
+try (FileChannel log = FileChannel.open(segmentPath, StandardOpenOption.READ)) {
+    long position = 12340;     // byte position found via the .index file
+    long count    = 1_048_576; // e.g. max.partition.fetch.bytes
+    long sent = log.transferTo(position, count, socketChannel);
+}</code></pre>
+          </div>
+          <div class="tab-panel" data-title="See it with strace">
+<pre class="terminal"><code>$ sudo strace -f -e trace=sendfile -p $(pgrep -f kafka.Kafka) 2&gt;&amp;1 | head -3
+[pid 4127] sendfile(212, 187, [12340] =&gt; [78012], 65672) = 65672
+[pid 4127] sendfile(212, 187, [78012] =&gt; [143684], 65672) = 65672
+[pid 4127] sendfile(219, 187, [12340] =&gt; [78012], 65672) = 65672</code></pre>
+            <p>Run a plaintext consumer against a broker while tracing. Arguments are <code>(socket_fd, file_fd, offset, count)</code>. Your fd numbers and sizes will differ; the point is seeing <code>sendfile</code> calls instead of <code>read</code>/<code>write</code> pairs.</p>
+          </div>
+        </div>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the same family of tricks as <code>splice()</code>, NIC scatter-gather and DMA rings that avoid touching packet payloads in a fast path: move <em>descriptors</em>, not bytes. Kafka is effectively a file server whose hot path is a sequence of <code>sendfile()</code> calls, plus a small amount of protocol framing around them.</p>
+          <p><b>Where the analogy breaks:</b> it only works if nobody needs to transform the bytes. Encryption is a transform.</p>
+        </div>
+
+        <h3>When zero-copy does not happen</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Situation</th><th>Why</th><th>Effect</th></tr></thead>
+            <tbody>
+              <tr><td><b>TLS / SSL listener</b></td><td>Java's TLS encrypts in user space, so bytes must come up into the JVM to be encrypted. Stock Kafka does not use kernel TLS (kTLS).</td><td>Extra CPU per byte. Plan more broker CPU when you turn on TLS, and measure.</td></tr>
+              <tr><td><b>Cold reads</b> (a consumer far behind)</td><td>The pages are not in the page cache, so the kernel must read from disk first.</td><td>Disk reads, and those pages can push out hot pages that tail readers need ("cache pollution").</td></tr>
+              <tr><td><b>Format conversion</b></td><td>Very old clients that need an older message format force the broker to rewrite batches. Kafka 4.x removed the oldest protocol versions, so this is mostly history now.</td><td>CPU and memory cost per fetch.</td></tr>
+              <tr><td><b>Producer writes</b></td><td><code>sendfile</code> is for the read path. Writes still arrive on a socket and are appended with normal file writes.</td><td>Writes are fast because they are sequential and batched, not because of zero-copy.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Common trap:</b> saying "Kafka writes with zero-copy". Zero-copy (<code>sendfile</code>) is the <b>consumer and follower read path</b>. The write path's speed comes from sequential appends, batching and the page cache.</p></div>
+      

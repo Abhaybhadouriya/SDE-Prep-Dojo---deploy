@@ -1,0 +1,139 @@
+
+  <h2>Drift: when reality and state disagree</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p><strong>Drift</strong> means the real infrastructure no longer matches what Terraform last recorded (and usually no longer matches the code). Terraform does not watch your cloud; it only notices drift when it next <em>refreshes</em> during a plan. Common causes:</p>
+  <ul>
+    <li>A <strong>manual console change</strong> during an incident: someone opens port 22 on a security group, raises an instance size, or edits a route table.</li>
+    <li><strong>Another tool</strong> managing the same object: an autoscaler changing <code>desired_count</code>, a Kubernetes controller adding tags, AWS adding default values.</li>
+    <li><strong>Two Terraform stacks</strong> managing the same object (for example two states both declaring the same security group rule).</li>
+    <li><strong>Deleted resources</strong>: someone removes a resource by hand, so the next plan wants to create it again.</li>
+  </ul>
+
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Code, state and real cloud drift apart, then a refresh-only plan detects it and the team decides">
+      <rect class="box svc" x="30" y="40" width="200" height="70" rx="8"/>
+      <text class="label" x="130" y="68">Code (git)</text>
+      <text class="label small mono" x="130" y="92">ingress: 443 only</text>
+      <rect class="box kafka" x="300" y="40" width="200" height="70" rx="8"/>
+      <text class="label" x="400" y="68">State (S3)</text>
+      <text class="label small mono" x="400" y="92">ingress: 443 only</text>
+      <rect class="box db" x="570" y="40" width="200" height="70" rx="8"/>
+      <text class="label" x="670" y="68">Real AWS</text>
+      <text class="label small mono" x="670" y="92">ingress: 443 only</text>
+      <g data-step="2">
+        <rect class="box hot" x="570" y="120" width="200" height="44" rx="8"/>
+        <text class="label small" x="670" y="147">console: +22 from 0.0.0.0/0</text>
+        <text class="label bad" x="670" y="186">reality changed</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M565 75 L506 75"/>
+        <text class="label small" x="535" y="132">refresh</text>
+        <text class="label small" x="400" y="140">plan -refresh-only:</text>
+        <text class="label small bad" x="400" y="160">"changed outside of Terraform"</text>
+      </g>
+      <g data-step-only="4">
+        <rect class="box ok" x="40" y="210" width="340" height="70" rx="8"/>
+        <text class="label" x="210" y="236">Revert: terraform apply</text>
+        <text class="label small" x="210" y="258">code wins, port 22 is removed</text>
+        <rect class="box warn" x="420" y="210" width="340" height="70" rx="8"/>
+        <text class="label" x="590" y="236">Codify: edit code, then apply</text>
+        <text class="label small" x="590" y="258">the change was right, make git match</text>
+      </g>
+      <g data-step-only="5">
+        <rect class="box ok" x="120" y="210" width="560" height="70" rx="8"/>
+        <text class="label" x="400" y="238">Scheduled job runs plan -detailed-exitcode nightly</text>
+        <text class="label small" x="400" y="260">exit 2 = diff found = open a ticket / Slack alert</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Normal day: code in git, the state file and the real cloud all agree.</li>
+      <li>During an incident someone opens SSH on the security group in the console. The cloud changed; code and state did not.</li>
+      <li>The next plan refreshes: it asks AWS for the live object, compares with state and reports "Objects have changed outside of Terraform".</li>
+      <li>A human decides. Either the code is right (apply reverts the manual change) or the change was right (update the code so they match again).</li>
+      <li>To catch drift within hours instead of at the next unrelated deploy, run a scheduled plan and alert on a non-empty diff.</li>
+    </ol>
+  </div>
+
+  <h3>Seeing drift with a refresh-only plan</h3>
+  <p><code>terraform plan -refresh-only</code> compares state with the real objects and shows <em>only</em> what changed outside Terraform, without proposing to change anything back. It is the safe, read-only way to look.</p>
+<pre class="terminal"><code>$ terraform plan -refresh-only
+aws_security_group.web: Refreshing state... [id=sg-0a1b2c3d4e5f60718]
+
+Note: Objects have changed outside of Terraform
+
+Terraform detected the following changes made outside of Terraform since the
+last "terraform apply" which may have affected this plan:
+
+  # aws_security_group.web has changed
+  ~ resource "aws_security_group" "web" {
+        id      = "sg-0a1b2c3d4e5f60718"
+      ~ ingress = [
+          + {
+              + cidr_blocks = ["0.0.0.0/0"]
+              + from_port   = 22
+              + protocol    = "tcp"
+              + to_port     = 22
+            },
+            # (1 unchanged element hidden)
+        ]
+    }
+
+This is a refresh-only plan, so Terraform will not take any actions to undo
+these. If you were expecting these changes then you can apply this plan to
+record the updated values in the Terraform state without changing any remote
+objects.</code></pre>
+  <p>Now there are three choices, and you should say them in this order in an interview:</p>
+  <ol class="steps">
+    <li><strong>Revert</strong> (code is the truth): run a normal <code>terraform plan</code>/<code>apply</code>. Terraform proposes removing the port-22 rule and puts things back.</li>
+    <li><strong>Codify</strong> (the change was right): edit the code to include the rule, open a PR, plan shows "No changes", merge. Now git, state and cloud agree again.</li>
+    <li><strong>Accept into state only</strong>: <code>terraform apply -refresh-only</code> writes the new values into state without touching the cloud. Use this rarely; if the code still disagrees, the very next normal plan will propose reverting anyway.</li>
+  </ol>
+  <p>If someone created a brand-new object by hand that should be managed, bring it in with an <code>import</code> block (Terraform 1.5+) so the import itself is reviewed in a plan:</p>
+<pre><code class="language-hcl">import {
+  to = aws_security_group_rule.bastion_ssh
+  id = "sgrule-1234567890"
+}</code></pre>
+
+  <h3>Scheduled drift detection in CI</h3>
+  <p><code>terraform plan -detailed-exitcode</code> returns <strong>0</strong> when there is no diff, <strong>1</strong> on error and <strong>2</strong> when there are changes. That makes a cron job trivial: run a plan for each stack every night (or every few hours for prod) and alert on exit code 2. HCP Terraform and other managed platforms offer the same idea as built-in "health assessments".</p>
+<pre><code class="language-yaml"># .github/workflows/drift.yml
+name: drift-detection
+on:
+  schedule:
+    - cron: "0 2 * * *"        # 02:00 UTC every day
+  workflow_dispatch: {}
+permissions:
+  id-token: write              # OIDC to AWS, no long-lived keys
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: [prod/network, prod/data, prod/cluster, prod/app-payments]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e   # v4.0.1
+        with:
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::111122223333:role/tf-readonly-plan
+          aws-region: ap-south-1
+      - name: Plan
+        working-directory: envs/${{ matrix.stack }}
+        run: |
+          terraform init -input=false
+          set +e
+          terraform plan -input=false -lock=false -detailed-exitcode -no-color &gt; plan.txt
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::Drift detected in ${{ matrix.stack }}"
+            exit 2
+          fi
+          exit $code</code></pre>
+  <div class="callout note"><p><b>Why <code>-lock=false</code> and a read-only role?</b> A drift job only reads. Running it without taking the state lock means it never blocks a real deploy, and a role that can only <code>Describe*</code>/<code>Get*</code> plus read the state bucket means a bug in the job can never change prod. (If you need perfectly consistent results, keep the lock; it is a trade-off.)</p></div>
+  <div class="callout warn"><p><b>Noisy drift is worse than no drift detection.</b> If an autoscaler legitimately changes <code>desired_capacity</code> every hour, the job reports drift every night and people learn to ignore it. Tell Terraform to stop tracking fields another system owns, with <code>lifecycle { ignore_changes = [desired_capacity] }</code>, so the remaining alerts are real.</p></div>
+  <p>The best drift detection is <strong>prevention</strong>: make production console access read-only for humans, keep a break-glass role for real emergencies that pages the team when assumed, and add a "codify or revert within 24 hours" item to every incident where someone used it.</p>

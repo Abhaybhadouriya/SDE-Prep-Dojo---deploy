@@ -1,0 +1,122 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Why it is fast even though it writes to disk</h3>
+        <p>Learner question answered explicitly: "Why is Kafka so fast if it writes to disk? I want to see sequential writes, page cache and zero-copy." Four reasons, each a deliberate design choice:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Normal read path copies data four times through user space; sendfile moves data from page cache to the NIC without entering user space">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="28">read() + write(): bytes enter user space</text>
+            <rect class="box db" x="20" y="45" width="120" height="44"/><text class="label small" x="80" y="72">disk</text>
+            <rect class="box cache" x="190" y="45" width="120" height="44"/><text class="label small" x="250" y="72">page cache</text>
+            <rect class="box hot" x="360" y="45" width="120" height="44"/><text class="label small" x="420" y="72">app buffer</text>
+            <rect class="box cache" x="530" y="45" width="120" height="44"/><text class="label small" x="590" y="72">socket buffer</text>
+            <rect class="box svc" x="690" y="45" width="90" height="44"/><text class="label small" x="735" y="72">NIC</text>
+            <path class="arrow" d="M140 67 L184 67"/><path class="arrow bad" d="M310 67 L354 67"/><path class="arrow bad" d="M480 67 L524 67"/><path class="arrow" d="M650 67 L684 67"/>
+            <text class="label small bad" x="440" y="110">2 extra CPU copies + 2 context switches</text>
+            <text class="label left" x="20" y="160">sendfile(): kernel moves page cache -&gt; NIC</text>
+            <rect class="box db" x="20" y="180" width="120" height="44"/><text class="label small" x="80" y="207">disk</text>
+            <rect class="box cache" x="190" y="180" width="120" height="44"/><text class="label small" x="250" y="207">page cache</text>
+            <rect class="box svc" x="690" y="180" width="90" height="44"/><text class="label small" x="735" y="207">NIC</text>
+            <path class="arrow ok thick" d="M310 202 L684 202"/>
+            <path class="arrow" d="M140 202 L184 202"/>
+            <text class="label small ok" x="500" y="245">no user-space copy (not with TLS: must encrypt in user space)</text>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M80 67 L250 67 L420 67 L590 67 L735 67"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="1.5s" repeatCount="indefinite" path="M80 202 L250 202 L735 202"/></circle>
+          </svg>
+          <figcaption>The top path copies bytes into the application and back; the bottom path never leaves the kernel. Kafka can do this because the on-disk format equals the wire format.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>Sequential I/O.</strong> Appending to the end of a file and reading forward avoids random seeks. Even spinning disks stream sequential data quickly, and the OS does read-ahead and write-behind for you.</li>
+          <li><strong>The OS page cache, not a JVM cache.</strong> Kafka's design doc tells you to rely on the filesystem cache: written data sits in RAM pages, recent data is read from RAM, and there is no second copy in the JVM heap (and no GC pressure from it). A broker restart keeps the cache warm because it belongs to the kernel.</li>
+          <li><strong>Zero-copy.</strong> <code>sendfile()</code> sends page-cache pages straight to the socket. Because the broker stores the producer's compressed batches unchanged, it never decodes or re-encodes messages.</li>
+          <li><strong>Batching and compression everywhere.</strong> Producers send batches, brokers write batches, consumers fetch batches. Fewer, bigger operations amortise per-request costs; compression is applied per batch, so bigger batches compress better.</li>
+        </ol>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is your packet path. Batching with <code>linger.ms</code> is interrupt coalescing / the NAPI budget: wait a moment to process many at once, trading a little latency for a lot of throughput. <code>sendfile()</code> is the zero-copy DMA path: data goes from memory to the NIC without the CPU touching it. Consumers pulling is NAPI polling instead of interrupts. <i>Where this breaks:</i> Kafka does not fsync each message; durability comes from replication across machines, not from the disk. A power cut on all replicas at once could lose the page-cache tail, so place replicas in different racks or zones.</p>
+        </div>
+
+        <h3>2. Replication: ISR, high watermark, acks and min.insync.replicas</h3>
+        <p>Each partition has one leader and RF-1 followers on different brokers (and racks: <code>broker.rack</code>). Followers fetch from the leader. The leader tracks the <b>ISR</b> (in-sync replicas): followers that have caught up within <code>replica.lag.time.max.ms</code> (30 s by default). The <b>high watermark</b> is the smallest log-end offset among the ISR: everything below it is on every in-sync replica and is "committed".</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Three replicas of one partition: leader at log-end offset 9, follower 1 at 8, follower 2 at 7; high watermark is offset 7, so consumers can read offsets 0 to 6">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="30">Partition orders-0, RF 3, ISR = {B1, B2, B3}</text>
+            <text class="label small left" x="20" y="78">B1 leader</text>
+            <text class="label small left" x="20" y="138">B2 follower</text>
+            <text class="label small left" x="20" y="198">B3 follower</text>
+            <g>
+              <rect class="box kafka" x="130" y="55" width="50" height="36"/><rect class="box kafka" x="185" y="55" width="50" height="36"/><rect class="box kafka" x="240" y="55" width="50" height="36"/><rect class="box kafka" x="295" y="55" width="50" height="36"/><rect class="box kafka" x="350" y="55" width="50" height="36"/><rect class="box kafka" x="405" y="55" width="50" height="36"/><rect class="box kafka" x="460" y="55" width="50" height="36"/><rect class="box hot" x="515" y="55" width="50" height="36"/><rect class="box hot" x="570" y="55" width="50" height="36"/>
+              <rect class="box kafka" x="130" y="115" width="50" height="36"/><rect class="box kafka" x="185" y="115" width="50" height="36"/><rect class="box kafka" x="240" y="115" width="50" height="36"/><rect class="box kafka" x="295" y="115" width="50" height="36"/><rect class="box kafka" x="350" y="115" width="50" height="36"/><rect class="box kafka" x="405" y="115" width="50" height="36"/><rect class="box kafka" x="460" y="115" width="50" height="36"/><rect class="box hot" x="515" y="115" width="50" height="36"/>
+              <rect class="box kafka" x="130" y="175" width="50" height="36"/><rect class="box kafka" x="185" y="175" width="50" height="36"/><rect class="box kafka" x="240" y="175" width="50" height="36"/><rect class="box kafka" x="295" y="175" width="50" height="36"/><rect class="box kafka" x="350" y="175" width="50" height="36"/><rect class="box kafka" x="405" y="175" width="50" height="36"/><rect class="box kafka" x="460" y="175" width="50" height="36"/>
+              <text class="label small" x="155" y="78">0</text><text class="label small" x="210" y="78">1</text><text class="label small" x="265" y="78">2</text><text class="label small" x="320" y="78">3</text><text class="label small" x="375" y="78">4</text><text class="label small" x="430" y="78">5</text><text class="label small" x="485" y="78">6</text><text class="label small" x="540" y="78">7</text><text class="label small" x="595" y="78">8</text>
+            </g>
+            <path class="arrow" d="M512 40 L512 225" stroke-dasharray="6 4"/>
+            <text class="label small ok" x="512" y="245">high watermark = 7</text>
+            <text class="label small" x="300" y="270">consumers may read offsets 0..6 (committed on every ISR member)</text>
+            <text class="label small bad" x="690" y="78">LEO 9</text>
+            <text class="label small bad" x="690" y="138">LEO 8</text>
+            <text class="label small bad" x="690" y="198">LEO 7</text>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M595 73 L595 133 L540 133 L540 193"/></circle>
+          </svg>
+          <figcaption>LEO = log-end offset (next offset each replica will write). The high watermark is the smallest LEO in the ISR. Offsets 7 and 8 (orange) exist on the leader but are not yet committed, so no consumer sees them and an <code>acks=all</code> producer has not been told OK yet. The moving dot shows follower fetches copying the tail down.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Producer acks</th><th>Producer is told OK when</th><th>Can lose acked data?</th></tr></thead>
+            <tbody>
+              <tr><td><code>acks=0</code></td><td>The bytes left the client</td><td>Yes, easily</td></tr>
+              <tr><td><code>acks=1</code></td><td>The leader wrote it to its log (page cache)</td><td>Yes, if the leader dies before followers copy it</td></tr>
+              <tr><td><code>acks=all</code> + <code>min.insync.replicas=1</code></td><td>All current ISR members have it, but the ISR may be just the leader</td><td>Yes, if the ISR had shrunk to the leader</td></tr>
+              <tr><td><code>acks=all</code> + RF 3 + <code>min.insync.replicas=2</code></td><td>At least 2 replicas have it</td><td>No, with any single broker failure. The production default pattern.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Since Kafka 3.0 the producer defaults are <code>acks=all</code> and <code>enable.idempotence=true</code>, but the broker's <code>min.insync.replicas</code> still defaults to 1, so you must set it. The trade-off is explicit: with min ISR 2, if two of three replicas are down, the partition refuses writes. That is CAP made visible: Kafka chooses consistency (no silent loss) over availability for those writers. <b>Unclean leader election</b> (<code>unclean.leader.election.enable</code>, false by default) is the opposite switch: let an out-of-sync replica lead, come back online, and lose whatever it missed. Kafka 4.x adds <b>eligible leader replicas</b> (KIP-966): replicas that left the ISR but are known to hold all committed data may still be elected safely.</p>
+        <p><b>Leader epochs</b>: every new leader term gets an epoch number. After a failover, a returning replica asks "what was the last offset of epoch N?" and truncates anything beyond it, so logs cannot diverge. It is the same idea as a Raft term.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The ISR is a redundancy group where only members with synced state may take over, like an HA standby that is "ready" only after a full state sync. The high watermark is TCP's cumulative ACK: everything up to it is acknowledged by all in-sync peers, everything beyond is still in flight. Leader election by the controller is like a VRRP election, but decided by one authority with a quorum behind it rather than by priority hellos, which avoids split brain. <b>Where this breaks:</b> a TCP ACK is between two peers; the high watermark needs every ISR member, so one slow follower holds back what consumers can read until it is dropped from the ISR after <code>replica.lag.time.max.ms</code>.</p>
+        </div>
+
+        <h3>3. Consumers: pull, offsets and rebalancing</h3>
+        <p><b>Pull vs push.</b> We chose pull. A push broker must guess each consumer's speed and either overwhelm slow ones or hold buffers for them. With pull, each consumer asks for data when ready (long-poll with <code>fetch.min.bytes</code> and <code>fetch.max.wait.ms</code>), naturally applying backpressure and allowing big batches. The cost is an empty poll loop when there is no data, solved by long polling.</p>
+        <p><b>Offsets.</b> The broker does not track per-message acknowledgements, only one number per (group, partition): the next offset to read. That is tiny state, which is why Kafka can serve many groups cheaply. Commit after processing for at-least-once; commit before processing for at-most-once.</p>
+        <p><b>Rebalancing.</b> When a consumer joins, leaves or stops heartbeating, partitions are reassigned. The classic protocol had an "eager" mode where every consumer gave up every partition (stop-the-world); cooperative rebalancing (KIP-429) moves only the partitions that must move. The new protocol in Kafka 4.0 (KIP-848) moves the assignment logic to the broker-side group coordinator and reconciles members incrementally; clients opt in with <code>group.protocol=consumer</code>. <b>Static membership</b> (<code>group.instance.id</code>) avoids rebalances during quick restarts such as a Kubernetes rolling update.</p>
+        <p>Learner question answered: "What is consumer lag, and what number is bad?" Lag = log-end offset minus committed offset, per partition: it is queue depth. There is no universal bad number; what matters is the trend. Lag that grows steadily means consumers are slower than producers; alert on lag growth rate and on lag measured in time (how old is the oldest unprocessed message), tied to your freshness SLO.</p>
+
+        <h3>4. Delivery semantics and exactly-once</h3>
+        <ul>
+          <li><b>Idempotent producer.</b> The broker gives each producer a producer ID and epoch, and each batch carries a per-partition sequence number. A retried batch with a sequence the broker already has is dropped, and a gap is rejected. This removes duplicates caused by retries within one producer session.</li>
+          <li><b>Transactions.</b> A <code>transactional.id</code> gives a stable identity across restarts (a restarted producer fences its old "zombie" self by bumping the epoch). A producer can write to many partitions and commit consumer offsets in one atomic transaction; a transaction coordinator writes commit or abort markers into each partition.</li>
+          <li><b>read_committed consumers</b> only read up to the last stable offset and skip aborted records.</li>
+          <li><b>The boundary.</b> Exactly-once covers read from Kafka, process, write to Kafka. It does <b>not</b> cover side effects outside Kafka (a database write, an email, a payment). For those, use idempotency keys, upserts or the outbox pattern. Saying this distinction unprompted is a strong SDE-2 signal. Full detail: <a href="{{BASE}}devops/kafka-06">Delivery Semantics &amp; Exactly-Once</a>.</li>
+        </ul>
+
+        <h3>5. Retention, compaction and tiered storage</h3>
+        <ul>
+          <li><b>Delete retention</b> by time (<code>retention.ms</code>) or size per partition (<code>retention.bytes</code>). Only closed segments are deleted, so data can live a little longer than configured.</li>
+          <li><b>Compaction</b> (<code>cleanup.policy=compact</code>) keeps at least the latest value per key and drops older ones in the background. A record with a null value (a <b>tombstone</b>) deletes the key after <code>delete.retention.ms</code>. This turns a topic into a replayable table: <code>__consumer_offsets</code>, CDC tables and Kafka Streams changelogs all use it. Bridge: a compacted topic is like a MAC or ARP table rebuilt from a stream of updates, where only the newest entry per key matters.</li>
+          <li><b>Tiered storage</b> (KIP-405, production-ready since 3.9): closed segments are uploaded to remote storage (S3, GCS, HDFS) via a plugin, and only a short local tail is kept (<code>local.retention.ms</code>). It fixes our estimate's problem (disk decides cluster size) and makes replacing a broker faster, because there is less local data to copy. Compacted topics are not supported for tiering.</li>
+        </ul>
+
+        <h3>6. Queue semantics: share groups, retries and dead letters</h3>
+        <p>A log with one owner per partition has a weakness for "work queue" jobs: you cannot have more busy consumers than partitions, and one slow or poisoned message blocks everything behind it in that partition. Three answers:</p>
+        <ul>
+          <li><b>Share groups</b> (KIP-932, Queues for Kafka, production-ready in Kafka 4.2): many consumers read the same partition; each record is acquired with a time-limited lock and acknowledged individually (accept, release, reject; renew since 4.2). After a delivery-count limit the record is archived, and Kafka 4.4 adds dead-letter queues for share groups. The price: no per-partition ordering.</li>
+          <li><b>Retry topics and a DLQ</b>: on failure, publish the message to <code>orders.retry.1m</code>, <code>orders.retry.10m</code>, then <code>orders.dlq</code>, and commit the original offset, so the main partition keeps moving. Uber's engineering blog describes this pattern for reliable reprocessing. See <a href="{{BASE}}devops/pipeline-03">Stream Processing, Retries &amp; DLQ</a>.</li>
+          <li><b>A consumer proxy</b>: Walmart's engineering team described a messaging proxy service that reads partitions and pushes to consumers over REST, keeping per-key order by allowing at most one in-flight message per key, with retries and DLQ handling. Conceptually close to share groups, built before they existed.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The dead-letter topic is the punt path / drop queue: packets the fast path cannot handle get diverted so they do not stall the pipeline, and someone inspects them later. Retry topics with growing delays are exponential backoff timers per class of failure. <b>Where this breaks:</b> a router may rate-limit and drop punted packets; a DLQ must keep every message, so it needs its own retention, alerts on growth and an owner who replays it.</p>
+        </div>
+
+        <h3>7. The controller: who decides leaders?</h3>
+        <p>Someone must store which broker leads each partition, the ISR of each partition, and topic configs, and must react when a broker dies. Old Kafka used ZooKeeper for this; Kafka 4.0 (March 2025) removed ZooKeeper entirely. In <b>KRaft</b> mode a small quorum of controllers (3, or 5 for large clusters) replicates a metadata log with Raft; the Raft leader is the active controller. Brokers replicate that metadata log like followers, so pushing a change is just appending a record. This made failover faster and lets clusters hold far more partitions. Detail: <a href="{{BASE}}devops/kafka-08">KRaft, Controllers &amp; Cluster Metadata</a>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Controllers vs brokers is control plane vs data plane. If the active controller dies, brokers keep serving produce and fetch for partitions whose leaders are alive, like line cards forwarding during a route-processor switchover (non-stop forwarding). What stops is change: no new leaders, no new topics, until a new controller is elected, which Raft does in seconds. <b>Where this breaks:</b> on a router the line cards keep their last FIB forever; here, if a broker that leads partitions dies while no controller is active, nobody can elect new leaders, so those partitions stay offline until the quorum is back.</p>
+        </div>
+      

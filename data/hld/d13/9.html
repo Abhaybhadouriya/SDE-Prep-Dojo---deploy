@@ -1,0 +1,116 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope</strong> Upload + processing + playback. Ask: max file size? Mobile and web? Do we need live? (No.) How fast must a video be ready? State durability, playback availability, eventual consistency of processing.</li>
+          <li><strong>5-10 min: numbers</strong> 500 h/min (quoted figure) gives about 50 uploads/s, 2.6 PB/day raw, 240 Gbit/s ingress, about 300k cores. Conclude: direct uploads, queue plus workers, sharded SQL is enough for metadata.</li>
+          <li><strong>10-15 min: API + data</strong> Create-video, presigned parts, complete, status. Videos table and status machine. Blob key layout.</li>
+          <li><strong>15-25 min: diagram</strong> Walk the 8 steps of the stepper above, both paths.</li>
+          <li><strong>25-40 min: deep dives</strong> Choose two: resumable upload, the DAG (idempotency, stragglers, poison segments), ABR and keyframe alignment, cost policy, view counts.</li>
+          <li><strong>40-45 min: wrap up</strong> Failure per box, metrics (upload success rate, time-to-ready p50/p99, task queue lag, rebuffer ratio, CDN hit ratio, cost per encoded hour).</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"The app gets presigned URLs and uploads parts straight to S3. When it finishes, an event goes to a queue. Workers run ffmpeg to make several resolutions and write HLS segments. We set the video READY in a MySQL table. Viewers fetch the manifest through a CDN." Correct and complete.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"Bytes never touch our servers. We split at aligned keyframes and fan out per segment, so a 2-hour video is ready in minutes; tasks are idempotent by (video, profile, segment), so spot preemption is cheap. Low renditions first, extra codecs when popular. Kafka for lifecycle events, but a share group or SQS for long tasks because of head-of-line blocking." Numbers, failure modes, cost.</p></div>
+        </div>
+        <div class="callout interview"><p><b>60-second answer</b> (say this out loud, then let the interviewer pick a deep dive): "The app creates a video and gets presigned URLs, then uploads 16 MB parts straight to blob storage, so it can resume after any drop and our servers never carry the bytes. When the upload completes, an event starts a transcoding DAG: validate, split at keyframes, encode each segment of each rendition in parallel on autoscaled spot workers, then package HLS and DASH. Tasks are idempotent by video, profile and segment, so retries are safe. When the low renditions are ready we flip the status to READY with a conditional update and publish an event. Viewers fetch the manifest and segments through a CDN, and the player switches bitrate per segment. Metadata lives in sharded MySQL; view counts are aggregated from a Kafka stream."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> uploading through the API servers; one giant PUT with no resume; storing videos in a database BLOB column; encoding the whole movie on one machine; forgetting keyframe alignment; incrementing a SQL view counter; putting video bytes in Kafka; no plan for corrupt files; spending 15 minutes on codec theory instead of the system; forgetting the creator's status screen.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Microsoft,Amazon">
+          <summary>Why should the video bytes not go through our upload service?</summary>
+          <div class="answer">
+            <p>At about 240 Gbit/s of average ingress, proxying bytes would need a huge fleet that does nothing except copy data, doubles network cost (in and out again), and holds long connections open for minutes. Blob stores already handle massive parallel writes, durability and checksums. With presigned URLs the service only signs a short-lived permission and records metadata. It keeps control (auth, quotas, key choice) without carrying the data.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use your estimate: "240 Gbit/s means..." Then name the mechanism (presigned, scoped, short-expiry URLs) and what the service still controls.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you stop a user from uploading 1 TB? (Declared size checked at create; signed content-length; bucket policy; quota per channel.)</li><li>How do you know the upload finished? (Complete call plus bucket event notification as a backup.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon,Flipkart">
+          <summary>The user's network drops at 80% of a 4 GB upload. What happens?</summary>
+          <div class="answer">
+            <p>Nothing is lost. The upload is multipart: parts 1 to about 205 already have ETags in the store. When the app comes back (even after a reboot, since it saved the <code>upload_id</code> locally), it asks the server which parts exist (S3 ListParts, or YouTube's empty PUT that returns 308 with a <code>Range</code>), then uploads only the missing parts and calls complete. Presigned URLs may have expired, so it asks for fresh ones.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "resumable multipart" in the first sentence, then the three steps: query, resend missing, complete. Mention where the client keeps the session id.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What part size would you pick for mobile?</li><li>How long do you keep an incomplete upload? (Lifecycle rule, for example 7 days.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do you make a 2-hour 4K video ready in minutes instead of hours?</summary>
+          <div class="answer">
+            <p>Split it into short chunks at keyframes, then encode every (chunk, rendition) pair in parallel on many workers, then stitch the playlists. With 2-second keyframe intervals and 4-6 second segments, a 2-hour video becomes over a thousand segments per rendition, so the wall-clock time is roughly the time of one chunk plus the queueing and fan-in overhead. Publish low renditions first so the video is watchable early; 4K follows.</p>
+            <div class="approach"><h5>How to answer</h5><p>Fan-out / fan-in, then the two details that make it work: keyframe-aligned splits and idempotent tasks. Mention stragglers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does chunked encoding hurt quality? (Slightly at chunk edges; encoders with look-ahead lose context; closed GOPs and good rate control limit it.)</li><li>How do you detect all chunks are done without races?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Google">
+          <summary>A transcode worker crashes halfway through a segment. How do you avoid a duplicate or a lost segment?</summary>
+          <div class="answer">
+            <p>The task is acknowledged only after its output is uploaded (at-least-once). So the crashed task is redelivered after its lease times out (or the consumer's offset was never committed). Duplicates are harmless because the task is idempotent: its key is <code>(video_id, profile, seg_no)</code>, and its output path is derived from that key, so a rerun overwrites the same object. The DONE update is conditional, so the fan-in counter is not double-counted.</p>
+            <div class="approach"><h5>How to answer</h5><p>"At-least-once delivery plus idempotent tasks" in one breath, then the deterministic output key. That pattern answers most worker questions.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a segment always crashes? (Attempt count, dead-letter queue, degrade or fail the video.)</li><li>Why not exactly-once? (Not needed; idempotency is cheaper.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Microsoft,Walmart">
+          <summary>Would you use Kafka as the transcoding task queue?</summary>
+          <div class="answer">
+            <p>For lifecycle events, yes. For the task hop, carefully. In a classic consumer group each partition goes to one consumer and is processed in order, so one 3-minute task blocks everything behind it, and you cannot have more busy workers than partitions. Long, uneven jobs want per-task ack, visibility timeouts and redelivery: SQS, RabbitMQ, a workflow engine, or Kafka share groups (KIP-932, production-ready in Kafka 4.2) that let many consumers share a partition. Uber and Walmart both built consumer proxies on top of Kafka for exactly this head-of-line problem.</p>
+            <div class="approach"><h5>How to answer</h5><p>Don't say yes or no. Split the two traffic types, name head-of-line blocking and the partition cap, then pick.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you autoscale workers? (On lag/queue depth, for example KEDA.)</li><li>How many partitions would you create?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Microsoft,Amazon">
+          <summary>What is adaptive bitrate streaming and why do we cut videos into segments?</summary>
+          <div class="answer">
+            <p>The player measures throughput and buffer level and chooses a rendition for each next segment. Segments (a few seconds each) are the switch points, and they are plain HTTP objects, so CDNs cache them like images. The manifest (HLS <code>.m3u8</code> or DASH <code>.mpd</code>) lists the renditions and their segments. Result: fast start (begin low), little rebuffering (drop quality instead of freezing), and best quality when the network allows.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the ladder with a moving dot. Mention that keyframes must align across renditions.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Short segments vs long segments? (Short: faster switching and live latency; long: fewer requests and better compression.)</li><li>HLS vs DASH? (Apple vs open standard; CMAF lets both share one set of segments.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Meta">
+          <summary>How would you count views for a video that gets 1 million views in an hour?</summary>
+          <div class="answer">
+            <p>Not with a SQL increment: that is one hot row taking roughly 280 writes per second on average, far more at the peak, and each increment holds a row lock. Instead, players send view events to an edge collector, then Kafka keyed by <code>video_id</code>. A stream job (Flink or Kafka Streams) deduplicates and validates them (bots, replays), aggregates per minute, and adds the deltas to a counter store. The public count is eventually consistent; YouTube visibly lags view counts on new videos while it validates them.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the hot-row problem first, then "stream, aggregate, batch-write". Mention dedupe and fraud filtering.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle a single super-hot key in Kafka? (Pre-aggregate in the producer or salt the key, then merge.)</li><li>Exact vs approximate unique viewers? (HyperLogLog for uniques.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>Encoding cost is exploding. What do you change first?</summary>
+          <div class="answer">
+            <p>Make cost follow views. Encode a minimal H.264 ladder at upload; add VP9/AV1 and 4K only when a video crosses a popularity threshold, because their extra encode cost is repaid by bandwidth savings only on watched videos. Skip renditions above the source resolution. Use per-title ladders. Run batch encodes on spot capacity, and move cold renditions to cheaper storage tiers (or even delete rarely watched high rungs and re-create them on demand).</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from the skew ("most videos get few views"), then list 3-4 levers with the trade-off of each.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What metric tells you a lever worked? (Cost per watched hour, not per uploaded hour.)</li><li>What happens to a video that suddenly goes viral at 3 a.m.?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do copyright and policy checks fit without slowing every upload?</summary>
+          <div class="answer">
+            <p>As a parallel branch of the DAG. Fingerprints (audio and video) are computed from the source or a low rendition and matched against a reference database (YouTube's system for this is Content ID). The result can block, monetise for the rights owner, or allow. The video can stay private/processing until the check finishes, or be published and taken down later depending on policy. Keep it async and event-driven: the check emits <code>video.blocked</code> or <code>video.cleared</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Place it on the diagram, say "parallel and async", and say what state the video is in while it runs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you match a clip that was cropped or pitch-shifted? (Robust perceptual fingerprints, not file hashes.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Amazon,Microsoft">
+          <summary>How does a new viral video avoid crushing the origin storage?</summary>
+          <div class="answer">
+            <p>Segments are immutable, so they get long cache TTLs at the CDN. A multi-tier CDN with an origin shield turns thousands of edge misses into one fetch per region, and request coalescing at each tier collapses concurrent misses for the same segment. Manifests for VOD are also immutable once READY. For predicted hits (a big creator's premiere), pre-warm the CDN by pushing the first segments of popular renditions to edges before the release time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the stampede, then three tools: long TTLs on immutable objects, shield plus coalescing, pre-warming.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is your CDN cache key? (Path without per-user query strings; auth via signed cookies or tokens checked at the edge.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "videos are stuck in processing for hours"</h4>
+          <div class="situation"><p>On a Sunday evening creators complain that uploads finish but stay "processing". Dashboards show the task topic's consumer lag rising steadily while worker CPU is only 40%.</p></div>
+          <div class="bad"><p>Weak answer: "Add more workers."</p></div>
+          <div class="good"><p>Strong answer: low CPU with rising lag means workers are waiting, not computing. Check whether pods are capped by partition count (idle consumers), whether a few partitions hold very long 4K tasks (head-of-line blocking), and whether downloads from the bucket are slow. Short term: prioritise low renditions, move 4K tasks to a separate topic and pool. Long term: per-task queue or share groups, and scale on lag per task class.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which three metrics would you put on the on-call dashboard?</li></ul></div>
+        </div>
+        <div class="callout warn"><p><b>What went wrong in the real world (illustrative scenario).</b> We could not find a public, sourced post-mortem for this exact failure, so this is built from the failure modes above. A creator uploads a file with a corrupt stream in the middle. The encoder crashes on segment 412 every time. Tasks are retried forever, each retry lands on a fresh spot VM, and the autoscaler adds workers because lag keeps growing. Within an hour thousands of workers are retrying a handful of "poison" segments and normal uploads wait behind them. How a team notices: time-to-ready p99 climbs while the success rate per task drops and the same task ids appear again and again in logs. The fix is on this page: a retry limit per task, a dead-letter queue for poison segments, a FAILED status for the creator, and an alert on "same task retried more than 3 times".</p></div>
+      

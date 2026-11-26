@@ -1,0 +1,309 @@
+
+  <h2>The code, run</h2>
+  <p>One Java file runs all three drills and checks invariants at the end: the single-lock and sharded LRUs stay consistent and within capacity; the read-lock LRU corrupts its list; 800 concurrent requests get exactly 10 tokens, then exactly 5 after one second of fake time; plain <code>int++</code> loses updates while <code>synchronized</code>, <code>AtomicLong</code> and <code>LongAdder</code> are exact; the 60-second window drops old hits. Timings and the lost-update count change per run. The Python tab is the O(1) LFU with a lock and an 8-thread stress test. Files: <code>lld-code/lld-conc-drills/</code>.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+import java.util.function.LongSupplier;
+
+// Drill 1: thread-safe LRU (coarse lock, sharded, and the broken read-lock version)
+// Drill 2: per-key token-bucket rate limiter
+// Drill 3: counters (lost updates, AtomicLong, LongAdder) and a sliding-window hit counter
+public class ConcurrencyDrills {
+
+    // =============== Drill 1: LRU ===============
+    interface Cache&lt;K, V&gt; { V get(K k); void put(K k, V v); int size(); }
+
+    // O(1) LRU: HashMap + doubly linked list. NOT thread-safe by itself.
+    static final class Lru&lt;K, V&gt; implements Cache&lt;K, V&gt; {
+        private final class Node { K k; V v; Node prev, next; Node(K k, V v) { this.k = k; this.v = v; } }
+        private final int cap;
+        private final Map&lt;K, Node&gt; map = new HashMap&lt;&gt;();
+        private final Node head = new Node(null, null), tail = new Node(null, null); // sentinels
+        Lru(int cap) { this.cap = cap; head.next = tail; tail.prev = head; }
+        private void unlink(Node n) { n.prev.next = n.next; n.next.prev = n.prev; }
+        private void addFront(Node n) { n.next = head.next; n.prev = head; head.next.prev = n; head.next = n; }
+        public V get(K k) {                         // a READ that WRITES: moves the node to the front
+            Node n = map.get(k);
+            if (n == null) return null;
+            unlink(n); addFront(n);
+            return n.v;
+        }
+        public void put(K k, V v) {
+            Node n = map.get(k);
+            if (n != null) { n.v = v; unlink(n); addFront(n); return; }
+            if (map.size() == cap) { Node lru = tail.prev; unlink(lru); map.remove(lru.k); }
+            n = new Node(k, v); map.put(k, n); addFront(n);
+        }
+        public int size() { return map.size(); }
+        int listLength() { int c = 0; for (Node n = head.next; n != tail &amp;&amp; c &lt;= cap + 5; n = n.next) c++; return c; }
+    }
+
+    // Coarse: one lock around everything. Correct and simple.
+    static final class LockedLru&lt;K, V&gt; implements Cache&lt;K, V&gt; {
+        private final Lru&lt;K, V&gt; lru; private final ReentrantLock lock = new ReentrantLock();
+        LockedLru(int cap) { lru = new Lru&lt;&gt;(cap); }
+        public V get(K k) { lock.lock(); try { return lru.get(k); } finally { lock.unlock(); } }
+        public void put(K k, V v) { lock.lock(); try { lru.put(k, v); } finally { lock.unlock(); } }
+        public int size() { lock.lock(); try { return lru.size(); } finally { lock.unlock(); } }
+        boolean consistent() { lock.lock(); try { return lru.size() == lru.listLength(); } finally { lock.unlock(); } }
+    }
+
+    // BROKEN: read lock for get(). Many readers relink the list at the same time.
+    static final class ReadLockLru&lt;K, V&gt; implements Cache&lt;K, V&gt; {
+        private final Lru&lt;K, V&gt; lru; private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+        ReadLockLru(int cap) { lru = new Lru&lt;&gt;(cap); }
+        public V get(K k) { rw.readLock().lock(); try { return lru.get(k); } finally { rw.readLock().unlock(); } }
+        public void put(K k, V v) { rw.writeLock().lock(); try { lru.put(k, v); } finally { rw.writeLock().unlock(); } }
+        public int size() { rw.readLock().lock(); try { return lru.size(); } finally { rw.readLock().unlock(); } }
+        boolean consistent() { rw.writeLock().lock(); try { return lru.size() == lru.listLength(); } finally { rw.writeLock().unlock(); } }
+    }
+
+    // Fine-grained: N independent locked shards. Approximate global LRU (each shard evicts on its own).
+    // Up to N-way parallelism, but measure first: in our run it was slower than one lock.
+    static final class ShardedLru&lt;K, V&gt; implements Cache&lt;K, V&gt; {
+        private final LockedLru&lt;K, V&gt;[] shards;
+        @SuppressWarnings("unchecked")
+        ShardedLru(int cap, int n) {   // the first cap % n shards get one extra slot, so the total is exactly cap
+            shards = new LockedLru[n];
+            for (int i = 0; i &lt; n; i++) shards[i] = new LockedLru&lt;&gt;(cap / n + (i &lt; cap % n ? 1 : 0));
+        }
+        private LockedLru&lt;K, V&gt; shard(K k) { return shards[Math.floorMod(k.hashCode(), shards.length)]; }
+        public V get(K k) { return shard(k).get(k); }
+        public void put(K k, V v) { shard(k).put(k, v); }
+        public int size() { int s = 0; for (LockedLru&lt;K, V&gt; x : shards) s += x.size(); return s; }
+        boolean consistent() { for (LockedLru&lt;K, V&gt; x : shards) if (!x.consistent()) return false; return true; }
+    }
+
+    static String hammer(Cache&lt;Integer, Integer&gt; c, int threads, int ops) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        AtomicInteger errors = new AtomicInteger();
+        CountDownLatch go = new CountDownLatch(1);
+        long t0 = System.nanoTime();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; threads; t++) fs.add(pool.submit(() -&gt; {
+            ThreadLocalRandom r = ThreadLocalRandom.current();
+            try { go.await(); } catch (InterruptedException e) { return; }
+            for (int i = 0; i &lt; ops; i++) {
+                int k = r.nextInt(300);
+                try { if (r.nextInt(10) &lt; 8) c.get(k); else c.put(k, i); }   // 80% reads
+                catch (RuntimeException e) { errors.incrementAndGet(); }
+            }
+        }));
+        go.countDown();
+        boolean hung = false;
+        for (Future&lt;?&gt; f : fs) try { f.get(10, TimeUnit.SECONDS); } catch (TimeoutException e) { hung = true; }
+        pool.shutdownNow();
+        long ms = (System.nanoTime() - t0) / 1_000_000;
+        return "exceptions=" + errors.get() + (hung ? " HUNG" : "") + " size=" + c.size() + " (" + ms + " ms)";
+    }
+
+    // =============== Drill 2: token bucket ===============
+    static final class TokenBucket {
+        private final long capacity; private final double refillPerNano; private final LongSupplier clock;
+        private double tokens; private long last;
+        TokenBucket(long capacity, double perSecond, LongSupplier clock) {
+            this.capacity = capacity; this.refillPerNano = perSecond / 1e9; this.clock = clock;
+            this.tokens = capacity; this.last = clock.getAsLong();
+        }
+        synchronized boolean tryAcquire() {             // refill + check + take = one atomic step
+            long now = clock.getAsLong();
+            tokens = Math.min(capacity, tokens + (now - last) * refillPerNano);   // lazy refill, no timer thread
+            last = now;
+            if (tokens &gt;= 1) { tokens -= 1; return true; }
+            return false;
+        }
+    }
+    static final class RateLimiter {
+        private final ConcurrentHashMap&lt;String, TokenBucket&gt; buckets = new ConcurrentHashMap&lt;&gt;();
+        private final long cap; private final double rate; private final LongSupplier clock;
+        RateLimiter(long cap, double rate, LongSupplier clock) { this.cap = cap; this.rate = rate; this.clock = clock; }
+        boolean allow(String key) {                     // per-key bucket, created atomically
+            return buckets.computeIfAbsent(key, k -&gt; new TokenBucket(cap, rate, clock)).tryAcquire();
+        }
+    }
+
+    // =============== Drill 3: counters ===============
+    static int unsafeCount = 0;
+    static final class SlidingWindowCounter {         // hits in the last W seconds, O(W) memory
+        private final long[] second, count; private final LongSupplier secondsClock;
+        SlidingWindowCounter(int window, LongSupplier secondsClock) { second = new long[window]; count = new long[window]; this.secondsClock = secondsClock; Arrays.fill(second, -1); }
+        synchronized void hit() {
+            long now = secondsClock.getAsLong(); int i = (int) (now % second.length);
+            if (second[i] != now) { second[i] = now; count[i] = 0; }   // slot is stale: reuse it
+            count[i]++;
+        }
+        synchronized long total() {
+            long now = secondsClock.getAsLong(), sum = 0;
+            for (int i = 0; i &lt; second.length; i++) if (now - second[i] &lt; second.length) sum += count[i];
+            return sum;
+        }
+    }
+
+    static long run(int threads, Runnable r) throws Exception {
+        Thread[] ts = new Thread[threads];
+        long t0 = System.nanoTime();
+        for (int i = 0; i &lt; threads; i++) { ts[i] = new Thread(r); ts[i].start(); }
+        for (Thread t : ts) t.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("Drill 1: LRU, 8 threads x 200k ops, capacity 100, 300 keys");
+        LockedLru&lt;Integer, Integer&gt; coarse = new LockedLru&lt;&gt;(100);
+        System.out.println("  one lock         : " + hammer(coarse, 8, 200_000) + " consistent=" + coarse.consistent());
+        ShardedLru&lt;Integer, Integer&gt; sharded = new ShardedLru&lt;&gt;(100, 8);
+        System.out.println("  8 shards         : " + hammer(sharded, 8, 200_000) + " consistent=" + sharded.consistent());
+        ReadLockLru&lt;Integer, Integer&gt; broken = new ReadLockLru&lt;&gt;(100);
+        String b = hammer(broken, 8, 200_000);
+        boolean ok;
+        try { ok = broken.consistent(); } catch (RuntimeException e) { ok = false; }
+        System.out.println("  read lock on get : " + (ok &amp;&amp; b.startsWith("exceptions=0 ") ? "no damage this run (still a bug)" : "CORRUPTED (" + b.replaceAll(" \\(.*", "") + ", consistent=" + ok + ")"));
+
+        System.out.println("Drill 2: token bucket, capacity 10, 5 tokens/s, fake clock");
+        long[] nanos = {0};
+        RateLimiter rl = new RateLimiter(10, 5, () -&gt; nanos[0]);
+        AtomicInteger allowed = new AtomicInteger();
+        run(8, () -&gt; { for (int i = 0; i &lt; 100; i++) if (rl.allow("user42")) allowed.incrementAndGet(); });
+        System.out.println("  t=0.0s  800 concurrent tries -&gt; allowed " + allowed.get() + " (expected 10)");
+        nanos[0] = 1_000_000_000L; allowed.set(0);
+        run(8, () -&gt; { for (int i = 0; i &lt; 100; i++) if (rl.allow("user42")) allowed.incrementAndGet(); });
+        System.out.println("  t=1.0s  800 concurrent tries -&gt; allowed " + allowed.get() + " (expected 5 refilled)");
+        System.out.println("  other key 'user7' at t=1.0s -&gt; " + rl.allow("user7") + " (own bucket)");
+
+        System.out.println("Drill 3: counters, 8 threads x 1,000,000 increments (expected 8000000)");
+        run(8, () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) unsafeCount++; });
+        System.out.println("  plain int++      : " + unsafeCount + "  &lt;- lost updates");
+        Object mon = new Object(); long[] syncCount = {0};
+        long ms = run(8, () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) synchronized (mon) { syncCount[0]++; } });
+        System.out.println("  synchronized     : " + syncCount[0]);
+        AtomicLong atomic = new AtomicLong();
+        run(8, () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) atomic.incrementAndGet(); });
+        System.out.println("  AtomicLong (CAS) : " + atomic.get());
+        LongAdder adder = new LongAdder();
+        run(8, () -&gt; { for (int i = 0; i &lt; 1_000_000; i++) adder.increment(); });
+        System.out.println("  LongAdder        : " + adder.sum() + "  (striped cells, summed on read)");
+
+        long[] sec = {100};
+        SlidingWindowCounter w = new SlidingWindowCounter(60, () -&gt; sec[0]);
+        run(4, () -&gt; { for (int i = 0; i &lt; 250; i++) w.hit(); });
+        sec[0] = 130; run(4, () -&gt; { for (int i = 0; i &lt; 100; i++) w.hit(); });
+        System.out.println("  window 60s at t=130: " + w.total() + " (1000 at t=100 + 400 at t=130)");
+        sec[0] = 165;
+        System.out.println("  window 60s at t=165: " + w.total() + " (t=100 hits expired)");
+        sec[0] = 200;
+        System.out.println("  window 60s at t=200: " + w.total());
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out ConcurrencyDrills.java &amp;&amp; java -cp out ConcurrencyDrills
+Drill 1: LRU, 8 threads x 200k ops, capacity 100, 300 keys
+  one lock         : exceptions=0 size=100 (199 ms) consistent=true
+  8 shards         : exceptions=0 size=100 (329 ms) consistent=true
+  read lock on get : CORRUPTED (exceptions=0 size=100, consistent=false)
+Drill 2: token bucket, capacity 10, 5 tokens/s, fake clock
+  t=0.0s  800 concurrent tries -&gt; allowed 10 (expected 10)
+  t=1.0s  800 concurrent tries -&gt; allowed 5 (expected 5 refilled)
+  other key 'user7' at t=1.0s -&gt; true (own bucket)
+Drill 3: counters, 8 threads x 1,000,000 increments (expected 8000000)
+  plain int++      : 2112994  &lt;- lost updates
+  synchronized     : 8000000
+  AtomicLong (CAS) : 8000000
+  LongAdder        : 8000000  (striped cells, summed on read)
+  window 60s at t=130: 1400 (1000 at t=100 + 400 at t=130)
+  window 60s at t=165: 400 (t=100 hits expired)
+  window 60s at t=200: 0</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python (LFU)">
+<pre><code class="language-python">"""Thread-safe O(1) LFU cache (LeetCode 460 shape) plus a stress test.
+One lock: get() changes frequencies and bucket order, so it is a write too.
+The GIL does NOT make this safe: each method is many bytecodes across several dicts."""
+import threading
+import random
+from collections import defaultdict, OrderedDict
+
+
+class LFUCache:
+    def __init__(self, capacity: int):
+        self.cap = capacity
+        self.val = {}                                  # key -&gt; value
+        self.freq = {}                                 # key -&gt; use count
+        self.buckets = defaultdict(OrderedDict)        # count -&gt; keys in LRU order (oldest first)
+        self.min_freq = 0
+        self.lock = threading.Lock()
+
+    def _touch(self, key):                             # caller holds the lock
+        f = self.freq[key]
+        del self.buckets[f][key]
+        if not self.buckets[f]:
+            del self.buckets[f]
+            if self.min_freq == f:
+                self.min_freq = f + 1
+        self.freq[key] = f + 1
+        self.buckets[f + 1][key] = None
+
+    def get(self, key):
+        with self.lock:
+            if key not in self.val:
+                return None
+            self._touch(key)
+            return self.val[key]
+
+    def put(self, key, value):
+        if self.cap &lt;= 0:
+            return
+        with self.lock:
+            if key in self.val:
+                self.val[key] = value
+                self._touch(key)
+                return
+            if len(self.val) == self.cap:              # evict least frequent, oldest among ties
+                victim, _ = self.buckets[self.min_freq].popitem(last=False)
+                if not self.buckets[self.min_freq]:
+                    del self.buckets[self.min_freq]
+                del self.val[victim], self.freq[victim]
+            self.val[key] = value
+            self.freq[key] = 1
+            self.buckets[1][key] = None
+            self.min_freq = 1
+
+    def check(self):
+        with self.lock:
+            in_buckets = sum(len(b) for b in self.buckets.values())
+            return len(self.val) &lt;= self.cap and in_buckets == len(self.val) == len(self.freq)
+
+
+if __name__ == "__main__":
+    c = LFUCache(2)                                    # the classic sequence
+    c.put(1, "a"); c.put(2, "b"); c.get(1)             # freq: 1 -&gt; 2, 2 -&gt; 1
+    c.put(3, "c")                                      # evicts key 2 (lowest frequency)
+    print("after put(3): get(2) =", c.get(2), "| get(1) =", c.get(1), "| get(3) =", c.get(3))
+
+    cache = LFUCache(50)
+    errors = []
+
+    def worker(seed):
+        r = random.Random(seed)
+        try:
+            for i in range(20000):
+                k = r.randrange(200)
+                if r.random() &lt; 0.8:
+                    cache.get(k)
+                else:
+                    cache.put(k, i)
+        except Exception as e:                         # would show corruption
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"8 threads x 20000 ops: errors={len(errors)} size={len(cache.val)} consistent={cache.check()}")</code></pre>
+<pre class="terminal"><code>$ python lfu_cache.py
+after put(3): get(2) = None | get(1) = a | get(3) = c
+8 threads x 20000 ops: errors=0 size=50 consistent=True</code></pre>
+    </div>
+  </div>

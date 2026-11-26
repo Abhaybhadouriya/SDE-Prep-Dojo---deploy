@@ -1,0 +1,131 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: clarify.</strong> L4, L7 or both? One region or global? TLS? Sticky sessions? Request rate and response size?</li>
+          <li><strong>5-10: estimate.</strong> Bandwidth in vs out, packets/s, number of nodes per tier.</li>
+          <li><strong>10-20: architecture.</strong> DNS/anycast, ECMP, L4 tier, L7 tier, control plane.</li>
+          <li><strong>20-35: deep dives.</strong> Consistent hashing + conntrack, health checks and draining, algorithm choice (P2C), LB HA.</li>
+          <li><strong>35-45: failure modes and ops.</strong> Upgrades, retry storms, DDoS, observability (per-backend latency and errors, conntrack size, drops).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Two tiers. DNS returns an anycast VIP; the router spreads packets over a few L4 nodes with ECMP. Each L4 node looks up the flow in its connection table, and on a miss uses a Maglev consistent-hash table so every L4 node picks the same L7 proxy for the same 5-tuple; it encapsulates the packet to that proxy, and the reply goes straight back (direct server return), because responses are 10x bigger than requests. L7 proxies such as Envoy terminate TLS, parse HTTP, route by path and pick a backend with power-of-two-choices least-request. A control plane pushes backend lists and runs deduplicated health checks with hysteresis, draining and slow start. L4 is packet-bound and cheap; L7 is CPU-bound and wider. Adding or losing a node moves only a slice of flows, and conntrack keeps the rest where they are."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: L4 vs L7, round robin vs least connections, health checks, no single LB box (active-passive or ECMP), TLS termination at L7, sticky sessions and why to avoid them. SDE-2 adds: the bandwidth maths that justifies DSR, Maglev tables vs ring hashing, conntrack plus consistent hashing and second-chance forwarding, P2C, draining and slow start, retry storms, and how kube-proxy and cloud LBs map onto the same ideas.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>an API gateway.</b> An L7 load balancer chooses <i>which copy</i> of a service gets the request; an API gateway also does auth, rate limits, request shaping and API versioning. Many products do both, but say which job you mean. Also do not confuse <b>L4 vs L7</b> with OSI purity: "L4" here means "never reads the payload", "L7" means "terminates the connection and reads HTTP".</p></div>
+        <h3>Common mistakes</h3>
+        <div class="callout warn"><p><b>Common mistakes:</b> one LB box (single point of failure); <code>hash % N</code>; forgetting connections must survive LB changes; health checks without hysteresis; no draining story; putting TLS on L4 nodes; ignoring that responses are much bigger than requests.</p></div>
+        <div class="video" data-yt="dBmxNsS3BGE" data-title="Top 6 Load Balancing Algorithms Every Developer Should Know" data-channel="ByteByteGo" data-mins="5"></div>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon,Microsoft">
+          <summary>Design a load balancer for 1M requests per second.</summary>
+          <div class="answer">
+            <p>Two tiers. Routers spread packets over an active-active L4 tier with ECMP; each L4 node uses a Maglev-style consistent-hash table plus a local connection table to pick an L7 proxy, encapsulates the packet, and the proxy replies with DSR. The L7 tier (Envoy-like) terminates TLS, routes by host/path, and picks backends with P2C least-request over pooled connections. A control plane stores config in etcd/Consul, runs deduplicated health checks and pushes versioned config. Sizing: 16 Gbps in, 160 Gbps out, ~5 L4 nodes and ~34 L7 nodes per region with headroom.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the in/out bandwidth math first; it justifies DSR and the two tiers. Then walk one packet through the stepper.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to live connections when you add an L4 node?</li><li>How do you deploy new proxy code safely?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>L4 vs L7 load balancing: when do you use which?</summary>
+          <div class="answer">
+            <p>L4 looks at IPs and ports only, forwards packets (NAT or encapsulation), is very fast and works for any TCP/UDP protocol; examples are AWS NLB, IPVS, Maglev. L7 terminates the connection, reads HTTP (path, headers, cookies), can route, retry, rewrite and terminate TLS, at much higher CPU cost; examples are AWS ALB, Envoy, NGINX, HAProxy. At scale you stack them: L4 for raw distribution, L7 for application logic.</p>
+            <div class="approach"><h5>How to answer</h5><p>One line each, one example each, then "in practice both".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can an L4 LB do TLS passthrough with SNI routing?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google">
+          <summary>How does Maglev hashing work, and why not a hash ring?</summary>
+          <div class="answer">
+            <p>Each backend derives a permutation of the M slots (M prime, default 65,537) from an offset and skip hash (worked by hand in deep dive 1: with M = 7, B0 with offset 3 and skip 4 prefers slots 3, 0, 4, 1, 5, 2, 6); backends take turns filling their next preferred free slot until the table is full. Lookup is one array index. Shares differ by at most one slot, and M &gt; 100 x N keeps imbalance under ~1%. A ring with virtual nodes is less even and needs a binary search; Maglev moves slightly more keys on changes, which conntrack covers.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw a tiny table before and after removing one backend.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you support weights? (Katran's extended Maglev gives a backend more turns.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Meta">
+          <summary>An L4 node dies. Do its TCP connections break?</summary>
+          <div class="answer">
+            <p>Mostly no. Routers withdraw it from ECMP and rehash its flows onto other nodes. Those nodes have no conntrack entry, but they build the same Maglev table from the same backend list, so they choose the same proxy, and the proxy still has the TCP socket. Connections break only if the backend set changed at the same moment. Stateless designs (GLB, Unimog) add a second-chance hop to the previous server to cover that too.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "consistent hashing covers LB changes, conntrack covers backend changes".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>And if the L7 proxy dies? (Its connections are lost; clients reconnect and retry idempotent requests.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>How do you deploy a new version of a backend without dropping requests?</summary>
+          <div class="answer">
+            <p>Mark the instance draining: the LB stops sending new requests, in-flight ones finish (ALB waits up to 300 s by default, finishing early if idle), then remove it. In Kubernetes, the pod leaves EndpointSlices on termination while a preStop sleep and grace period let in-flight work finish. New instances join through slow start so cold caches are not flooded. Use weighted routing for canaries (90/10).</p>
+            <div class="approach"><h5>How to answer</h5><p>Draining + slow start + canary weights, in that order.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about WebSocket connections that last hours?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Uber">
+          <summary>Why is "send to the least loaded server" dangerous with many LB nodes? What do you use instead?</summary>
+          <div class="answer">
+            <p>Each LB node only sees its own counts, or a slightly stale global view, so all nodes pick the same "least loaded" server and overload it (herding). Power of two choices: sample two random healthy backends and pick the less loaded. It is nearly as good as full least-loaded and avoids synchronised decisions. Envoy uses it by default for equal weights.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the herding problem, then P2C, then mention latency-aware variants (EWMA).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle backends with different capacity?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Google">
+          <summary>A bug makes health checks fail on every backend. What should the LB do?</summary>
+          <div class="answer">
+            <p>Fail open: if the share of healthy backends drops below a threshold, ignore health and send to all, because "everything is down" is more likely a checker or shared-dependency problem than a real total outage. ALB does this. Also cap how many hosts outlier detection can eject at once, alert loudly, and keep health checks shallow enough not to depend on shared downstreams.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you distrust your own monitoring; give the threshold idea.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Deep vs shallow health checks: which and why?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>How do you make the load balancer itself highly available?</summary>
+          <div class="answer">
+            <p>Small scale: an active-passive pair sharing a VIP with VRRP (keepalived), failover in seconds. Large scale: active-active, every node announces the VIP over BGP, routers ECMP across them; a dead node is withdrawn; capacity grows by adding nodes. Across regions: DNS or anycast. Maglev moved from pairs to ECMP because pairs wasted half the machines and capped a VIP at one box.</p>
+            <div class="approach"><h5>How to answer</h5><p>Present both, recommend active-active with the reason.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does BGP convergence time mean for failover?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>Where do you terminate TLS, and how do resumed sessions work across many proxies?</summary>
+          <div class="answer">
+            <p>At the L7 tier (or edge PoP), not on L4 nodes, so L4 stays packet-fast and certificates live in one managed place. Share and rotate session-ticket keys across all proxies so a client can resume on any proxy. If compliance requires encryption inside, re-encrypt to backends with mTLS (a service mesh does this). L4 can do TLS passthrough when the backend must hold the key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention CPU cost of handshakes as the reason the L7 tier is the bigger tier.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does the backend learn the client's IP? (X-Forwarded-For, or PROXY protocol at L4.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Meta">
+          <summary>Why do Maglev and Katran use DSR and encapsulation instead of NAT?</summary>
+          <div class="answer">
+            <p>Responses are often 10x larger than requests. With DSR the backend (which owns the VIP on loopback) answers the client directly, so the LB only carries inbound traffic and scales much further. Encapsulation (GRE, IP-in-IP, GUE) keeps the original packet intact, so the backend sees the real client address and the VIP, and routing works across L3 networks. NAT would force replies back through the same LB and rewrite addresses.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use your estimate numbers (16 vs 160 Gbps).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about MTU? (Encapsulation adds bytes; Unimog turns 1,500 into 1,536 and uses jumbo frames internally.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart,Hotstar">
+          <summary>After moving behind an AWS ALB, a Node.js service sees a small, steady rate of 502s with no errors in its own logs. What is happening?</summary>
+          <div class="answer">
+            <p>Almost always the keep-alive race. The ALB reuses idle backend connections for up to its idle timeout (60 s by default), but Node closes idle keep-alive connections after 5 s by default. Sometimes the ALB sends a request on a connection at the same moment Node closes it; the request meets a closed socket and the ALB returns 502. The app never saw the request, so its logs are clean. Fix: make the app's keep-alive longer than the ALB's idle timeout (<code>keepAliveTimeout = 65000</code> and <code>headersTimeout</code> a bit higher), which is AWS's own guidance. Confirm with <code>HTTPCode_ELB_502_Count</code> rising while target 5xx stays flat.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name both timers, say which side closes and which side reuses, then give the rule (backend timeout &gt; LB timeout) and the metric that proves it. Contrast with 504 (target too slow).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you prepare an ALB for a launch-day spike? (LCU reservation sized from <code>PeakLCUs</code> or a load test; historically a pre-warm request.)</li><li>Why do idle connections through an NLB get reset after about 6 minutes? (350 s flow timeout; use TCP keepalives below it.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: one backend is at 95% CPU, the rest at 40%</h4>
+          <div class="situation"><p>The LB uses source-IP hashing. A big customer sends all traffic through one corporate NAT address.</p></div>
+          <div class="bad"><p>Weak answer: "Add more servers."</p></div>
+          <div class="good"><p>Strong answer: source-IP hashing puts everything behind one NAT address on one backend. Adding servers does not move it. If affinity is not needed, switch to P2C least-request. If it is (cache locality), hash on a finer key (user ID, session cookie) and use bounded-load consistent hashing so no backend takes more than, say, 1.25x average. Verify with per-backend RPS and CPU.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you detect this automatically?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: every LB fleet upgrade drops a few thousand connections</h4>
+          <div class="situation"><p>Rolling restarts of L4 nodes coincide with autoscaling of backends.</p></div>
+          <div class="bad"><p>Weak answer: "Upgrade at night."</p></div>
+          <div class="good"><p>Strong answer: this is the double-change case: a flow moves to a new L4 node (no conntrack) while the backend table also changed. Freeze backend-set changes during LB rollouts, drain each L4 node (withdraw BGP, wait) before restart, or move to a stateless design with a second-chance hop to the previous owner like GLB/Unimog.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long must you wait before restarting a drained node?</li></ul></div>
+        </div>
+      

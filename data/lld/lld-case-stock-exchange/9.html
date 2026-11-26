@@ -1,0 +1,1121 @@
+
+  <h2>Full code</h2>
+  <p>Java is the main version: exchange + broker + ticker in one file, with a demo that checks itself, including a 4-thread stress test that proves cash and shares are conserved and the book is never left crossed. Python mirrors it with a <code>unittest</code> suite. The C++14 tab is the matching engine alone (single-threaded, which is how a per-symbol engine runs anyway).</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: the trades and the 4-thread stress test.</li><li><code>Broker.place</code>: the rule chain and the funds block, then <code>Exchange.submit</code>.</li><li><code>OrderBook.match</code>: price-time priority on two sorted maps of FIFO queues. This is the heart (about 30 lines).</li><li>The <code>OrderRule</code> classes and <code>PriceTicker</code> (an observer).</li><li>Skip on first read: the enums and <code>Money</code>.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+// ================= exchange side =================
+enum Side { BUY, SELL }
+enum OrderType { LIMIT, MARKET }
+enum OrderStatus { OPEN, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED }
+
+final class Order {
+    final String id, userId, symbol;
+    final Side side;
+    final OrderType type;
+    final long limitPrice;          // paise; ignored for MARKET
+    final int qty;
+    final long seq;                 // arrival order = time priority
+    private volatile int filled;                     // written under the book lock, read anywhere
+    private volatile OrderStatus status = OrderStatus.OPEN;
+
+    Order(String id, String userId, String symbol, Side side, OrderType type, long limitPrice, int qty, long seq) {
+        this.id = id; this.userId = userId; this.symbol = symbol; this.side = side;
+        this.type = type; this.limitPrice = limitPrice; this.qty = qty; this.seq = seq;
+    }
+    int filled() { return filled; }
+    int remaining() { return qty - filled; }
+    OrderStatus status() { return status; }
+    void fill(int q) {
+        filled += q;
+        status = remaining() == 0 ? OrderStatus.FILLED : OrderStatus.PARTIALLY_FILLED;
+    }
+    void cancel() { status = OrderStatus.CANCELLED; }
+    void reject() { status = OrderStatus.REJECTED; }
+    boolean isLive() { return status == OrderStatus.OPEN || status == OrderStatus.PARTIALLY_FILLED; }
+    public String toString() {
+        return id + "(" + side + " " + qty + (type == OrderType.MARKET ? " MKT" : " @" + Money.fmt(limitPrice))
+                + ", filled " + filled + ", " + status + ")";
+    }
+}
+
+final class Trade {
+    final long id; final String symbol, buyOrderId, sellOrderId, buyer, seller;
+    final long price; final int qty;
+    Trade(long id, String symbol, Order buy, Order sell, long price, int qty) {
+        this.id = id; this.symbol = symbol; this.buyOrderId = buy.id; this.sellOrderId = sell.id;
+        this.buyer = buy.userId; this.seller = sell.userId; this.price = price; this.qty = qty;
+    }
+    public String toString() { return "T" + id + " " + symbol + " " + qty + " @ " + Money.fmt(price) + " (" + buyOrderId + " x " + sellOrderId + ")"; }
+}
+
+final class Money {
+    static String fmt(long paise) { return String.format("%d.%02d", paise / 100, paise % 100); }
+}
+
+// Observer: anyone interested in trades (broker settlement, price ticker, alerts)
+interface TradeListener { void onTrade(Trade t); }
+
+// One book per symbol. Price-time priority: best price first, then earliest seq (FIFO queue per level).
+final class OrderBook {
+    final String symbol;
+    private final TreeMap&lt;Long, ArrayDeque&lt;Order&gt;&gt; bids = new TreeMap&lt;&gt;(Comparator.reverseOrder()); // highest first
+    private final TreeMap&lt;Long, ArrayDeque&lt;Order&gt;&gt; asks = new TreeMap&lt;&gt;();                          // lowest first
+    private final Map&lt;String, Order&gt; resting = new HashMap&lt;&gt;();
+    private long lastPrice;
+    final ReentrantLock lock = new ReentrantLock(true);   // one writer per symbol
+
+    OrderBook(String symbol, long openPrice) { this.symbol = symbol; this.lastPrice = openPrice; }
+    long lastPrice() { return lastPrice; }
+
+    /** Match the incoming order against the opposite side; rest the remainder if it is a LIMIT order. */
+    List&lt;Trade&gt; match(Order in, AtomicLong tradeIds) {
+        List&lt;Trade&gt; trades = new ArrayList&lt;&gt;();
+        TreeMap&lt;Long, ArrayDeque&lt;Order&gt;&gt; opposite = in.side == Side.BUY ? asks : bids;
+        while (in.remaining() &gt; 0 &amp;&amp; !opposite.isEmpty()) {
+            Map.Entry&lt;Long, ArrayDeque&lt;Order&gt;&gt; best = opposite.firstEntry();
+            long price = best.getKey();
+            if (in.type == OrderType.LIMIT &amp;&amp; !crosses(in, price)) break;
+            ArrayDeque&lt;Order&gt; level = best.getValue();
+            Order maker = level.peekFirst();                 // earliest order at the best price
+            int q = Math.min(in.remaining(), maker.remaining());
+            in.fill(q); maker.fill(q);
+            lastPrice = price;                               // trade happens at the resting (maker) price
+            Order buy = in.side == Side.BUY ? in : maker, sell = in.side == Side.BUY ? maker : in;
+            trades.add(new Trade(tradeIds.incrementAndGet(), symbol, buy, sell, price, q));
+            if (maker.remaining() == 0) { level.pollFirst(); resting.remove(maker.id); }
+            if (level.isEmpty()) opposite.remove(price);
+        }
+        if (in.remaining() &gt; 0) {
+            if (in.type == OrderType.LIMIT) {
+                (in.side == Side.BUY ? bids : asks).computeIfAbsent(in.limitPrice, p -&gt; new ArrayDeque&lt;&gt;()).addLast(in);
+                resting.put(in.id, in);
+            } else {
+                in.cancel();                                 // market remainder: immediate-or-cancel
+            }
+        }
+        return trades;
+    }
+    private static boolean crosses(Order in, long price) {
+        return in.side == Side.BUY ? in.limitPrice &gt;= price : in.limitPrice &lt;= price;
+    }
+    Order cancel(String orderId) {
+        Order o = resting.remove(orderId);
+        if (o == null) return null;
+        TreeMap&lt;Long, ArrayDeque&lt;Order&gt;&gt; side = o.side == Side.BUY ? bids : asks;
+        ArrayDeque&lt;Order&gt; level = side.get(o.limitPrice);
+        level.remove(o);
+        if (level.isEmpty()) side.remove(o.limitPrice);
+        o.cancel();
+        return o;
+    }
+    Long bestBid() { return bids.isEmpty() ? null : bids.firstKey(); }
+    Long bestAsk() { return asks.isEmpty() ? null : asks.firstKey(); }
+    String depth() {
+        StringBuilder sb = new StringBuilder(symbol + " asks:");
+        asks.descendingMap().forEach((p, q) -&gt; sb.append(' ').append(Money.fmt(p)).append('x').append(sum(q)));
+        sb.append(" | bids:");
+        bids.forEach((p, q) -&gt; sb.append(' ').append(Money.fmt(p)).append('x').append(sum(q)));
+        return sb.toString();
+    }
+    private static int sum(ArrayDeque&lt;Order&gt; q) { int s = 0; for (Order o : q) s += o.remaining(); return s; }
+}
+
+final class Exchange {
+    private final ConcurrentHashMap&lt;String, OrderBook&gt; books = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;TradeListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final AtomicLong seq = new AtomicLong(), tradeIds = new AtomicLong();
+
+    void listStock(String symbol, long openPrice) {
+        if (books.putIfAbsent(symbol, new OrderBook(symbol, openPrice)) != null)
+            throw new IllegalArgumentException("already listed: " + symbol);
+    }
+    void subscribe(TradeListener l) { listeners.add(l); }
+    long nextSeq() { return seq.incrementAndGet(); }
+    OrderBook book(String symbol) {
+        OrderBook b = books.get(symbol);
+        if (b == null) throw new IllegalArgumentException("unknown symbol " + symbol);
+        return b;
+    }
+    long lastPrice(String symbol) { return book(symbol).lastPrice(); }
+
+    List&lt;Trade&gt; submit(Order o) {
+        OrderBook b = book(o.symbol);
+        b.lock.lock();
+        try {
+            List&lt;Trade&gt; trades = b.match(o, tradeIds);
+            for (Trade t : trades) for (TradeListener l : listeners) l.onTrade(t);   // in trade order, under the book lock
+            return trades;
+        } finally { b.lock.unlock(); }
+    }
+    Order cancel(String symbol, String orderId) {
+        OrderBook b = book(symbol);
+        b.lock.lock();
+        try { return b.cancel(orderId); } finally { b.lock.unlock(); }
+    }
+}
+
+// ================= trading client (broker) side =================
+final class Account {
+    final String userId;
+    long cash, blockedCash;                                  // paise
+    final Map&lt;String, Integer&gt; shares = new HashMap&lt;&gt;(), blockedShares = new HashMap&lt;&gt;();
+    Account(String userId, long cash) { this.userId = userId; this.cash = cash; }
+    int free(String s) { return shares.getOrDefault(s, 0); }
+    public synchronized String toString() {
+        return userId + " cash=" + Money.fmt(cash) + " blocked=" + Money.fmt(blockedCash) + " shares=" + shares + " blockedShares=" + blockedShares;
+    }
+}
+
+class OrderRejected extends RuntimeException { OrderRejected(String m) { super(m); } }
+
+// Pre-trade risk checks: small strategies run in order (a simple chain of rules).
+interface OrderRule { void check(Order o, Account a, long lastPrice, long blockPerUnit); }
+
+final class QuantityRule implements OrderRule {
+    public void check(Order o, Account a, long last, long block) {
+        if (o.qty &lt;= 0) throw new OrderRejected("quantity must be positive");
+    }
+}
+final class PriceBandRule implements OrderRule {                 // limit price within +-band% of last trade
+    private final int bandPercent;
+    PriceBandRule(int bandPercent) { this.bandPercent = bandPercent; }
+    public void check(Order o, Account a, long last, long block) {
+        if (o.type == OrderType.MARKET) return;
+        long lo = last * (100 - bandPercent) / 100, hi = last * (100 + bandPercent) / 100;
+        if (o.limitPrice &lt; lo || o.limitPrice &gt; hi)
+            throw new OrderRejected("price " + Money.fmt(o.limitPrice) + " outside band " + Money.fmt(lo) + "-" + Money.fmt(hi));
+    }
+}
+final class FundsRule implements OrderRule {
+    public void check(Order o, Account a, long last, long block) {
+        if (o.side == Side.BUY &amp;&amp; a.cash &lt; block * o.qty) throw new OrderRejected("insufficient funds");
+        if (o.side == Side.SELL &amp;&amp; a.free(o.symbol) &lt; o.qty) throw new OrderRejected("insufficient shares");
+    }
+}
+
+/** The trading client: users, wallets, holdings, order history; settles trades it hears about. */
+final class Broker implements TradeListener {
+    private final Exchange ex;
+    private final int bandPercent;
+    private final Map&lt;String, Account&gt; accounts = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Order&gt; orders = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Long&gt; blockPerUnit = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, List&lt;Trade&gt;&gt; history = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;OrderRule&gt; rules;
+    private final AtomicLong ids = new AtomicLong();
+
+    Broker(Exchange ex, int bandPercent) {
+        this.ex = ex; this.bandPercent = bandPercent;
+        this.rules = List.of(new QuantityRule(), new PriceBandRule(bandPercent), new FundsRule());
+        ex.subscribe(this);
+    }
+    void register(String userId, long cash) { accounts.put(userId, new Account(userId, cash)); }
+    void addMoney(String userId, long paise) {
+        if (paise &lt;= 0) throw new IllegalArgumentException("amount must be positive");
+        Account a = acct(userId); synchronized (a) { a.cash += paise; }
+    }
+    void depositShares(String userId, String symbol, int qty) {
+        Account a = acct(userId); synchronized (a) { a.shares.merge(symbol, qty, Integer::sum); }
+    }
+    Account acct(String id) {
+        Account a = accounts.get(id);
+        if (a == null) throw new IllegalArgumentException("unknown user " + id);
+        return a;
+    }
+
+    Order place(String userId, String symbol, Side side, OrderType type, long limitPrice, int qty) {
+        Account a = acct(userId);
+        long last = ex.lastPrice(symbol);
+        // what to block per share: the limit price, or the top of the band for a market buy
+        long block = type == OrderType.LIMIT ? limitPrice : last * (100 + bandPercent) / 100;
+        Order o = new Order("O" + ids.incrementAndGet(), userId, symbol, side, type, limitPrice, qty, ex.nextSeq());
+        orders.put(o.id, o);
+        synchronized (a) {
+            try {
+                for (OrderRule r : rules) r.check(o, a, last, block);
+            } catch (OrderRejected e) { o.reject(); throw e; }
+            if (side == Side.BUY) { a.cash -= block * qty; a.blockedCash += block * qty; }
+            else { a.shares.merge(symbol, -qty, Integer::sum); a.blockedShares.merge(symbol, qty, Integer::sum); }
+        }
+        blockPerUnit.put(o.id, block);
+        ex.submit(o);                                   // trades settle through onTrade()
+        if (type == OrderType.MARKET &amp;&amp; o.status() == OrderStatus.CANCELLED) release(o);  // IOC remainder
+        return o;
+    }
+
+    boolean cancel(String userId, String orderId) {
+        Order o = orders.get(orderId);
+        if (o == null || !o.userId.equals(userId)) return false;
+        Order c = ex.cancel(o.symbol, orderId);
+        if (c == null) return false;                    // already filled or cancelled
+        release(c);
+        return true;
+    }
+
+    private void release(Order o) {                     // give back what is still blocked
+        Account a = acct(o.userId);
+        int rem = o.remaining();
+        synchronized (a) {
+            if (o.side == Side.BUY) { long amt = blockPerUnit.get(o.id) * rem; a.blockedCash -= amt; a.cash += amt; }
+            else { a.blockedShares.merge(o.symbol, -rem, Integer::sum); a.shares.merge(o.symbol, rem, Integer::sum); }
+        }
+    }
+
+    @Override public void onTrade(Trade t) {            // settlement: one account lock at a time, never nested
+        Account buyer = acct(t.buyer), seller = acct(t.seller);
+        long blocked = blockPerUnit.get(t.buyOrderId);
+        synchronized (buyer) {
+            buyer.blockedCash -= blocked * t.qty;
+            buyer.cash += (blocked - t.price) * t.qty;  // refund the gap if it traded cheaper than blocked
+            buyer.shares.merge(t.symbol, t.qty, Integer::sum);
+        }
+        synchronized (seller) {
+            seller.blockedShares.merge(t.symbol, -t.qty, Integer::sum);
+            seller.cash += t.price * t.qty;
+        }
+        history.computeIfAbsent(t.buyer, k -&gt; new CopyOnWriteArrayList&lt;&gt;()).add(t);
+        history.computeIfAbsent(t.seller, k -&gt; new CopyOnWriteArrayList&lt;&gt;()).add(t);
+    }
+    List&lt;Trade&gt; tradesOf(String userId) { return history.getOrDefault(userId, List.of()); }
+    Order order(String id) { return orders.get(id); }
+    Collection&lt;Account&gt; accounts() { return accounts.values(); }
+}
+
+/** Observer #2: a market-data ticker that remembers the last price per symbol and fires alerts. */
+final class PriceTicker implements TradeListener {
+    final Map&lt;String, Long&gt; last = new ConcurrentHashMap&lt;&gt;();
+    final List&lt;String&gt; alerts = new CopyOnWriteArrayList&lt;&gt;();
+    private final Map&lt;String, Long&gt; alertAbove = new ConcurrentHashMap&lt;&gt;();
+    void alertWhenAbove(String symbol, long price) { alertAbove.put(symbol, price); }
+    public void onTrade(Trade t) {
+        last.put(t.symbol, t.price);
+        Long lim = alertAbove.get(t.symbol);
+        if (lim != null &amp;&amp; t.price &gt; lim &amp;&amp; alertAbove.remove(t.symbol, lim))
+            alerts.add(t.symbol + " crossed " + Money.fmt(lim) + " at " + Money.fmt(t.price));
+    }
+}
+
+// ================= demo + checks =================
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static long rs(double rupees) { return Math.round(rupees * 100); }
+
+    public static void main(String[] args) throws Exception {
+        Exchange ex = new Exchange();
+        ex.listStock("INFY", rs(1500));
+        Broker zerodha = new Broker(ex, 20);
+        PriceTicker ticker = new PriceTicker();
+        ex.subscribe(ticker);
+        ticker.alertWhenAbove("INFY", rs(1504));
+
+        zerodha.register("asha", rs(100_000));
+        zerodha.register("bala", rs(10_000));
+        zerodha.register("chen", rs(10_000));
+        zerodha.depositShares("bala", "INFY", 50);
+        zerodha.depositShares("chen", "INFY", 50);
+
+        System.out.println("== 1. resting sells, FIFO at the same price ==");
+        Order s1 = zerodha.place("bala", "INFY", Side.SELL, OrderType.LIMIT, rs(1500), 10);
+        Order s2 = zerodha.place("chen", "INFY", Side.SELL, OrderType.LIMIT, rs(1505), 5);
+        Order s3 = zerodha.place("bala", "INFY", Side.SELL, OrderType.LIMIT, rs(1505), 5);
+        System.out.println(ex.book("INFY").depth());
+
+        System.out.println("== 2. buy 12 @ 1510 sweeps two levels, partial fill ==");
+        Order b1 = zerodha.place("asha", "INFY", Side.BUY, OrderType.LIMIT, rs(1510), 12);
+        zerodha.tradesOf("asha").forEach(System.out::println);
+        check(b1.status() == OrderStatus.FILLED, "buy filled");
+        check(s1.status() == OrderStatus.FILLED, "best price first");
+        check(s2.status() == OrderStatus.PARTIALLY_FILLED &amp;&amp; s2.filled() == 2, "earlier order at 1505 goes first");
+        check(s3.filled() == 0, "later order at same price waits");
+        check(ex.lastPrice("INFY") == rs(1505), "last price = last trade price");
+        Account asha = zerodha.acct("asha");
+        check(asha.cash == rs(100_000) - rs(1500) * 10 - rs(1505) * 2, "asha paid trade prices, not her limit");
+        check(asha.blockedCash == 0, "nothing left blocked");
+        System.out.println(asha);
+        System.out.println(ex.book("INFY").depth());
+
+        System.out.println("== 3. market buy 10: takes 3 + 5, rest cancelled ==");
+        Order m = zerodha.place("asha", "INFY", Side.BUY, OrderType.MARKET, 0, 10);
+        System.out.println(m);
+        check(m.filled() == 8 &amp;&amp; m.status() == OrderStatus.CANCELLED, "IOC remainder cancelled");
+        check(asha.blockedCash == 0, "market block released");
+
+        System.out.println("== 4. rejections ==");
+        try { zerodha.place("asha", "INFY", Side.BUY, OrderType.LIMIT, rs(1900), 1); check(false, "band"); }
+        catch (OrderRejected e) { System.out.println("rejected: " + e.getMessage()); checks++; }
+        try { zerodha.place("bala", "INFY", Side.BUY, OrderType.LIMIT, rs(1500), 100); check(false, "funds"); }
+        catch (OrderRejected e) { System.out.println("rejected: " + e.getMessage()); checks++; }
+        try { zerodha.place("chen", "INFY", Side.SELL, OrderType.LIMIT, rs(1500), 999); check(false, "shares"); }
+        catch (OrderRejected e) { System.out.println("rejected: " + e.getMessage()); checks++; }
+
+        System.out.println("== 5. resting bid, then cancel releases the block ==");
+        long before = zerodha.acct("bala").cash;
+        Order bid = zerodha.place("bala", "INFY", Side.BUY, OrderType.LIMIT, rs(1490), 4);
+        check(zerodha.acct("bala").blockedCash == rs(1490) * 4, "cash blocked");
+        check(zerodha.cancel("bala", bid.id), "cancel ok");
+        check(!zerodha.cancel("bala", bid.id), "second cancel is a no-op");
+        check(zerodha.acct("bala").cash == before &amp;&amp; zerodha.acct("bala").blockedCash == 0, "block released");
+        System.out.println(bid);
+
+        System.out.println("== 6. observer: ticker and price alert ==");
+        System.out.println("ticker last INFY = " + Money.fmt(ticker.last.get("INFY")) + ", alerts = " + ticker.alerts);
+        check(ticker.alerts.size() == 1, "alert fired once");
+
+        System.out.println("== 7. 4 threads x 2000 random orders: conservation + uncrossed book ==");
+        Exchange ex2 = new Exchange();
+        ex2.listStock("TCS", rs(4000));
+        Broker br = new Broker(ex2, 20);
+        for (int i = 0; i &lt; 8; i++) { br.register("u" + i, rs(10_000_000)); br.depositShares("u" + i, "TCS", 10_000); }
+        long cash0 = totalCash(br), shares0 = totalShares(br, "TCS");
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        AtomicInteger rejected = new AtomicInteger();
+        for (int t = 0; t &lt; 4; t++) {
+            final int seed = t;
+            pool.submit(() -&gt; {
+                Random r = new Random(seed);
+                for (int i = 0; i &lt; 2000; i++) {
+                    String u = "u" + r.nextInt(8);
+                    Side side = r.nextBoolean() ? Side.BUY : Side.SELL;
+                    long px = rs(3990) + r.nextInt(21) * 100;           // 3990..4010
+                    try {
+                        Order o = br.place(u, "TCS", side, OrderType.LIMIT, px, 1 + r.nextInt(20));
+                        if (r.nextInt(5) == 0) br.cancel(u, o.id);
+                    } catch (OrderRejected e) { rejected.incrementAndGet(); }
+                }
+            });
+        }
+        pool.shutdown();
+        check(pool.awaitTermination(30, TimeUnit.SECONDS), "threads done");
+        OrderBook tcs = ex2.book("TCS");
+        check(tcs.bestBid() == null || tcs.bestAsk() == null || tcs.bestBid() &lt; tcs.bestAsk(), "book never left crossed");
+        check(totalCash(br) == cash0, "cash conserved (free + blocked)");
+        check(totalShares(br, "TCS") == shares0, "shares conserved (free + blocked)");
+        System.out.println("cash and shares conserved; book uncrossed: " + (tcs.bestBid() == null || tcs.bestAsk() == null || tcs.bestBid() &lt; tcs.bestAsk()));
+        System.out.println("All " + checks + " checks passed");
+    }
+
+    static long totalCash(Broker b) {
+        long s = 0; for (Account a : b.accounts()) synchronized (a) { s += a.cash + a.blockedCash; } return s;
+    }
+    static long totalShares(Broker b, String sym) {
+        long s = 0;
+        for (Account a : b.accounts()) synchronized (a) { s += a.shares.getOrDefault(sym, 0) + a.blockedShares.getOrDefault(sym, 0); }
+        return s;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<p><code>exchange.py</code></p>
+<pre><code class="language-python">"""Stock exchange order book (price-time priority) + a broker / trading client. Money in paise."""
+from __future__ import annotations
+
+import bisect
+import enum
+import itertools
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Deque, Dict, List, Optional
+
+
+class Side(enum.Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class OrderType(enum.Enum):
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
+
+class Status(enum.Enum):
+    OPEN = "OPEN"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+@dataclass(eq=False)
+class Order:
+    id: str
+    user: str
+    symbol: str
+    side: Side
+    type: OrderType
+    price: int          # limit price in paise (0 for market)
+    qty: int
+    seq: int
+    filled: int = 0
+    status: Status = Status.OPEN
+
+    @property
+    def remaining(self) -&gt; int:
+        return self.qty - self.filled
+
+    def fill(self, q: int) -&gt; None:
+        self.filled += q
+        self.status = Status.FILLED if self.remaining == 0 else Status.PARTIALLY_FILLED
+
+
+@dataclass(frozen=True)
+class Trade:
+    id: int
+    symbol: str
+    buy_order: str
+    sell_order: str
+    buyer: str
+    seller: str
+    price: int
+    qty: int
+
+
+def fmt(paise: int) -&gt; str:
+    return f"{paise // 100}.{paise % 100:02d}"
+
+
+class PriceLevels:
+    """Sorted prices + a FIFO queue per price. best() is the first price (lowest for asks)."""
+
+    def __init__(self, descending: bool) -&gt; None:
+        self._sign = -1 if descending else 1
+        self._keys: List[int] = []            # sign * price, ascending
+        self._q: Dict[int, Deque[Order]] = {}
+
+    def __bool__(self) -&gt; bool:
+        return bool(self._keys)
+
+    def best(self) -&gt; Optional[int]:
+        return self._sign * self._keys[0] if self._keys else None
+
+    def queue(self, price: int) -&gt; Deque[Order]:
+        return self._q[price]
+
+    def add(self, o: Order) -&gt; None:
+        if o.price not in self._q:
+            bisect.insort(self._keys, self._sign * o.price)
+            self._q[o.price] = deque()
+        self._q[o.price].append(o)
+
+    def remove(self, o: Order) -&gt; None:
+        q = self._q[o.price]
+        q.remove(o)
+        if not q:
+            self.drop(o.price)
+
+    def drop(self, price: int) -&gt; None:
+        del self._q[price]
+        self._keys.pop(bisect.bisect_left(self._keys, self._sign * price))
+
+    def depth(self) -&gt; List[str]:
+        return [f"{fmt(self._sign * k)}x{sum(o.remaining for o in self._q[self._sign * k])}" for k in self._keys]
+
+
+class OrderBook:
+    def __init__(self, symbol: str, open_price: int) -&gt; None:
+        self.symbol = symbol
+        self.last_price = open_price
+        self.bids = PriceLevels(descending=True)
+        self.asks = PriceLevels(descending=False)
+        self.resting: Dict[str, Order] = {}
+        self.lock = threading.Lock()           # one writer per symbol
+
+    def match(self, o: Order, trade_ids: Callable[[], int]) -&gt; List[Trade]:
+        trades: List[Trade] = []
+        book = self.asks if o.side is Side.BUY else self.bids
+        while o.remaining and book:
+            price = book.best()
+            if o.type is OrderType.LIMIT and not (o.price &gt;= price if o.side is Side.BUY else o.price &lt;= price):
+                break
+            level = book.queue(price)
+            maker = level[0]                    # earliest order at the best price
+            q = min(o.remaining, maker.remaining)
+            o.fill(q)
+            maker.fill(q)
+            self.last_price = price             # trade at the resting order's price
+            buy, sell = (o, maker) if o.side is Side.BUY else (maker, o)
+            trades.append(Trade(trade_ids(), self.symbol, buy.id, sell.id, buy.user, sell.user, price, q))
+            if maker.remaining == 0:
+                level.popleft()
+                del self.resting[maker.id]
+                if not level:
+                    book.drop(price)
+        if o.remaining:
+            if o.type is OrderType.LIMIT:
+                (self.bids if o.side is Side.BUY else self.asks).add(o)
+                self.resting[o.id] = o
+            else:
+                o.status = Status.CANCELLED     # market remainder: immediate-or-cancel
+        return trades
+
+    def cancel(self, order_id: str) -&gt; Optional[Order]:
+        o = self.resting.pop(order_id, None)
+        if o is None:
+            return None
+        (self.bids if o.side is Side.BUY else self.asks).remove(o)
+        o.status = Status.CANCELLED
+        return o
+
+    def depth(self) -&gt; str:
+        return f"{self.symbol} asks: {' '.join(reversed(self.asks.depth()))} | bids: {' '.join(self.bids.depth())}"
+
+
+class Exchange:
+    def __init__(self) -&gt; None:
+        self._books: Dict[str, OrderBook] = {}
+        self._listeners: List[Callable[[Trade], None]] = []
+        self._seq = itertools.count(1)
+        self._tid = itertools.count(1)
+        self._id_lock = threading.Lock()
+
+    def list_stock(self, symbol: str, open_price: int) -&gt; None:
+        if symbol in self._books:
+            raise ValueError(f"already listed: {symbol}")
+        self._books[symbol] = OrderBook(symbol, open_price)
+
+    def subscribe(self, fn: Callable[[Trade], None]) -&gt; None:
+        self._listeners.append(fn)
+
+    def next_seq(self) -&gt; int:
+        with self._id_lock:
+            return next(self._seq)
+
+    def _next_trade_id(self) -&gt; int:
+        with self._id_lock:
+            return next(self._tid)
+
+    def book(self, symbol: str) -&gt; OrderBook:
+        if symbol not in self._books:
+            raise KeyError(f"unknown symbol {symbol}")
+        return self._books[symbol]
+
+    def submit(self, o: Order) -&gt; List[Trade]:
+        b = self.book(o.symbol)
+        with b.lock:
+            trades = b.match(o, self._next_trade_id)
+            for t in trades:
+                for fn in self._listeners:      # Observer: settle, tick, alert - in trade order
+                    fn(t)
+            return trades
+
+    def cancel(self, symbol: str, order_id: str) -&gt; Optional[Order]:
+        b = self.book(symbol)
+        with b.lock:
+            return b.cancel(order_id)
+
+
+class OrderRejected(Exception):
+    pass
+
+
+@dataclass
+class Account:
+    user: str
+    cash: int
+    blocked_cash: int = 0
+    shares: Dict[str, int] = field(default_factory=dict)
+    blocked_shares: Dict[str, int] = field(default_factory=dict)
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+# pre-trade rules: each raises OrderRejected
+def quantity_rule(o: Order, a: Account, last: int, block: int, band: int) -&gt; None:
+    if o.qty &lt;= 0:
+        raise OrderRejected("quantity must be positive")
+
+
+def price_band_rule(o: Order, a: Account, last: int, block: int, band: int) -&gt; None:
+    if o.type is OrderType.MARKET:
+        return
+    lo, hi = last * (100 - band) // 100, last * (100 + band) // 100
+    if not lo &lt;= o.price &lt;= hi:
+        raise OrderRejected(f"price {fmt(o.price)} outside band {fmt(lo)}-{fmt(hi)}")
+
+
+def funds_rule(o: Order, a: Account, last: int, block: int, band: int) -&gt; None:
+    if o.side is Side.BUY and a.cash &lt; block * o.qty:
+        raise OrderRejected("insufficient funds")
+    if o.side is Side.SELL and a.shares.get(o.symbol, 0) &lt; o.qty:
+        raise OrderRejected("insufficient shares")
+
+
+class Broker:
+    """Trading client: wallets, holdings, risk checks, settlement, history."""
+
+    def __init__(self, ex: Exchange, band_percent: int = 20) -&gt; None:
+        self.ex, self.band = ex, band_percent
+        self.accounts: Dict[str, Account] = {}
+        self.orders: Dict[str, Order] = {}
+        self.block_per_unit: Dict[str, int] = {}
+        self.history: Dict[str, List[Trade]] = {}
+        self.rules = [quantity_rule, price_band_rule, funds_rule]
+        self._ids = itertools.count(1)
+        self._ids_lock = threading.Lock()
+        ex.subscribe(self.on_trade)
+
+    def register(self, user: str, cash: int) -&gt; None:
+        self.accounts[user] = Account(user, cash)
+
+    def deposit_shares(self, user: str, symbol: str, qty: int) -&gt; None:
+        a = self.accounts[user]
+        with a.lock:
+            a.shares[symbol] = a.shares.get(symbol, 0) + qty
+
+    def place(self, user: str, symbol: str, side: Side, otype: OrderType, price: int, qty: int) -&gt; Order:
+        a = self.accounts[user]
+        last = self.ex.book(symbol).last_price
+        block = price if otype is OrderType.LIMIT else last * (100 + self.band) // 100
+        with self._ids_lock:
+            oid = f"O{next(self._ids)}"
+        o = Order(oid, user, symbol, side, otype, price, qty, self.ex.next_seq())
+        self.orders[oid] = o
+        with a.lock:
+            try:
+                for rule in self.rules:
+                    rule(o, a, last, block, self.band)
+            except OrderRejected:
+                o.status = Status.REJECTED
+                raise
+            if side is Side.BUY:
+                a.cash -= block * qty
+                a.blocked_cash += block * qty
+            else:
+                a.shares[symbol] -= qty
+                a.blocked_shares[symbol] = a.blocked_shares.get(symbol, 0) + qty
+        self.block_per_unit[oid] = block
+        self.ex.submit(o)
+        if otype is OrderType.MARKET and o.status is Status.CANCELLED:
+            self._release(o)
+        return o
+
+    def cancel(self, user: str, order_id: str) -&gt; bool:
+        o = self.orders.get(order_id)
+        if o is None or o.user != user:
+            return False
+        c = self.ex.cancel(o.symbol, order_id)
+        if c is None:
+            return False
+        self._release(c)
+        return True
+
+    def _release(self, o: Order) -&gt; None:
+        a = self.accounts[o.user]
+        with a.lock:
+            if o.side is Side.BUY:
+                amt = self.block_per_unit[o.id] * o.remaining
+                a.blocked_cash -= amt
+                a.cash += amt
+            else:
+                a.blocked_shares[o.symbol] -= o.remaining
+                a.shares[o.symbol] += o.remaining
+
+    def on_trade(self, t: Trade) -&gt; None:
+        buyer, seller = self.accounts[t.buyer], self.accounts[t.seller]
+        blocked = self.block_per_unit[t.buy_order]
+        with buyer.lock:                         # one account lock at a time: no lock-order deadlock
+            buyer.blocked_cash -= blocked * t.qty
+            buyer.cash += (blocked - t.price) * t.qty
+            buyer.shares[t.symbol] = buyer.shares.get(t.symbol, 0) + t.qty
+        with seller.lock:
+            seller.blocked_shares[t.symbol] -= t.qty
+            seller.cash += t.price * t.qty
+        self.history.setdefault(t.buyer, []).append(t)
+        self.history.setdefault(t.seller, []).append(t)</code></pre>
+<p><code>main.py</code></p>
+<pre><code class="language-python">from exchange import Broker, Exchange, OrderRejected, OrderType, Side, Status, fmt
+
+
+def rs(rupees: float) -&gt; int:
+    return round(rupees * 100)
+
+
+def main() -&gt; None:
+    ex = Exchange()
+    ex.list_stock("INFY", rs(1500))
+    zerodha = Broker(ex, band_percent=20)
+    ticks = []
+    ex.subscribe(lambda t: ticks.append(t.price))          # a second observer: price ticker
+    zerodha.register("asha", rs(100_000))
+    for u in ("bala", "chen"):
+        zerodha.register(u, rs(10_000))
+        zerodha.deposit_shares(u, "INFY", 50)
+
+    print("== 1. resting sells, FIFO at the same price ==")
+    s1 = zerodha.place("bala", "INFY", Side.SELL, OrderType.LIMIT, rs(1500), 10)
+    s2 = zerodha.place("chen", "INFY", Side.SELL, OrderType.LIMIT, rs(1505), 5)
+    s3 = zerodha.place("bala", "INFY", Side.SELL, OrderType.LIMIT, rs(1505), 5)
+    print(ex.book("INFY").depth())
+
+    print("== 2. buy 12 @ 1510 sweeps two levels ==")
+    b1 = zerodha.place("asha", "INFY", Side.BUY, OrderType.LIMIT, rs(1510), 12)
+    for t in zerodha.history["asha"]:
+        print(f"T{t.id} {t.qty} @ {fmt(t.price)} ({t.buy_order} x {t.sell_order})")
+    assert b1.status is Status.FILLED and s1.status is Status.FILLED
+    assert s2.filled == 2 and s3.filled == 0
+    a = zerodha.accounts["asha"]
+    assert a.cash == rs(100_000) - rs(1500) * 10 - rs(1505) * 2 and a.blocked_cash == 0
+    print(ex.book("INFY").depth())
+
+    print("== 3. market buy 10, remainder cancelled ==")
+    m = zerodha.place("asha", "INFY", Side.BUY, OrderType.MARKET, 0, 10)
+    print(m.id, "filled", m.filled, m.status.value)
+    assert m.filled == 8 and m.status is Status.CANCELLED and a.blocked_cash == 0
+
+    print("== 4. rejection ==")
+    try:
+        zerodha.place("asha", "INFY", Side.BUY, OrderType.LIMIT, rs(1900), 1)
+    except OrderRejected as e:
+        print("rejected:", e)
+    print("ticks:", [fmt(p) for p in ticks])
+    print("All checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p><code>test_exchange.py</code></p>
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from exchange import Broker, Exchange, OrderRejected, OrderType, Side, Status
+
+
+def setup(cash=1_000_000_00, shares=100):
+    ex = Exchange()
+    ex.list_stock("X", 100_00)
+    br = Broker(ex, 20)
+    for u in ("a", "b", "c"):
+        br.register(u, cash)
+        br.deposit_shares(u, "X", shares)
+    return ex, br
+
+
+def totals(br, sym="X"):
+    cash = sum(a.cash + a.blocked_cash for a in br.accounts.values())
+    sh = sum(a.shares.get(sym, 0) + a.blocked_shares.get(sym, 0) for a in br.accounts.values())
+    return cash, sh
+
+
+class ExchangeTest(unittest.TestCase):
+    def test_price_priority_then_time(self):
+        ex, br = setup()
+        late_cheap = br.place("a", "X", Side.SELL, OrderType.LIMIT, 99_00, 5)
+        early = br.place("b", "X", Side.SELL, OrderType.LIMIT, 100_00, 5)
+        later = br.place("c", "X", Side.SELL, OrderType.LIMIT, 100_00, 5)
+        br.place("a", "X", Side.BUY, OrderType.LIMIT, 100_00, 7)
+        self.assertEqual(late_cheap.status, Status.FILLED)   # lowest ask fills first
+        self.assertEqual(early.filled, 2)
+        self.assertEqual(later.filled, 0)
+
+    def test_no_match_when_not_crossing(self):
+        ex, br = setup()
+        br.place("a", "X", Side.SELL, OrderType.LIMIT, 101_00, 5)
+        bid = br.place("b", "X", Side.BUY, OrderType.LIMIT, 100_00, 5)
+        self.assertEqual(bid.status, Status.OPEN)
+        self.assertEqual(ex.book("X").bids.best(), 100_00)
+        self.assertEqual(ex.book("X").asks.best(), 101_00)
+
+    def test_trade_at_resting_price_and_refund(self):
+        ex, br = setup()
+        br.place("a", "X", Side.SELL, OrderType.LIMIT, 95_00, 10)
+        br.place("b", "X", Side.BUY, OrderType.LIMIT, 105_00, 10)
+        b = br.accounts["b"]
+        self.assertEqual(b.cash, 1_000_000_00 - 95_00 * 10)
+        self.assertEqual(b.blocked_cash, 0)
+        self.assertEqual(ex.book("X").last_price, 95_00)
+
+    def test_market_ioc_and_empty_book(self):
+        ex, br = setup()
+        m = br.place("a", "X", Side.BUY, OrderType.MARKET, 0, 5)
+        self.assertEqual((m.filled, m.status), (0, Status.CANCELLED))
+        self.assertEqual(br.accounts["a"].blocked_cash, 0)
+
+    def test_rules(self):
+        ex, br = setup(cash=1_000_00)
+        with self.assertRaises(OrderRejected):
+            br.place("a", "X", Side.BUY, OrderType.LIMIT, 130_00, 1)      # outside +20%
+        with self.assertRaises(OrderRejected):
+            br.place("a", "X", Side.BUY, OrderType.LIMIT, 100_00, 11)     # funds
+        with self.assertRaises(OrderRejected):
+            br.place("a", "X", Side.SELL, OrderType.LIMIT, 100_00, 101)   # shares
+        with self.assertRaises(OrderRejected):
+            br.place("a", "X", Side.SELL, OrderType.LIMIT, 100_00, 0)     # qty
+
+    def test_cancel_releases_and_is_idempotent(self):
+        ex, br = setup()
+        o = br.place("a", "X", Side.SELL, OrderType.LIMIT, 110_00, 10)
+        self.assertEqual(br.accounts["a"].shares["X"], 90)
+        self.assertTrue(br.cancel("a", o.id))
+        self.assertFalse(br.cancel("a", o.id))
+        self.assertFalse(br.cancel("b", o.id))
+        self.assertEqual(br.accounts["a"].shares["X"], 100)
+
+    def test_concurrent_conservation(self):
+        ex, br = setup(cash=10**12, shares=10**6)
+        before = totals(br)
+
+        def worker(seed):
+            r = random.Random(seed)
+            for _ in range(1500):
+                u = r.choice("abc")
+                side = r.choice([Side.BUY, Side.SELL])
+                try:
+                    o = br.place(u, "X", side, OrderType.LIMIT, 99_00 + r.randint(0, 20) * 10, r.randint(1, 20))
+                    if r.random() &lt; 0.2:
+                        br.cancel(u, o.id)
+                except OrderRejected:
+                    pass
+
+        ts = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(totals(br), before)
+        b = ex.book("X")
+        if b.bids and b.asks:
+            self.assertLess(b.bids.best(), b.asks.best())
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Matching engine core in C++14: price-time priority order book with partial fills,
+// market (IOC) orders, cancel by id, and trade listeners (Observer via std::function).
+// Single-threaded on purpose: one engine thread per symbol is how real books run.
+// Build: g++ -std=c++14 -O2 -Wall main.cpp -o main.exe
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+
+enum class Side { BUY, SELL };
+enum class Type { LIMIT, MARKET };
+
+struct Order {
+    long id; Side side; Type type; long price; int qty; int filled = 0; bool cancelled = false;
+    int remaining() const { return qty - filled; }
+};
+struct Trade { long buyId, sellId, price; int qty; };
+
+static std::string fmt(long paise) {
+    char buf[32]; std::snprintf(buf, sizeof buf, "%ld.%02ld", paise / 100, paise % 100); return buf;
+}
+
+class OrderBook {
+    using Level = std::deque&lt;std::shared_ptr&lt;Order&gt;&gt;;
+    std::map&lt;long, Level, std::greater&lt;long&gt;&gt; bids_;   // highest first
+    std::map&lt;long, Level&gt; asks_;                        // lowest first
+    std::unordered_map&lt;long, std::shared_ptr&lt;Order&gt;&gt; resting_;
+    std::vector&lt;std::function&lt;void(const Trade&amp;)&gt;&gt; listeners_;
+    long lastPrice_;
+
+    template &lt;class Book&gt;
+    void sweep(Order&amp; in, Book&amp; book, std::vector&lt;Trade&gt;&amp; out) {
+        while (in.remaining() &gt; 0 &amp;&amp; !book.empty()) {
+            auto best = book.begin();
+            long px = best-&gt;first;
+            bool crosses = in.side == Side::BUY ? in.price &gt;= px : in.price &lt;= px;
+            if (in.type == Type::LIMIT &amp;&amp; !crosses) break;
+            Level&amp; level = best-&gt;second;
+            Order&amp; maker = *level.front();              // earliest at the best price
+            int q = std::min(in.remaining(), maker.remaining());
+            in.filled += q; maker.filled += q; lastPrice_ = px;
+            Trade t = in.side == Side::BUY ? Trade{in.id, maker.id, px, q} : Trade{maker.id, in.id, px, q};
+            out.push_back(t);
+            for (auto&amp; fn : listeners_) fn(t);
+            if (maker.remaining() == 0) { resting_.erase(maker.id); level.pop_front(); }
+            if (level.empty()) book.erase(best);
+        }
+    }
+    template &lt;class Book&gt;
+    static void removeFrom(Book&amp; book, const std::shared_ptr&lt;Order&gt;&amp; o) {
+        auto it = book.find(o-&gt;price);
+        Level&amp; lv = it-&gt;second;
+        for (auto i = lv.begin(); i != lv.end(); ++i) if (*i == o) { lv.erase(i); break; }
+        if (lv.empty()) book.erase(it);
+    }
+public:
+    explicit OrderBook(long open) : lastPrice_(open) {}
+    void onTrade(std::function&lt;void(const Trade&amp;)&gt; fn) { listeners_.push_back(std::move(fn)); }
+    long lastPrice() const { return lastPrice_; }
+
+    std::vector&lt;Trade&gt; submit(std::shared_ptr&lt;Order&gt; o) {
+        std::vector&lt;Trade&gt; trades;
+        if (o-&gt;side == Side::BUY) sweep(*o, asks_, trades); else sweep(*o, bids_, trades);
+        if (o-&gt;remaining() &gt; 0) {
+            if (o-&gt;type == Type::MARKET) o-&gt;cancelled = true;          // immediate-or-cancel
+            else {
+                if (o-&gt;side == Side::BUY) bids_[o-&gt;price].push_back(o); else asks_[o-&gt;price].push_back(o);
+                resting_[o-&gt;id] = o;
+            }
+        }
+        return trades;
+    }
+    bool cancel(long id) {
+        auto it = resting_.find(id);
+        if (it == resting_.end()) return false;
+        auto o = it-&gt;second; resting_.erase(it);
+        if (o-&gt;side == Side::BUY) removeFrom(bids_, o); else removeFrom(asks_, o);
+        o-&gt;cancelled = true;
+        return true;
+    }
+    long bestBid() const { return bids_.empty() ? -1 : bids_.begin()-&gt;first; }
+    long bestAsk() const { return asks_.empty() ? -1 : asks_.begin()-&gt;first; }
+    void print() const {
+        std::printf("asks:");
+        for (auto it = asks_.rbegin(); it != asks_.rend(); ++it) {
+            int s = 0; for (auto&amp; o : it-&gt;second) s += o-&gt;remaining();
+            std::printf(" %sx%d", fmt(it-&gt;first).c_str(), s);
+        }
+        std::printf(" | bids:");
+        for (auto&amp; kv : bids_) { int s = 0; for (auto&amp; o : kv.second) s += o-&gt;remaining(); std::printf(" %sx%d", fmt(kv.first).c_str(), s); }
+        std::printf("\n");
+    }
+};
+
+int main() {
+    long nextId = 0;
+    auto mk = [&amp;](Side s, Type t, long px, int q) { return std::make_shared&lt;Order&gt;(Order{++nextId, s, t, px, q}); };
+    OrderBook book(150000);
+    long volume = 0;
+    book.onTrade([&amp;](const Trade&amp; t) {                      // observer 1: tape
+        std::printf("trade %d @ %s (buy #%ld x sell #%ld)\n", t.qty, fmt(t.price).c_str(), t.buyId, t.sellId);
+    });
+    book.onTrade([&amp;](const Trade&amp; t) { volume += t.qty; });  // observer 2: volume counter
+
+    std::printf("== 1. rest three sells ==\n");
+    auto s1 = mk(Side::SELL, Type::LIMIT, 150000, 10);
+    auto s2 = mk(Side::SELL, Type::LIMIT, 150500, 5);
+    auto s3 = mk(Side::SELL, Type::LIMIT, 150500, 5);
+    book.submit(s1); book.submit(s2); book.submit(s3);
+    book.print();
+
+    std::printf("== 2. buy 12 @ 1510.00 ==\n");
+    auto b1 = mk(Side::BUY, Type::LIMIT, 151000, 12);
+    auto tr = book.submit(b1);
+    assert(tr.size() == 2 &amp;&amp; b1-&gt;remaining() == 0);
+    assert(s1-&gt;remaining() == 0 &amp;&amp; s2-&gt;filled == 2 &amp;&amp; s3-&gt;filled == 0);   // price, then time
+    book.print();
+
+    std::printf("== 3. bid that does not cross rests; cancel it ==\n");
+    auto b2 = mk(Side::BUY, Type::LIMIT, 149000, 4);
+    book.submit(b2);
+    assert(book.bestBid() == 149000 &amp;&amp; book.bestAsk() == 150500);
+    book.print();
+    assert(book.cancel(b2-&gt;id) &amp;&amp; !book.cancel(b2-&gt;id));
+    assert(book.bestBid() == -1);
+
+    std::printf("== 4. market sell 3 into an empty bid side ==\n");
+    auto m = mk(Side::SELL, Type::MARKET, 0, 3);
+    book.submit(m);
+    assert(m-&gt;cancelled &amp;&amp; m-&gt;filled == 0);
+    std::printf("market sell cancelled, filled 0\n");
+
+    std::printf("== 5. market buy 10 takes 8, rest cancelled ==\n");
+    auto m2 = mk(Side::BUY, Type::MARKET, 0, 10);
+    book.submit(m2);
+    assert(m2-&gt;filled == 8 &amp;&amp; m2-&gt;cancelled);
+    std::printf("volume traded = %ld, last price = %s\n", volume, fmt(book.lastPrice()).c_str());
+    assert(volume == 20);
+    std::printf("All checks passed\n");
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Demo output</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre class="terminal"><code>== 1. resting sells, FIFO at the same price ==
+INFY asks: 1505.00x10 1500.00x10 | bids:
+== 2. buy 12 @ 1510 sweeps two levels, partial fill ==
+T1 INFY 10 @ 1500.00 (O4 x O1)
+T2 INFY 2 @ 1505.00 (O4 x O2)
+asha cash=81990.00 blocked=0.00 shares={INFY=12} blockedShares={}
+INFY asks: 1505.00x8 | bids:
+== 3. market buy 10: takes 3 + 5, rest cancelled ==
+O5(BUY 10 MKT, filled 8, CANCELLED)
+== 4. rejections ==
+rejected: price 1900.00 outside band 1204.00-1806.00
+rejected: insufficient funds
+rejected: insufficient shares
+== 5. resting bid, then cancel releases the block ==
+O9(BUY 4 @1490.00, filled 0, CANCELLED)
+== 6. observer: ticker and price alert ==
+ticker last INFY = 1505.00, alerts = [INFY crossed 1504.00 at 1505.00]
+== 7. 4 threads x 2000 random orders: conservation + uncrossed book ==
+cash and shares conserved; book uncrossed: true
+All 21 checks passed</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre class="terminal"><code>== 1. resting sells, FIFO at the same price ==
+INFY asks: 1505.00x10 1500.00x10 | bids: 
+== 2. buy 12 @ 1510 sweeps two levels ==
+T1 10 @ 1500.00 (O4 x O1)
+T2 2 @ 1505.00 (O4 x O2)
+INFY asks: 1505.00x8 | bids: 
+== 3. market buy 10, remainder cancelled ==
+O5 filled 8 CANCELLED
+== 4. rejection ==
+rejected: price 1900.00 outside band 1204.00-1806.00
+ticks: ['1500.00', '1505.00', '1505.00', '1505.00']
+All checks passed</code></pre>
+<pre class="terminal"><code>test_cancel_releases_and_is_idempotent (test_exchange.ExchangeTest.test_cancel_releases_and_is_idempotent) ... ok
+test_concurrent_conservation (test_exchange.ExchangeTest.test_concurrent_conservation) ... ok
+test_market_ioc_and_empty_book (test_exchange.ExchangeTest.test_market_ioc_and_empty_book) ... ok
+test_no_match_when_not_crossing (test_exchange.ExchangeTest.test_no_match_when_not_crossing) ... ok
+test_price_priority_then_time (test_exchange.ExchangeTest.test_price_priority_then_time) ... ok
+test_rules (test_exchange.ExchangeTest.test_rules) ... ok
+test_trade_at_resting_price_and_refund (test_exchange.ExchangeTest.test_trade_at_resting_price_and_refund) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.051s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre class="terminal"><code>== 1. rest three sells ==
+asks: 1505.00x10 1500.00x10 | bids:
+== 2. buy 12 @ 1510.00 ==
+trade 10 @ 1500.00 (buy #4 x sell #1)
+trade 2 @ 1505.00 (buy #4 x sell #2)
+asks: 1505.00x8 | bids:
+== 3. bid that does not cross rests; cancel it ==
+asks: 1505.00x8 | bids: 1490.00x4
+== 4. market sell 3 into an empty bid side ==
+market sell cancelled, filled 0
+== 5. market buy 10 takes 8, rest cancelled ==
+trade 3 @ 1505.00 (buy #7 x sell #2)
+trade 5 @ 1505.00 (buy #7 x sell #3)
+volume traded = 20, last price = 1505.00
+All checks passed</code></pre>
+    </div>
+  </div>

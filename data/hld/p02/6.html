@@ -1,0 +1,124 @@
+
+        <h2>In the interview</h2>
+        <h3>Phrases that land well</h3>
+        <ul>
+          <li>"The race is read-check-write. I'll make the check part of the write: <code>UPDATE ... WHERE available &gt; 0</code> and check rows affected."</li>
+          <li>"Payment takes minutes, so I'll split reserve and confirm, with a hold that expires. Expiry is checked in the write itself."</li>
+          <li>"Is this lock for efficiency or correctness? If correctness, I need fencing tokens or the DB's own atomicity."</li>
+          <li>"For a hot SKU, the bottleneck is one row. I'll put a waiting room in front and split the stock into shards."</li>
+        </ul>
+        <h3>Traps</h3>
+        <ul>
+          <li>Reaching for Redlock first. Interviewers will ask about GC pauses and clock drift.</li>
+          <li>Holding a database transaction open across a payment call or user think-time.</li>
+          <li>Using OCC for a flash sale (999 of 1,000 requests retry).</li>
+          <li>Forgetting idempotency: a retried "confirm" must not book twice. Use an <a href="{{BASE}}interview/glossary#idempotency-key">idempotency key</a>: a unique id the client chooses per attempt, which the server stores with the first result so a retry gets that same result back (see <a href="{{BASE}}hld/hld-06">idempotency keys</a>).</li>
+          <li>Relying on a cron job to release holds on time; correctness should not depend on it.</li>
+        </ul>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon,Flipkart,Uber">
+          <summary>Two users click "book" on the last seat at the same time. How do you guarantee only one wins?</summary>
+          <div class="answer">
+            <p>Make the check and the write one atomic statement: <code>UPDATE seats SET status='BOOKED', user=? WHERE seat_id=? AND status='AVAILABLE'</code>, then check rows affected (1 = won, 0 = lost). Or insert into a bookings table with <code>UNIQUE(show_id, seat_id)</code>. Both rely on the database's row-level atomicity, so no extra lock service is needed. If the flow includes payment, use a hold with expiry first (AVAILABLE to HELD to BOOKED).</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the race in one sentence, give the one-line SQL fix, then extend to holds and to scale only if asked.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the user picks 4 seats? (All-or-nothing: one transaction, or a Lua script in Redis.)</li><li>What isolation level do you need for this statement?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Amazon,Microsoft">
+          <summary>Optimistic vs pessimistic locking: when would you pick each?</summary>
+          <div class="answer">
+            <p>Pessimistic (<code>SELECT ... FOR UPDATE</code>) locks rows up front; others wait. Good when conflicts are frequent and the transaction is short, since waiting is cheaper than redoing work. Optimistic reads a version, writes with <code>WHERE version = ?</code>, and retries on conflict. Good when conflicts are rare and you want no lock waits or deadlocks, including across HTTP requests (store the version in the form). Under heavy conflict OCC causes retry storms, and pessimistic locking causes queues; then change the design (holds, queues, <a href="{{BASE}}interview/glossary#sharding">sharding</a>).</p>
+            <div class="approach"><h5>How to answer</h5><p>Define both in one line each, give the "conflict rate" rule, then a concrete example of each.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the ABA problem and how do versions fix it?</li><li>How do you avoid deadlocks with pessimistic locks? (Lock in a fixed order; keep transactions short; use timeouts.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Amazon,Flipkart">
+          <summary>How do you hold a seat for 10 minutes while the user pays, without double booking or leaking seats?</summary>
+          <div class="answer">
+            <p>Add <code>status</code>, <code>held_by</code> and <code>hold_expires_at</code>. Take the hold with a conditional update that treats "HELD but expired" as free. On payment success, a conditional update moves HELD to BOOKED only if <code>held_by</code> matches and the hold has not expired (otherwise refund). Abandoned holds expire on their own; a sweeper only tidies. Alternative: Redis <code>SET NX EX 600</code> per seat, with the database still making the final BOOKED write conditionally. Use the payment's idempotency key so a retried confirm is safe.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the three-state machine, then walk the success, timeout and late-payment paths.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Payment succeeds one second after the hold expired and someone else holds the seat. What now?</li><li>How long should the TTL be, and who decides?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft,Uber">
+          <summary>Is a Redis lock safe? What can go wrong?</summary>
+          <div class="answer">
+            <p>For efficiency, yes. For correctness, not by itself. A holder can pause (GC, page fault, SIGSTOP) past the lease, another client takes the lock, and both act. Failover to a replica that did not get the key also loses the lock, and Redlock depends on bounded clock drift and timing. Kleppmann's fix is a fencing token: an increasing number from the lock service that the storage checks, rejecting older tokens. Redlock does not give one, so for correctness use ZooKeeper or etcd (where a zxid or revision can serve as a token) or rely on the database's own atomic writes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Ask "efficiency or correctness?", then tell the 33/34 story.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why must the lock value be random, and why release with compare-and-delete?</li><li>What if the storage cannot check tokens (a third-party API)?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart,Amazon,Walmart">
+          <summary>Big Billion Days: 1 million users want 10,000 phones in the first minute. Design the stock decrement.</summary>
+          <div class="answer">
+            <p>First shrink the crowd: CDN-served page, bot filtering, a virtual waiting room that admits users at the rate checkout can handle (Shopify's edge leaky bucket, admitting a fixed number per 5 s with a signed token). Then make the decrement cheap and atomic: stock in Redis, <code>DECR</code> (or a Lua check-and-decrement), split across 10 shard keys of 1,000 units to avoid one hot key. A winner gets a hold with a TTL and an order event goes to Kafka; order and payment services process at their own pace. Unpaid holds expire and return stock. Reconcile Redis with the database after the sale.</p>
+            <div class="approach"><h5>How to answer</h5><p>Funnel first (protect), then the atomic decrement (correctness), then async processing and stock return (resilience).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Redis fails mid-sale. Do you oversell or undersell?</li><li>How do you make the queue fair? (Shopify Part II: first-attempt timestamp in a signed cookie.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Inventory updates for the same item come from 10 sources at once. How do you avoid lost updates without locks?</summary>
+          <div class="answer">
+            <p>Serialise per key: publish every event to Kafka keyed by item+store so all events for that key land in one partition and one consumer applies them in order. Walmart's inventory system does exactly this to stop two threads updating the same item-store. Make each event idempotent (event id dedupe) and apply deltas (debit/credit) rather than absolute values. Align the database partition key with the Kafka key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "single writer per key" and explain why it removes the race instead of guarding it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens during a consumer-group rebalance?</li><li>One item is 100x hotter than others. Now what?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Uber">
+          <summary>Many workers poll a jobs table. How do you make sure each job is claimed once?</summary>
+          <div class="answer">
+            <p>Claim with <code>SELECT ... FROM jobs WHERE status='READY' ORDER BY run_at LIMIT 10 FOR UPDATE SKIP LOCKED</code>, then set status to RUNNING with a lease expiry and worker id in the same transaction. <code>SKIP LOCKED</code> lets each worker grab different rows instead of queueing on the same ones. If a worker dies, the lease expires and another worker reclaims the job, so the job itself must be idempotent.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name SKIP LOCKED, the lease, and idempotency; that covers claim, crash and retry.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>When would you move from a table to a queue like SQS or Kafka?</li><li>How do you stop a slow worker and the reclaimer both running the job?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Two users book Airbnb dates that overlap but are not identical. How do you prevent the overlap?</summary>
+          <div class="answer">
+            <p>Model inventory per listing per night (one row per date), and book a stay by conditionally updating every night in one transaction, locking rows in date order; if any night is taken, roll back. PostgreSQL can also enforce it declaratively with an exclusion constraint on a date range per listing. Hotels with many identical rooms keep <code>total</code> and <code>booked</code> per room type per night and use <code>WHERE booked &lt; total</code> or OCC.</p>
+            <div class="approach"><h5>How to answer</h5><p>Turn ranges into discrete rows (or a range constraint), then apply rung 1 or 2.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show availability quickly in search without hitting these rows?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>A celebrity post gets 500,000 likes per minute and the counter row is the bottleneck. Fix it.</summary>
+          <div class="answer">
+            <p>Correctness here is easy (increments commute); the problem is throughput on one row. Split into N sub-counters (<code>post:42:shard:0..99</code>), increment a random shard, and sum on read (cache the sum for a second). Or buffer increments in memory or Kafka and apply one batched update per second. Keep per-user "did I like it" rows separately for idempotency.</p>
+            <div class="approach"><h5>How to answer</h5><p>Spot that it is throughput contention, not correctness, and say "shard the hot key, batch the writes".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many shards? Can you add shards dynamically?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Google">
+          <summary>Which isolation level stops the double-booking race?</summary>
+          <div class="answer">
+            <p>A single <code>UPDATE ... WHERE status='AVAILABLE'</code> is safe even at READ COMMITTED, because the row lock plus re-check on update decides the winner. The race reappears when you read in one statement and write in another: at READ COMMITTED both reads see "available". Fix it with <code>FOR UPDATE</code>, with SERIALIZABLE, or by moving the check into the write. Know how SERIALIZABLE behaves on your database: in PostgreSQL, SERIALIZABLE (SSI, serializable snapshot isolation) aborts one transaction with a serialization failure rather than blocking; MySQL InnoDB's SERIALIZABLE turns plain reads into shared locking reads, so transactions block and can deadlock instead. Either way, the app must retry. Saying that difference is a strong signal.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "one statement" from "read then write", then name the fix for each.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is write skew?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: oversold by 3%</h4>
+          <div class="situation"><p>After a flash sale, 10,300 orders exist for 10,000 phones. The code reads stock from Redis, checks it is above zero, then calls <code>DECR</code>.</p></div>
+          <div class="bad"><p>"Add a Redis lock around the read and the DECR."</p></div>
+          <div class="good"><p>The bug is read-check-write across two commands. Use the atomic result instead: call <code>DECR</code> and if the returned value is below zero, <code>INCR</code> back and reject; or one Lua script that checks and decrements. Then make order creation idempotent, reconcile Redis stock with the order DB after the sale, and add a test that fires thousands of concurrent buys at one SKU.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if Redis failed over during the sale and lost recent writes?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: deadlocks in the wallet service</h4>
+          <div class="situation"><p>Transfers A to B and B to A run at the same time and Postgres reports deadlocks several times a minute at peak.</p></div>
+          <div class="bad"><p>"Retry on deadlock."</p></div>
+          <div class="good"><p>Retrying is a band-aid. Lock both accounts in a fixed global order (lower account id first) in every code path, keep the transaction short (no remote calls inside), and set a <code>lock_timeout</code>. For very hot accounts (a merchant receiving millions of payments), stop updating one balance row: append ledger entries and compute or roll up balances asynchronously.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does this change when the two accounts are on different shards? (See <a href="{{BASE}}hld/p03">sagas</a>.)</li></ul></div>
+        </div>
+      

@@ -1,0 +1,133 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Turning counts into a stable multiplier</h3>
+        <p>Raw <code>demand / supply</code> per cell per minute is noisy: one cell might have 3 requests and 0 drivers this minute, giving an infinite ratio. A production design layers several controls. Uber has not published its formula, so present these as a reasonable design, not as Uber's exact method:</p>
+        <ol class="steps">
+          <li><strong>Spatial smoothing</strong> Blend each cell with its ring of 6 neighbours (H3 <code>gridDisk(cell, 1)</code>). Drivers 300 m away are real supply. Hexagons make this one uniform weight.</li>
+          <li><strong>Sparse roll-up</strong> If a cell has fewer than N events, use its parent cell's ratio (res 8 to res 7).</li>
+          <li><strong>Temporal smoothing</strong> Exponentially weighted moving average: <code>s_t = a * r_t + (1 - a) * s_(t-1)</code>, so a single spike does not flip the price.</li>
+          <li><strong>Curve and caps</strong> Map the smoothed ratio to a multiplier with a monotonic curve, floor at 1.0, cap per city or by regulation, and round to steps (1.1, 1.2...).</li>
+          <li><strong>Hysteresis</strong> Raise quickly, lower slowly (or need the ratio to drop below a lower threshold), so prices do not flap every minute.</li>
+          <li><strong>Forecast</strong> A model can add predicted demand (concert ends at 22:00) so supply is nudged before the spike.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Feedback loop: surge raises price, which reduces demand and attracts supply, which lowers surge">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box queue" x="320" y="20" width="160" height="56"/>
+            <text class="label" x="400" y="42">Surge up</text>
+            <text class="label small" x="400" y="62">multiplier 1.0 -&gt; 1.6</text>
+            <rect class="box client" x="570" y="100" width="200" height="56"/>
+            <text class="label" x="670" y="122">Demand falls</text>
+            <text class="label small" x="670" y="142">some riders wait</text>
+            <rect class="box k8s" x="320" y="170" width="160" height="56"/>
+            <text class="label" x="400" y="192">Supply rises</text>
+            <text class="label small" x="400" y="212">drivers move in</text>
+            <rect class="box svc" x="30" y="100" width="200" height="56"/>
+            <text class="label" x="130" y="122">Ratio drops</text>
+            <text class="label small" x="130" y="142">surge comes down</text>
+            <path class="arrow" d="M480 50 L600 98"/>
+            <path class="arrow" d="M600 158 L482 198"/>
+            <path class="arrow" d="M320 198 L200 158"/>
+            <path class="arrow" d="M200 98 L318 50"/>
+            <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M480 50 L600 100 L600 156 L480 198 L320 198 L200 156 L200 100 L320 50 Z"/></circle>
+          </svg>
+          <figcaption>Surge is a closed control loop. Uber's paper describes it as reducing rider demand and encouraging drivers to "drive during certain hours and locations". Too much gain makes the loop oscillate, which is why smoothing and hysteresis matter.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is congestion control. The EWMA is the same trick as TCP's smoothed RTT estimator. Hysteresis is like a link-flap dampening timer, and "raise fast, lower slowly" is the mirror of TCP's additive-increase / multiplicative-decrease. A controller with too much gain and too much delay oscillates, whether it controls a window size or a price.</p>
+        </div>
+
+        <h3>2. Freshness over consistency in the stream</h3>
+        <ul>
+          <li><b>Event time, not arrival time.</b> Windows use the timestamp from the phone. A watermark (event time minus allowed lateness, say 10 s) closes each window. Events behind the watermark are dropped. Uber: "late-arriving messages do not contribute to the surge computation".</li>
+          <li><b>Lossy-but-fast Kafka.</b> Using <code>acks=1</code> and a throughput-tuned cluster is acceptable because the next ping replaces the lost one in 5 s. Compare payments, where you would use <code>acks=all</code> and idempotent producers (<a href="{{BASE}}devops/kafka-06">Delivery semantics</a>).</li>
+          <li><b>Deduplicate supply.</b> Count distinct drivers per cell per window, not pings (a driver sends 12 pings a minute). Use a set of driver ids per cell, or HyperLogLog if cardinality is large (<a href="{{BASE}}hld/hld-12">Big Data &amp; Streaming</a>).</li>
+          <li><b>Hot cells.</b> A stadium cell gets a burst of events. Pre-aggregate in a combiner before the keyed shuffle (local counts per task, then merge), the same trick as in <a href="{{BASE}}hld/d21">Ad Click Aggregator</a>.</li>
+        </ul>
+
+        <h3>3. Multi-region: active-active without replicating state</h3>
+        <p>Uber's paper describes the disaster-recovery design. Trip events go to <b>regional</b> Kafka clusters, then are replicated into <b>aggregate</b> clusters that hold the global view. <b>Every region runs the same large-memory Flink job</b> on the same aggregate input, so every region computes the same state. An all-active coordinator marks one region's "update service" as primary; only the primary writes results to an active/active database. If that region fails, the coordinator promotes another region, whose Flink job is already warm.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Regional Kafka feeds aggregate Kafka; each region runs Flink; only the primary update service writes to the active-active DB">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone kafka" x="20" y="20" width="370" height="230"/>
+            <text class="zone-label" x="32" y="42">Region A (primary)</text>
+            <rect class="zone k8s" x="410" y="20" width="370" height="230"/>
+            <text class="zone-label" x="422" y="42">Region B (standby compute)</text>
+            <rect class="box kafka" x="40" y="60" width="150" height="44"/>
+            <text class="label small" x="115" y="82">regional Kafka</text>
+            <rect class="box kafka" x="220" y="60" width="150" height="44"/>
+            <text class="label small" x="295" y="82">aggregate Kafka</text>
+            <rect class="box queue" x="220" y="125" width="150" height="44"/>
+            <text class="label small" x="295" y="147">Flink surge job</text>
+            <rect class="box svc hot" x="220" y="190" width="150" height="44"/>
+            <text class="label small" x="295" y="212">update svc: PRIMARY</text>
+            <rect class="box kafka" x="430" y="60" width="150" height="44"/>
+            <text class="label small" x="505" y="82">regional Kafka</text>
+            <rect class="box kafka" x="610" y="60" width="150" height="44"/>
+            <text class="label small" x="685" y="82">aggregate Kafka</text>
+            <rect class="box queue" x="610" y="125" width="150" height="44"/>
+            <text class="label small" x="685" y="147">Flink surge job</text>
+            <rect class="box svc ghost" x="610" y="190" width="150" height="44"/>
+            <text class="label small" x="685" y="212">update svc: idle</text>
+            <path class="arrow" d="M190 82 L212 82"/>
+            <path class="arrow" d="M580 82 L602 82"/>
+            <path class="arrow" d="M190 90 L602 90"/>
+            <path class="arrow" d="M580 74 L378 74"/>
+            <path class="arrow" d="M295 104 L295 118"/>
+            <path class="arrow" d="M685 104 L685 118"/>
+            <path class="arrow" d="M295 169 L295 183"/>
+            <path class="arrow dashed" d="M685 169 L685 183"/>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M190 90 L602 90"/></circle>
+          </svg>
+          <figcaption>Both regions compute; one writes. Flink state is too large to replicate synchronously, so Uber recomputes it in each region from identical aggregate input and lets it converge.</figcaption>
+        </figure>
+        <p>The trade-off is cost: you run redundant pipelines everywhere. The paper contrasts this with an active/passive consumer mode for jobs that can tolerate a slower failover. See <a href="{{BASE}}hld/hld-13">Reliability, Multi-Region &amp; DR</a>.</p>
+
+        <h3>4. ETA: routing engine plus an ML residual</h3>
+        <p>Uber's routing post tells the history, and it is a great interview story:</p>
+        <ul>
+          <li><b>Road graph:</b> intersections are nodes, road segments are edges, weights are travel time. Plain Dijkstra is too slow in production.</li>
+          <li><b>Contraction hierarchies</b> (used by OSRM) answer in a few ms by preprocessing, but rebuilding the world graph took about <b>12 hours</b>, so live traffic could not be used. Even dynamic re-weighting took about <b>10 minutes</b> when 10% of segments changed. Too slow.</li>
+          <li><b>A*</b> handles live weights with no preprocessing and is fine for short pickup trips, but a cross-city route took ~120 ms.</li>
+          <li><b>Uber's answer (Gurafu, 2015):</b> split the graph into layers of small, relatively independent cells, and rerun preprocessing only for the cells whose traffic changed, in parallel. Result: hundreds of thousands of ETA requests per second at single-digit ms. (This is the idea behind customizable route planning.)</li>
+          <li><b>Live speeds</b> come from map-matching drivers' GPS traces to road segments and aggregating speeds per segment (Uber's historical traffic system was called Flux).</li>
+        </ul>
+        <p>Then the ML layer. The DeepETA post says the routing engine is the "physical model", and an ML model predicts the <b>residual</b> (real arrival time minus routing ETA) from origin, destination, time, live traffic and request type. Uber first used one of the largest XGBoost ensembles, then moved to a deep model with a <b>linear transformer</b> encoder. To stay within "a few milliseconds", it discretises every input and looks up embeddings (lat/lng are hashed into multi-resolution grids), so one prediction touches only about <b>0.25%</b> of hundreds of millions of parameters. It trains with an <b>asymmetric Huber loss</b> so a business can say "being late is worse than being early". Requests go through <b>uRoute</b> (routing front end) to the routing engine and then to Michelangelo online prediction.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="ETA equals routing engine ETA plus ML predicted residual">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="70" width="130" height="60"/>
+            <text class="label" x="85" y="92">Request</text>
+            <text class="label small" x="85" y="114">A -&gt; B, 18:40</text>
+            <rect class="box svc" x="190" y="70" width="130" height="60"/>
+            <text class="label" x="255" y="92">uRoute</text>
+            <text class="label small" x="255" y="114">front end</text>
+            <rect class="box cache" x="360" y="20" width="180" height="60"/>
+            <text class="label" x="450" y="42">Routing engine</text>
+            <text class="label small" x="450" y="62">route ETA = 900 s</text>
+            <rect class="box queue" x="360" y="120" width="180" height="60"/>
+            <text class="label" x="450" y="142">ML residual model</text>
+            <text class="label small" x="450" y="162">predicts +130 s</text>
+            <rect class="box k8s" x="600" y="70" width="180" height="60"/>
+            <text class="label" x="690" y="92">Final ETA</text>
+            <text class="label small" x="690" y="114">900 + 130 = 1,030 s</text>
+            <path class="arrow" d="M150 100 L182 100"/>
+            <path class="arrow" d="M320 90 L352 55"/>
+            <path class="arrow" d="M450 80 L450 112"/>
+            <path class="arrow" d="M540 150 L592 110"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M150 100 L190 100 L320 100 L360 50 L450 80 L450 120 L540 150 L600 100"/></circle>
+          </svg>
+          <figcaption>Hybrid ETA: physics first, learning second. Changing the ML model is easier than refactoring the routing engine, which is why Uber calls this "ETA post-processing".</figcaption>
+        </figure>
+
+        <h3>5. Price lock, fairness and auditing</h3>
+        <ul>
+          <li><b>Quote = contract.</b> Store quote id, price, surge version, route ETA with a TTL. Booking reads the quote strongly (single-key read); if expired, re-quote.</li>
+          <li><b>Idempotent booking.</b> Idempotency key so a double tap does not create two rides (<a href="{{BASE}}hld/d10">Payment System</a>).</li>
+          <li><b>Audit trail.</b> Persist every published surge snapshot (cell, multiplier, inputs) to the lake so you can explain any price later and train better models.</li>
+          <li><b>Guardrails.</b> Caps during emergencies, kill switch per city, alerts when a city's average multiplier jumps unusually.</li>
+        </ul>
+      

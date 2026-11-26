@@ -1,0 +1,42 @@
+
+  <h2>Subsystem boundaries: the kernel as a coupling lesson</h2>
+  <p>The Linux kernel is a large system that stays workable largely because of where it puts its boundaries. Read it as a coupling diagram:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 1000 380" role="img" aria-label="Linux layering as a coupling example: syscall ABI, subsystems, ops tables, drivers"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker><marker id="arrow-tri" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse"><path d="M1,1 L11,6 L1,11 z" style="fill:var(--surface);stroke:var(--svg-arrow);stroke-width:1.4"/></marker><marker id="arrow-dia" viewBox="0 0 16 10" refX="1" refY="5" markerWidth="14" markerHeight="9" orient="auto"><path d="M1,5 L8,1 L15,5 L8,9 z" style="fill:var(--svg-arrow);stroke:var(--svg-arrow)"/></marker><marker id="arrow-odia" viewBox="0 0 16 10" refX="1" refY="5" markerWidth="14" markerHeight="9" orient="auto"><path d="M1,5 L8,1 L15,5 L8,9 z" style="fill:var(--surface);stroke:var(--svg-arrow);stroke-width:1.4"/></marker></defs><rect class="zone" x="10" y="10" width="980" height="90" rx="14"/><text class="zone-label" x="500" y="30" style="text-anchor:middle">USER SPACE: only the syscall ABI is visible (never breaks)</text><rect class="box client" x="60" y="45" width="200" height="40"/><text class="label" x="160" y="65">read(fd, buf, n)</text><rect class="box client" x="400" y="45" width="200" height="40"/><text class="label" x="500" y="65">ioctl / sendmsg</text><rect class="box client" x="740" y="45" width="200" height="40"/><text class="label" x="840" y="65">/proc, /sys files</text><rect class="box k8s solid" x="10" y="115" width="980" height="36"/><text class="label white" x="500" y="133">system call layer (controller + stable boundary)</text><rect class="box svc" x="60" y="170" width="270" height="60"/><text class="label" x="195" y="200">VFS core</text><rect class="box svc" x="365" y="170" width="270" height="60"/><text class="label" x="500" y="200">socket layer</text><rect class="box svc" x="670" y="170" width="270" height="60"/><text class="label" x="805" y="200">block layer</text><rect class="box db solid" x="60" y="250" width="880" height="34"/><text class="label white" x="500" y="267">ops tables: file_operations, proto_ops, blk_mq_ops (the narrow seams)</text><rect class="box client" x="60" y="305" width="112" height="40"/><text class="label" x="116" y="325">ext4</text><rect class="box client" x="188" y="305" width="112" height="40"/><text class="label" x="244" y="325">xfs</text><rect class="box client" x="316" y="305" width="112" height="40"/><text class="label" x="372" y="325">procfs</text><rect class="box client" x="444" y="305" width="112" height="40"/><text class="label" x="500" y="325">tcp</text><rect class="box client" x="572" y="305" width="112" height="40"/><text class="label" x="628" y="325">udp</text><rect class="box client" x="700" y="305" width="112" height="40"/><text class="label" x="756" y="325">nvme</text><rect class="box client" x="828" y="305" width="112" height="40"/><text class="label" x="884" y="325">virtio-blk</text><text class="label small" x="500" y="370">Each driver depends on one ops table, not on the other drivers: data coupling across the boundary, functional cohesion inside.</text></svg>
+    <figcaption>Stable seams at two places (the syscall ABI and the ops tables) keep thousands of drivers from depending on each other.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><strong>The syscall ABI</strong> is the most stable seam. User programs see <code>read()</code>, never VFS internals. The kernel guarantees not to break it, so millions of programs can stay coupled to it at data level.</li>
+    <li><strong>Subsystems</strong> (VFS, sockets, block) are each functionally cohesive: all file-ish logic is in VFS, all socket logic in the socket layer.</li>
+    <li><strong>Ops tables</strong> (<code>file_operations</code>, <code>proto_ops</code>, <code>blk_mq_ops</code>) are the narrow seams between a subsystem and its implementations. ext4 and xfs both depend on the VFS contract, never on each other.</li>
+    <li><strong>Exported symbols</strong> (<code>EXPORT_SYMBOL_GPL</code>) are the explicit list of what a module may touch. Anything not exported cannot be coupled to from a module - a compile-and-link-time coupling limit.</li>
+    <li><strong>Inside a subsystem</strong>, coupling is allowed to be tighter on purpose: internal APIs change freely, and the person changing them fixes all callers in the same patch. That is a deliberate trade: low coupling where code is owned by many teams, tighter coupling where one team owns both sides.</li>
+  </ol>
+  <p>The same driver written both ways, in plain C (<code>lld-code/lld-prin-coupling/coupling.c</code>, builds with <code>gcc -std=c99 -Wall</code>):</p>
+<pre><code class="language-c">struct e1000_priv { int tx_ring_used; int tx_ring_size; char name[16]; };
+
+/* TIGHT (content coupling): core reads the driver's private layout */
+static int core_can_send_tight(struct e1000_priv *p) {
+    return p-&gt;tx_ring_used &lt; p-&gt;tx_ring_size;   /* breaks when the driver changes */
+}
+
+/* LOOSE: core knows only a two-function contract */
+struct netdev;
+struct netdev_ops {
+    int (*can_send)(struct netdev *dev);
+    int (*xmit)(struct netdev *dev, const char *frame, int len);
+};
+struct netdev { const struct netdev_ops *ops; void *priv; };
+
+static int core_send_loose(struct netdev *dev, const char *frame) {
+    if (!dev-&gt;ops-&gt;can_send(dev)) return -1;       /* -EBUSY in the real kernel */
+    return dev-&gt;ops-&gt;xmit(dev, frame, (int)strlen(frame));
+}</code></pre>
+<pre class="terminal"><code>$ gcc -std=c99 -Wall -o coupling coupling.c &amp;&amp; ./coupling
+tight check says can send: 1
+  eth0: sent 3 bytes (ARP), ring 1/2
+loose send 1 -&gt; 0
+  eth0: sent 4 bytes (PING), ring 2/2
+loose send 2 -&gt; 0
+loose send 3 -&gt; -1 (ring full)</code></pre>
+  <div class="bridge"><h4>From your world</h4><p>The <code>void *priv</code> plus <code>container_of()</code> idiom is the C way of keeping a driver's private state private: the core holds an opaque pointer and never dereferences it. In Java or C++ the same effect comes from <code>private</code> fields and an interface type. Same idea, enforced by the compiler instead of by review.</p></div>

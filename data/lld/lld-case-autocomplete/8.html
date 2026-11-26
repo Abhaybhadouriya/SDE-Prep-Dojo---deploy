@@ -1,0 +1,476 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language for Java and C++, a module plus a driver for Python. In a real round, split Java into <code>autocomplete/</code> (Entry, TrieNode, RankingStrategy and implementations, AutocompleteEngine, TypingSession) and <code>router/</code> (PathTrie, RouteMatch), and write JUnit tests; Atlassian explicitly expects tests. The same files live in <code>lld-code/lld-case-autocomplete/</code> in this repo; each was compiled and run, and the output below is real. The demo includes a randomised check that the cached engine always returns exactly what a full scan returns, including after removals. In C++ one mutex per engine and per router guards every public call (Java uses a read-write lock; the C++14 equivalent is <code>std::shared_timed_mutex</code>, since <code>std::shared_mutex</code> is C++17). The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>).</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+// =====================================================================
+// Part 1: autocomplete - trie + top-k + ranking Strategy
+// =====================================================================
+
+/** One stored phrase. Mutated only under the engine's write lock. */
+final class Entry {
+    final String text;
+    long count;
+    long lastUsed;      // logical clock, so tests are deterministic
+    Entry(String text) { this.text = text; }
+}
+
+/** What callers get back: an immutable snapshot. */
+record Suggestion(String text, long count) {
+    @Override public String toString() { return text + "(" + count + ")"; }
+}
+
+/** Strategy: orders entries, best first. Scores may only go UP when a phrase is recorded. */
+interface RankingStrategy extends Comparator&lt;Entry&gt; {
+    String name();
+}
+
+final class ByFrequency implements RankingStrategy {
+    public String name() { return "frequency"; }
+    public int compare(Entry a, Entry b) {
+        int c = Long.compare(b.count, a.count);
+        return c != 0 ? c : a.text.compareTo(b.text);        // ties: alphabetical (LeetCode 642 rule)
+    }
+}
+
+final class ByRecency implements RankingStrategy {
+    public String name() { return "recency"; }
+    public int compare(Entry a, Entry b) {
+        int c = Long.compare(b.lastUsed, a.lastUsed);
+        return c != 0 ? c : a.text.compareTo(b.text);
+    }
+}
+
+final class TrieNode {
+    final TreeMap&lt;Character, TrieNode&gt; children = new TreeMap&lt;&gt;();
+    Entry entry;                 // non-null when a phrase ends here
+    List&lt;Entry&gt; topK;            // cached best k of this subtree (cache mode only)
+}
+
+final class AutocompleteEngine {
+    private final TrieNode root = new TrieNode();
+    private final RankingStrategy rank;
+    private final int k;
+    private final boolean cacheTopK;
+    private final ReadWriteLock rw = new ReentrantReadWriteLock();
+    private long clock = 0;
+
+    AutocompleteEngine(RankingStrategy rank, int k, boolean cacheTopK) {
+        if (k &lt; 1) throw new IllegalArgumentException("k must be &gt;= 1");
+        this.rank = rank; this.k = k; this.cacheTopK = cacheTopK;
+    }
+
+    /** Lower case, single spaces; a phrase is also trimmed. */
+    static String normalize(String s, boolean trimEnd) {
+        if (s == null) return "";
+        String t = s.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").replaceAll("^ ", "");
+        return trimEnd ? t.trim() : t;
+    }
+
+    void record(String phrase) { record(phrase, 1); }
+
+    void record(String phrase, long times) {
+        String p = normalize(phrase, true);
+        if (p.isEmpty()) throw new IllegalArgumentException("empty phrase");
+        if (times &lt; 1) throw new IllegalArgumentException("times must be &gt;= 1");
+        rw.writeLock().lock();
+        try {
+            List&lt;TrieNode&gt; path = new ArrayList&lt;&gt;();
+            TrieNode n = root;
+            path.add(n);
+            for (char c : p.toCharArray()) {
+                n = n.children.computeIfAbsent(c, x -&gt; new TrieNode());
+                path.add(n);
+            }
+            if (n.entry == null) n.entry = new Entry(p);
+            n.entry.count += times;
+            n.entry.lastUsed = ++clock;
+            if (cacheTopK) for (TrieNode node : path) offer(node, n.entry);
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    // The recorded entry's score only went up and nobody else's changed, so
+    // "move it in, re-sort, drop the (k+1)th" keeps every cache on the path exact.
+    private void offer(TrieNode node, Entry e) {
+        if (node.topK == null) node.topK = new ArrayList&lt;&gt;();
+        node.topK.remove(e);
+        node.topK.add(e);
+        node.topK.sort(rank);
+        if (node.topK.size() &gt; k) node.topK.remove(k);
+    }
+
+    /** Removing breaks "scores only go up", so the caches on the path are rebuilt bottom-up from the children. */
+    boolean remove(String phrase) {
+        String p = normalize(phrase, true);
+        rw.writeLock().lock();
+        try {
+            List&lt;TrieNode&gt; path = new ArrayList&lt;&gt;();
+            TrieNode n = root;
+            path.add(n);
+            for (char c : p.toCharArray()) {
+                n = n.children.get(c);
+                if (n == null) return false;
+                path.add(n);
+            }
+            if (n.entry == null) return false;
+            n.entry = null;
+            for (int i = path.size() - 1; i &gt;= 1; i--) {          // prune empty leaves
+                TrieNode child = path.get(i);
+                if (child.entry == null &amp;&amp; child.children.isEmpty()) path.get(i - 1).children.remove(p.charAt(i - 1));
+                else break;
+            }
+            if (cacheTopK) for (int i = path.size() - 1; i &gt;= 0; i--) rebuild(path.get(i));
+            return true;
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    private void rebuild(TrieNode node) {
+        List&lt;Entry&gt; all = new ArrayList&lt;&gt;();
+        if (node.entry != null) all.add(node.entry);
+        for (TrieNode ch : node.children.values()) if (ch.topK != null) all.addAll(ch.topK);
+        all.sort(rank);
+        node.topK = new ArrayList&lt;&gt;(all.subList(0, Math.min(k, all.size())));
+    }
+
+    List&lt;Suggestion&gt; suggest(String prefix) {
+        String p = normalize(prefix, false);
+        rw.readLock().lock();
+        try {
+            TrieNode n = root;
+            for (char c : p.toCharArray()) {
+                n = n.children.get(c);
+                if (n == null) return List.of();
+            }
+            List&lt;Entry&gt; best = cacheTopK ? (n.topK == null ? List.of() : n.topK) : topKByScan(n);
+            List&lt;Suggestion&gt; out = new ArrayList&lt;&gt;();
+            for (Entry e : best) out.add(new Suggestion(e.text, e.count));
+            return out;
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    /** No cache: walk the whole subtree, keep the best k in a heap whose head is the worst kept. */
+    private List&lt;Entry&gt; topKByScan(TrieNode start) {
+        PriorityQueue&lt;Entry&gt; heap = new PriorityQueue&lt;&gt;(rank.reversed());
+        Deque&lt;TrieNode&gt; stack = new ArrayDeque&lt;&gt;();
+        stack.push(start);
+        while (!stack.isEmpty()) {
+            TrieNode n = stack.pop();
+            if (n.entry != null) {
+                heap.offer(n.entry);
+                if (heap.size() &gt; k) heap.poll();
+            }
+            for (TrieNode ch : n.children.values()) stack.push(ch);
+        }
+        List&lt;Entry&gt; out = new ArrayList&lt;&gt;(heap);
+        out.sort(rank);
+        return out;
+    }
+
+    TypingSession session() { return new TypingSession(this); }
+    String describe() { return rank.name() + ", k=" + k + (cacheTopK ? ", cached top-k" : ", scan"); }
+}
+
+/** LeetCode 642 style: characters arrive one by one; '#' ends the sentence and records it. */
+final class TypingSession {
+    private final AutocompleteEngine engine;
+    private final StringBuilder typed = new StringBuilder();
+    TypingSession(AutocompleteEngine engine) { this.engine = engine; }
+
+    List&lt;Suggestion&gt; type(char c) {
+        if (c == '#') {
+            engine.record(typed.toString());
+            typed.setLength(0);
+            return List.of();
+        }
+        typed.append(c);
+        return engine.suggest(typed.toString());
+    }
+}
+
+// =====================================================================
+// Part 2: wildcard router (Atlassian "middleware router") and wildcard get
+// =====================================================================
+
+final class RouteMatch&lt;V&gt; {
+    final V value;
+    final String pattern;
+    final Map&lt;String, String&gt; params;
+    RouteMatch(V value, String pattern, Map&lt;String, String&gt; params) { this.value = value; this.pattern = pattern; this.params = params; }
+    @Override public String toString() { return value + " via " + pattern + (params.isEmpty() ? "" : " " + params); }
+}
+
+/**
+ * A trie keyed by path segment.
+ *   put("/users/:id", v)   literal, ":name" (one segment, captured), "*" (one segment), "**" (rest, last only)
+ *   match("/users/42")     concrete path against stored patterns; literal beats :param beats * beats **
+ *   findAll("/team/*\/lead") wildcard query against stored plain keys (the KV follow-up)
+ */
+final class PathTrie&lt;V&gt; {
+    private static final class Node&lt;V&gt; {
+        final TreeMap&lt;String, Node&lt;V&gt;&gt; literal = new TreeMap&lt;&gt;();
+        Node&lt;V&gt; param; String paramName;
+        Node&lt;V&gt; star, globstar;
+        V value; String pattern;
+    }
+
+    private final Node&lt;V&gt; root = new Node&lt;&gt;();
+    private final ReadWriteLock rw = new ReentrantReadWriteLock();
+
+    static List&lt;String&gt; segments(String path) {
+        if (path == null || !path.startsWith("/")) throw new IllegalArgumentException("path must start with /: " + path);
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        for (String s : path.split("/")) if (!s.isEmpty()) out.add(s);    // "/a//b/" == "/a/b"
+        return out;
+    }
+
+    void put(String pattern, V value) {
+        List&lt;String&gt; segs = segments(pattern);
+        String norm = "/" + String.join("/", segs);
+        rw.writeLock().lock();
+        try {
+            Node&lt;V&gt; n = root;
+            for (int i = 0; i &lt; segs.size(); i++) {
+                String s = segs.get(i);
+                if (s.equals("**")) {
+                    if (i != segs.size() - 1) throw new IllegalArgumentException("** must be the last segment: " + pattern);
+                    if (n.globstar == null) n.globstar = new Node&lt;&gt;();
+                    n = n.globstar;
+                } else if (s.equals("*")) {
+                    if (n.star == null) n.star = new Node&lt;&gt;();
+                    n = n.star;
+                } else if (s.startsWith(":")) {
+                    String name = s.substring(1);
+                    if (name.isEmpty()) throw new IllegalArgumentException("empty parameter name: " + pattern);
+                    if (n.param == null) { n.param = new Node&lt;&gt;(); n.paramName = name; }
+                    else if (!n.paramName.equals(name))
+                        throw new IllegalArgumentException("conflict: :" + name + " vs :" + n.paramName + " in " + pattern);
+                    n = n.param;
+                } else {
+                    n = n.literal.computeIfAbsent(s, x -&gt; new Node&lt;&gt;());
+                }
+            }
+            if (n.value != null) throw new IllegalArgumentException("duplicate route " + norm + " (already " + n.pattern + ")");
+            n.value = value;
+            n.pattern = norm;
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    Optional&lt;RouteMatch&lt;V&gt;&gt; match(String path) {
+        List&lt;String&gt; segs = segments(path);
+        rw.readLock().lock();
+        try {
+            Map&lt;String, String&gt; params = new LinkedHashMap&lt;&gt;();
+            Node&lt;V&gt; hit = match(root, segs, 0, params);
+            return hit == null ? Optional.empty() : Optional.of(new RouteMatch&lt;&gt;(hit.value, hit.pattern, params));
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    // Depth-first with backtracking, most specific branch first.
+    private Node&lt;V&gt; match(Node&lt;V&gt; n, List&lt;String&gt; segs, int i, Map&lt;String, String&gt; params) {
+        if (i == segs.size()) {
+            if (n.value != null) return n;
+            if (n.globstar != null &amp;&amp; n.globstar.value != null) { params.put("**", ""); return n.globstar; }
+            return null;
+        }
+        String s = segs.get(i);
+        Node&lt;V&gt; lit = n.literal.get(s);
+        if (lit != null) {
+            Node&lt;V&gt; r = match(lit, segs, i + 1, params);
+            if (r != null) return r;
+        }
+        if (n.param != null) {
+            params.put(n.paramName, s);
+            Node&lt;V&gt; r = match(n.param, segs, i + 1, params);
+            if (r != null) return r;
+            params.remove(n.paramName);
+        }
+        if (n.star != null) {
+            Node&lt;V&gt; r = match(n.star, segs, i + 1, params);
+            if (r != null) return r;
+        }
+        if (n.globstar != null &amp;&amp; n.globstar.value != null) {
+            params.put("**", String.join("/", segs.subList(i, segs.size())));
+            return n.globstar;
+        }
+        return null;
+    }
+
+    /** KV follow-up: keys are plain paths, the QUERY has "*" for exactly one segment. Sorted by key. */
+    List&lt;String&gt; findAll(String query) {
+        List&lt;String&gt; segs = segments(query);
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        rw.readLock().lock();
+        try {
+            collect(root, segs, 0, out);
+        } finally {
+            rw.readLock().unlock();
+        }
+        return out;
+    }
+
+    private void collect(Node&lt;V&gt; n, List&lt;String&gt; segs, int i, List&lt;String&gt; out) {
+        if (i == segs.size()) {
+            if (n.value != null) out.add(n.pattern + "=" + n.value);
+            return;
+        }
+        String s = segs.get(i);
+        if (s.equals("*")) {
+            for (Node&lt;V&gt; ch : n.literal.values()) collect(ch, segs, i + 1, out);
+        } else {
+            Node&lt;V&gt; ch = n.literal.get(s);
+            if (ch != null) collect(ch, segs, i + 1, out);
+        }
+    }
+}
+
+// =====================================================================
+// Demo driver with assertions
+// =====================================================================
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+    static void expectError(Runnable r, String contains) {
+        try { r.run(); } catch (IllegalArgumentException e) {
+            System.out.println("  rejected: " + e.getMessage());
+            check(e.getMessage().contains(contains), "error mentions " + contains);
+            return;
+        }
+        throw new AssertionError("expected error: " + contains);
+    }
+    static void seed(AutocompleteEngine e) {
+        e.record("linux kernel", 5);
+        e.record("linked list", 3);
+        e.record("lint rules", 3);
+        e.record("linus torvalds", 2);
+        e.record("LRU   Cache", 4);              // normalised to "lru cache"
+        e.record("linux kernel modules", 1);
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("== autocomplete");
+        AutocompleteEngine freq = new AutocompleteEngine(new ByFrequency(), 3, true);
+        AutocompleteEngine recent = new AutocompleteEngine(new ByRecency(), 3, true);
+        seed(freq);
+        seed(recent);
+        System.out.println("  [" + freq.describe() + "] 'lin' -&gt; " + freq.suggest("lin"));
+        System.out.println("  [" + recent.describe() + "] 'lin' -&gt; " + recent.suggest("lin"));
+        check(freq.suggest("lin").toString().equals("[linux kernel(5), linked list(3), lint rules(3)]"), "frequency, ties alphabetical");
+        check(recent.suggest("lin").get(0).text().equals("linux kernel modules"), "recency puts the last one first");
+        System.out.println("  'LI' -&gt; " + freq.suggest("LI") + "   'xyz' -&gt; " + freq.suggest("xyz"));
+        check(freq.suggest("xyz").isEmpty(), "unknown prefix gives nothing");
+
+        System.out.println("== typing session (LeetCode 642 style)");
+        TypingSession t = freq.session();
+        for (char c : "lru cache#".toCharArray()) {
+            List&lt;Suggestion&gt; s = t.type(c);
+            if (c == 'l' || c == 'r' || c == '#') System.out.println("  typed '" + c + "' -&gt; " + s);
+        }
+        System.out.println("  'l' now -&gt; " + freq.suggest("l"));
+        check(freq.suggest("l").get(1).toString().equals("lru cache(5)"), "recorded via '#', tie broken alphabetically");
+
+        System.out.println("== remove 'linux kernel'");
+        check(freq.remove("linux kernel"), "removed");
+        check(!freq.remove("linux kernel"), "second remove is a no-op");
+        System.out.println("  'lin' -&gt; " + freq.suggest("lin") + "   'linux' -&gt; " + freq.suggest("linux"));
+        check(freq.suggest("linux").toString().equals("[linux kernel modules(1)]"), "longer phrase survives");
+
+        System.out.println("== cached top-k equals full scan (random workload)");
+        Random rnd = new Random(7);
+        String[] vocab = {"a", "ab", "abc", "abd", "b", "ba", "bab", "bad", "c", "ca", "cab", "cad", "dab", "dad"};
+        AutocompleteEngine cached = new AutocompleteEngine(new ByFrequency(), 3, true);
+        AutocompleteEngine scan = new AutocompleteEngine(new ByFrequency(), 3, false);
+        int mismatches = 0, ops = 2000;
+        for (int i = 0; i &lt; ops; i++) {
+            String w = vocab[rnd.nextInt(vocab.length)];
+            if (rnd.nextInt(10) == 0) { cached.remove(w); scan.remove(w); }
+            else { cached.record(w); scan.record(w); }
+            for (String p : new String[]{"", "a", "b", "ba", "c", "d"})
+                if (!cached.suggest(p).equals(scan.suggest(p))) mismatches++;
+        }
+        System.out.println("  " + ops + " ops, " + mismatches + " mismatches");
+        check(mismatches == 0, "cache matches scan");
+
+        System.out.println("== router");
+        PathTrie&lt;String&gt; r = new PathTrie&lt;&gt;();
+        r.put("/users", "listUsers");
+        r.put("/users/:id", "getUser");
+        r.put("/users/me", "currentUser");
+        r.put("/users/:id/orders/*", "ordersByStatus");
+        r.put("/static/**", "staticFiles");
+        r.put("/a/b/x", "abx");
+        r.put("/a/*/c", "anyC");
+        String[] paths = {"/users/me", "/users/42", "/users/42/orders/open", "/static/css/site.css", "/static", "/a/b/c", "//users//", "/nope"};
+        for (String p : paths)
+            System.out.println("  " + p + " -&gt; " + r.match(p).map(Object::toString).orElse("404"));
+        check(r.match("/users/me").get().value.equals("currentUser"), "literal beats param");
+        check(r.match("/users/42").get().params.get("id").equals("42"), "param captured");
+        check(r.match("/a/b/c").get().value.equals("anyC"), "backtracks from the literal branch");
+        check(r.match("/static").get().value.equals("staticFiles"), "** matches zero segments");
+        check(r.match("/nope").isEmpty(), "no route");
+        expectError(() -&gt; r.put("/users/:id", "again"), "duplicate");
+        expectError(() -&gt; r.put("/users/:uid/cart", "cart"), "conflict");
+        expectError(() -&gt; r.put("/x/**/y", "bad"), "last segment");
+        expectError(() -&gt; r.match("users"), "must start with /");
+
+        System.out.println("== wildcard get over plain keys (KV follow-up)");
+        PathTrie&lt;String&gt; kv = new PathTrie&lt;&gt;();
+        kv.put("/team/alpha/lead", "asha");
+        kv.put("/team/alpha/dev", "ben");
+        kv.put("/team/beta/lead", "chen");
+        System.out.println("  /team/*/lead  -&gt; " + kv.findAll("/team/*/lead"));
+        System.out.println("  /team/alpha/* -&gt; " + kv.findAll("/team/alpha/*"));
+        System.out.println("  /*/*/*        -&gt; " + kv.findAll("/*/*/*").size() + " keys");
+        check(kv.findAll("/team/*/lead").size() == 2 &amp;&amp; kv.findAll("/*/*/*").size() == 3, "wildcard query");
+
+        System.out.println("== 4 writers x 500 records while 2 readers suggest");
+        AutocompleteEngine shared = new AutocompleteEngine(new ByFrequency(), 3, true);
+        ExecutorService pool = Executors.newFixedThreadPool(6);
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int w = 0; w &lt; 4; w++) fs.add(pool.submit(() -&gt; { for (int i = 0; i &lt; 500; i++) shared.record("load test"); }));
+        for (int q = 0; q &lt; 2; q++) fs.add(pool.submit(() -&gt; { for (int i = 0; i &lt; 500; i++) shared.suggest("lo"); }));
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("  'lo' -&gt; " + shared.suggest("lo"));
+        check(shared.suggest("lo").get(0).count() == 2000, "no lost updates");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+  </div>
+  

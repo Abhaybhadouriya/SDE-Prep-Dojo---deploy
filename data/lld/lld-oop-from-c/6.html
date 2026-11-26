@@ -1,0 +1,284 @@
+
+  <h2>The whole program in C, Java and C++</h2>
+  <p>A complete, runnable version of the device example: two "classes" (loopback and a 4-slot ring device), generic code that calls through the interface, a default <code>stop</code>, and reference counting. Read the three tabs side by side and notice what disappears as you move right. All three files are in <code>lld-code/lld-oop-from-c/</code>. They print the same log up to <code>ring drained and stopped</code>; then C and C++ show the refcount release (<code>last reference dropped</code> or <code>destroyed</code>, then <code>lo still alive</code>), and Java shows nothing more, because the garbage collector frees the objects silently. If a piece of Java syntax is new to you, see <a href="#reading-java">Reading Java as a C programmer</a> below.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="C (netdev.c)">
+<pre><code class="language-c">/* lld-oop-from-c: an "object" in C = struct + pointer to a const ops table.
+   Build: gcc -std=c99 -Wall -o netdev netdev.c &amp;&amp; ./netdev */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;string.h&gt;
+
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+
+/* ---- a tiny kref: one counter, one release callback ---- */
+struct kref { int refcount; };
+static void kref_init(struct kref *k) { k-&gt;refcount = 1; }
+static void kref_get(struct kref *k)  { k-&gt;refcount++; }
+static int  kref_put(struct kref *k, void (*release)(struct kref *)) {
+    if (--k-&gt;refcount == 0) { release(k); return 1; }
+    return 0;
+}
+
+/* ---- the "interface": a table of function pointers ---- */
+struct net_dev;
+struct net_dev_ops {
+    int  (*open)(struct net_dev *dev);
+    int  (*xmit)(struct net_dev *dev, const char *pkt);
+    void (*stop)(struct net_dev *dev);        /* may be NULL: "use the default" */
+};
+
+/* ---- the "base class": common fields + vtable pointer ---- */
+struct net_dev {
+    char name[16];
+    const struct net_dev_ops *ops;            /* the vptr */
+    struct kref ref;
+    void (*free_fn)(struct net_dev *dev);     /* how to free the containing object */
+};
+
+/* generic code: knows only the base type, calls through the table */
+static int dev_send(struct net_dev *dev, const char *pkt) {
+    return dev-&gt;ops-&gt;xmit(dev, pkt);          /* dynamic dispatch */
+}
+static void dev_stop(struct net_dev *dev) {
+    if (dev-&gt;ops-&gt;stop) dev-&gt;ops-&gt;stop(dev);
+    else printf("[%s] default stop\n", dev-&gt;name);
+}
+static void dev_release(struct kref *k) {
+    struct net_dev *dev = container_of(k, struct net_dev, ref);
+    printf("[%s] last reference dropped, freeing\n", dev-&gt;name);
+    dev-&gt;free_fn(dev);
+}
+
+/* ---- "subclass" 1: loopback, adds a counter ---- */
+struct loopback_dev {
+    struct net_dev base;                      /* embedded base = inheritance of data */
+    int looped;
+};
+static int lo_open(struct net_dev *dev) { printf("[%s] up\n", dev-&gt;name); return 0; }
+static int lo_xmit(struct net_dev *dev, const char *pkt) {
+    struct loopback_dev *lo = container_of(dev, struct loopback_dev, base); /* "downcast" */
+    lo-&gt;looped++;
+    printf("[%s] looped back '%s' (total %d)\n", dev-&gt;name, pkt, lo-&gt;looped);
+    return 0;
+}
+static const struct net_dev_ops loopback_ops = { .open = lo_open, .xmit = lo_xmit, .stop = NULL };
+static void lo_free(struct net_dev *dev) { free(container_of(dev, struct loopback_dev, base)); }
+
+/* ---- "subclass" 2: a ring device with a small TX ring ---- */
+#define RING 4
+struct ring_dev {
+    struct net_dev base;
+    int head, tail;
+    const char *slots[RING];
+};
+static int ring_open(struct net_dev *dev) {
+    struct ring_dev *r = container_of(dev, struct ring_dev, base);
+    r-&gt;head = r-&gt;tail = 0;
+    printf("[%s] ring of %d slots ready\n", dev-&gt;name, RING);
+    return 0;
+}
+static int ring_xmit(struct net_dev *dev, const char *pkt) {
+    struct ring_dev *r = container_of(dev, struct ring_dev, base);
+    if (r-&gt;head - r-&gt;tail == RING) { printf("[%s] ring full, drop '%s'\n", dev-&gt;name, pkt); return -1; }
+    r-&gt;slots[r-&gt;head++ % RING] = pkt;
+    printf("[%s] queued '%s' (%d in ring)\n", dev-&gt;name, pkt, r-&gt;head - r-&gt;tail);
+    return 0;
+}
+static void ring_stop(struct net_dev *dev) { printf("[%s] ring drained and stopped\n", dev-&gt;name); }
+static const struct net_dev_ops ring_ops = { .open = ring_open, .xmit = ring_xmit, .stop = ring_stop };
+static void ring_free(struct net_dev *dev) { free(container_of(dev, struct ring_dev, base)); }
+
+/* ---- "constructors" ---- */
+static struct net_dev *loopback_new(const char *name) {
+    struct loopback_dev *lo = calloc(1, sizeof *lo);
+    strncpy(lo-&gt;base.name, name, sizeof lo-&gt;base.name - 1);
+    lo-&gt;base.ops = &amp;loopback_ops; lo-&gt;base.free_fn = lo_free;
+    kref_init(&amp;lo-&gt;base.ref);
+    return &amp;lo-&gt;base;
+}
+static struct net_dev *ring_new(const char *name) {
+    struct ring_dev *r = calloc(1, sizeof *r);
+    strncpy(r-&gt;base.name, name, sizeof r-&gt;base.name - 1);
+    r-&gt;base.ops = &amp;ring_ops; r-&gt;base.free_fn = ring_free;
+    kref_init(&amp;r-&gt;base.ref);
+    return &amp;r-&gt;base;
+}
+
+int main(void) {
+    struct net_dev *devs[2] = { loopback_new("lo"), ring_new("eth0") };
+    for (int i = 0; i &lt; 2; i++) devs[i]-&gt;ops-&gt;open(devs[i]);
+    for (int i = 0; i &lt; 2; i++) dev_send(devs[i], "ping");
+    for (int i = 0; i &lt; 4; i++) dev_send(devs[1], "data");   /* 5th packet overall drops */
+
+    kref_get(&amp;devs[0]-&gt;ref);                 /* a second user holds lo */
+    for (int i = 0; i &lt; 2; i++) dev_stop(devs[i]);
+    for (int i = 0; i &lt; 2; i++) kref_put(&amp;devs[i]-&gt;ref, dev_release);
+    printf("lo still alive, refcount=%d\n", devs[0]-&gt;ref.refcount);
+    kref_put(&amp;devs[0]-&gt;ref, dev_release);    /* second user lets go */
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java 21 (NetDevDemo.java)">
+<pre><code class="language-java">// lld-oop-from-c: the same design as netdev.c in Java 21.
+// Run: java NetDevDemo.java
+import java.util.ArrayDeque;
+import java.util.List;
+
+public class NetDevDemo {
+    static boolean send(NetDevice dev, String pkt) { return dev.xmit(pkt); }  // generic code
+
+    public static void main(String[] args) {
+        List&lt;NetDevice&gt; devs = List.of(new LoopbackDevice("lo"), new RingDevice("eth0"));
+        devs.forEach(NetDevice::open);           // Type::method = a function pointer to open(), called per item
+        devs.forEach(d -&gt; send(d, "ping"));      // d -&gt; ... = anonymous function (like a fn pointer + captured context)
+        for (int i = 0; i &lt; 4; i++) send(devs.get(1), "data");
+        devs.forEach(NetDevice::stop);
+        // No kref_get/kref_put and no "freeing" lines: when nothing references the objects,
+        // the garbage collector frees them silently, so the Java log ends at "ring drained and stopped".
+    }
+}
+
+
+interface NetDevice {                       // = struct net_dev_ops (the contract)
+    String name();
+    void open();
+    boolean xmit(String pkt);
+    default void stop() {                   // = a NULL slot that means "use the default"
+        System.out.println("[" + name() + "] default stop");
+    }
+}
+
+abstract class BaseDevice implements NetDevice {   // = struct net_dev (shared data)
+    private final String name;              // private: only this class touches it
+    protected BaseDevice(String name) { this.name = name; }
+    public final String name() { return name; }
+}
+
+final class LoopbackDevice extends BaseDevice {
+    private int looped;                      // = the extra field in loopback_dev
+    LoopbackDevice(String name) { super(name); }
+    public void open() { System.out.println("[" + name() + "] up"); }
+    public boolean xmit(String pkt) {        // no container_of: 'this' is already the full object
+        looped++;
+        System.out.println("[" + name() + "] looped back '" + pkt + "' (total " + looped + ")");
+        return true;
+    }
+}
+
+final class RingDevice extends BaseDevice {
+    private static final int RING = 4;
+    private final ArrayDeque&lt;String&gt; ring = new ArrayDeque&lt;&gt;(RING);
+    RingDevice(String name) { super(name); }
+    public void open() { ring.clear(); System.out.println("[" + name() + "] ring of " + RING + " slots ready"); }
+    public boolean xmit(String pkt) {
+        if (ring.size() == RING) { System.out.println("[" + name() + "] ring full, drop '" + pkt + "'"); return false; }
+        ring.addLast(pkt);
+        System.out.println("[" + name() + "] queued '" + pkt + "' (" + ring.size() + " in ring)");
+        return true;
+    }
+    @Override public void stop() { System.out.println("[" + name() + "] ring drained and stopped"); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14 (netdev.cpp)">
+<pre><code class="language-cpp">// lld-oop-from-c: the same design in C++14.
+// Build: g++ -std=c++14 -Wall -o netdev_cpp netdev.cpp &amp;&amp; ./netdev_cpp
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;deque&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+class NetDevice {                                   // abstract base = ops table + base struct
+public:
+    explicit NetDevice(std::string name)            // explicit: no silent conversion from a string
+        : name_(std::move(name)) {}                 // std::move: hand over the string buffer, no copy
+    virtual ~NetDevice() { std::cout &lt;&lt; "[" &lt;&lt; name_ &lt;&lt; "] destroyed\n"; }  // virtual dtor!
+    virtual void open() = 0;                        // pure virtual = mandatory slot
+    virtual bool xmit(const std::string&amp; pkt) = 0;
+    virtual void stop() { std::cout &lt;&lt; "[" &lt;&lt; name_ &lt;&lt; "] default stop\n"; } // default impl
+    const std::string&amp; name() const { return name_; }
+private:
+    std::string name_;
+};
+
+class LoopbackDevice : public NetDevice {
+public:
+    using NetDevice::NetDevice;                     // reuse the base constructor
+    void open() override { std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] up\n"; }  // override: error if no base slot matches
+    bool xmit(const std::string&amp; pkt) override {
+        ++looped_;
+        std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] looped back '" &lt;&lt; pkt &lt;&lt; "' (total " &lt;&lt; looped_ &lt;&lt; ")\n";
+        return true;
+    }
+private:
+    int looped_ = 0;
+};
+
+class RingDevice : public NetDevice {
+public:
+    using NetDevice::NetDevice;                     // reuse the base constructor
+    void open() override { ring_.clear(); std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] ring of " &lt;&lt; kRing &lt;&lt; " slots ready\n"; }
+    bool xmit(const std::string&amp; pkt) override {
+        if (ring_.size() == kRing) { std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] ring full, drop '" &lt;&lt; pkt &lt;&lt; "'\n"; return false; }
+        ring_.push_back(pkt);
+        std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] queued '" &lt;&lt; pkt &lt;&lt; "' (" &lt;&lt; ring_.size() &lt;&lt; " in ring)\n";
+        return true;
+    }
+    void stop() override { std::cout &lt;&lt; "[" &lt;&lt; name() &lt;&lt; "] ring drained and stopped\n"; }
+private:
+    static const std::size_t kRing = 4;
+    std::deque&lt;std::string&gt; ring_;
+};
+
+static bool send(NetDevice&amp; dev, const std::string&amp; pkt) { return dev.xmit(pkt); }
+
+int main() {
+    std::vector&lt;std::shared_ptr&lt;NetDevice&gt;&gt; devs = {
+        std::make_shared&lt;LoopbackDevice&gt;("lo"),     // make_shared: object + refcount block in one go (kref_init)
+        std::make_shared&lt;RingDevice&gt;("eth0") };
+    for (auto&amp; d : devs) d-&gt;open();
+    for (auto&amp; d : devs) send(*d, "ping");
+    for (int i = 0; i &lt; 4; ++i) send(*devs[1], "data");
+    std::shared_ptr&lt;NetDevice&gt; second_user = devs[0];   // kref_get
+    for (auto&amp; d : devs) d-&gt;stop();
+    devs.clear();                                       // kref_put x2: eth0 dies, lo survives
+    std::cout &lt;&lt; "lo still alive, use_count=" &lt;&lt; second_user.use_count() &lt;&lt; "\n";
+    second_user.reset();                                // last put: lo destroyed
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <p>Output of the C version (<code>gcc -std=c99 -Wall -o netdev netdev.c &amp;&amp; ./netdev</code>). The C++ version ends with <code>[eth0] destroyed</code>, <code>lo still alive, use_count=1</code> and <code>[lo] destroyed</code> instead; the Java version stops after <code>[eth0] ring drained and stopped</code>.</p>
+<pre class="terminal"><code>[lo] up
+[eth0] ring of 4 slots ready
+[lo] looped back 'ping' (total 1)
+[eth0] queued 'ping' (1 in ring)
+[eth0] queued 'data' (2 in ring)
+[eth0] queued 'data' (3 in ring)
+[eth0] queued 'data' (4 in ring)
+[eth0] ring full, drop 'data'
+[lo] default stop
+[eth0] ring drained and stopped
+[eth0] last reference dropped, freeing
+lo still alive, refcount=1
+[lo] last reference dropped, freeing</code></pre>
+
+  <h3>The mapping, line by line</h3>
+  <div class="table-wrap">
+  <table class="table">
+    <thead><tr><th>C (kernel style)</th><th>Java</th><th>C++</th></tr></thead>
+    <tbody>
+      <tr><td><code>struct net_dev_ops</code> (function-pointer table)</td><td><code>interface NetDevice</code></td><td>abstract class with <code>virtual ... = 0</code></td></tr>
+      <tr><td>NULL slot means default</td><td><code>default</code> method in the interface</td><td>non-pure <code>virtual</code> with a body</td></tr>
+      <tr><td><code>struct net_dev</code> embedded as first member</td><td><code>extends BaseDevice</code></td><td><code>: public NetDevice</code></td></tr>
+      <tr><td><code>container_of(dev, struct ring_dev, base)</code></td><td><code>this</code> (or a checked cast)</td><td><code>this</code> (or <code>dynamic_cast</code>)</td></tr>
+      <tr><td><code>ring_new()</code> calloc + fill ops + init</td><td>constructor <code>new RingDevice("eth0")</code></td><td>constructor; <code>std::make_shared</code></td></tr>
+      <tr><td><code>kref_get</code> / <code>kref_put</code> + release</td><td>garbage collector; <code>AutoCloseable</code> for non-memory resources</td><td><code>std::shared_ptr</code> copies and destructor</td></tr>
+      <tr><td><code>static</code> functions in the .c file</td><td><code>private</code> methods</td><td><code>private</code> members</td></tr>
+      <tr><td><code>const</code> ops table shared by all devices</td><td>one class, many instances</td><td>one vtable per class</td></tr>
+    </tbody>
+  </table>
+  </div>

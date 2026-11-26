@@ -1,0 +1,125 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> Request, match, accept, track, pay. Ask: one city or global? Pooling? Scheduled rides? State: match in seconds, no double booking, fresh locations.</li>
+          <li><strong>5-10 min: numbers</strong> 1M drivers / 4 s = 250K writes/s; 100 MB of live state; ~700 ride requests/s; map reads cached per cell. Say: "two systems: hot location stream and consistent trip store".</li>
+          <li><strong>10-15 min: API + data</strong> Driver stream (loc, offer, accept), rider REST with idempotency key, trips table with state and version, geo index in memory.</li>
+          <li><strong>15-25 min: high-level design</strong> Draw the stepper: location path, then request -&gt; match -&gt; geo -&gt; ETA -&gt; CAS -&gt; offer -&gt; accept -&gt; commit.</li>
+          <li><strong>25-40 min: deep dives</strong> Geo index choice (and the neighbour bug), double-booking, hot cells, ETA, failure of a geo shard.</li>
+          <li><strong>40-45 min: wrap up</strong> Metrics (match time p99, offer accept rate, "no cars found" rate, ping lag), multi-region, surge as an extension.</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"Drivers send their location every few seconds; we keep the latest in Redis with GEOADD. When a rider requests, we search nearby drivers with GEOSEARCH, pick the closest, and send them an offer. When they accept, we mark the driver busy and save the trip in a SQL database." Clear and workable.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"250K pings/s but only 100 MB of state, so in memory, sharded by city for throughput and blast radius. Search the cell plus neighbours, rank top candidates by road ETA, CAS the driver to OFFERED with a TTL, and fence the final commit with a conditional update and a unique index. Pings on Kafka with acks=1 keyed by driver; trip events with acks=all keyed by trip; payments idempotent per trip; hot cells get finer cells and per-cell caching." Numbers, failure handling, trade-offs.</p></div>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> writing every GPS ping to the SQL trips database; searching only one geohash cell; ranking by straight-line distance; forgetting the race between two riders for one driver; no timeout on offers; polling for offers over HTTP; treating locations and payments with the same consistency; ignoring stadium/airport hot spots; drawing ZooKeeper next to Kafka (Kafka 4.x runs KRaft only).</p></div>
+
+        <h3>60-second answer</h3>
+        <div class="callout interview"><p>"I split ride hailing into two systems. The first is the location stream: about a million drivers ping every four seconds, roughly 250 thousand writes a second, but only the latest point matters, about 100 megabytes in total, so I keep it in an in-memory geo index sharded by city, and publish pings to Kafka for surge, tracking and traces. The second is the trip system: a few hundred requests a second that must be correct, in a strongly consistent SQL store with a state machine. To match, I convert the pickup into a geo cell, search it and its neighbours for available drivers, rank the top few by real road ETA, and reserve the best driver with a compare-and-set to OFFERED with a short TTL. I push the offer over a persistent connection; if it is declined or times out, I release the driver and try the next. On accept, one conditional database update marks the trip matched, with a unique index so a driver can never have two active trips. Payments consume trip events idempotently."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Amazon,Microsoft">
+          <summary>Why not store driver locations in the main database?</summary>
+          <div class="answer">
+            <p>Because of the shape of the data: about 250K writes per second, each value useless after a few seconds, and only the latest value per driver matters. A transactional database would spend its effort on durability (write-ahead logs, fsyncs, replication) we do not need, and the trip workload would suffer. The full live state is about 100 MB, so it fits in memory; we keep it in a sharded in-memory geo index and stream pings to Kafka for anything that needs history.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the write rate, the "stale in 4 seconds" point, and the memory size. Then say where history goes instead (Kafka -&gt; cheap storage).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens when an in-memory shard crashes? (Rebuild from the next pings or a compacted topic.)</li><li>Why shard 100 MB at all? (Write throughput, availability, locality.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Google,Amazon">
+          <summary>How do you find drivers near a rider quickly?</summary>
+          <div class="answer">
+            <p>Divide the map into cells (geohash, H3 or S2) and keep, per cell, the set of available drivers. Convert the pickup point to its cell, read that cell plus its neighbours, and filter by status and car type. If too few drivers, widen to the next ring. Off the shelf, Redis <code>GEOSEARCH</code> does this on a geohash sorted set; PostGIS uses an R-tree. Then rank the few candidates by road ETA.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain why a normal B-tree on lat and lng is not enough (it sorts on one dimension), then cells, then the neighbour rule, then ETA ranking.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Geohash vs quadtree vs H3?</li><li>What cell size would you pick and why?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Amazon,Flipkart">
+          <summary>Two riders request at the same time and the best driver is the same. How do you avoid double booking?</summary>
+          <div class="answer">
+            <p>Make every driver state change a conditional, atomic write. Matching does a compare-and-set from AVAILABLE to OFFERED(ride) with a TTL; only one caller wins, the other moves to its next candidate. On accept, the trips database does a conditional update to MATCHED, and a partial unique index allows only one active trip per driver. So even if the cache lock misbehaves, the database is the final fence. Alternatively, a single owner per city cell serialises offers and avoids the race entirely.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the race, show the CAS, then the database fence, then the TTL for crashed matchers. Mention the single-writer alternative.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is a Redis lock alone not enough? (Pauses and failovers can break it; you need a fencing check at the source of truth.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Microsoft">
+          <summary>What happens if the chosen driver does not respond?</summary>
+          <div class="answer">
+            <p>Each offer has a deadline (around 15 seconds). The matching service holds an in-memory timer; on timeout or decline it sets the driver back to AVAILABLE (conditional on the offer id), and offers the ride to the next ranked candidate, re-searching if the list is stale. The driver-side TTL on OFFERED is the safety net if the matcher itself dies. After a few failures, widen the search radius or tell the rider no cars are available.</p>
+            <div class="approach"><h5>How to answer</h5><p>Timer, release with a condition, next candidate, safety TTL, user-facing fallback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you offer to two drivers at once to save time? (Yes, with "first accept wins" and a CAS; drivers who lose see "ride taken", which annoys them.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Google">
+          <summary>A concert ends and 20,000 people request rides from three cells. What breaks?</summary>
+          <div class="answer">
+            <p>That geo shard and its matching server get a burst of requests competing for the same few hundred drivers, and many CAS attempts fail on the same drivers. Fixes: finer cells (or adaptive quadtree splits) around known venues, a per-cell request queue processed in small batches (batch matching gives better assignments under contention), caching nearby-cars answers per cell, rate limiting retries from the app, surge pricing per hexagon to balance demand and attract supply, and pre-scaling for scheduled events.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the hot spot, explain contention, then fixes at the index, the algorithm, the product (surge, pickup zones) and operations (pre-scaling).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How is surge computed? (Supply and demand per H3 hexagon in a streaming job; see the surge page.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Uber,Amazon,Walmart">
+          <summary>How would you use Kafka here, and with what settings?</summary>
+          <div class="answer">
+            <p>Two topics with opposite needs. <code>driver-locations</code>, keyed by driver id for per-driver order, with acks=1, compression and batching, short retention: throughput matters more than any single ping. Consumers: surge (Flink per hexagon), live tracking, trace archive, ML. Optionally a compacted <code>driver-latest</code> topic to rebuild the geo index. <code>trip-events</code>, keyed by trip id, with acks=all, min.insync.replicas=2 and idempotent producers, written through an outbox; consumers (payments, notifications) dedupe by event id and use retry topics plus a DLQ.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate the two streams by value, then key, durability settings, consumers, and how duplicates are handled.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not key locations by cell?</li><li>How many partitions? (Enough for peak throughput per consumer, with headroom; changing later remaps keys.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Google,Amazon">
+          <summary>Why rank by ETA instead of distance, and how do you keep it fast?</summary>
+          <div class="answer">
+            <p>Roads, rivers, one-way streets and traffic make straight-line distance a poor guide; the nearest driver can be the slowest. So search returns maybe the 10 nearest by distance, and a routing service computes road ETAs for those in one batch, using a precomputed road graph with shortcuts and live traffic, plus an ML correction. Give it a strict budget (tens of milliseconds) and fall back to distance times a road factor if it is slow.</p>
+            <div class="approach"><h5>How to answer</h5><p>Example of distance lying, then "filter by distance, rank by ETA", then budget and fallback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you compute shortest paths fast on a city graph? (Precomputed hierarchies such as contraction hierarchies; see Google Maps page.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Microsoft,Flipkart">
+          <summary>How does the rider see the car moving in real time?</summary>
+          <div class="answer">
+            <p>Once matched, the rider app opens (or reuses) a streaming connection to a push gateway and subscribes to that trip. A tracking consumer reads the driver's pings from Kafka (or directly from the location service), snaps them to the road, and pushes them to the rider every few seconds. The app animates smoothly between points. If the stream drops, the app falls back to polling <code>GET /rides/{id}</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Subscription per trip, source of pings, smoothing, fallback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>WebSocket or SSE? (SSE is enough for one-way tracking; the driver needs two-way.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Uber,Amazon,Google">
+          <summary>How do you make this survive a full region outage?</summary>
+          <div class="answer">
+            <p>Keep each city's home region, with trips replicated to a standby region. Live location state needs no replication: after failover, drivers' apps reconnect to the new region and the geo index refills within a couple of ping intervals. In-progress trips must survive: replicate the trips DB (synchronously within a region, asynchronously across regions) and let apps carry the trip id and last state so they can resume. Accept that a few seconds of matching may be lost; never accept losing a completed trip's payment record.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split again: rebuildable state (do not replicate) vs precious state (replicate). Give RPO/RTO in words and describe what users see.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the old region comes back and both think they own the city? (Fencing: a lease with an epoch number checked on every write.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="k8s" data-company="Microsoft,Walmart,Uber">
+          <summary>How would you deploy the matching service on Kubernetes?</summary>
+          <div class="answer">
+            <p>As a StatefulSet per city (or per city region), because each pod owns a fixed slice of cells and needs a stable identity, reachable through a headless Service. Spread replicas across zones, mark pods ready only after the geo index is warm, and use a PodDisruptionBudget so maintenance never takes out a city. Stateless services (ride, ETA, payments) are Deployments with HPAs. Pre-scale before known peaks, since autoscaling reacts in minutes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Pick the workload type with a reason, then readiness, spread, disruption budget, and scaling strategy.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the K8s control plane goes down? (Running pods keep serving; only changes stop.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "No cars available" while drivers are visibly nearby</h4>
+          <div class="situation"><p>After a release, the "no cars found" rate in one city triples. Drivers say they are online and idle. Matching servers are healthy and CPU is low.</p></div>
+          <div class="bad"><p>Weak answer: "Restart the matching servers."</p></div>
+          <div class="good"><p>Strong answer: "Healthy servers plus missing drivers suggests a data problem, not capacity. I would check three things: whether the release changed the search to the single cell without neighbours (the boundary bug), whether longitude and latitude were swapped in GEOADD (drivers end up in the ocean), and whether driver-state TTLs are expiring because pings are arriving later than the TTL. I would compare one known driver's ping with what the index holds. Roll back first, then fix, then add a canary metric for 'no cars found' per city."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What metric would have caught this before users did?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: a rider was charged twice for one trip</h4>
+          <div class="situation"><p>Support reports a handful of double charges after a Kafka broker restart.</p></div>
+          <div class="bad"><p>Weak answer: "Turn on Kafka exactly-once and the problem goes away."</p></div>
+          <div class="good"><p>Strong answer: "A broker restart causes consumer rebalances, and the payment consumer re-read <code>TripCompleted</code> events it had processed but not yet committed. That is normal at-least-once behaviour. The bug is that the charge was not idempotent. Fix: use the trip id as the idempotency key with the payment provider and a unique constraint on <code>(trip_id, charge_type)</code> in our ledger, so a replay becomes a no-op. Refund the affected riders, then add a reconciliation job that flags duplicate charges daily."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where else in this design can duplicates appear? (Offers, notifications, ride requests: each needs its own key.)</li></ul></div>
+        </div>
+      

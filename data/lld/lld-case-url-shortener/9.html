@@ -1,0 +1,1186 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language; in a real round split into <code>model/</code>, <code>generator/</code>, <code>repository/</code>, <code>service/</code> and <code>Main</code>. The same files are in <code>lld-code/lld-case-url-shortener/</code>. Each was compiled and run; the output below is real.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+// URL shortener, LLD flavour: in-memory, pluggable code generation, collisions, expiry, analytics.
+// Run: javac -d out Main.java &amp;&amp; java -cp out Main
+public class Main {
+
+    // ---------- errors ----------
+    static class ShortenerException extends RuntimeException { ShortenerException(String m) { super(m); } }
+    static final class InvalidUrlException extends ShortenerException { InvalidUrlException(String m) { super(m); } }
+    static final class AliasTakenException extends ShortenerException { AliasTakenException(String m) { super(m); } }
+    static final class NotOwnerException extends ShortenerException { NotOwnerException(String m) { super(m); } }
+
+    // ---------- base62 ----------
+    static final class Base62 {
+        static final String ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        static String encode(long n) {
+            if (n &lt; 0) throw new IllegalArgumentException("negative");
+            if (n == 0) return "0";
+            StringBuilder sb = new StringBuilder();
+            while (n &gt; 0) { sb.append(ALPHABET.charAt((int) (n % 62))); n /= 62; }
+            return sb.reverse().toString();
+        }
+        static long decode(String s) {
+            long n = 0;
+            for (char ch : s.toCharArray()) {
+                int d = ALPHABET.indexOf(ch);
+                if (d &lt; 0) throw new IllegalArgumentException("not base62: " + ch);
+                n = n * 62 + d;
+            }
+            return n;
+        }
+    }
+
+    // ---------- time is injected so expiry is testable ----------
+    interface Clock { Instant now(); }
+    static final class FakeClock implements Clock {
+        private volatile Instant t;
+        FakeClock(Instant t) { this.t = t; }
+        public Instant now() { return t; }
+        void advance(Duration d) { t = t.plus(d); }
+    }
+
+    // ---------- entity ----------
+    static final class ShortUrl {
+        final String code, longUrl, owner;
+        final Instant createdAt, expiresAt;     // expiresAt null = never
+        final boolean custom;
+        final LongAdder clicks = new LongAdder();
+        ShortUrl(String code, String longUrl, String owner, Instant createdAt, Instant expiresAt, boolean custom) {
+            this.code = code; this.longUrl = longUrl; this.owner = owner;
+            this.createdAt = createdAt; this.expiresAt = expiresAt; this.custom = custom;
+        }
+        boolean expired(Instant now) { return expiresAt != null &amp;&amp; !now.isBefore(expiresAt); }
+    }
+
+    // ---------- id generation: Strategy ----------
+    interface CodeGenerator {
+        // attempt = 0, 1, 2 ... ; a generator that can collide must return a different code for a new attempt
+        String generate(String longUrl, int attempt);
+    }
+    // Counter + base62: never collides with itself, short, but guessable (see the scramble follow-up).
+    static final class CounterGenerator implements CodeGenerator {
+        private final AtomicLong next;
+        CounterGenerator(long start) { next = new AtomicLong(start); }
+        public String generate(String longUrl, int attempt) { return Base62.encode(next.getAndIncrement()); }
+    }
+    // Hash of (url, attempt): same URL -&gt; same first code; collisions resolved by re-hashing with attempt + 1.
+    // Keep the LOW-order base62 digits (n mod 62^length, left-padded). A prefix of a most-significant-first
+    // encoding is not uniform: the leading digit of a 63-bit number is only ever 1..10.
+    static final class HashGenerator implements CodeGenerator {
+        private final int length;
+        HashGenerator(int length) { this.length = length; }
+        public String generate(String longUrl, int attempt) {
+            try {
+                byte[] h = MessageDigest.getInstance("SHA-256")
+                        .digest((longUrl + "#" + attempt).getBytes(StandardCharsets.UTF_8));
+                long n = 0;
+                for (int i = 0; i &lt; 8; i++) n = (n &lt;&lt; 8) | (h[i] &amp; 0xff);
+                n &amp;= Long.MAX_VALUE;
+                char[] c = new char[length];
+                for (int i = length - 1; i &gt;= 0; i--) { c[i] = Base62.ALPHABET.charAt((int) (n % 62)); n /= 62; }
+                return new String(c);
+            } catch (java.security.NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+    // Random code: unguessable; collisions resolved by drawing again.
+    static final class RandomGenerator implements CodeGenerator {
+        private final Random rnd; private final int length;
+        RandomGenerator(Random rnd, int length) { this.rnd = rnd; this.length = length; }
+        public String generate(String longUrl, int attempt) {
+            char[] c = new char[length];
+            for (int i = 0; i &lt; length; i++) c[i] = Base62.ALPHABET.charAt(rnd.nextInt(62));
+            return new String(c);
+        }
+    }
+
+    // ---------- storage: Repository ----------
+    interface UrlRepository {
+        boolean saveIfAbsent(ShortUrl u);           // atomic claim of the code
+        Optional&lt;ShortUrl&gt; find(String code);
+        boolean delete(String code);
+        Collection&lt;ShortUrl&gt; all();
+    }
+    static final class InMemoryUrlRepository implements UrlRepository {
+        private final ConcurrentHashMap&lt;String, ShortUrl&gt; byCode = new ConcurrentHashMap&lt;&gt;();
+        public boolean saveIfAbsent(ShortUrl u) { return byCode.putIfAbsent(u.code, u) == null; }
+        public Optional&lt;ShortUrl&gt; find(String code) { return Optional.ofNullable(byCode.get(code)); }
+        public boolean delete(String code) { return byCode.remove(code) != null; }
+        public Collection&lt;ShortUrl&gt; all() { return byCode.values(); }
+    }
+
+    // ---------- validation ----------
+    static final class UrlValidator {
+        private static final Pattern ALIAS = Pattern.compile("[A-Za-z0-9_-]{3,30}");
+        private static final Set&lt;String&gt; RESERVED = Set.of("api", "admin", "login", "stats", "health");
+        private final String ownHost;
+        UrlValidator(String ownHost) { this.ownHost = ownHost; }
+        String normalize(String url) {
+            if (url == null || url.isBlank() || url.length() &gt; 2048) throw new InvalidUrlException("empty or too long");
+            URI u;
+            try { u = new URI(url.trim()); } catch (Exception e) { throw new InvalidUrlException("not a URL: " + url); }
+            String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase(Locale.ROOT);
+            if (!scheme.equals("http") &amp;&amp; !scheme.equals("https")) throw new InvalidUrlException("only http/https: " + url);
+            if (u.getHost() == null) throw new InvalidUrlException("no host: " + url);
+            String host = u.getHost().toLowerCase(Locale.ROOT);
+            if (host.equals(ownHost)) throw new InvalidUrlException("would redirect to ourselves: " + url);
+            return scheme + "://" + host + (u.getPort() == -1 ? "" : ":" + u.getPort())
+                    + (u.getRawPath() == null ? "" : u.getRawPath())
+                    + (u.getRawQuery() == null ? "" : "?" + u.getRawQuery());
+        }
+        void checkAlias(String alias) {
+            if (!ALIAS.matcher(alias).matches()) throw new InvalidUrlException("alias must be 3-30 of [A-Za-z0-9_-]: " + alias);
+            if (RESERVED.contains(alias.toLowerCase(Locale.ROOT))) throw new InvalidUrlException("reserved alias: " + alias);
+        }
+    }
+
+    // ---------- analytics: Observer ----------
+    interface ClickListener { void onClick(ShortUrl u, Instant at); }
+
+    enum Outcome { FOUND, NOT_FOUND, EXPIRED }
+    static final class Resolution {
+        final Outcome outcome; final String longUrl;
+        Resolution(Outcome o, String url) { outcome = o; longUrl = url; }
+        int httpStatus() { return outcome == Outcome.FOUND ? 302 : outcome == Outcome.EXPIRED ? 410 : 404; }
+    }
+
+    static final class ShortenRequest {
+        final String longUrl; String alias; Duration ttl; String owner = "anonymous";
+        ShortenRequest(String longUrl) { this.longUrl = longUrl; }
+        ShortenRequest alias(String a) { alias = a; return this; }
+        ShortenRequest ttl(Duration d) { ttl = d; return this; }
+        ShortenRequest owner(String o) { owner = o; return this; }
+    }
+
+    // ---------- the service: Facade over generator, repository, validator, clock, listeners ----------
+    static final class UrlShortener {
+        static final int MAX_ATTEMPTS = 5;
+        private final String baseUrl;
+        private final CodeGenerator generator;
+        private final UrlRepository repo;
+        private final UrlValidator validator;
+        private final Clock clock;
+        private final boolean dedupe;
+        // dedupe index keyed by (owner, url): two owners never share one ShortUrl, so a delete by one
+        // cannot kill the other's link and click counts stay per owner
+        private final ConcurrentHashMap&lt;String, String&gt; codeByUrl = new ConcurrentHashMap&lt;&gt;();
+        private final List&lt;ClickListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+        final LongAdder collisions = new LongAdder();
+
+        UrlShortener(String ownHost, CodeGenerator g, UrlRepository r, Clock c, boolean dedupe) {
+            this.baseUrl = "https://" + ownHost + "/"; this.generator = g; this.repo = r;
+            this.validator = new UrlValidator(ownHost); this.clock = c; this.dedupe = dedupe;
+        }
+        void addListener(ClickListener l) { listeners.add(l); }
+        String link(ShortUrl u) { return baseUrl + u.code; }
+
+        ShortUrl shorten(ShortenRequest req) {
+            String url = validator.normalize(req.longUrl);
+            Instant now = clock.now();
+            Instant exp = req.ttl == null ? null : now.plus(req.ttl);
+            if (req.alias != null) {                                   // custom alias: claim or fail, never retry
+                validator.checkAlias(req.alias);
+                ShortUrl u = new ShortUrl(req.alias, url, req.owner, now, exp, true);
+                if (!repo.saveIfAbsent(u)) throw new AliasTakenException("alias taken: " + req.alias);
+                return u;
+            }
+            if (dedupe &amp;&amp; req.ttl == null) {                           // same URL -&gt; same code (one winner under races)
+                String key = dedupeKey(req.owner, url);
+                while (true) {
+                    String code = codeByUrl.computeIfAbsent(key, k -&gt; claim(url, req.owner, now, null).code);
+                    Optional&lt;ShortUrl&gt; found = repo.find(code);
+                    if (found.isPresent()) return found.get();
+                    codeByUrl.remove(key, code);   // a delete() removed the link but not yet this entry: drop it, retry
+                }
+            }
+            return claim(url, req.owner, now, exp);
+        }
+
+        private static String dedupeKey(String owner, String url) { return owner + "\0" + url; }
+
+        private ShortUrl claim(String url, String owner, Instant now, Instant exp) {
+            for (int attempt = 0; attempt &lt; MAX_ATTEMPTS; attempt++) {
+                ShortUrl u = new ShortUrl(generator.generate(url, attempt), url, owner, now, exp, false);
+                if (repo.saveIfAbsent(u)) return u;                     // atomic: no check-then-act race
+                collisions.increment();
+            }
+            throw new ShortenerException("could not find a free code after " + MAX_ATTEMPTS + " attempts");
+        }
+
+        Resolution resolve(String code) {
+            Optional&lt;ShortUrl&gt; found = repo.find(code);
+            if (!found.isPresent()) return new Resolution(Outcome.NOT_FOUND, null);
+            ShortUrl u = found.get();
+            Instant now = clock.now();
+            if (u.expired(now)) return new Resolution(Outcome.EXPIRED, null);   // lazy expiry
+            u.clicks.increment();
+            for (ClickListener l : listeners) l.onClick(u, now);
+            return new Resolution(Outcome.FOUND, u.longUrl);
+        }
+
+        void delete(String code, String owner) {
+            ShortUrl u = repo.find(code).orElseThrow(() -&gt; new ShortenerException("no such code: " + code));
+            if (!u.owner.equals(owner)) throw new NotOwnerException(owner + " does not own " + code);
+            codeByUrl.remove(dedupeKey(u.owner, u.longUrl), code);    // dedupe entry first, so no shorten() sees a dead code
+            repo.delete(code);
+        }
+
+        int purgeExpired() {                                           // eager sweep, e.g. from a scheduled job
+            Instant now = clock.now();
+            int n = 0;
+            for (ShortUrl u : new ArrayList&lt;&gt;(repo.all()))
+                if (u.expired(now) &amp;&amp; repo.delete(u.code)) n++;
+            return n;
+        }
+
+        long clicks(String code) { return repo.find(code).map(u -&gt; u.clicks.sum()).orElse(0L); }
+
+        List&lt;String&gt; topK(int k) {
+            return repo.all().stream()
+                    .sorted(Comparator.comparingLong((ShortUrl u) -&gt; u.clicks.sum()).reversed().thenComparing(u -&gt; u.code))
+                    .limit(k).map(u -&gt; u.code + "=" + u.clicks.sum()).collect(Collectors.toList());
+        }
+    }
+
+    // ---------- demo driver with simple checks ----------
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static void expectThrows(Class&lt;? extends Exception&gt; type, Runnable r, String what) {
+        try { r.run(); } catch (Exception e) { check(type.isInstance(e), what + " threw " + e.getClass().getSimpleName()); return; }
+        check(false, what + " did not throw");
+    }
+
+    public static void main(String[] args) throws Exception {
+        FakeClock clock = new FakeClock(Instant.parse("2026-01-01T00:00:00Z"));
+        String host = "sho.rt";
+
+        // 1. counter + base62, dedupe on
+        UrlShortener s = new UrlShortener(host, new CounterGenerator(1_000_000), new InMemoryUrlRepository(), clock, true);
+        ShortUrl a = s.shorten(new ShortenRequest("https://Example.com/docs?id=42"));
+        ShortUrl b = s.shorten(new ShortenRequest("https://example.com/blog"));
+        ShortUrl a2 = s.shorten(new ShortenRequest("https://EXAMPLE.com/docs?id=42"));
+        System.out.println("1. counter: " + s.link(a) + " -&gt; " + a.longUrl + " | " + s.link(b) + " | same URL again -&gt; " + a2.code);
+        check(a.code.equals("4c92") &amp;&amp; Base62.decode(a.code) == 1_000_000, "base62 of 1,000,000");
+        check(a2.code.equals(a.code), "dedupe returns the same code");
+
+        // 2. custom alias, taken alias, bad alias, reserved alias
+        ShortUrl c = s.shorten(new ShortenRequest("https://example.com/handbook").alias("team-docs").owner("asha"));
+        expectThrows(AliasTakenException.class, () -&gt; s.shorten(new ShortenRequest("https://other.org").alias("team-docs")), "taken alias");
+        expectThrows(InvalidUrlException.class, () -&gt; s.shorten(new ShortenRequest("https://other.org").alias("a b")), "bad alias");
+        expectThrows(InvalidUrlException.class, () -&gt; s.shorten(new ShortenRequest("https://other.org").alias("admin")), "reserved alias");
+        System.out.println("2. alias: " + s.link(c) + "; taken / bad / reserved aliases rejected");
+
+        // 3. URL validation
+        expectThrows(InvalidUrlException.class, () -&gt; s.shorten(new ShortenRequest("ftp://files.example.com/x")), "ftp");
+        expectThrows(InvalidUrlException.class, () -&gt; s.shorten(new ShortenRequest("not a url")), "garbage");
+        expectThrows(InvalidUrlException.class, () -&gt; s.shorten(new ShortenRequest("https://sho.rt/4c92")), "self loop");
+        System.out.println("3. validation: ftp, garbage and self-links rejected");
+
+        // 4. resolve + analytics (observer) + top-k
+        Map&lt;String, Integer&gt; perDay = new TreeMap&lt;&gt;();
+        s.addListener((u, at) -&gt; perDay.merge(u.code + "@" + at.toString().substring(0, 10), 1, Integer::sum));
+        for (int i = 0; i &lt; 3; i++) s.resolve(a.code);
+        s.resolve(c.code);
+        Resolution miss = s.resolve("zzzz");
+        System.out.println("4. resolve: " + a.code + " -&gt; " + s.resolve(a.code).httpStatus() + " " + s.resolve(a.code).longUrl
+                + " | zzzz -&gt; " + miss.httpStatus() + " | top2 " + s.topK(2) + " | per day " + perDay);
+        check(s.clicks(a.code) == 5 &amp;&amp; miss.outcome == Outcome.NOT_FOUND, "clicks and 404");
+
+        // 5. expiry with an injected clock: lazy on read, eager purge
+        ShortUrl t = s.shorten(new ShortenRequest("https://example.com/sale").ttl(Duration.ofSeconds(60)));
+        check(s.resolve(t.code).outcome == Outcome.FOUND, "before expiry");
+        clock.advance(Duration.ofSeconds(61));
+        Resolution gone = s.resolve(t.code);
+        int purged = s.purgeExpired();
+        System.out.println("5. expiry: " + t.code + " after 61 s -&gt; " + gone.httpStatus() + " " + gone.outcome + ", purged " + purged);
+        check(gone.outcome == Outcome.EXPIRED &amp;&amp; purged == 1 &amp;&amp; s.resolve(t.code).outcome == Outcome.NOT_FOUND, "expiry");
+
+        // 6. owner-only delete
+        expectThrows(NotOwnerException.class, () -&gt; s.delete(c.code, "ben"), "delete by non-owner");
+        s.delete(c.code, "asha");
+        check(s.resolve(c.code).outcome == Outcome.NOT_FOUND, "deleted");
+        System.out.println("6. delete: ben refused, asha deleted team-docs");
+
+        // 6b. dedupe is per owner: asha and ben shorten the same URL, asha deletes hers, ben's still resolves
+        ShortUrl ra = s.shorten(new ShortenRequest("https://example.com/shared").owner("asha"));
+        ShortUrl rb = s.shorten(new ShortenRequest("https://example.com/shared").owner("ben"));
+        check(!ra.code.equals(rb.code) &amp;&amp; rb.owner.equals("ben"), "per-owner dedupe gives ben his own code");
+        check(s.shorten(new ShortenRequest("https://example.com/shared").owner("ben")).code.equals(rb.code), "ben dedupes onto his own code");
+        s.delete(ra.code, "asha");
+        check(s.resolve(rb.code).outcome == Outcome.FOUND, "ben's link survives asha's delete");
+        System.out.println("6b. per-owner dedupe: asha " + ra.code + ", ben " + rb.code + "; asha deleted hers, ben's still -&gt; 302");
+
+        // 6c. delete vs dedupe: the link row is gone but the dedupe entry still points at it (the race window)
+        InMemoryUrlRepository r6 = new InMemoryUrlRepository();
+        UrlShortener s6 = new UrlShortener(host, new CounterGenerator(5_000), r6, clock, true);
+        ShortUrl old6 = s6.shorten(new ShortenRequest("https://example.com/race"));
+        r6.delete(old6.code);                                          // as if delete() paused between its two steps
+        ShortUrl new6 = s6.shorten(new ShortenRequest("https://example.com/race"));
+        check(!new6.code.equals(old6.code) &amp;&amp; s6.resolve(new6.code).outcome == Outcome.FOUND, "stale dedupe entry is dropped, not a 500");
+        System.out.println("6c. delete vs dedupe: stale code " + old6.code + " dropped, new code " + new6.code);
+
+        // 7. hash strategy with a forced collision: another URL already holds the first hash code
+        InMemoryUrlRepository repo = new InMemoryUrlRepository();
+        HashGenerator hg = new HashGenerator(7);
+        String target = "https://example.com/very/long/path";
+        String firstCode = hg.generate(target, 0);
+        repo.saveIfAbsent(new ShortUrl(firstCode, "https://squatter.example/", "x", clock.now(), null, false));
+        UrlShortener hs = new UrlShortener(host, hg, repo, clock, false);
+        ShortUrl h = hs.shorten(new ShortenRequest(target));
+        System.out.println("7. hash: first code " + firstCode + " was taken -&gt; got " + h.code + " after " + hs.collisions.sum() + " collision");
+        check(!h.code.equals(firstCode) &amp;&amp; h.code.equals(hg.generate(target, 1)) &amp;&amp; hs.collisions.sum() == 1, "re-hash on collision");
+
+        // 7b. the hash code is spread over the whole alphabet, first character included
+        Set&lt;Character&gt; firstChars = new HashSet&lt;&gt;();
+        for (int i = 0; i &lt; 10_000; i++) firstChars.add(hg.generate("https://spread.example/" + i, 0).charAt(0));
+        System.out.println("7b. hash spread: first character took " + firstChars.size() + " of 62 symbols over 10000 URLs");
+        check(firstChars.size() == 62, "first character uniform over base62");
+
+        // 8. a generator that always collides must fail loudly, not loop forever
+        UrlShortener stuck = new UrlShortener(host, (url, attempt) -&gt; "same", new InMemoryUrlRepository(), clock, false);
+        stuck.shorten(new ShortenRequest("https://one.example/"));
+        expectThrows(ShortenerException.class, () -&gt; stuck.shorten(new ShortenRequest("https://two.example/")), "bounded retries");
+        System.out.println("8. bounded retries: gave up after " + UrlShortener.MAX_ATTEMPTS + " attempts");
+
+        // 9. concurrency: 8 threads x 1000 distinct URLs (random codes), 8 threads on one URL (dedupe), 8 x 1000 clicks
+        UrlShortener cs = new UrlShortener(host, new RandomGenerator(new Random(42), 3), new InMemoryUrlRepository(), clock, true);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        Set&lt;String&gt; codes = ConcurrentHashMap.newKeySet();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t8 = 0; t8 &lt; 8; t8++) {
+            final int id = t8;
+            fs.add(pool.submit(() -&gt; { for (int i = 0; i &lt; 1000; i++) codes.add(cs.shorten(new ShortenRequest("https://site.example/" + id + "/" + i)).code); }));
+        }
+        for (Future&lt;?&gt; f : fs) f.get();
+        Set&lt;String&gt; same = ConcurrentHashMap.newKeySet();
+        fs.clear();
+        for (int t8 = 0; t8 &lt; 8; t8++) fs.add(pool.submit(() -&gt; same.add(cs.shorten(new ShortenRequest("https://hot.example/launch")).code)));
+        for (Future&lt;?&gt; f : fs) f.get();
+        String hot = same.iterator().next();
+        fs.clear();
+        for (int t8 = 0; t8 &lt; 8; t8++) fs.add(pool.submit(() -&gt; { for (int i = 0; i &lt; 1000; i++) cs.resolve(hot); }));
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("9. concurrency: " + codes.size() + " unique codes, " + same.size() + " code for 8 racing shortens of one URL, "
+                + cs.clicks(hot) + " clicks counted, " + (cs.collisions.sum() &gt; 0 ? "collisions retried" : "no collisions"));
+        check(codes.size() == 8000 &amp;&amp; same.size() == 1 &amp;&amp; cs.clicks(hot) == 8000, "concurrency");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""URL shortener, LLD flavour: pluggable code generation, collision retry, expiry, analytics.
+
+Run: python main.py        Tests: python -m unittest test_main
+"""
+from __future__ import annotations
+
+import hashlib
+import random
+import re
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from urllib.parse import urlsplit
+
+ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+class ShortenerError(Exception): ...
+class InvalidUrlError(ShortenerError): ...
+class AliasTakenError(ShortenerError): ...
+class NotOwnerError(ShortenerError): ...
+
+
+def b62_encode(n: int) -&gt; str:
+    if n &lt; 0:
+        raise ValueError("negative")
+    if n == 0:
+        return "0"
+    out = []
+    while n:
+        n, r = divmod(n, 62)
+        out.append(ALPHABET[r])
+    return "".join(reversed(out))
+
+
+def b62_decode(s: str) -&gt; int:
+    n = 0
+    for ch in s:
+        d = ALPHABET.find(ch)
+        if d &lt; 0:
+            raise ValueError(f"not base62: {ch}")
+        n = n * 62 + d
+    return n
+
+
+class Clock(Protocol):
+    def now(self) -&gt; datetime: ...
+
+
+class FakeClock:
+    def __init__(self, t: datetime) -&gt; None:
+        self.t = t
+
+    def now(self) -&gt; datetime:
+        return self.t
+
+    def advance(self, d: timedelta) -&gt; None:
+        self.t += d
+
+
+@dataclass
+class ShortUrl:
+    code: str
+    long_url: str
+    owner: str
+    created_at: datetime
+    expires_at: Optional[datetime]
+    custom: bool = False
+    clicks: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+
+    def expired(self, now: datetime) -&gt; bool:
+        return self.expires_at is not None and now &gt;= self.expires_at
+
+    def click(self) -&gt; None:
+        with self._lock:              # += is not atomic across threads
+            self.clicks += 1
+
+
+# ---------- id generation: Strategy (any callable (url, attempt) -&gt; code works) ----------
+CodeGenerator = Callable[[str, int], str]
+
+
+class CounterGenerator:
+    def __init__(self, start: int) -&gt; None:
+        self._next, self._lock = start, threading.Lock()
+
+    def __call__(self, url: str, attempt: int) -&gt; str:
+        with self._lock:
+            n, self._next = self._next, self._next + 1
+        return b62_encode(n)
+
+
+class HashGenerator:
+    def __init__(self, length: int) -&gt; None:
+        self.length = length
+
+    def __call__(self, url: str, attempt: int) -&gt; str:
+        h = hashlib.sha256(f"{url}#{attempt}".encode()).digest()
+        n = int.from_bytes(h[:8], "big") &amp; ((1 &lt;&lt; 63) - 1)
+        # low-order digits, left-padded: a prefix of b62_encode(n) is not uniform (its first digit is 1..10)
+        return b62_encode(n % 62 ** self.length).rjust(self.length, ALPHABET[0])
+
+
+class RandomGenerator:
+    def __init__(self, rnd: random.Random, length: int) -&gt; None:
+        self.rnd, self.length, self._lock = rnd, length, threading.Lock()
+
+    def __call__(self, url: str, attempt: int) -&gt; str:
+        with self._lock:
+            return "".join(self.rnd.choice(ALPHABET) for _ in range(self.length))
+
+
+# ---------- storage: Repository ----------
+class InMemoryUrlRepository:
+    def __init__(self) -&gt; None:
+        self._by_code: Dict[str, ShortUrl] = {}
+        self._lock = threading.Lock()
+
+    def save_if_absent(self, u: ShortUrl) -&gt; bool:      # atomic claim
+        with self._lock:
+            if u.code in self._by_code:
+                return False
+            self._by_code[u.code] = u
+            return True
+
+    def find(self, code: str) -&gt; Optional[ShortUrl]:
+        with self._lock:
+            return self._by_code.get(code)
+
+    def delete(self, code: str) -&gt; bool:
+        with self._lock:
+            return self._by_code.pop(code, None) is not None
+
+    def all(self) -&gt; List[ShortUrl]:
+        with self._lock:
+            return list(self._by_code.values())
+
+
+class UrlValidator:
+    ALIAS = re.compile(r"[A-Za-z0-9_-]{3,30}")
+    RESERVED = {"api", "admin", "login", "stats", "health"}
+
+    def __init__(self, own_host: str) -&gt; None:
+        self.own_host = own_host
+
+    def normalize(self, url: str) -&gt; str:
+        if not url or not url.strip() or len(url) &gt; 2048:
+            raise InvalidUrlError("empty or too long")
+        if any(ch.isspace() for ch in url.strip()):
+            raise InvalidUrlError(f"not a URL: {url}")
+        parts = urlsplit(url.strip())
+        scheme = parts.scheme.lower()
+        if scheme not in ("http", "https"):
+            raise InvalidUrlError(f"only http/https: {url}")
+        if not parts.hostname:
+            raise InvalidUrlError(f"no host: {url}")
+        host = parts.hostname.lower()
+        if host == self.own_host:
+            raise InvalidUrlError(f"would redirect to ourselves: {url}")
+        port = f":{parts.port}" if parts.port else ""
+        query = f"?{parts.query}" if parts.query else ""
+        return f"{scheme}://{host}{port}{parts.path}{query}"
+
+    def check_alias(self, alias: str) -&gt; None:
+        if not self.ALIAS.fullmatch(alias):
+            raise InvalidUrlError(f"alias must be 3-30 of [A-Za-z0-9_-]: {alias}")
+        if alias.lower() in self.RESERVED:
+            raise InvalidUrlError(f"reserved alias: {alias}")
+
+
+class Outcome(Enum):
+    FOUND = 302
+    NOT_FOUND = 404
+    EXPIRED = 410
+
+
+@dataclass
+class Resolution:
+    outcome: Outcome
+    long_url: Optional[str] = None
+
+
+ClickListener = Callable[[ShortUrl, datetime], None]
+
+
+class UrlShortener:
+    MAX_ATTEMPTS = 5
+
+    def __init__(self, own_host: str, generator: CodeGenerator, repo: InMemoryUrlRepository,
+                 clock: Clock, dedupe: bool = True) -&gt; None:
+        self.base = f"https://{own_host}/"
+        self.generator, self.repo, self.clock, self.dedupe = generator, repo, clock, dedupe
+        self.validator = UrlValidator(own_host)
+        self._code_by_url: Dict[Tuple[str, str], str] = {}
+        self._dedupe_lock = threading.Lock()
+        self._listeners: List[ClickListener] = []
+        self.collisions = 0
+        self._stats_lock = threading.Lock()
+
+    def add_listener(self, l: ClickListener) -&gt; None:
+        self._listeners.append(l)
+
+    def link(self, u: ShortUrl) -&gt; str:
+        return self.base + u.code
+
+    def shorten(self, long_url: str, alias: Optional[str] = None, ttl: Optional[timedelta] = None,
+                owner: str = "anonymous") -&gt; ShortUrl:
+        url = self.validator.normalize(long_url)
+        now = self.clock.now()
+        exp = now + ttl if ttl else None
+        if alias is not None:
+            self.validator.check_alias(alias)
+            u = ShortUrl(alias, url, owner, now, exp, custom=True)
+            if not self.repo.save_if_absent(u):
+                raise AliasTakenError(f"alias taken: {alias}")
+            return u
+        if self.dedupe and ttl is None:
+            key = (owner, url)                            # per owner: a delete by one owner never kills another's link
+            with self._dedupe_lock:                       # one winner when many threads shorten the same URL
+                code = self._code_by_url.get(key)
+                found = self.repo.find(code) if code is not None else None
+                if found is None:                         # no entry, or a stale one whose link was deleted
+                    found = self._claim(url, owner, now, None)
+                    self._code_by_url[key] = found.code
+            return found
+        return self._claim(url, owner, now, exp)
+
+    def _claim(self, url: str, owner: str, now: datetime, exp: Optional[datetime]) -&gt; ShortUrl:
+        for attempt in range(self.MAX_ATTEMPTS):
+            u = ShortUrl(self.generator(url, attempt), url, owner, now, exp)
+            if self.repo.save_if_absent(u):
+                return u
+            with self._stats_lock:
+                self.collisions += 1
+        raise ShortenerError(f"could not find a free code after {self.MAX_ATTEMPTS} attempts")
+
+    def resolve(self, code: str) -&gt; Resolution:
+        u = self.repo.find(code)
+        if u is None:
+            return Resolution(Outcome.NOT_FOUND)
+        now = self.clock.now()
+        if u.expired(now):
+            return Resolution(Outcome.EXPIRED)
+        u.click()
+        for l in self._listeners:
+            l(u, now)
+        return Resolution(Outcome.FOUND, u.long_url)
+
+    def delete(self, code: str, owner: str) -&gt; None:
+        u = self.repo.find(code)
+        if u is None:
+            raise ShortenerError(f"no such code: {code}")
+        if u.owner != owner:
+            raise NotOwnerError(f"{owner} does not own {code}")
+        with self._dedupe_lock:                           # entry and row go together: shorten() never sees a dead code
+            if self._code_by_url.get((u.owner, u.long_url)) == code:
+                del self._code_by_url[(u.owner, u.long_url)]
+            self.repo.delete(code)
+
+    def purge_expired(self) -&gt; int:
+        now = self.clock.now()
+        return sum(1 for u in self.repo.all() if u.expired(now) and self.repo.delete(u.code))
+
+    def clicks(self, code: str) -&gt; int:
+        u = self.repo.find(code)
+        return u.clicks if u else 0
+
+    def top_k(self, k: int) -&gt; List[str]:
+        ranked = sorted(self.repo.all(), key=lambda u: (-u.clicks, u.code))
+        return [f"{u.code}={u.clicks}" for u in ranked[:k]]
+
+
+def demo() -&gt; None:
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    s = UrlShortener("sho.rt", CounterGenerator(1_000_000), InMemoryUrlRepository(), clock)
+    a = s.shorten("https://Example.com/docs?id=42")
+    b = s.shorten("https://example.com/blog")
+    print(f"1. counter: {s.link(a)} -&gt; {a.long_url} | {s.link(b)} | same URL again -&gt; {s.shorten('https://EXAMPLE.com/docs?id=42').code}")
+    c = s.shorten("https://example.com/handbook", alias="team-docs", owner="asha")
+    for _ in range(3):
+        s.resolve(a.code)
+    s.resolve(c.code)
+    print(f"4. resolve: {a.code} -&gt; {s.resolve(a.code).outcome.value} | zzzz -&gt; {s.resolve('zzzz').outcome.value} | top2 {s.top_k(2)}")
+    t = s.shorten("https://example.com/sale", ttl=timedelta(seconds=60))
+    clock.advance(timedelta(seconds=61))
+    print(f"5. expiry: {t.code} after 61 s -&gt; {s.resolve(t.code).outcome.value} {s.resolve(t.code).outcome.name}, purged {s.purge_expired()}")
+    hg = HashGenerator(7)
+    repo = InMemoryUrlRepository()
+    target = "https://example.com/very/long/path"
+    first = hg(target, 0)
+    repo.save_if_absent(ShortUrl(first, "https://squatter.example/", "x", clock.now(), None))
+    hs = UrlShortener("sho.rt", hg, repo, clock, dedupe=False)
+    h = hs.shorten(target)
+    print(f"7. hash: first code {first} was taken -&gt; got {h.code} after {hs.collisions} collision")
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python tests">
+<pre><code class="language-python">import random
+import threading
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from main import (AliasTakenError, CounterGenerator, FakeClock, HashGenerator, InMemoryUrlRepository,
+                  InvalidUrlError, NotOwnerError, Outcome, RandomGenerator, ShortenerError, ShortUrl, UrlShortener,
+                  b62_decode, b62_encode)
+
+
+def make(gen=None, dedupe=True):
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+    return UrlShortener("sho.rt", gen or CounterGenerator(1_000_000), InMemoryUrlRepository(), clock, dedupe), clock
+
+
+class Base62Test(unittest.TestCase):
+    def test_round_trip(self):
+        for n in (0, 1, 61, 62, 1_000_000, 62 ** 7 - 1):
+            self.assertEqual(b62_decode(b62_encode(n)), n)
+        self.assertEqual(b62_encode(1_000_000), "4c92")
+        self.assertEqual(len(b62_encode(62 ** 7 - 1)), 7)
+
+
+class ShortenerTest(unittest.TestCase):
+    def test_counter_codes_and_dedupe(self):
+        s, _ = make()
+        a = s.shorten("https://Example.com/docs?id=42")
+        b = s.shorten("https://example.com/blog")
+        self.assertEqual((a.code, b.code), ("4c92", "4c93"))
+        self.assertEqual(s.shorten("https://EXAMPLE.com/docs?id=42").code, a.code)
+
+    def test_no_dedupe_gives_new_codes(self):
+        s, _ = make(dedupe=False)
+        self.assertNotEqual(s.shorten("https://x.example/").code, s.shorten("https://x.example/").code)
+
+    def test_alias_rules(self):
+        s, _ = make()
+        s.shorten("https://example.com/handbook", alias="team-docs")
+        with self.assertRaises(AliasTakenError):
+            s.shorten("https://other.org", alias="team-docs")
+        for bad in ("a b", "x", "admin", "Login"):
+            with self.assertRaises(InvalidUrlError):
+                s.shorten("https://other.org", alias=bad)
+
+    def test_validation(self):
+        s, _ = make()
+        for bad in ("", "ftp://files.example.com/x", "not a url", "https://sho.rt/4c92", "https://", "x" * 3000):
+            with self.assertRaises(InvalidUrlError, msg=bad):
+                s.shorten(bad)
+
+    def test_resolve_counts_and_404(self):
+        s, _ = make()
+        a = s.shorten("https://example.com/a")
+        seen = []
+        s.add_listener(lambda u, at: seen.append(u.code))
+        r = s.resolve(a.code)
+        self.assertEqual((r.outcome, r.long_url), (Outcome.FOUND, "https://example.com/a"))
+        self.assertEqual(s.resolve("nope").outcome, Outcome.NOT_FOUND)
+        self.assertEqual((s.clicks(a.code), seen), (1, [a.code]))
+
+    def test_expiry_lazy_and_purge(self):
+        s, clock = make()
+        t = s.shorten("https://example.com/sale", ttl=timedelta(seconds=60))
+        clock.advance(timedelta(seconds=59))
+        self.assertEqual(s.resolve(t.code).outcome, Outcome.FOUND)
+        clock.advance(timedelta(seconds=1))              # exactly at expiry: gone
+        self.assertEqual(s.resolve(t.code).outcome, Outcome.EXPIRED)
+        self.assertEqual(s.purge_expired(), 1)
+        self.assertEqual(s.resolve(t.code).outcome, Outcome.NOT_FOUND)
+
+    def test_ttl_links_are_not_deduped(self):
+        s, _ = make()
+        a = s.shorten("https://example.com/p")
+        b = s.shorten("https://example.com/p", ttl=timedelta(days=1))
+        self.assertNotEqual(a.code, b.code)
+
+    def test_owner_delete(self):
+        s, _ = make()
+        c = s.shorten("https://example.com/h", alias="team-docs", owner="asha")
+        with self.assertRaises(NotOwnerError):
+            s.delete(c.code, "ben")
+        s.delete(c.code, "asha")
+        self.assertEqual(s.resolve(c.code).outcome, Outcome.NOT_FOUND)
+
+    def test_hash_collision_rehashes(self):
+        hg = HashGenerator(7)
+        s, clock = make(hg, dedupe=False)
+        target = "https://example.com/very/long/path"
+        s.repo.save_if_absent(ShortUrl(hg(target, 0), "https://squatter.example/", "x", clock.now(), None))
+        self.assertEqual(s.shorten(target).code, hg(target, 1))
+        self.assertEqual(s.collisions, 1)
+
+    def test_hash_first_char_is_uniform(self):
+        hg = HashGenerator(7)
+        firsts = {hg(f"https://spread.example/{i}", 0)[0] for i in range(10_000)}
+        self.assertEqual(len(firsts), 62)          # a prefix of the full encoding gave only ~10
+        self.assertTrue(all(len(hg(f"https://x.example/{i}", 0)) == 7 for i in range(100)))
+
+    def test_dedupe_is_per_owner(self):
+        s, _ = make()
+        a = s.shorten("https://example.com/shared", owner="asha")
+        b = s.shorten("https://example.com/shared", owner="ben")
+        self.assertNotEqual(a.code, b.code)
+        self.assertEqual(s.shorten("https://example.com/shared", owner="ben").code, b.code)
+        s.delete(a.code, "asha")
+        self.assertEqual(s.resolve(b.code).outcome, Outcome.FOUND)
+
+    def test_delete_vs_dedupe_drops_stale_entry(self):
+        s, _ = make()
+        old = s.shorten("https://example.com/race")
+        s.repo.delete(old.code)                        # row gone, dedupe entry left behind (the race window)
+        new = s.shorten("https://example.com/race")
+        self.assertNotEqual(new.code, old.code)
+        self.assertEqual(s.resolve(new.code).outcome, Outcome.FOUND)
+
+    def test_bounded_retries(self):
+        s, _ = make(lambda url, attempt: "same", dedupe=False)
+        s.shorten("https://one.example/")
+        with self.assertRaises(ShortenerError):
+            s.shorten("https://two.example/")
+        self.assertEqual(s.collisions, UrlShortener.MAX_ATTEMPTS)
+
+    def test_top_k_tie_break(self):
+        s, _ = make()
+        a, b = s.shorten("https://a.example/"), s.shorten("https://b.example/")
+        s.resolve(b.code)
+        self.assertEqual(s.top_k(2), [f"{b.code}=1", f"{a.code}=0"])
+
+    def test_concurrent_shortens_and_clicks(self):
+        s, _ = make(RandomGenerator(random.Random(42), 3))
+        codes, same = set(), set()
+        lock = threading.Lock()
+
+        def many(tid):
+            for i in range(300):
+                c = s.shorten(f"https://site.example/{tid}/{i}").code
+                with lock:
+                    codes.add(c)
+
+        def hot():
+            c = s.shorten("https://hot.example/launch").code
+            with lock:
+                same.add(c)
+
+        ts = [threading.Thread(target=many, args=(i,)) for i in range(8)] + [threading.Thread(target=hot) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual((len(codes), len(same)), (2400, 1))
+        code = same.pop()
+        clickers = [threading.Thread(target=lambda: [s.resolve(code) for _ in range(500)]) for _ in range(8)]
+        for t in clickers:
+            t.start()
+        for t in clickers:
+            t.join()
+        self.assertEqual(s.clicks(code), 4000)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// URL shortener (LLD) in C++14: Strategy for code generation, Repository, lazy expiry, click analytics.
+// Build: g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main
+// Single-threaded demo: MinGW g++ 6.3 has no std::mutex. In a threaded build, the repository's saveIfAbsent /
+// find / remove take one std::mutex (or use a concurrent map), the counter is std::atomic&lt;long long&gt;, and clicks
+// are std::atomic&lt;long long&gt; per entry. The C++ standard library has no SHA-256, so HashGenerator uses FNV-1a 64.
+#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdint&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;random&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+
+static const std::string ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+struct ShortenerError : std::runtime_error { using std::runtime_error::runtime_error; };
+struct InvalidUrl : ShortenerError { using ShortenerError::ShortenerError; };
+struct AliasTaken : ShortenerError { using ShortenerError::ShortenerError; };
+struct NotOwner : ShortenerError { using ShortenerError::ShortenerError; };
+
+static std::string b62encode(unsigned long long n) {
+    if (n == 0) return "0";
+    std::string s;
+    while (n) { s.push_back(ALPHABET[n % 62]); n /= 62; }
+    std::reverse(s.begin(), s.end());
+    return s;
+}
+static unsigned long long b62decode(const std::string&amp; s) {
+    unsigned long long n = 0;
+    for (char ch : s) {
+        size_t d = ALPHABET.find(ch);
+        if (d == std::string::npos) throw std::invalid_argument("not base62");
+        n = n * 62 + d;
+    }
+    return n;
+}
+
+// time in seconds, injected
+struct Clock { virtual ~Clock() {} virtual long long now() const = 0; };
+struct FakeClock : Clock { long long t = 0; long long now() const override { return t; } };
+
+struct ShortUrl {
+    std::string code, longUrl, owner;
+    long long createdAt = 0, expiresAt = -1;   // -1 = never
+    bool custom = false;
+    long long clicks = 0;
+    bool expired(long long now) const { return expiresAt &gt;= 0 &amp;&amp; now &gt;= expiresAt; }
+};
+
+// ---- Strategy: code generation ----
+struct CodeGenerator {
+    virtual ~CodeGenerator() {}
+    virtual std::string generate(const std::string&amp; url, int attempt) = 0;
+};
+struct CounterGenerator : CodeGenerator {
+    unsigned long long next;
+    explicit CounterGenerator(unsigned long long start) : next(start) {}
+    std::string generate(const std::string&amp;, int) override { return b62encode(next++); }
+};
+struct HashGenerator : CodeGenerator {
+    size_t length;
+    explicit HashGenerator(size_t len) : length(len) {}
+    static std::uint64_t fnv1a(const std::string&amp; s) {
+        std::uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+        return h;
+    }
+    std::string generate(const std::string&amp; url, int attempt) override {
+        // low-order base62 digits, left-padded: a prefix of the full encoding is not uniform
+        std::uint64_t n = fnv1a(url + "#" + std::to_string(attempt)) &amp; 0x7fffffffffffffffULL;
+        std::string code(length, ALPHABET[0]);
+        for (size_t i = length; i-- &gt; 0;) { code[i] = ALPHABET[n % 62]; n /= 62; }
+        return code;
+    }
+};
+struct RandomGenerator : CodeGenerator {
+    std::mt19937 rng; size_t length;
+    RandomGenerator(unsigned seed, size_t len) : rng(seed), length(len) {}
+    std::string generate(const std::string&amp;, int) override {
+        std::uniform_int_distribution&lt;int&gt; d(0, 61);
+        std::string s;
+        for (size_t i = 0; i &lt; length; ++i) s.push_back(ALPHABET[d(rng)]);
+        return s;
+    }
+};
+struct FixedGenerator : CodeGenerator {   // always the same code: proves retries are bounded
+    std::string generate(const std::string&amp;, int) override { return "same"; }
+};
+
+// ---- Repository ----
+struct UrlRepository {
+    virtual ~UrlRepository() {}
+    virtual bool saveIfAbsent(const ShortUrl&amp; u) = 0;
+    virtual ShortUrl* find(const std::string&amp; code) = 0;   // nullptr = missing
+    virtual bool remove(const std::string&amp; code) = 0;
+    virtual std::vector&lt;ShortUrl*&gt; all() = 0;
+};
+struct InMemoryRepository : UrlRepository {
+    std::unordered_map&lt;std::string, ShortUrl&gt; byCode;
+    bool saveIfAbsent(const ShortUrl&amp; u) override { return byCode.emplace(u.code, u).second; }
+    ShortUrl* find(const std::string&amp; c) override { auto it = byCode.find(c); return it == byCode.end() ? nullptr : &amp;it-&gt;second; }
+    bool remove(const std::string&amp; c) override { return byCode.erase(c) &gt; 0; }
+    std::vector&lt;ShortUrl*&gt; all() override { std::vector&lt;ShortUrl*&gt; v; for (auto&amp; kv : byCode) v.push_back(&amp;kv.second); return v; }
+};
+
+// ---- validation ----
+static std::string lower(std::string s) { for (char&amp; c : s) c = static_cast&lt;char&gt;(std::tolower(static_cast&lt;unsigned char&gt;(c))); return s; }
+struct UrlValidator {
+    std::string ownHost;
+    std::string normalize(const std::string&amp; url) const {
+        if (url.empty() || url.size() &gt; 2048) throw InvalidUrl("empty or too long");
+        if (std::any_of(url.begin(), url.end(), [](char c) { return std::isspace(static_cast&lt;unsigned char&gt;(c)) != 0; }))
+            throw InvalidUrl("not a URL: " + url);
+        size_t sep = url.find("://");
+        if (sep == std::string::npos) throw InvalidUrl("not a URL: " + url);
+        std::string scheme = lower(url.substr(0, sep));
+        if (scheme != "http" &amp;&amp; scheme != "https") throw InvalidUrl("only http/https: " + url);
+        size_t hostEnd = url.find_first_of("/?#", sep + 3);
+        std::string host = lower(url.substr(sep + 3, hostEnd == std::string::npos ? std::string::npos : hostEnd - sep - 3));
+        if (host.empty()) throw InvalidUrl("no host: " + url);
+        if (host == ownHost) throw InvalidUrl("would redirect to ourselves: " + url);
+        std::string rest = hostEnd == std::string::npos ? "" : url.substr(hostEnd);
+        size_t hash = rest.find('#');
+        if (hash != std::string::npos) rest = rest.substr(0, hash);   // fragments never reach the server
+        return scheme + "://" + host + rest;
+    }
+    void checkAlias(const std::string&amp; a) const {
+        static const std::set&lt;std::string&gt; reserved = {"api", "admin", "login", "stats", "health"};
+        if (a.size() &lt; 3 || a.size() &gt; 30) throw InvalidUrl("alias must be 3-30 chars");
+        for (char c : a) if (!(std::isalnum(static_cast&lt;unsigned char&gt;(c)) || c == '_' || c == '-')) throw InvalidUrl("bad alias char");
+        if (reserved.count(lower(a))) throw InvalidUrl("reserved alias: " + a);
+    }
+};
+
+enum class Outcome { FOUND = 302, NOT_FOUND = 404, EXPIRED = 410 };
+struct Resolution { Outcome outcome; std::string longUrl; };
+
+class UrlShortener {
+public:
+    static const int MAX_ATTEMPTS = 5;
+    long long collisions = 0;
+    std::function&lt;void(const ShortUrl&amp;, long long)&gt; onClick;   // one-listener Observer
+
+    UrlShortener(std::string host, std::unique_ptr&lt;CodeGenerator&gt; g, std::unique_ptr&lt;UrlRepository&gt; r,
+                 const Clock&amp; c, bool dedupe)
+        : base_("https://" + host + "/"), gen_(std::move(g)), repo_(std::move(r)), clock_(c), dedupe_(dedupe) {
+        validator_.ownHost = host;
+    }
+    UrlRepository&amp; repo() { return *repo_; }
+    std::string link(const ShortUrl&amp; u) const { return base_ + u.code; }
+
+    ShortUrl shorten(const std::string&amp; longUrl, const std::string&amp; alias = "", long long ttl = -1,
+                     const std::string&amp; owner = "anonymous") {
+        std::string url = validator_.normalize(longUrl);
+        long long now = clock_.now(), exp = ttl &lt; 0 ? -1 : now + ttl;
+        if (!alias.empty()) {
+            validator_.checkAlias(alias);
+            ShortUrl u{alias, url, owner, now, exp, true, 0};
+            if (!repo_-&gt;saveIfAbsent(u)) throw AliasTaken("alias taken: " + alias);
+            return u;
+        }
+        if (dedupe_ &amp;&amp; ttl &lt; 0) {
+            std::string key = owner + '\0' + url;              // dedupe per owner
+            auto it = codeByUrl_.find(key);
+            if (it != codeByUrl_.end()) {
+                if (ShortUrl* found = repo_-&gt;find(it-&gt;second)) return *found;
+                codeByUrl_.erase(it);                          // stale: its link was deleted underneath
+            }
+            ShortUrl u = claim(url, owner, now, -1);
+            codeByUrl_[key] = u.code;
+            return u;
+        }
+        return claim(url, owner, now, exp);
+    }
+
+    Resolution resolve(const std::string&amp; code) {
+        ShortUrl* u = repo_-&gt;find(code);
+        if (!u) return Resolution{Outcome::NOT_FOUND, ""};
+        long long now = clock_.now();
+        if (u-&gt;expired(now)) return Resolution{Outcome::EXPIRED, ""};
+        ++u-&gt;clicks;
+        if (onClick) onClick(*u, now);
+        return Resolution{Outcome::FOUND, u-&gt;longUrl};
+    }
+
+    void remove(const std::string&amp; code, const std::string&amp; owner) {
+        ShortUrl* u = repo_-&gt;find(code);
+        if (!u) throw ShortenerError("no such code: " + code);
+        if (u-&gt;owner != owner) throw NotOwner(owner + " does not own " + code);
+        auto it = codeByUrl_.find(u-&gt;owner + '\0' + u-&gt;longUrl);
+        if (it != codeByUrl_.end() &amp;&amp; it-&gt;second == code) codeByUrl_.erase(it);
+        repo_-&gt;remove(code);
+    }
+
+    int purgeExpired() {
+        long long now = clock_.now();
+        std::vector&lt;std::string&gt; dead;
+        for (ShortUrl* u : repo_-&gt;all()) if (u-&gt;expired(now)) dead.push_back(u-&gt;code);
+        for (const auto&amp; c : dead) repo_-&gt;remove(c);
+        return static_cast&lt;int&gt;(dead.size());
+    }
+
+    std::vector&lt;std::string&gt; topK(size_t k) {
+        std::vector&lt;ShortUrl*&gt; v = repo_-&gt;all();
+        std::sort(v.begin(), v.end(), [](const ShortUrl* a, const ShortUrl* b) {
+            return a-&gt;clicks != b-&gt;clicks ? a-&gt;clicks &gt; b-&gt;clicks : a-&gt;code &lt; b-&gt;code;
+        });
+        std::vector&lt;std::string&gt; out;
+        for (size_t i = 0; i &lt; v.size() &amp;&amp; i &lt; k; ++i) out.push_back(v[i]-&gt;code + "=" + std::to_string(v[i]-&gt;clicks));
+        return out;
+    }
+
+private:
+    std::string base_;
+    std::unique_ptr&lt;CodeGenerator&gt; gen_;
+    std::unique_ptr&lt;UrlRepository&gt; repo_;
+    const Clock&amp; clock_;
+    bool dedupe_;
+    UrlValidator validator_;
+    std::unordered_map&lt;std::string, std::string&gt; codeByUrl_;
+
+    ShortUrl claim(const std::string&amp; url, const std::string&amp; owner, long long now, long long exp) {
+        for (int attempt = 0; attempt &lt; MAX_ATTEMPTS; ++attempt) {
+            ShortUrl u{gen_-&gt;generate(url, attempt), url, owner, now, exp, false, 0};
+            if (repo_-&gt;saveIfAbsent(u)) return u;
+            ++collisions;
+        }
+        throw ShortenerError("no free code after retries");
+    }
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); } ++checks; }
+template &lt;class E, class F&gt; static void expectThrows(F f, const char* what) {
+    try { f(); } catch (const E&amp;) { ++checks; return; } catch (...) { check(false, what); }
+    check(false, what);
+}
+template &lt;class G&gt; static std::unique_ptr&lt;CodeGenerator&gt; gen(G* g) { return std::unique_ptr&lt;CodeGenerator&gt;(g); }
+static std::unique_ptr&lt;UrlRepository&gt; repo() { return std::unique_ptr&lt;UrlRepository&gt;(new InMemoryRepository()); }
+
+int main() {
+    FakeClock clock;
+    UrlShortener s("sho.rt", gen(new CounterGenerator(1000000)), repo(), clock, true);
+    ShortUrl a = s.shorten("https://Example.com/docs?id=42#top");
+    ShortUrl b = s.shorten("https://example.com/blog");
+    check(a.code == "4c92" &amp;&amp; b.code == "4c93" &amp;&amp; b62decode(a.code) == 1000000, "counter + base62");
+    check(s.shorten("https://EXAMPLE.com/docs?id=42").code == a.code, "dedupe ignores host case and fragment");
+    std::cout &lt;&lt; "1. counter: " &lt;&lt; s.link(a) &lt;&lt; " -&gt; " &lt;&lt; a.longUrl &lt;&lt; " | " &lt;&lt; s.link(b) &lt;&lt; "\n";
+
+    ShortUrl c = s.shorten("https://example.com/handbook", "team-docs", -1, "asha");
+    expectThrows&lt;AliasTaken&gt;([&amp;] { s.shorten("https://other.org", "team-docs"); }, "taken alias");
+    expectThrows&lt;InvalidUrl&gt;([&amp;] { s.shorten("https://other.org", "admin"); }, "reserved alias");
+    expectThrows&lt;InvalidUrl&gt;([&amp;] { s.shorten("ftp://x.example/a"); }, "ftp");
+    expectThrows&lt;InvalidUrl&gt;([&amp;] { s.shorten("not a url"); }, "garbage");
+    expectThrows&lt;InvalidUrl&gt;([&amp;] { s.shorten("https://sho.rt/4c92"); }, "self loop");
+
+    int listenerCalls = 0;
+    s.onClick = [&amp;listenerCalls](const ShortUrl&amp;, long long) { ++listenerCalls; };
+    for (int i = 0; i &lt; 3; ++i) s.resolve(a.code);
+    s.resolve(c.code);
+    check(s.resolve("zzzz").outcome == Outcome::NOT_FOUND &amp;&amp; listenerCalls == 4, "resolve + observer");
+    std::vector&lt;std::string&gt; top = s.topK(2);
+    std::cout &lt;&lt; "4. top2: " &lt;&lt; top[0] &lt;&lt; " " &lt;&lt; top[1] &lt;&lt; "\n";
+
+    ShortUrl t = s.shorten("https://example.com/sale", "", 60);
+    check(s.resolve(t.code).outcome == Outcome::FOUND, "before expiry");
+    clock.t += 61;
+    check(s.resolve(t.code).outcome == Outcome::EXPIRED &amp;&amp; s.purgeExpired() == 1, "expiry + purge");
+    std::cout &lt;&lt; "5. expiry: " &lt;&lt; t.code &lt;&lt; " after 61 s -&gt; " &lt;&lt; static_cast&lt;int&gt;(Outcome::EXPIRED) &lt;&lt; ", purged 1\n";
+
+    expectThrows&lt;NotOwner&gt;([&amp;] { s.remove(c.code, "ben"); }, "non-owner delete");
+    s.remove(c.code, "asha");
+    check(s.resolve(c.code).outcome == Outcome::NOT_FOUND, "deleted");
+    ShortUrl ra = s.shorten("https://example.com/shared", "", -1, "asha");
+    ShortUrl rb = s.shorten("https://example.com/shared", "", -1, "ben");
+    s.remove(ra.code, "asha");
+    check(ra.code != rb.code &amp;&amp; s.resolve(rb.code).outcome == Outcome::FOUND, "per-owner dedupe survives other owner's delete");
+    std::cout &lt;&lt; "6b. per-owner dedupe: asha " &lt;&lt; ra.code &lt;&lt; ", ben " &lt;&lt; rb.code &lt;&lt; "; asha deleted hers, ben's still resolves\n";
+
+    HashGenerator probe(7);
+    std::string target = "https://example.com/very/long/path";
+    std::string first = probe.generate(target, 0);
+    UrlShortener hs("sho.rt", gen(new HashGenerator(7)), repo(), clock, false);
+    hs.repo().saveIfAbsent(ShortUrl{first, "https://squatter.example/", "x", 0, -1, false, 0});
+    ShortUrl h = hs.shorten(target);
+    check(h.code == probe.generate(target, 1) &amp;&amp; hs.collisions == 1, "re-hash on collision");
+    std::cout &lt;&lt; "7. hash (FNV-1a): first code " &lt;&lt; first &lt;&lt; " was taken -&gt; got " &lt;&lt; h.code &lt;&lt; "\n";
+    std::set&lt;char&gt; firsts;
+    for (int i = 0; i &lt; 10000; ++i) firsts.insert(probe.generate("https://spread.example/" + std::to_string(i), 0)[0]);
+    check(firsts.size() == 62, "first character uniform over base62");
+    std::cout &lt;&lt; "7b. hash spread: first character took " &lt;&lt; firsts.size() &lt;&lt; " of 62 symbols over 10000 URLs\n";
+
+    UrlShortener stuck("sho.rt", gen(new FixedGenerator()), repo(), clock, false);
+    stuck.shorten("https://one.example/");
+    expectThrows&lt;ShortenerError&gt;([&amp;] { stuck.shorten("https://two.example/"); }, "bounded retries");
+
+    UrlShortener rs("sho.rt", gen(new RandomGenerator(42, 3)), repo(), clock, false);
+    std::set&lt;std::string&gt; codes;
+    for (int i = 0; i &lt; 8000; ++i) codes.insert(rs.shorten("https://site.example/" + std::to_string(i)).code);
+    check(codes.size() == 8000, "8000 unique random codes");
+    std::cout &lt;&lt; "9. random 3-char codes: 8000 unique, " &lt;&lt; rs.collisions &lt;&lt; " collisions retried\n";
+
+    std::cout &lt;&lt; "All " &lt;&lt; checks &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  

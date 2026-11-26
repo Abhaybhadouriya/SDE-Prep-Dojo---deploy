@@ -1,0 +1,54 @@
+
+        <h2>Data model</h2>
+        <p>Square's Books service shows the minimal shape. A <b>book</b> (account) holds a cached balance and a version. A <b>journal entry</b> is one atomic money movement. <b>Book entries</b> (postings) link the two and carry +/- amounts. Only the balance row is ever updated. Everything else is insert-only.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Ledger schema: account, journal_entry, posting, idempotency">
+            <rect class="box db" x="20" y="30" width="230" height="130"/>
+            <text class="label" x="135" y="55">account</text>
+            <text class="label small" x="135" y="80">account_id PK (shard key)</text>
+            <text class="label small" x="135" y="100">type: user / merchant / clearing</text>
+            <text class="label small" x="135" y="120">balance BIGINT (cached)</text>
+            <text class="label small" x="135" y="140">version BIGINT</text>
+            <rect class="box svc" x="290" y="30" width="220" height="110"/>
+            <text class="label" x="400" y="55">journal_entry</text>
+            <text class="label small" x="400" y="80">entry_id PK</text>
+            <text class="label small" x="400" y="100">idempotency_key UNIQUE</text>
+            <text class="label small" x="400" y="120">type, created_at, metadata</text>
+            <rect class="box queue" x="550" y="30" width="230" height="130"/>
+            <text class="label" x="665" y="55">posting (append-only)</text>
+            <text class="label small" x="665" y="80">entry_id FK, account_id FK</text>
+            <text class="label small" x="665" y="100">amount BIGINT (+/-)</text>
+            <text class="label small" x="665" y="120">currency, account_version</text>
+            <text class="label small" x="665" y="140">SUM(amount) per entry = 0</text>
+            <path class="arrow" d="M510 85 L542 85"/>
+            <path class="arrow" d="M550 130 L258 130"/>
+            <rect class="box cache" x="160" y="200" width="480" height="60"/>
+            <text class="label" x="400" y="225">balance = SUM(postings) = cached account.balance</text>
+            <text class="label small" x="400" y="247">a nightly job re-sums and compares (drift = bug)</text>
+          </svg>
+          <figcaption>A double-entry schema. Postings are never updated or deleted. A wrong entry is fixed with a reversing entry.</figcaption>
+        </figure>
+<pre><code class="language-sql">-- one transfer inside ONE shard: a single ACID transaction
+BEGIN;
+INSERT INTO journal_entry (entry_id, idempotency_key, type)
+     VALUES (:eid, :idem, 'P2P');                         -- duplicate key -&gt; already done, return stored result
+UPDATE account SET balance = balance - :amt, version = version + 1
+ WHERE account_id = :from AND balance &gt;= :amt;           -- 0 rows -&gt; insufficient funds -&gt; ROLLBACK
+UPDATE account SET balance = balance + :amt, version = version + 1
+ WHERE account_id = :to;
+INSERT INTO posting (entry_id, account_id, amount) VALUES (:eid, :from, -:amt), (:eid, :to, :amt);
+COMMIT;</code></pre>
+        <h3>Why SQL (or NewSQL)</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Option</th><th>Fit</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>Sharded MySQL / Postgres</td><td>Good</td><td>ACID per shard. A transfer across shards needs a distributed transaction (2PC, TC/C or a saga, compared in deep dive 1). This is the most common interview answer.</td></tr>
+              <tr><td>Spanner / CockroachDB / YugabyteDB</td><td>Very good</td><td>Distributed ACID transactions hide the sharding. Square's Books is a purpose-built ledger service, reported to run on Cloud Spanner (per StackShare; Square's own post does not say). They are costlier and add commit latency.</td></tr>
+              <tr><td>Redis as the balance store</td><td>Bad as the source of truth</td><td>Fast, but two updates on two nodes are not atomic. ByteByteGo's first design fails here: a crash between the debit and the credit loses money.</td></tr>
+              <tr><td>Event log + state machine (event sourcing)</td><td>Best for audit and peak throughput</td><td>An append-only command/event log, deterministic replay, and snapshots. ByteByteGo's final design.</td></tr>
+              <tr><td>Purpose-built ledger DB</td><td>At huge scale</td><td>Uber's LedgerStore: immutable, verifiable, tiered storage, trillions of index entries.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      

@@ -1,0 +1,97 @@
+
+        <h2>Architecture</h2>
+        <p>The cluster has many nodes, each owning part of the key space, each with a replica in another zone. Clients find the right node either by themselves (smart client) or through a proxy. The application uses the <b>cache-aside</b> pattern (also called lookaside): the app, not the cache, talks to the database.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 360" role="img" aria-label="Cache-aside read and write: client routes key to shard, miss goes to database and fills cache; a write updates the database then deletes the key; a moved slot redirects the client">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="150" width="140" height="70"/>
+            <text class="label" x="90" y="178">App server</text>
+            <text class="label small" x="90" y="200">+ smart client</text>
+            <rect class="zone k8s" x="230" y="20" width="300" height="320"/>
+            <text class="zone-label" x="242" y="42">Cache cluster</text>
+            <rect class="box cache" x="260" y="60" width="240" height="50"/><text class="label" x="380" y="90">node A  slots 0-5460</text>
+            <rect class="box cache" x="260" y="160" width="240" height="50"/><text class="label" x="380" y="190">node B  slots 5461-10922</text>
+            <rect class="box cache" x="260" y="260" width="240" height="50"/><text class="label" x="380" y="290">node C  slots 10923-16383</text>
+            <rect class="box db" x="620" y="150" width="160" height="70"/>
+            <text class="label" x="700" y="178">Database</text>
+            <text class="label small" x="700" y="200">source of truth</text>
+            <g data-step="1">
+              <text class="label small" x="100" y="240">slot = CRC16(key)</text>
+              <text class="label small" x="100" y="258">mod 16384</text>
+              <text class="label small" x="100" y="276">"user:42" -&gt; 15880 -&gt; C</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow" d="M160 200 L254 280"/>
+              <text class="label bad" x="380" y="330">MISS</text>
+            </g>
+            <g data-step-only="3">
+              <path class="arrow" d="M160 175 C 350 130, 500 140, 614 175"/>
+              <text class="label small" x="450" y="140">SELECT ... WHERE id=42</text>
+            </g>
+            <g data-step-only="4">
+              <path class="arrow ok" d="M160 210 L254 290"/>
+              <text class="label ok" x="380" y="330">SET user:42 ... EX 300</text>
+            </g>
+            <g data-step-only="5">
+              <path class="arrow ok" d="M160 205 L254 285"/>
+              <text class="label ok" x="380" y="330">HIT in under 1 ms</text>
+            </g>
+            <g data-step-only="6">
+              <path class="arrow" d="M160 185 C 350 230, 500 230, 614 200"/>
+              <text class="label small" x="450" y="250">1. UPDATE users ... COMMIT</text>
+              <path class="arrow bad" d="M160 215 L254 295"/>
+              <text class="label bad" x="380" y="330">2. DEL user:42</text>
+            </g>
+            <g data-step-only="7">
+              <path class="arrow" d="M160 170 L254 95"/>
+              <text class="label bad" x="380" y="135">-MOVED 15880 node-D</text>
+              <text class="label small" x="90" y="120">refresh slot map</text>
+            </g>
+            <g data-step-only="8">
+              <rect class="box fail" x="260" y="260" width="240" height="50"/>
+              <text class="label small bad" x="380" y="290">C down: replica C' promoted</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Route.</b> The smart client hashes the key to one of 16,384 hash slots and looks up which node owns that slot in its cached slot map. No proxy hop, no central lookup.</li>
+            <li><b>Read: miss.</b> The client asks node C for <code>user:42</code>. Not there (first time, expired, or evicted).</li>
+            <li><b>Read from the database.</b> The application, not the cache, queries the source of truth. This is what "cache-aside" means.</li>
+            <li><b>Fill.</b> The app writes the value into the cache with a TTL (here 300 s). The TTL is the safety net: even if an invalidation is lost, staleness is bounded.</li>
+            <li><b>Read: hit.</b> The next reads are served from RAM in well under a millisecond, and the database never sees them.</li>
+            <li><b>Write.</b> On update, the app first commits to the database, then <b>deletes</b> the cache key (not updates it). The next read misses and refills with fresh data. Deleting is idempotent and avoids racing two writers' values.</li>
+            <li><b>Resharding.</b> If slot 15880 has moved to a new node D, node C answers <code>MOVED 15880 &lt;D's address&gt;</code>. The client retries at D and refreshes its slot map. During a live migration, <code>ASK</code> redirects are used for keys already copied.</li>
+            <li><b>Failure.</b> If C dies, the remaining primaries notice through the cluster gossip bus (<a href="{{BASE}}interview/glossary#gossip">gossip</a> = nodes periodically exchange "who is alive" messages with a few random peers, like OSPF hellos but peer-to-peer, so news spreads to everyone in a few rounds), agree that C is failed, and its replica C' is promoted to own the slots. Writes acked by C but not yet copied to C' are lost: replication is asynchronous.</li>
+          </ol>
+        </div>
+        <h3>Write strategies compared</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Strategy</th><th>How it works</th><th>Good for</th><th>Risk</th></tr></thead>
+            <tbody>
+              <tr><td><b>Cache-aside</b> (lookaside)</td><td>App reads cache, on miss reads DB and fills; on write updates DB and deletes key</td><td>The default for most read-heavy apps</td><td>Stale window; race on fill (deep dive 4)</td></tr>
+              <tr><td>Read-through</td><td>Cache itself loads from DB on miss</td><td>Uniform loading logic, libraries like Caffeine</td><td>Cache must know the DB</td></tr>
+              <tr><td>Write-through</td><td>Write goes to cache and DB synchronously</td><td>Data read right after write</td><td>Slower writes; caches data nobody reads</td></tr>
+              <tr><td>Write-behind (write-back)</td><td>Write to cache, flush to DB later in batches</td><td>Very write-heavy counters, metrics</td><td>Data loss if the cache node dies before flushing</td></tr>
+              <tr><td>Write-around</td><td>Write to DB only; cache fills on read</td><td>Data written once, rarely read</td><td>First read is always a miss</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Trade-off sentence: <i>"I would pick cache-aside with delete-on-write because it is simple and the cache can fail without breaking writes; the cost is a short stale window and a refill miss after each write; if stale reads become a problem I would add CDC-driven invalidation or leases."</i></p>
+        <h3>Where the cache can live</h3>
+        <p>Learner question answered: "Where does a cache go (client, CDN, app, DB) and how does it go stale?" From closest to the user to closest to the data:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Cache layers from browser to CDN to in-process cache to distributed cache to database buffer pool">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="60" width="130" height="70"/><text class="label" x="75" y="90">Browser</text><text class="label small" x="75" y="112">HTTP cache</text>
+            <rect class="box svc" x="170" y="60" width="130" height="70"/><text class="label" x="235" y="90">CDN edge</text><text class="label small" x="235" y="112">static, public</text>
+            <rect class="box k8s" x="330" y="60" width="130" height="70"/><text class="label" x="395" y="90">In-process</text><text class="label small" x="395" y="112">L1, per pod</text>
+            <rect class="box cache" x="490" y="60" width="130" height="70"/><text class="label" x="555" y="90">Redis</text><text class="label small" x="555" y="112">L2, shared</text>
+            <rect class="box db" x="650" y="60" width="140" height="70"/><text class="label" x="720" y="90">DB buffer pool</text><text class="label small" x="720" y="112">pages in RAM</text>
+            <path class="arrow" d="M140 95 L164 95"/><path class="arrow" d="M300 95 L324 95"/><path class="arrow" d="M460 95 L484 95"/><path class="arrow" d="M620 95 L644 95"/>
+            <text class="label small" x="400" y="170">closer to the user = faster, but more copies to keep fresh</text>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M75 60 L235 60 L395 60 L555 60 L720 60"/></circle>
+          </svg>
+          <figcaption>Each layer goes stale in its own way: browsers and CDNs by HTTP headers (<code>Cache-Control: max-age</code>), in-process caches by a short TTL, Redis by TTL plus explicit deletes. More layers mean more places a stale copy can hide.</figcaption>
+        </figure>
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> Cache-aside, TTL, LRU eviction, sharding by hash, one replica per shard, and "a cache outage must not become a DB outage" is a complete SDE-1 answer. The deep dives are SDE-2 material.</p></div>
+      

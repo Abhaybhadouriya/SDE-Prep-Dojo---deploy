@@ -1,0 +1,38 @@
+
+        <div class="callout note"><p><b>Deep dive:</b> stop here for SDE-1. Read this section for SDE-2, platform or infra roles.</p></div>
+        <h2>Layer consequences that bite in production</h2>
+        <h3>1. Deleting in a later layer never shrinks the image</h3>
+        <p>Because layers only add, a file created in one layer and deleted in the next is still shipped inside the first layer. The later layer only adds a whiteout.</p>
+<pre><code class="language-dockerfile">FROM alpine:3.24
+RUN dd if=/dev/zero of=/big.bin bs=1M count=50
+RUN rm /big.bin</code></pre>
+<pre class="terminal"><code>$ docker history fat-demo --format '{{.Size}}\t{{.CreatedBy}}'
+0B      RUN /bin/sh -c rm /big.bin # buildkit
+52.4MB  RUN /bin/sh -c dd if=/dev/zero of=/big.bin bs=1M count=50 # buildkit
+0B      CMD ["/bin/sh"]
+7.8MB   ADD alpine-minirootfs-3.24.x-x86_64.tar.gz / # buildkit</code></pre>
+        <p>The image still carries 52 MB of zeros that no container can ever see. The fix is to create and delete in the <b>same</b> <code>RUN</code> step, or better, use a multi-stage build so temporary files never reach the final image. This also has a security side: a secret copied in one layer and deleted in the next is still readable by anyone who pulls the image. Uber's engineering team described exactly this "secrets stay in layers" problem as one reason they built their own image builder, Makisu.</p>
+
+        <h3>2. Writes in the container layer are slow for big files</h3>
+        <p>Copy-up copies whole files. A database that modifies a few pages of a 2 GB file inside the container layer pays a 2 GB copy on first write, and every later write goes through the overlay. Databases, queues like Kafka, and anything write-heavy should use a <a href="{{BASE}}devops/docker-06">volume</a>, which bypasses OverlayFS entirely.</p>
+
+        <h3>3. Renaming directories across layers</h3>
+        <p>Renaming a directory that lives in a lower layer can fail with <code>EXDEV</code> (the errno for a cross-filesystem rename, "cross-device link") on overlay, so applications must fall back to copy-and-delete. Most tools already do this, but some older software breaks in containers because of it.</p>
+
+        <h3>4. Image size is a deploy-speed problem</h3>
+        <p>Every new server, and every Kubernetes node that has not seen an image, must pull it before the container starts. A 1.5 GB image on a fresh node during an autoscaling burst means minutes of waiting. Shared base layers, small runtime images, and regional registry mirrors all help. At very large scale, companies use lazy-pulling snapshotters (such as stargz, or SOCI on AWS) that start the container before all layers arrive, or peer-to-peer distribution like Uber's Kraken.</p>
+
+        <h3>5. Disk fills up quietly</h3>
+<pre class="terminal"><code>$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          23        4         6.1GB     4.8GB (78%)
+Containers      6         2         310MB     290MB (93%)
+Local Volumes   5         2         1.2GB     800MB (66%)
+Build Cache     118       0         3.4GB     3.4GB</code></pre>
+        <p>Old images, stopped containers and build cache pile up. <code>docker image prune</code> removes <b>dangling</b> images (layers with no tag, usually left behind when you rebuild a tag), <code>docker builder prune</code> clears build cache, and <code>docker system prune</code> does several at once. Removing a container never removes its image or its named volumes. (Numbers above are an example.)</p>
+
+        <div class="proscons">
+          <div class="pros"><h5>Why layers are great</h5><ul><li>Pull and push only what changed</li><li>One copy on disk and in page cache for many containers</li><li>Build cache reuses unchanged steps</li><li>Content hashes make images tamper-evident</li></ul></div>
+          <div class="cons"><h5>What layers cost you</h5><ul><li>Deletes never shrink an image</li><li>Secrets in any layer are forever</li><li>Copy-up makes big-file writes slow</li><li>Order of steps matters for the cache</li></ul></div>
+        </div>
+      

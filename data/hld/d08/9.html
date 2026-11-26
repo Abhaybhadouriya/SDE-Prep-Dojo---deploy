@@ -1,0 +1,114 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: Clarify.</strong> Physical goods? Multiple sellers and warehouses? Which payment methods? Is the cart in scope? State the split: the cart is AP, the order is CP.</li>
+          <li><strong>5-10: Estimate.</strong> Orders per second at peak (anchor: Flipkart's 2,000+/s), cart writes per second, storage per year. Conclude: shard orders by customer, put the cart in a KV store.</li>
+          <li><strong>10-15: API.</strong> Cart APIs, the checkout session with a quote, and <code>POST /orders</code> with an idempotency key. Spell out the 201 / 202 / 409 responses.</li>
+          <li><strong>15-25: Architecture.</strong> Walk the saga: claim the key, quote, reserve, authorise, confirm + outbox, fan out.</li>
+          <li><strong>25-40: Deep dives.</strong> Idempotency mechanics, compensations and the pivot, oversell, the unknown payment state. Offer the hot SKU problem as a bridge to flash sales.</li>
+          <li><strong>40-45: Wrap up.</strong> Failure per box, metrics (checkout conversion, Place Order p99, payment success rate, reservation expiry rate, outbox age), reconciliation.</li>
+        </ol>
+        <div class="callout note"><p><b>SDE-1 vs SDE-2.</b> SDE-1: cart in a KV store, an idempotent Place Order, an atomic stock update, a clear order state machine. SDE-2: explains why not 2PC, designs the saga with compensations and a pivot, handles the UNKNOWN payment, uses an outbox, and talks about reconciliation without being prompted.</p></div>
+        <div class="callout danger"><p><b>Common mistakes:</b> one giant transaction across services; "check stock then decrement" (a race); reserving at add-to-cart; the server generating the idempotency key; retrying a timed-out payment with a new key; publishing to Kafka outside the DB transaction; floats for money; forgetting that compensations can fail too.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart,Walmart">
+          <summary>How do you make sure a double click on "Place order" does not create two orders?</summary>
+          <div class="answer">
+            <p>The client creates an idempotency key when the review page loads and sends it on every attempt. The orders table has <code>UNIQUE (customer_id, idempotency_key)</code>. The first request's insert wins and runs the checkout. Any repeat hits the constraint, reads the existing row and returns its saved response (or "in progress"). I also store a hash of the request body and reject the same key with a different body. Downstream, the order id is the idempotency key for the payment provider, so even an internal retry cannot charge twice.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cover four things: who makes the key, how it is enforced (a constraint, not a read), what a repeat returns, and how the key is propagated downstream. Mention Amazon's client request token as prior art.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep keys? (At least as long as clients retry, for example 24 hours, then archive.)</li><li>Why must the idempotency read hit the primary?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart,Flipkart">
+          <summary>Why not use a distributed transaction (2PC) for inventory + payment + order?</summary>
+          <div class="answer">
+            <p>2PC holds locks in every participant until the coordinator decides. A slow or dead coordinator blocks all of them, and latency is set by the slowest participant. It couples the services' availability together. And the payment provider is an external HTTP API that will never take part in our 2PC. A saga keeps each step a short local transaction with a compensating action. The cost is that intermediate states are visible (stock looks reserved), so I make them explicit with a PENDING status and reservations with a TTL.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the three costs of 2PC (blocking, coupling, external participants), then the saga's cost (no isolation) and how you handle it. That is a balanced trade-off answer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Orchestration or choreography here, and why?</li><li>What is a pivot transaction?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Walk me through a failure: inventory is reserved and then the payment is declined.</summary>
+          <div class="answer">
+            <p>The orchestrator has saved "steps 1 and 2 done". The payment step returns DECLINED, so it runs compensations in reverse: release the reservation (an idempotent call keyed by orderId+sku that sets the reservation to RELEASED and decreases <code>reserved</code>), then mark the order PAYMENT_FAILED and save that response for the idempotency key. The customer sees "payment declined, try another method". If they try again, the client creates a new key, because this is a new attempt. If the release call fails, it is retried with backoff. The reservation TTL is the last safety net.</p>
+            <div class="approach"><h5>How to answer</h5><p>Narrate the saga state at each moment. Show that compensations are idempotent, retried and backed by TTLs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the orchestrator crashes between the decline and the release?</li><li>Should a retry after a decline reuse the old key?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Walmart,PhonePe">
+          <summary>The payment call times out. What do you do?</summary>
+          <div class="answer">
+            <p>Never assume. Store the payment as UNKNOWN and keep the reservation. Retry the authorisation with the same idempotency key (the provider will return the first result if it already processed it), query the provider's status API, and also accept the webhook. Show the customer "confirming your payment". If it is still unknown after a limit, a reconciliation job against the provider's report decides. Then confirm the order, or release the stock and void the authorisation.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the two wrong answers (retry with a new key = double charge; assume success = free goods), then give the UNKNOWN state plus reconciliation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you dedupe webhooks?</li><li>How long should the reservation outlive an unknown payment?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Flipkart,Meesho">
+          <summary>How do you prevent overselling the last unit?</summary>
+          <div class="answer">
+            <p>Make the check and the change one atomic statement: <code>UPDATE inventory SET reserved = reserved + q WHERE sku = ? AND on_hand - reserved &gt;= q</code>, then look at rows affected. A CHECK constraint (<code>reserved &lt;= on_hand</code>) protects against bugs. Reserve at checkout with a TTL, confirm on shipment, release on failure or expiry. The cached "only 3 left" is display-only. For extremely hot SKUs, move the counter to Redis behind a waiting room, as in the flash sale design.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the race first (check-then-write), then the atomic fix. Mention the lock-contention limit and when you would switch to flash-sale techniques.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Multiple warehouses: which one do you reserve in?</li><li>What if the physical count is wrong (damaged item)?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>Why is the cart in a key-value store and the order in SQL?</summary>
+          <div class="answer">
+            <p>The cart is a single-key document with a very high write rate, and the business wants it to accept writes even during failures, so an AP key-value store (DynamoDB-style) fits. A rare stale read or a merged conflict is cheap. Orders need multi-row transactions (order + lines + outbox), unique constraints for idempotency, and strong consistency for money. A relational database does that natively. Amazon's Dynamo paper uses the shopping cart as its motivating example of an always-writable service.</p>
+            <div class="approach"><h5>How to answer</h5><p>One sentence each, tied to access patterns and the consistency each needs. That is the "SQL vs NoSQL" justification interviewers want.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you merge two conflicting cart versions?</li><li>How do you shard orders?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Flipkart,Amazon">
+          <summary>How do downstream services learn about a confirmed order reliably?</summary>
+          <div class="answer">
+            <p>With a transactional outbox: the CONFIRMED status and an outbox row commit in one transaction. A relay (Debezium CDC on the WAL, or a poller) publishes the row to the <code>order-events</code> topic, keyed by orderId. Delivery is at-least-once, so every consumer dedupes by event id or makes its effect idempotent (an upsert, a unique constraint, a state machine that ignores repeats). Kafka's exactly-once transactions only cover Kafka-to-Kafka processing. They do not make the email send or the warehouse API exactly-once.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the dual-write problem, give the outbox, then pre-empt the "exactly-once" trap.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Poller or CDC: which and why?</li><li>How do you keep the outbox table from growing forever?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon,Meesho">
+          <summary>A coupon can be used once per user and only 10,000 times in total. How do you enforce it at checkout?</summary>
+          <div class="answer">
+            <p>Two checks inside the saga, both atomic. Per user: a <code>coupon_redemptions</code> table with <code>UNIQUE (coupon_id, user_id)</code>, inserted as a saga step (its compensation deletes or voids the row if the order fails). Global cap: an atomic counter, either a conditional update <code>... SET used = used + 1 WHERE used &lt; cap</code> or a Redis DECR for very hot coupons. The quote shows the discount, but redemption happens at Place Order, so an abandoned checkout does not burn a use.</p>
+            <div class="approach"><h5>How to answer</h5><p>Treat a coupon exactly like inventory: a reservation with a compensation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the order is refunded later: does the use come back?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>How would you shard the orders table, and what queries get harder?</summary>
+          <div class="answer">
+            <p>Shard by <code>customer_id</code> (hash), so "my orders" and the idempotency check stay on one shard. Embed the shard id in the order id (Snowflake-style bits), so a lookup by order id goes straight to the right shard. Queries across customers, such as "all orders for seller X" or "all orders in warehouse 7 today", become scatter-gather. Serve those from a different read model, built from <code>order-events</code> into a seller-sharded store or a search index.</p>
+            <div class="approach"><h5>How to answer</h5><p>Choose the key from the most common query, name the query that suffers, and solve it with a second read model fed by events (CQRS).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A huge business customer places millions of orders. Is that a hot shard?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Why authorise at order time but capture at shipment?</summary>
+          <div class="answer">
+            <p>An authorisation holds funds without moving them. If the order is cancelled or cannot be fulfilled before shipping, you void the hold, and the customer is never charged. A capture followed by a refund takes days to show up and costs fees. Capturing at shipment also matches "charge when we deliver value". The cost: authorisations expire after a provider-defined window, so long-delayed shipments may need re-authorisation, and some methods (UPI, many wallets) do not support separate auth and capture, so they need a refund path instead.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain the money difference in one sentence, then name the expiry and payment-method caveats. Those caveats are what separate a good answer from a memorised one.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The order has items shipping from two warehouses on different days. How do you capture?</li></ul></div>
+          </div>
+        </details>
+
+        <h3>60-second answer (say it out loud)</h3>
+        <div class="callout interview"><p>"I split checkout into two worlds. The cart is an availability problem: a key-value store keyed by user, always writable, with conflicts merged as a union. Placing the order is a correctness problem: the client sends an idempotency key, the orders table has a unique constraint on it, and repeats get the saved response. The orchestrator then runs a saga: check the price quote, reserve stock with an atomic conditional update and a TTL, authorise the payment with the order id as the provider's key, and finally confirm the order and write an outbox row in the same transaction. If a step fails, compensations run in reverse: void, release, fail. A timeout means an UNKNOWN payment that I resolve by querying and reconciling, never by retrying with a new key. Events go from the outbox through CDC to Kafka, keyed by order id, to fulfilment, email and analytics, and every consumer is idempotent."</p></div>
+
+        <div class="scenario">
+          <h4>Scenario: customers report double charges after a deploy</h4>
+          <div class="situation">Since this morning's release, about 0.1% of orders show two payment authorisations. There is only one order row per checkout.</div>
+          <div class="bad">Weak answer: "Add a check that looks for an existing payment before calling the provider."</div>
+          <div class="good">Strong answer: "One order but two auths means the provider-side key changed. I would diff the release for how the payment idempotency key is built: did it switch from the order id to a fresh UUID per call, or add a timestamp? A retry inside the payment client with a new key would cause exactly this. Mitigation now: roll back, and void the duplicate auths found by joining our payments table with the provider report. Prevent it: a unique constraint on (order_id) in payments, a contract test that retries must reuse the key, and an alert on 'auths per order &gt; 1'. A 'check then call' is racy and would not fix it."</div>
+          <div class="followups">Follow-ups: How do you find every affected customer? (Reconciliation report.) What do you tell them? (Proactive void plus an apology. Auths drop off without a refund.)</div>
+        </div>
+      

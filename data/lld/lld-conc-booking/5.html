@@ -1,0 +1,80 @@
+
+  <h2>Holds with a TTL: when the user needs minutes</h2>
+  <p>Real booking flows have a long gap between "I pick seats" and "payment succeeded": 30 seconds to 10 minutes. You cannot hold a Java lock or a database row lock for minutes. Instead you store a <b>hold</b> (a soft reservation) with an <b>expiry time</b>. The seat moves through states, and the lock is only held for the few microseconds each state change takes.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 230" role="img" aria-label="Seat state machine: FREE to HELD on hold, HELD to BOOKED on confirm before expiry, HELD to FREE on expiry or cancel, BOOKED to FREE on cancellation and refund">
+      <rect class="box ok" x="40" y="80" width="160" height="64" rx="30"/>
+      <text class="label big" x="120" y="118">FREE</text>
+      <rect class="box warn" x="320" y="80" width="160" height="64" rx="30"/>
+      <text class="label big" x="400" y="110">HELD</text>
+      <text class="label small" x="400" y="132">user, expiresAt</text>
+      <rect class="box db" x="600" y="80" width="160" height="64" rx="30"/>
+      <text class="label big" x="680" y="118">BOOKED</text>
+      <path class="arrow" d="M202 98 L316 98"/>
+      <text class="label small mono" x="259" y="88">hold(ttl)</text>
+      <path class="arrow" d="M482 98 L596 98"/>
+      <text class="label small mono" x="539" y="78">confirm()</text>
+      <text class="label small" x="539" y="92">now &lt; expiresAt</text>
+      <path class="arrow dashed" d="M400 146 C400 200 120 200 120 148"/>
+      <text class="label small" x="260" y="214">expiry passed, or user cancels</text>
+      <path class="arrow dashed" d="M680 78 C680 20 120 20 120 76"/>
+      <text class="label small" x="400" y="30">cancel booking (refund flow)</text>
+    </svg>
+    <figcaption>The seat's state machine (see <a href="{{BASE}}lld/lld-uml-state">UML state diagrams</a>). Each arrow is one short atomic step under a lock or a conditional update. Expiry is just a timestamp check; a cleaner can run later.</figcaption>
+  </figure>
+  <p>Rules that make holds correct:</p>
+  <ol class="steps">
+    <li><strong>Hold is atomic.</strong> "All requested seats are FREE (or their hold expired) then mark them HELD by me until now + TTL" happens in one critical section or one conditional update.</li>
+    <li><strong>Expiry is checked, not trusted.</strong> Do not rely on a background job to free seats on time. Every read treats <code>HELD</code> with <code>expiresAt &lt;= now</code> as FREE (lazy expiry). The cleaner job is only for tidiness and for releasing inventory in reports.</li>
+    <li><strong>Someone must delete expired holds.</strong> Lazy expiry frees the <em>seat</em>, but the hold record stays in memory (or in the table) until something removes it, so every abandoned checkout leaks one entry. Our <code>HoldService</code> drops expired holds for the seats it touches in <code>hold()</code> and <code>confirm()</code>, and exposes <code>sweep()</code> for a <code>ScheduledExecutorService</code> to call every minute; in a database the same job is <code>DELETE FROM holds WHERE expires_at &lt; now()</code>. The last line of the Java run shows five abandoned holds swept.</li>
+    <li><strong>Confirm re-checks ownership and expiry.</strong> Payment can succeed after the hold expired and someone else grabbed the seat. Confirm must say "REJECTED, refund", never overwrite the new holder. The code run shows exactly this at t = 302 s.</li>
+    <li><strong>Inject the clock.</strong> A <code>Clock</code> or <code>LongSupplier</code> parameter lets tests jump time forward without sleeping. Interviewers notice this.</li>
+    <li><strong>Make confirm idempotent.</strong> The payment callback may arrive twice. Use the hold id (or a payment id) as an idempotency key, so the second call returns the same result.</li>
+  </ol>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 330" role="img" aria-label="UML class diagram: BookingService uses SeatLockProvider interface with InMemorySeatLocks and DbSeatLocks implementations, owns SeatHold objects, and reads ShowSeat">
+      <rect class="box client" x="20" y="20" width="280" height="146"/>
+      <text class="label" x="160" y="38">BookingService</text>
+      <line class="line" x1="20" y1="52" x2="300" y2="52"/>
+      <text class="label small mono left" x="29" y="70">- locks: SeatLockProvider</text>
+      <text class="label small mono left" x="29" y="89">- clock: Clock</text>
+      <text class="label small mono left" x="29" y="108">- ttl: Duration</text>
+      <line class="line" x1="20" y1="118" x2="300" y2="118"/>
+      <text class="label small mono left" x="29" y="136">+ hold(show, seats, user): SeatHold</text>
+      <text class="label small mono left" x="29" y="155">+ confirm(holdId, paymentId)</text>
+      <rect class="box svc" x="380" y="20" width="270" height="128"/>
+      <text class="label small" x="515" y="34">&#171;interface&#187;</text>
+      <text class="label" x="515" y="52" font-style="italic">SeatLockProvider</text>
+      <line class="line" x1="380" y1="66" x2="650" y2="66"/>
+      <text class="label small mono left" x="389" y="84">(no state)</text>
+      <line class="line" x1="380" y1="94" x2="650" y2="94"/>
+      <text class="label small mono left" x="389" y="112">+ tryHold(seats, user, until)</text>
+      <text class="label small mono left" x="389" y="131">+ release(seats, user)</text>
+      <rect class="box ok" x="330" y="210" width="200" height="104"/>
+      <text class="label" x="430" y="228">InMemorySeatLocks</text>
+      <line class="line" x1="330" y1="242" x2="530" y2="242"/>
+      <text class="label small mono left" x="339" y="260">- perShow: Map&lt;id,Lock&gt;</text>
+      <line class="line" x1="330" y1="270" x2="530" y2="270"/>
+      <text class="label small mono left" x="339" y="288">machine coding</text>
+      <rect class="box ok" x="560" y="210" width="220" height="104"/>
+      <text class="label" x="670" y="228">DbSeatLocks</text>
+      <line class="line" x1="560" y1="242" x2="780" y2="242"/>
+      <text class="label small mono left" x="569" y="260">- dataSource</text>
+      <line class="line" x1="560" y1="270" x2="780" y2="270"/>
+      <text class="label small mono left" x="569" y="288">UPDATE .. WHERE</text>
+      <text class="label small mono left" x="569" y="306">status/version</text>
+      <rect class="box db" x="20" y="210" width="270" height="104"/>
+      <text class="label" x="155" y="228">SeatHold</text>
+      <line class="line" x1="20" y1="242" x2="290" y2="242"/>
+      <text class="label small mono left" x="29" y="260">- id, user, seats</text>
+      <text class="label small mono left" x="29" y="279">- expiresAt: Instant</text>
+      <line class="line" x1="20" y1="290" x2="290" y2="290"/>
+      <text class="label small mono left" x="29" y="306">+ isActive(now): boolean</text>
+      <path class="arrow" d="M302 84 L374 84"/>
+      <path class="arrow none" d="M430 208 L490 152" style="marker-end:url(#bk-tri)"/>
+      <path class="arrow none" d="M670 208 L560 152" style="marker-end:url(#bk-tri)"/>
+      <path class="arrow none" d="M155 207 L155 170" style="marker-end:url(#bk-dia)"/>
+      <text class="label small left" x="163" y="194">creates 0..*</text>
+    </svg>
+    <figcaption>Keep the locking choice behind an interface. The machine-coding version is in memory; the production version is the database. The service code, the hold rules and the tests stay the same. (Strategy plus Dependency Inversion: see <a href="{{BASE}}lld/lld-prin-dip">DIP</a>.)</figcaption>
+  </figure>

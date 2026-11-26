@@ -1,0 +1,138 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. The fetch budget: what to look at, and how often</h3>
+        <p>You cannot look at 500M products every hour, and you should not try. The fix is a <b>priority schedule</b> driven by user interest. Each product has a <b>next due time</b>. When it is fetched, the next due time is set from its tier: hourly for hot, daily for warm, weekly for cold. Tier comes from simple signals: number of watchers, recent page views from the extension, and how often the price has changed recently (a product that changes daily deserves more looks than one stable for a year).</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Three fetch tiers with promotion and demotion rules">
+            <rect class="box cache" x="40" y="60" width="200" height="80"/>
+            <text class="label" x="140" y="92">Hot: every hour</text>
+            <text class="label small" x="140" y="116">~5M products, 100+ watchers</text>
+            <rect class="box svc" x="300" y="60" width="200" height="80"/>
+            <text class="label" x="400" y="92">Warm: every day</text>
+            <text class="label small" x="400" y="116">~45M, at least 1 watcher</text>
+            <rect class="box db" x="560" y="60" width="200" height="80"/>
+            <text class="label" x="660" y="92">Cold: every week</text>
+            <text class="label small" x="660" y="116">~450M, nobody watching</text>
+            <path class="arrow" d="M300 80 L244 80"/>
+            <text class="label small" x="272" y="50">promote</text>
+            <path class="arrow" d="M244 120 L300 120"/>
+            <text class="label small" x="272" y="160">demote</text>
+            <path class="arrow" d="M560 80 L504 80"/>
+            <text class="label small" x="532" y="50">1st watcher</text>
+            <path class="arrow" d="M504 120 L560 120"/>
+            <text class="label small" x="532" y="160">30 days idle</text>
+            <rect class="box k8s" x="250" y="190" width="300" height="44"/>
+            <text class="label" x="400" y="218">New watch: fetch once right now</text>
+          </svg>
+          <figcaption>Tiers follow interest. A new watch triggers a one-off fetch so the user sees a fresh price immediately, then the product joins its tier.</figcaption>
+        </figure>
+        <p><b>Politeness is part of the design, not an afterthought.</b> Every request to a shop goes through a per-shop token bucket (for example 1 request per second per worker IP with a small burst). Workers obey <code>robots.txt</code>: RFC 9309 says a crawler should not use a cached copy for more than 24 hours, should treat a 5xx on <code>robots.txt</code> as "disallow everything", and should apply the longest matching rule. Use the shop's official product API or an affiliate or partner feed wherever it exists: fewer bytes, a clear contract, and no cat-and-mouse. (Amazon, for example, has moved its affiliate catalogue access from PA-API 5 to a newer Creators API; the point for the interview is "use the official API, and plan for it to change".) If a shop says no, the honest design answer is "we do not track that shop", not "we evade its bot defences".</p>
+        <div class="callout warn"><p>Do not propose rotating residential proxies or CAPTCHA solving in an interview as your main plan. It is legally risky, against most sites' terms, and interviewers read it as a red flag. Talk about official feeds, rate limits, caching, and the extension instead.</p></div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The per-shop token bucket is the same token bucket you know from traffic policing on a router interface: tokens refill at a fixed rate, a burst can use saved tokens, and an empty bucket means wait. The sorted "next due" set is a <b>timer wheel</b>: pop everything whose deadline has passed. The tiers are like multi-level feedback queues in a CPU scheduler, where interactive (watched) tasks get more turns.</p>
+        </div>
+        <p><b>The extension as a free sensor.</b> One million extension users open product pages all day. If each browser reports the price it just showed, the server gets millions of free observations of exactly the products people care about. One case study estimates that extension-reported prices could cut server-side fetching by 50-80%. The catch is trust, which is deep dive 3.</p>
+
+        <h3>2. Matching: find the users whose line was just crossed</h3>
+        <p>A price changed from 3,200 to 2,800. Who gets an alert? The naive way is to loop over all watches on the product and compare each target. That is fine for 10 watchers and terrible for 200,000. Worse, if you ask "who has <code>target &gt;= 2,800</code>?", you re-alert everybody who was already notified at 2,900 yesterday.</p>
+        <p>The right question is a <b>crossing</b>: which <b>armed</b> watches have <code>target_price &gt;= new_price</code>? Armed means "this user has not been alerted since the watch was created or last re-armed". With an index on <code>(product_id, condition, armed, target_price)</code> (or the partial index below, which holds only armed rows), this is one B-tree range scan: O(log n) to find the start, then one step per alert you actually send. The matcher disarms each hit <b>in the same transaction</b> that records the alert.</p>
+        <p>Why not use the old price as the lower edge, <code>new_price &lt;= target &lt; old_price</code>? It looks tighter, but the <b>armed flag</b> is what stops repeats, not the old price. The old price is unreliable: a price-changed event can be dropped or arrive out of order, the matcher can be down for an hour, a watch can be created when the price is already below its target, or a re-arm can run late. In each case an armed watch with a target at or above the old price would never fire. Using only "armed and target &gt;= new price" makes the query <b>robust to lost and reordered events</b>: the next price event (or the nightly sweep) catches anything that was missed. Also run the same check <b>once when a watch is created</b>, so a user who sets a target above today's price is told at once.</p>
+<pre><code class="language-sql">-- inside one transaction, for a price-changed event
+UPDATE watch
+   SET armed = false, last_notified_price = :new_price, last_notified_at = now()
+ WHERE product_id = :product_id AND condition = :condition
+   AND armed = true AND target_price &gt;= :new_price
+RETURNING watch_id, user_id, target_price;
+-- served by the partial index watch_match (product_id, condition, target_price) WHERE armed</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Number line of targets showing which fire when price drops from 3200 to 2800">
+            <line class="arrow" x1="40" y1="120" x2="770" y2="120"/>
+            <text class="label small" x="60" y="150">2,500</text>
+            <text class="label small" x="240" y="150">2,800</text>
+            <text class="label small" x="420" y="150">3,000</text>
+            <text class="label small" x="600" y="150">3,200</text>
+            <rect class="zone" x="240" y="70" width="530" height="100"/>
+            <text class="label" x="420" y="60">fires if armed: target &gt;= new (2,800)</text>
+            <circle class="packet" cx="130" cy="120" r="7"/>
+            <text class="label small" x="130" y="100">2,600</text>
+            <circle class="packet alt" cx="300" cy="120" r="7"/>
+            <text class="label small" x="300" y="100">2,850</text>
+            <circle class="packet alt" cx="420" cy="120" r="7"/>
+            <text class="label small" x="460" y="100">3,000</text>
+            <circle class="packet alt" cx="560" cy="120" r="7"/>
+            <text class="label small" x="560" y="100">3,150</text>
+            <circle class="packet" cx="690" cy="120" r="7"/>
+            <text class="label small" x="690" y="100">3,500</text>
+            <text class="label small" x="130" y="200">not yet (price still above 2,600)</text>
+            <text class="label small" x="640" y="200">3,500: alerted before, disarmed</text>
+          </svg>
+          <figcaption>Price falls from 3,200 to 2,800. Every <b>armed</b> watch with a target of 2,800 or more fires (2,850, 3,000, 3,150). The 3,500 watcher was alerted earlier and is disarmed, so the armed flag, not the old price, stops a repeat; if that alert had been missed, it would fire now. The 2,600 watcher must wait.</figcaption>
+        </figure>
+        <p><b>Re-arming.</b> After a watch fires it is <b>disarmed</b>, so price wobbling around the target (2,799, 2,801, 2,799...) does not send ten emails. It re-arms only when the price climbs back above the target by a margin, say 5% (this margin is called <b>hysteresis</b>, exactly like a thermostat or a Schmitt trigger). On the way up, the matcher runs the mirror query: disarmed watches with <code>target_price * 1.05 &lt; new_price</code> get re-armed.</p>
+        <p><b>Percentage watches</b> ("tell me if it falls 20%") become absolute thresholds when created: target = price at creation x 0.8. Store the computed target and the same index works. A "20% below the 90-day average" rule is rarer; evaluate it in a periodic batch job using the daily rollups.</p>
+        <p><b>Stock variant (Uber's bar-raiser shape).</b> Here prices are pushed by the exchange feed many times per second, so you keep the thresholds <b>in memory</b>. Shard by symbol: each matcher process owns a set of symbols and holds, per symbol, two sorted structures: "below" alerts sorted by price descending and "above" alerts sorted ascending. On each tick, pop from the front while the tick has crossed the alert's price. Each tick costs O(log n) plus the alerts it fires. It looks a lot like one side of an order book in a <a href="{{BASE}}hld/d26">stock exchange matching engine</a>. Persist alerts in a database and rebuild the in-memory structures from it (plus a Kafka replay from a stored offset) when a matcher restarts.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Per-symbol in-memory alert books for the stock variant">
+            <rect class="box kafka" x="20" y="90" width="150" height="60"/>
+            <text class="label" x="95" y="114">Exchange feed</text>
+            <text class="label small" x="95" y="134">ticks by symbol</text>
+            <rect class="box svc" x="240" y="30" width="220" height="80"/>
+            <text class="label" x="350" y="58">Matcher shard A</text>
+            <text class="label small" x="350" y="80">AAPL: below [182, 180, 175]</text>
+            <text class="label small" x="350" y="98">AAPL: above [190, 195]</text>
+            <rect class="box svc" x="240" y="140" width="220" height="80"/>
+            <text class="label" x="350" y="168">Matcher shard B</text>
+            <text class="label small" x="350" y="190">MSFT, NVDA, ...</text>
+            <text class="label small" x="350" y="208">same two books per symbol</text>
+            <path class="arrow" d="M170 110 L236 75"/>
+            <path class="arrow" d="M170 130 L236 175"/>
+            <rect class="box queue" x="560" y="90" width="200" height="60"/>
+            <text class="label" x="660" y="114">Alert events</text>
+            <text class="label small" x="660" y="134">to notification</text>
+            <path class="arrow" d="M460 75 L556 110"/>
+            <path class="arrow" d="M460 175 L556 130"/>
+            <circle class="packet" r="6"><animateMotion dur="2.2s" repeatCount="indefinite" path="M170 110 L240 72 L460 72 L560 110"/></circle>
+          </svg>
+          <figcaption>A tick of 179.50 for AAPL pops 182 and 180 from the front of the "below" book; 175 waits. Nothing else is touched.</figcaption>
+        </figure>
+
+        <h3>3. Trust: fake prices and broken parsers</h3>
+        <p>Hello Interview lists "malicious price updates from Chrome extension users" as a core deep dive. Two very different things can produce a wrong price, and both end in the same disaster: a million users told "your item is now Rs 0!".</p>
+        <ul>
+          <li><b>Bad actors.</b> Someone scripts the extension API to report a fake low price (to spam, or to damage trust). Defences: authenticate extension installs and rate-limit per install; never alert on a single report; require <b>k agreeing reports from distinct installs</b>, or better, treat a report as a trigger to schedule an immediate fetch of our own and alert only on our own confirmed reading.</li>
+          <li><b>Our own bugs.</b> The shop changes its page layout, the parser reads an empty field, and "no price" becomes "price 0". One case study calls this <b>extraction drift</b>. Defences: prefer structured data (an API response, or the page's embedded product markup) over screen-scraping; run two extractors and require agreement; reject prices outside a sanity band (for example 50% to 200% of the recent range) into a <b>quarantine</b> queue instead of alerting; keep a small <b>canary set</b> of products per shop that is fetched after every parser deploy and alarms on any change.</li>
+        </ul>
+        <p>A useful trick from trivago's price pipeline (about 70 billion prices over a week): prices are roughly exponential, so a "3 standard deviations" outlier rule works badly on raw prices. They take <code>log10</code> of the price first and then reject outliers. trivago also found that about 88% of incoming price records were duplicates, which is a reminder to dedupe observations before you store them.</p>
+        <div class="callout interview"><p>Interviewers love the "price 0" story. Say: <b>"An alert is a user-visible side effect, so I put a validation gate in front of it: sanity band, two sources or a confirmation fetch, and quarantine instead of alert when in doubt. A late alert is fine within our 1-hour budget; a wrong alert to a million people is not."</b></p></div>
+
+        <h3>4. The flash-sale burst and alert fatigue</h3>
+        <p>On a big sale day, one popular phone drops 30% and 200,000 people are watching it. Hundreds of products do the same within minutes. The case study we read models this as tens of millions of alert events in a few minutes. Three things keep the system calm:</p>
+        <ol class="steps">
+          <li><strong>Decouple with Kafka</strong> The matcher writes alert events to an <code>alerts</code> topic; the notification system drains it at the rate email and push providers allow. Lag grows, nobody crashes. See <a href="{{BASE}}devops/kafka-04">consumer groups</a> for how to add consumers.</li>
+          <li><strong>Re-key for fan-out</strong> <code>price-changed</code> is keyed by product (to keep order per product). One hot product would pin all its 200,000 matches to one partition, so the matcher pages through the watch range in chunks of, say, 1,000 and emits chunk tasks keyed by <code>watch_id</code>, spreading the work across all partitions. This is the fan-out pattern in <a href="{{BASE}}hld/p08">Fan-out (Push vs Pull)</a>.</li>
+          <li><strong>Protect the user</strong> At most one alert per watch per hour, a daily cap per user, and a <b>digest</b> ("5 of your items dropped today") when a user has many hits at once. If lag passes the freshness budget, shed or delay the lowest-priority alerts (for example free tier) first and keep paid or stock alerts on time.</li>
+        </ol>
+        <p><b>Idempotency.</b> Kafka consumers can see an event twice after a crash (at-least-once delivery). The matcher inserts <code>(watch_id, crossing_id)</code> into the sent-alerts table with a unique constraint before handing off; a duplicate insert fails, and the duplicate alert is dropped. <code>crossing_id</code> can be the id of the <code>price-changed</code> event. Details in <a href="{{BASE}}devops/kafka-06">Delivery Semantics</a>.</p>
+
+        <h3>5. Fast history charts (under 500 ms)</h3>
+        <p>A 2-year chart from raw points could mean thousands of rows. Keep three resolutions: raw points for 30 days, hourly rollups for a year, daily rollups beyond that. TimescaleDB's <b>continuous aggregates</b> keep those rollups up to date in the background as new rows arrive, and only recompute the time buckets that changed. The API picks the resolution from the range (1 month = raw or hourly, 1 year = daily). Then cache the finished chart JSON per <code>(product, range)</code> in Redis and invalidate it when that product's price changes. Since most products change rarely, hit rates are very high, and the extension's lookups mostly never reach the database.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Raw points rolled up into hourly and daily buckets">
+            <rect class="box db" x="30" y="60" width="200" height="70"/>
+            <text class="label" x="130" y="90">Raw: 30 days</text>
+            <text class="label small" x="130" y="112">every change</text>
+            <rect class="box db" x="300" y="60" width="200" height="70"/>
+            <text class="label" x="400" y="90">Hourly: 1 year</text>
+            <text class="label small" x="400" y="112">min / max / last</text>
+            <rect class="box db" x="570" y="60" width="200" height="70"/>
+            <text class="label" x="670" y="90">Daily: forever</text>
+            <text class="label small" x="670" y="112">min / max / avg</text>
+            <path class="arrow" d="M230 95 L296 95"/>
+            <path class="arrow" d="M500 95 L566 95"/>
+            <text class="label small" x="400" y="170">continuous aggregates refresh in the background; charts read the coarsest level that looks right</text>
+          </svg>
+          <figcaption>Downsampling: a 1-year chart reads about 365 daily rows from one partition, then sits in a cache.</figcaption>
+        </figure>
+      

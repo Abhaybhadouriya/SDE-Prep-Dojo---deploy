@@ -1,0 +1,743 @@
+
+  <h2>Full code</h2>
+  <p>The same files as in <code>lld-code/lld-case-bookmyshow/</code>. The Java demo runs the whole story twice, once per inventory implementation, then races 100 threads for the same two seats and 200 more on random overlapping pairs. The C++14 version is single-threaded (MinGW g++ 6.3 here has no <code>std::thread</code>); the comments mark where the per-show mutex goes.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.scenario</code> (Main.java): the story end to end, then the 100-thread race.</li><li><code>BookingService.start</code> and <code>pay</code> (BookingService.java): the use cases in order.</li><li><code>PessimisticSeatInventory.hold</code> and <code>confirm</code> (Inventory.java): all-or-nothing seat holds under one per-show lock. This is the heart.</li><li><code>OptimisticSeatInventory.hold</code>: the same contract with compare-and-set, to compare.</li><li>Skip on first read: the records in Model.java and the pricing/payment classes in Strategies.java.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java">
+      <p><b>Model.java</b> - catalogue records, the sealed seat state, the booking state machine, a manual clock.</p>
+<pre><code class="language-java">import java.time.Clock;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.List;
+
+// ---------- catalogue: mostly immutable data ----------
+enum SeatType { REGULAR, PREMIUM, RECLINER }
+
+record Movie(String id, String title, int minutes) {}
+
+record Seat(String id, SeatType type) {}                       // "A1", REGULAR
+
+record Screen(String id, String theatre, String city, List&lt;Seat&gt; seats) {}
+
+record Show(String id, Movie movie, Screen screen, LocalDateTime start) {}
+
+// ---------- booking lifecycle ----------
+enum BookingStatus { PENDING, CONFIRMED, CANCELLED, EXPIRED, FAILED }
+
+// The state of ONE seat for ONE show. Sealed: these three are the only possibilities.
+sealed interface SeatState permits Free, Held, Booked {}
+record Free() implements SeatState {}
+record Held(String holdId, String userId, Instant expiresAt) implements SeatState {}
+record Booked(String bookingId) implements SeatState {}
+
+// What the inventory hands back after a successful hold.
+record SeatHold(String id, String showId, String userId, List&lt;String&gt; seatIds, Instant expiresAt) {}
+
+final class Booking {
+    private final String id;
+    private final String userId;
+    private final Show show;
+    private final SeatHold hold;
+    private final long amount;
+    private BookingStatus status = BookingStatus.PENDING;   // guarded by "this"
+
+    Booking(String id, String userId, Show show, SeatHold hold, long amount) {
+        this.id = id; this.userId = userId; this.show = show; this.hold = hold; this.amount = amount;
+    }
+
+    String id() { return id; }
+    String userId() { return userId; }
+    Show show() { return show; }
+    SeatHold hold() { return hold; }
+    List&lt;String&gt; seatIds() { return hold.seatIds(); }
+    long amount() { return amount; }
+    synchronized BookingStatus status() { return status; }
+
+    // allowed moves of the little state machine; anything else is a bug in the caller
+    synchronized void moveTo(BookingStatus next) {
+        boolean ok = switch (status) {
+            case PENDING -&gt; next == BookingStatus.CONFIRMED || next == BookingStatus.EXPIRED || next == BookingStatus.FAILED;
+            case CONFIRMED -&gt; next == BookingStatus.CANCELLED;
+            default -&gt; false;
+        };
+        if (!ok) throw new IllegalStateException("booking " + id + ": " + status + " -&gt; " + next + " not allowed");
+        status = next;
+    }
+
+    @Override public String toString() { return id + " " + userId + " " + seatIds() + " Rs " + amount + " " + status(); }
+}
+
+// ---------- errors the caller can act on ----------
+class SeatUnavailableException extends RuntimeException {
+    SeatUnavailableException(String msg) { super(msg); }
+}
+
+class HoldExpiredException extends RuntimeException {
+    HoldExpiredException(String msg) { super(msg); }
+}
+
+// ---------- a clock tests can move forward (TTL holds need it) ----------
+final class ManualClock extends Clock {
+    private volatile Instant now;
+    ManualClock(Instant start) { this.now = start; }
+    void advanceSeconds(long s) { now = now.plusSeconds(s); }
+    @Override public Instant instant() { return now; }
+    @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+    @Override public Clock withZone(ZoneId zone) { return this; }
+}</code></pre>
+      <p><b>Inventory.java</b> - the <code>SeatInventory</code> interface with the pessimistic and optimistic implementations.</p>
+<pre><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
+
+// The one interface the booking service depends on. Two interchangeable implementations below.
+interface SeatInventory {
+    String name();
+    void register(Show show);
+    SeatHold hold(Show show, List&lt;String&gt; seatIds, String userId);   // all or nothing
+    void confirm(SeatHold hold, String bookingId);                    // held -&gt; booked
+    void release(SeatHold hold);                                      // held -&gt; free (payment failed, user left)
+    void cancel(Show show, List&lt;String&gt; seatIds, String bookingId);   // booked -&gt; free
+    Set&lt;String&gt; available(Show show);
+    double occupancy(Show show);
+}
+
+abstract class BaseInventory implements SeatInventory {
+    protected final Clock clock;
+    protected final Duration ttl;
+    private final AtomicLong holdSeq = new AtomicLong();
+
+    BaseInventory(Clock clock, Duration ttl) { this.clock = clock; this.ttl = ttl; }
+
+    protected String nextHoldId() { return "H" + holdSeq.incrementAndGet(); }
+
+    // a hold whose time is up counts as free: no background sweeper is needed for correctness
+    protected boolean isFreeNow(SeatState s, Instant now) {
+        return s instanceof Free || (s instanceof Held h &amp;&amp; !now.isBefore(h.expiresAt()));
+    }
+
+    protected static List&lt;String&gt; sorted(List&lt;String&gt; ids) {
+        if (ids.isEmpty()) throw new IllegalArgumentException("choose at least one seat");
+        List&lt;String&gt; out = new ArrayList&lt;&gt;(new TreeSet&lt;&gt;(ids));   // dedupe + fixed order
+        if (out.size() != ids.size()) throw new IllegalArgumentException("duplicate seat in request");
+        return out;
+    }
+}
+
+// ---------- PESSIMISTIC: one lock per show; check every seat and write every seat inside it ----------
+final class PessimisticSeatInventory extends BaseInventory {
+    private static final class ShowSeats {
+        final ReentrantLock lock = new ReentrantLock();
+        final Map&lt;String, SeatState&gt; state = new HashMap&lt;&gt;();      // guarded by lock
+    }
+    private final ConcurrentHashMap&lt;String, ShowSeats&gt; shows = new ConcurrentHashMap&lt;&gt;();
+
+    PessimisticSeatInventory(Clock clock, Duration ttl) { super(clock, ttl); }
+    public String name() { return "pessimistic (lock per show)"; }
+
+    public void register(Show show) {
+        ShowSeats s = new ShowSeats();
+        for (Seat seat : show.screen().seats()) s.state.put(seat.id(), new Free());
+        shows.putIfAbsent(show.id(), s);
+    }
+
+    private ShowSeats of(String showId) {
+        ShowSeats s = shows.get(showId);
+        if (s == null) throw new IllegalArgumentException("unknown show " + showId);
+        return s;
+    }
+
+    public SeatHold hold(Show show, List&lt;String&gt; seatIds, String userId) {
+        List&lt;String&gt; ids = sorted(seatIds);
+        ShowSeats s = of(show.id());
+        s.lock.lock();
+        try {
+            Instant now = clock.instant();
+            for (String id : ids) {                                  // 1. check all
+                SeatState st = s.state.get(id);
+                if (st == null) throw new IllegalArgumentException("no seat " + id);
+                if (!isFreeNow(st, now)) throw new SeatUnavailableException("seat " + id + " is not available");
+            }
+            SeatHold hold = new SeatHold(nextHoldId(), show.id(), userId, ids, now.plus(ttl));
+            for (String id : ids)                                    // 2. write all, same critical section
+                s.state.put(id, new Held(hold.id(), userId, hold.expiresAt()));
+            return hold;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    public void confirm(SeatHold hold, String bookingId) {
+        ShowSeats s = of(hold.showId());
+        s.lock.lock();
+        try {
+            Instant now = clock.instant();
+            for (String id : hold.seatIds())
+                if (!(s.state.get(id) instanceof Held h) || !h.holdId().equals(hold.id()) || !now.isBefore(h.expiresAt()))
+                    throw new HoldExpiredException("hold " + hold.id() + " expired or lost");
+            for (String id : hold.seatIds()) s.state.put(id, new Booked(bookingId));
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    public void release(SeatHold hold) {
+        ShowSeats s = of(hold.showId());
+        s.lock.lock();
+        try {
+            for (String id : hold.seatIds())
+                if (s.state.get(id) instanceof Held h &amp;&amp; h.holdId().equals(hold.id())) s.state.put(id, new Free());
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    public void cancel(Show show, List&lt;String&gt; seatIds, String bookingId) {
+        ShowSeats s = of(show.id());
+        s.lock.lock();
+        try {
+            for (String id : seatIds)
+                if (s.state.get(id) instanceof Booked b &amp;&amp; b.bookingId().equals(bookingId)) s.state.put(id, new Free());
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    public Set&lt;String&gt; available(Show show) {
+        ShowSeats s = of(show.id());
+        s.lock.lock();
+        try {
+            Instant now = clock.instant();
+            Set&lt;String&gt; out = new TreeSet&lt;&gt;();
+            s.state.forEach((id, st) -&gt; { if (isFreeNow(st, now)) out.add(id); });
+            return out;
+        } finally {
+            s.lock.unlock();
+        }
+    }
+
+    public double occupancy(Show show) {
+        return 1.0 - (double) available(show).size() / show.screen().seats().size();
+    }
+}
+
+// ---------- OPTIMISTIC: no lock; each seat is an AtomicReference changed with compare-and-set ----------
+final class OptimisticSeatInventory extends BaseInventory {
+    private final ConcurrentHashMap&lt;String, Map&lt;String, AtomicReference&lt;SeatState&gt;&gt;&gt; shows = new ConcurrentHashMap&lt;&gt;();
+
+    OptimisticSeatInventory(Clock clock, Duration ttl) { super(clock, ttl); }
+    public String name() { return "optimistic (CAS per seat)"; }
+
+    public void register(Show show) {
+        Map&lt;String, AtomicReference&lt;SeatState&gt;&gt; m = new HashMap&lt;&gt;();
+        for (Seat seat : show.screen().seats()) m.put(seat.id(), new AtomicReference&lt;&gt;(new Free()));
+        shows.putIfAbsent(show.id(), Map.copyOf(m));                  // the map itself never changes
+    }
+
+    private AtomicReference&lt;SeatState&gt; ref(String showId, String seatId) {
+        Map&lt;String, AtomicReference&lt;SeatState&gt;&gt; m = shows.get(showId);
+        if (m == null) throw new IllegalArgumentException("unknown show " + showId);
+        AtomicReference&lt;SeatState&gt; r = m.get(seatId);
+        if (r == null) throw new IllegalArgumentException("no seat " + seatId);
+        return r;
+    }
+
+    public SeatHold hold(Show show, List&lt;String&gt; seatIds, String userId) {
+        List&lt;String&gt; ids = sorted(seatIds);
+        Instant now = clock.instant();
+        SeatHold hold = new SeatHold(nextHoldId(), show.id(), userId, ids, now.plus(ttl));
+        Held mine = new Held(hold.id(), userId, hold.expiresAt());
+        List&lt;AtomicReference&lt;SeatState&gt;&gt; taken = new ArrayList&lt;&gt;();
+        for (String id : ids) {
+            AtomicReference&lt;SeatState&gt; r = ref(show.id(), id);
+            SeatState seen = r.get();
+            // read, check, then write only if nobody changed it in between
+            if (!isFreeNow(seen, now) || !r.compareAndSet(seen, mine)) {
+                for (AtomicReference&lt;SeatState&gt; t : taken) t.compareAndSet(mine, new Free());   // roll back
+                throw new SeatUnavailableException("seat " + id + " is not available");
+            }
+            taken.add(r);
+        }
+        return hold;
+    }
+
+    public void confirm(SeatHold hold, String bookingId) {
+        Instant now = clock.instant();
+        if (!now.isBefore(hold.expiresAt())) throw new HoldExpiredException("hold " + hold.id() + " expired");
+        Booked booked = new Booked(bookingId);
+        List&lt;AtomicReference&lt;SeatState&gt;&gt; done = new ArrayList&lt;&gt;();
+        for (String id : hold.seatIds()) {
+            AtomicReference&lt;SeatState&gt; r = ref(hold.showId(), id);
+            SeatState seen = r.get();
+            if (!(seen instanceof Held h) || !h.holdId().equals(hold.id()) || !r.compareAndSet(seen, booked)) {
+                for (AtomicReference&lt;SeatState&gt; d : done) d.compareAndSet(booked, new Free());
+                throw new HoldExpiredException("hold " + hold.id() + " expired or lost");
+            }
+            done.add(r);
+        }
+    }
+
+    public void release(SeatHold hold) {
+        for (String id : hold.seatIds()) {
+            AtomicReference&lt;SeatState&gt; r = ref(hold.showId(), id);
+            SeatState seen = r.get();
+            if (seen instanceof Held h &amp;&amp; h.holdId().equals(hold.id())) r.compareAndSet(seen, new Free());
+        }
+    }
+
+    public void cancel(Show show, List&lt;String&gt; seatIds, String bookingId) {
+        for (String id : seatIds) {
+            AtomicReference&lt;SeatState&gt; r = ref(show.id(), id);
+            SeatState seen = r.get();
+            if (seen instanceof Booked b &amp;&amp; b.bookingId().equals(bookingId)) r.compareAndSet(seen, new Free());
+        }
+    }
+
+    public Set&lt;String&gt; available(Show show) {
+        Instant now = clock.instant();
+        Set&lt;String&gt; out = new TreeSet&lt;&gt;();
+        shows.get(show.id()).forEach((id, r) -&gt; { if (isFreeNow(r.get(), now)) out.add(id); });
+        return out;
+    }
+
+    public double occupancy(Show show) {
+        return 1.0 - (double) available(show).size() / show.screen().seats().size();
+    }
+}</code></pre>
+      <p><b>Strategies.java</b> - pricing (with a demand decorator), payment, and the notification observer.</p>
+<pre><code class="language-java">import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+// ---------- Strategy: price of one seat ----------
+interface PricingStrategy {
+    long price(Show show, Seat seat, double occupancy);
+}
+
+final class SeatTypePricing implements PricingStrategy {
+    private final Map&lt;SeatType, Long&gt; base;
+    SeatTypePricing(Map&lt;SeatType, Long&gt; base) { this.base = Map.copyOf(base); }
+    public long price(Show show, Seat seat, double occupancy) { return base.get(seat.type()); }
+}
+
+// Decorator over any pricing: add a surcharge once the show is filling up
+final class DemandPricing implements PricingStrategy {
+    private final PricingStrategy inner;
+    private final double threshold;
+    private final int surchargePercent;
+
+    DemandPricing(PricingStrategy inner, double threshold, int surchargePercent) {
+        this.inner = inner; this.threshold = threshold; this.surchargePercent = surchargePercent;
+    }
+
+    public long price(Show show, Seat seat, double occupancy) {
+        long p = inner.price(show, seat, occupancy);
+        return occupancy &gt;= threshold ? p + p * surchargePercent / 100 : p;
+    }
+}
+
+// ---------- Strategy: how the user pays (gateways are outside our system) ----------
+interface PaymentStrategy {
+    String name();
+    boolean pay(String bookingId, long amount);   // true = money captured
+}
+
+final class UpiPayment implements PaymentStrategy {
+    private final String vpa;
+    UpiPayment(String vpa) { this.vpa = vpa; }
+    public String name() { return "UPI " + vpa; }
+    public boolean pay(String bookingId, long amount) { return amount &gt; 0; }   // stand-in for the gateway call
+}
+
+final class CardPayment implements PaymentStrategy {
+    private final boolean declined;
+    CardPayment(boolean declined) { this.declined = declined; }
+    public String name() { return declined ? "card (will be declined)" : "card"; }
+    public boolean pay(String bookingId, long amount) { return !declined; }
+}
+
+// ---------- Observer: who wants to hear about bookings ----------
+interface BookingListener {
+    void onBookingChanged(Booking booking);
+}
+
+final class NotificationService implements BookingListener {
+    private final Set&lt;String&gt; sent = ConcurrentHashMap.newKeySet();
+    public void onBookingChanged(Booking b) { sent.add(b.id() + ":" + b.status()); }
+    boolean wasSent(String bookingId, BookingStatus status) { return sent.contains(bookingId + ":" + status); }
+}</code></pre>
+      <p><b>BookingService.java</b> - the catalogue and the hold / pay / cancel service.</p>
+<pre><code class="language-java">import java.time.Clock;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+
+// Search side: which shows play where. Read-mostly, so a concurrent map is plenty.
+final class ShowCatalog {
+    private final Map&lt;String, Show&gt; shows = new ConcurrentHashMap&lt;&gt;();
+
+    void add(Show show) { shows.put(show.id(), show); }
+
+    Show get(String showId) {
+        Show s = shows.get(showId);
+        if (s == null) throw new IllegalArgumentException("unknown show " + showId);
+        return s;
+    }
+
+    List&lt;Show&gt; find(String city, String title) {
+        List&lt;Show&gt; out = new ArrayList&lt;&gt;();
+        for (Show s : shows.values())
+            if (s.screen().city().equalsIgnoreCase(city) &amp;&amp; s.movie().title().equalsIgnoreCase(title)) out.add(s);
+        out.sort((a, b) -&gt; a.start().compareTo(b.start()));
+        return out;
+    }
+}
+
+// Booking side: hold -&gt; pay -&gt; confirm, or expire / fail / cancel.
+final class BookingService {
+    private final ShowCatalog catalog;
+    private final SeatInventory inventory;
+    private final Clock clock;
+    private volatile PricingStrategy pricing;
+    private final Map&lt;String, Booking&gt; bookings = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicLong seq = new AtomicLong();
+    private final List&lt;BookingListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+
+    BookingService(ShowCatalog catalog, SeatInventory inventory, PricingStrategy pricing, Clock clock) {
+        this.catalog = catalog; this.inventory = inventory; this.pricing = pricing; this.clock = clock;
+    }
+
+    void setPricing(PricingStrategy p) { this.pricing = p; }
+    void addListener(BookingListener l) { listeners.add(l); }
+
+    void addShow(Show show) { catalog.add(show); inventory.register(show); }
+
+    // Step 1: hold the seats for the TTL and quote a price. No money moves yet.
+    Booking start(String userId, String showId, List&lt;String&gt; seatIds) {
+        Show show = catalog.get(showId);
+        double occupancy = inventory.occupancy(show);      // price on what the user saw
+        SeatHold hold = inventory.hold(show, seatIds, userId);
+        long amount = 0;
+        for (String id : hold.seatIds()) amount += pricing.price(show, seat(show, id), occupancy);
+        Booking b = new Booking("B" + seq.incrementAndGet(), userId, show, hold, amount);
+        bookings.put(b.id(), b);
+        return b;
+    }
+
+    // Step 2: pay, then turn the hold into a booking. Expired holds never charge the user.
+    Booking pay(String bookingId, PaymentStrategy payment) {
+        Booking b = get(bookingId);
+        synchronized (b) {                                   // one payment attempt per booking at a time
+            if (b.status() != BookingStatus.PENDING)
+                throw new IllegalStateException("booking " + bookingId + " is " + b.status());
+            if (!clock.instant().isBefore(b.hold().expiresAt())) {   // check BEFORE charging the user
+                inventory.release(b.hold());
+                b.moveTo(BookingStatus.EXPIRED);
+                publish(b);
+                throw new HoldExpiredException("hold expired for " + bookingId);
+            }
+            if (!payment.pay(b.id(), b.amount())) {
+                inventory.release(b.hold());
+                b.moveTo(BookingStatus.FAILED);
+                publish(b);
+                return b;
+            }
+            try {
+                inventory.confirm(b.hold(), b.id());
+            } catch (HoldExpiredException e) {
+                // money was taken but the seats are gone: refund (out of scope here) and report
+                b.moveTo(BookingStatus.EXPIRED);
+                publish(b);
+                throw e;
+            }
+            b.moveTo(BookingStatus.CONFIRMED);
+            publish(b);
+            return b;
+        }
+    }
+
+    Booking cancel(String bookingId) {
+        Booking b = get(bookingId);
+        synchronized (b) {
+            b.moveTo(BookingStatus.CANCELLED);               // throws unless CONFIRMED
+            inventory.cancel(b.show(), b.seatIds(), b.id());
+            publish(b);
+            return b;
+        }
+    }
+
+    // user closed the page: give the seats back now instead of waiting for the TTL
+    void abandon(String bookingId) {
+        Booking b = get(bookingId);
+        synchronized (b) {
+            if (b.status() == BookingStatus.PENDING) {
+                inventory.release(b.hold());
+                b.moveTo(BookingStatus.EXPIRED);
+                publish(b);
+            }
+        }
+    }
+
+    List&lt;String&gt; availableSeats(String showId) { return new ArrayList&lt;&gt;(inventory.available(catalog.get(showId))); }
+
+    Booking get(String bookingId) {
+        Booking b = bookings.get(bookingId);
+        if (b == null) throw new IllegalArgumentException("unknown booking " + bookingId);
+        return b;
+    }
+
+    private static Seat seat(Show show, String id) {
+        for (Seat s : show.screen().seats()) if (s.id().equals(id)) return s;
+        throw new IllegalArgumentException("no seat " + id);
+    }
+
+    private void publish(Booking b) { listeners.forEach(l -&gt; l.onBookingChanged(b)); }
+}</code></pre>
+      <p><b>Main.java</b> - demo driver with 44 checks and the two race tests.</p>
+<pre><code class="language-java">import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.TreeMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static void expectThrows(Class&lt;? extends RuntimeException&gt; type, Runnable r, String what) {
+        try {
+            r.run();
+        } catch (RuntimeException e) {
+            check(type.isInstance(e), what + " (got " + e.getClass().getSimpleName() + ")");
+            System.out.println("  rejected as expected: " + e.getMessage());
+            return;
+        }
+        throw new AssertionError("FAILED: expected " + type.getSimpleName() + " for " + what);
+    }
+
+    static Screen screen() {
+        List&lt;Seat&gt; seats = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 4; i++) seats.add(new Seat("A" + i, SeatType.REGULAR));
+        for (int i = 1; i &lt;= 4; i++) seats.add(new Seat("B" + i, SeatType.PREMIUM));
+        return new Screen("S1", "Dojo Cinemas", "Bengaluru", seats);
+    }
+
+    static final Map&lt;SeatType, Long&gt; BASE = Map.of(SeatType.REGULAR, 200L, SeatType.PREMIUM, 350L, SeatType.RECLINER, 600L);
+
+    public static void main(String[] args) throws Exception {
+        for (String mode : List.of("pessimistic", "optimistic")) {
+            ManualClock clock = new ManualClock(Instant.parse("2026-11-23T12:00:00Z"));
+            SeatInventory inv = mode.equals("pessimistic")
+                    ? new PessimisticSeatInventory(clock, Duration.ofMinutes(5))
+                    : new OptimisticSeatInventory(clock, Duration.ofMinutes(5));
+            System.out.println("######## inventory: " + inv.name() + " ########");
+            scenario(clock, inv);
+            race(inv);
+        }
+        System.out.println("All " + checks + " checks passed");
+    }
+
+    static void scenario(ManualClock clock, SeatInventory inv) {
+        BookingService svc = new BookingService(new ShowCatalog(), inv, new SeatTypePricing(BASE), clock);
+        NotificationService notifier = new NotificationService();
+        svc.addListener(notifier);
+        Movie movie = new Movie("M1", "Packet Storm", 128);
+        svc.addShow(new Show("SH1", movie, screen(), LocalDateTime.of(2026, 11, 23, 18, 30)));
+
+        System.out.println("== 1. two users, overlapping seats ==");
+        Booking alice = svc.start("alice", "SH1", List.of("A1", "A2"));
+        System.out.println("  " + alice);
+        check(alice.amount() == 400, "2 regular seats = 400");
+        expectThrows(SeatUnavailableException.class, () -&gt; svc.start("bob", "SH1", List.of("A2", "A3")), "A2 is held by alice");
+        check(svc.availableSeats("SH1").contains("A3"), "a failed multi-seat hold leaves no seat behind");
+        Booking bob = svc.start("bob", "SH1", List.of("A3", "A4"));
+        System.out.println("  " + bob);
+
+        System.out.println("== 2. alice pays within the hold ==");
+        svc.pay(alice.id(), new UpiPayment("alice@upi"));
+        System.out.println("  " + alice + " | free now: " + svc.availableSeats("SH1"));
+        check(alice.status() == BookingStatus.CONFIRMED, "alice confirmed");
+        check(notifier.wasSent(alice.id(), BookingStatus.CONFIRMED), "confirmation notified");
+        expectThrows(IllegalStateException.class, () -&gt; svc.pay(alice.id(), new UpiPayment("alice@upi")), "paying twice");
+
+        System.out.println("== 3. bob waits 6 minutes (TTL is 5) ==");
+        clock.advanceSeconds(6 * 60);
+        check(svc.availableSeats("SH1").containsAll(List.of("A3", "A4")), "expired hold counts as free, no sweeper needed");
+        expectThrows(HoldExpiredException.class, () -&gt; svc.pay(bob.id(), new CardPayment(false)), "late payment");
+        check(bob.status() == BookingStatus.EXPIRED, "bob expired");
+        Booking carol = svc.start("carol", "SH1", List.of("A3"));
+        System.out.println("  carol takes A3 after bob's hold expired: " + carol);
+
+        System.out.println("== 4. payment declined releases the seats ==");
+        Booking dave = svc.start("dave", "SH1", List.of("B1", "B2"));
+        svc.pay(dave.id(), new CardPayment(true));
+        System.out.println("  " + dave);
+        check(dave.status() == BookingStatus.FAILED, "declined card -&gt; FAILED");
+        check(svc.availableSeats("SH1").containsAll(List.of("B1", "B2")), "seats back after failure");
+
+        System.out.println("== 5. cancel a confirmed booking ==");
+        svc.cancel(alice.id());
+        check(svc.availableSeats("SH1").containsAll(List.of("A1", "A2")), "cancel frees seats");
+        expectThrows(IllegalStateException.class, () -&gt; svc.cancel(bob.id()), "cancel an expired booking");
+
+        System.out.println("== 6. demand pricing: +20% once 50% of seats are taken ==");
+        svc.setPricing(new DemandPricing(new SeatTypePricing(BASE), 0.5, 20));
+        Booking e1 = svc.start("erin", "SH1", List.of("A1", "A2", "A4"));   // occupancy before: 1/8
+        svc.pay(e1.id(), new UpiPayment("erin@upi"));
+        Booking f1 = svc.start("frank", "SH1", List.of("B3"));              // occupancy before: 4/8 = 50%
+        System.out.println("  " + e1 + "\n  " + f1);
+        check(e1.amount() == 600, "3 x 200 before the threshold");
+        check(f1.amount() == 420, "350 + 20% at 50% full");
+        expectThrows(IllegalArgumentException.class, () -&gt; svc.start("gina", "SH1", List.of("Z9")), "unknown seat");
+        expectThrows(IllegalArgumentException.class, () -&gt; svc.start("gina", "SH1", List.of("B4", "B4")), "duplicate seat");
+    }
+
+    // 100 users want B2 and B3 at the same instant; 200 more grab random pairs. No seat may be sold twice.
+    static void race(SeatInventory inv) throws Exception {
+        ManualClock clock = new ManualClock(Instant.parse("2026-11-23T12:00:00Z"));
+        SeatInventory fresh = inv instanceof PessimisticSeatInventory
+                ? new PessimisticSeatInventory(clock, Duration.ofMinutes(5))
+                : new OptimisticSeatInventory(clock, Duration.ofMinutes(5));
+        BookingService svc = new BookingService(new ShowCatalog(), fresh, new SeatTypePricing(BASE), clock);
+        svc.addShow(new Show("SH2", new Movie("M1", "Packet Storm", 128), screen(), LocalDateTime.of(2026, 11, 23, 21, 0)));
+
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger won = new AtomicInteger(), lost = new AtomicInteger();
+        for (int i = 0; i &lt; 100; i++) {
+            final String user = "u" + i;
+            pool.submit(() -&gt; {
+                try {
+                    go.await();
+                    Booking b = svc.start(user, "SH2", List.of("B2", "B3"));
+                    svc.pay(b.id(), new UpiPayment(user + "@upi"));
+                    won.incrementAndGet();
+                } catch (SeatUnavailableException e) {
+                    lost.incrementAndGet();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        go.countDown();
+        pool.shutdown();
+        check(pool.awaitTermination(10, TimeUnit.SECONDS), "race finished");
+        System.out.println("== race on B2+B3: winners=" + won.get() + " losers=" + lost.get() + " ==");
+        check(won.get() == 1 &amp;&amp; lost.get() == 99, "exactly one user gets B2+B3");
+
+        // random overlapping pairs: count how many times each seat is confirmed
+        String[] ids = {"A1", "A2", "A3", "A4", "B1", "B4"};
+        ExecutorService pool2 = Executors.newFixedThreadPool(8);
+        ConcurrentLinkedQueue&lt;Booking&gt; confirmed = new ConcurrentLinkedQueue&lt;&gt;();
+        for (int i = 0; i &lt; 200; i++) {
+            final int n = i;
+            pool2.submit(() -&gt; {
+                String a = ids[n % ids.length], b = ids[(n * 7 + 3) % ids.length];
+                if (a.equals(b)) return;
+                try {
+                    Booking bk = svc.start("r" + n, "SH2", List.of(a, b));
+                    if (svc.pay(bk.id(), new UpiPayment("r@upi")).status() == BookingStatus.CONFIRMED) confirmed.add(bk);
+                } catch (SeatUnavailableException ignored) {
+                }
+            });
+        }
+        pool2.shutdown();
+        check(pool2.awaitTermination(10, TimeUnit.SECONDS), "pairs finished");
+        Map&lt;String, Integer&gt; sold = new TreeMap&lt;&gt;();
+        for (Booking b : confirmed) for (String s : b.seatIds()) sold.merge(s, 1, Integer::sum);
+        System.out.println("== random pairs: confirmed bookings=" + confirmed.size() + " seats sold=" + sold.keySet() + " ==");
+        check(sold.values().stream().allMatch(c -&gt; c == 1), "no seat sold twice");
+        check(svc.availableSeats("SH2").size() == 8 - 2 - sold.size(), "inventory agrees with bookings");
+    }
+}</code></pre>
+      <p>Build and run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>. The "random pairs" line can differ between runs (thread timing decides who wins); the checks cannot.</p>
+<pre class="terminal"><code>######## inventory: pessimistic (lock per show) ########
+== 1. two users, overlapping seats ==
+  B1 alice [A1, A2] Rs 400 PENDING
+  rejected as expected: seat A2 is not available
+  B2 bob [A3, A4] Rs 400 PENDING
+== 2. alice pays within the hold ==
+  B1 alice [A1, A2] Rs 400 CONFIRMED | free now: [B1, B2, B3, B4]
+  rejected as expected: booking B1 is CONFIRMED
+== 3. bob waits 6 minutes (TTL is 5) ==
+  rejected as expected: hold expired for B2
+  carol takes A3 after bob's hold expired: B3 carol [A3] Rs 200 PENDING
+== 4. payment declined releases the seats ==
+  B4 dave [B1, B2] Rs 700 FAILED
+== 5. cancel a confirmed booking ==
+  rejected as expected: booking B2: EXPIRED -&gt; CANCELLED not allowed
+== 6. demand pricing: +20% once 50% of seats are taken ==
+  B5 erin [A1, A2, A4] Rs 600 CONFIRMED
+  B6 frank [B3] Rs 420 PENDING
+  rejected as expected: no seat Z9
+  rejected as expected: duplicate seat in request
+== race on B2+B3: winners=1 losers=99 ==
+== random pairs: confirmed bookings=3 seats sold=[A1, A2, A3, A4, B1, B4] ==
+######## inventory: optimistic (CAS per seat) ########
+== 1. two users, overlapping seats ==
+  B1 alice [A1, A2] Rs 400 PENDING
+  rejected as expected: seat A2 is not available
+  B2 bob [A3, A4] Rs 400 PENDING
+== 2. alice pays within the hold ==
+  B1 alice [A1, A2] Rs 400 CONFIRMED | free now: [B1, B2, B3, B4]
+  rejected as expected: booking B1 is CONFIRMED
+== 3. bob waits 6 minutes (TTL is 5) ==
+  rejected as expected: hold expired for B2
+  carol takes A3 after bob's hold expired: B3 carol [A3] Rs 200 PENDING
+== 4. payment declined releases the seats ==
+  B4 dave [B1, B2] Rs 700 FAILED
+== 5. cancel a confirmed booking ==
+  rejected as expected: booking B2: EXPIRED -&gt; CANCELLED not allowed
+== 6. demand pricing: +20% once 50% of seats are taken ==
+  B5 erin [A1, A2, A4] Rs 600 CONFIRMED
+  B6 frank [B3] Rs 420 PENDING
+  rejected as expected: no seat Z9
+  rejected as expected: duplicate seat in request
+== race on B2+B3: winners=1 losers=99 ==
+== random pairs: confirmed bookings=3 seats sold=[A1, A2, A3, A4, B1, B4] ==
+All 44 checks passed</code></pre>
+    </div>
+  </div>
+  

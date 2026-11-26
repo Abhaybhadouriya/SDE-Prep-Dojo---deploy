@@ -1,0 +1,63 @@
+
+        <h2>Inference serving: prefill, decode and the KV cache</h2>
+        <p>Every LLM request has two phases with very different hardware needs. Getting this one idea right explains batching, the KV cache, latency metrics and even why some companies split their GPU fleets in two.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 900 260" role="img" aria-label="Timeline: prefill processes the whole prompt at once, then decode produces one token per step">
+            <text class="label left" x="20" y="30">One request over time</text>
+            <rect class="box kafka" x="20" y="60" width="200" height="70"/>
+            <text class="label" x="120" y="86">Prefill</text>
+            <text class="label small" x="120" y="110">all prompt tokens at once</text>
+
+            <rect class="box svc" x="240" y="60" width="70" height="70"/><text class="label" x="275" y="95">t1</text>
+            <rect class="box svc" x="320" y="60" width="70" height="70"/><text class="label" x="355" y="95">t2</text>
+            <rect class="box svc" x="400" y="60" width="70" height="70"/><text class="label" x="435" y="95">t3</text>
+            <rect class="box svc" x="480" y="60" width="70" height="70"/><text class="label" x="515" y="95">t4</text>
+            <text class="label" x="600" y="95">...</text>
+            <rect class="box svc" x="650" y="60" width="70" height="70"/><text class="label" x="685" y="95">tN</text>
+            <text class="label small" x="480" y="150">Decode: one token per step, each step re-reads all weights + KV cache</text>
+
+            <path class="arrow" marker-end="url(#arrow)" d="M20 185 L870 185"/>
+            <text class="label small" x="870" y="205">time</text>
+            <path class="arrow accent" marker-end="url(#arrow)" d="M240 230 L240 195"/>
+            <text class="label small" x="240" y="246">TTFT ends here</text>
+            <path class="arrow dashed" marker-end="url(#arrow)" d="M320 230 L320 195"/>
+            <text class="label small" x="470" y="230">gap between tokens = TPOT</text>
+            <text class="label small" x="120" y="165">compute-bound</text>
+            <text class="label small" x="780" y="95">memory-bound</text>
+          </svg>
+          <figcaption>Prefill reads the whole prompt in one big parallel pass. Decode then produces tokens one at a time. Users feel the first phase as "time to first token" and the second as "typing speed".</figcaption>
+        </figure>
+
+        <h3>Prefill and decode</h3>
+        <ul>
+          <li><strong>Prefill</strong>: the model processes every prompt token in parallel. This is big matrix-times-matrix maths, so it keeps the GPU's compute units busy (compute-bound).</li>
+          <li><strong>Decode</strong>: the model makes one token per step. Each step must stream the whole model's weights from GPU memory to do a small matrix-times-vector job. The GPU spends its time <em>moving bytes</em>, not computing. Databricks and NVIDIA both describe decode as <strong>memory-bandwidth bound</strong>.</li>
+        </ul>
+
+        <h3>The two latency numbers</h3>
+        <div class="stats">
+          <div class="stat"><b>TTFT</b><span>time to first token</span></div>
+          <div class="stat"><b>TPOT</b><span>time per output token</span></div>
+          <div class="stat"><b>100 ms</b><span>TPOT = ~10 tokens/s per user</span></div>
+          <div class="stat"><b>46 ms</b><span>TTFT, MPT-7B on 1x A100 (Databricks)</span></div>
+        </div>
+        <p>Databricks gives the formula you should write on the whiteboard: <code>latency = TTFT + TPOT x output_tokens</code>. A 500-token answer at 50 ms per token takes about 25 seconds to finish, which is why every chat product <b>streams</b>. Hello Interview's ChatGPT breakdown makes the same point: users judge the product by the blank screen before the first token, not by total completion time.</p>
+
+        <h3>The KV cache: the model's notebook</h3>
+        <p>To make token number 500, the attention layers need information about tokens 1 to 499. Recomputing that every step would be wasteful, so the server stores two vectors per token per layer, the <strong>key</strong> and the <strong>value</strong>. That store is the <strong>KV cache</strong>. It lives in GPU memory next to the weights and grows by one entry per token, for every request in flight.</p>
+<pre><code class="language-python"># KV cache bytes per token (NVIDIA's formula)
+kv_per_token = 2 * num_layers * (num_heads * head_dim) * bytes_per_value
+#              ^ K and V
+
+# Llama 2 7B: 32 layers, hidden size 4096, FP16 (2 bytes)
+kv_per_token = 2 * 32 * 4096 * 2      # = 524,288 bytes, about 0.5 MB
+kv_4k_tokens = kv_per_token * 4096    # about 2 GB for ONE 4k-token sequence
+weights      = 7e9 * 2                # about 14 GB just for the weights</code></pre>
+        <p>Those numbers match NVIDIA's worked example (14 GB of weights, about 2 GB of KV cache for one 4,096-token sequence). Anyscale gives the same picture for a 13B model on a 40 GB A100: about 26 GB of weights leaves about 14 GB, which at nearly 1 MB per token holds only about <b>14,000 tokens in total</b> - roughly 28 sequences of 512 tokens, or 7 sequences of 2,048. <b>GPU memory, not compute, caps how many users one GPU can serve.</b></p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The KV cache is per-connection state, like a TCP control block plus its receive buffer: small per packet, but it grows with the stream and multiplied by thousands of concurrent flows it decides how many connections a box can hold. Decode being memory-bound is the same story as a router that is limited by memory bandwidth for packet buffers, not by the CPU's instruction rate.</p>
+        </div>
+      

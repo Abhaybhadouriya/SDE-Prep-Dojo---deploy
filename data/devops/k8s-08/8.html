@@ -1,0 +1,33 @@
+
+        <h2>Production choices: network disk, local NVMe or shared filesystem?</h2>
+        <div class="chips"><span class="chip warn">Deep dive (platform teams)</span></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>Network block disk (EBS, Azure Disk, PD)</th><th>Local NVMe (local PV)</th><th>Shared filesystem (NFS, CephFS, EFS, Azure Files)</th></tr></thead>
+            <tbody>
+              <tr><td>Access mode</td><td>RWO / RWOP</td><td>RWO, pinned to one node</td><td>RWX</td></tr>
+              <tr><td>Survives node loss?</td><td>Yes - detach and reattach elsewhere (same zone)</td><td><b>No</b> - the data dies with the node</td><td>Yes</td></tr>
+              <tr><td>Latency / throughput</td><td>Good; limited by the provisioned IOPS and the network</td><td>Best (direct PCIe)</td><td>Usually the slowest; metadata-heavy work hurts</td></tr>
+              <tr><td>Moves when pod moves?</td><td>Yes, in the same zone (tens of seconds)</td><td>Never - pod must return to that node</td><td>Yes, any node</td></tr>
+              <tr><td>Fits</td><td>Most databases, Kafka on cloud</td><td>Systems that replicate themselves (Kafka, Cassandra, Elasticsearch)</td><td>Shared uploads, ML datasets, legacy apps</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The key idea: <b>who provides durability?</b> If the storage layer does (network disks are replicated inside the zone by the cloud), you can use one copy per pod. If the application does (Kafka keeps 3 replicas on 3 brokers), you can choose fast but fragile local disks - losing one node just means one replica rebuilds from the others. Doing both (Kafka RF=3 on top of replicated network disks) is common on cloud and simply costs more.</p>
+        <div class="callout danger"><p><b>Real outage lesson (Datadog, March 2023):</b> after a bad OS update broke node networking, cloud auto-healing replaced a large share of instances in one region within hours. Stateful stores that relied on <b>local disks</b> lost those disks with the instances, which made recovery much slower. Local NVMe is fast, but "replace the node" then means "rebuild the data". Source: <a href="https://www.datadoghq.com/blog/engineering/2023-03-08-deep-dive-into-platform-level-impact/" target="_blank" rel="noopener">Datadog engineering blog</a>.</p></div>
+
+        <h3>Storage for Kafka on Kubernetes</h3>
+        <p>A Kafka broker writes its partition logs (<a href="{{BASE}}devops/kafka-07">Kafka storage internals</a>) to a directory that must survive restarts, because a broker that comes back empty has to re-copy every replica it hosted over the network. So each broker needs <b>its own</b> PVC - never a shared RWX volume, and never a single PVC shared by all replicas of a <a href="{{BASE}}interview/glossary#deployment">Deployment</a>. That "one disk per replica, with a stable name" requirement is exactly what <a href="{{BASE}}devops/k8s-10">StatefulSets and the Strimzi operator</a> provide through <code>volumeClaimTemplates</code> or per-pod claims. Kafka's own replication (RF=3, <code>min.insync.replicas=2</code>) provides the cross-zone durability; see <a href="{{BASE}}devops/kafka-05">Replication &amp; ISR</a>.</p>
+
+        <h3>Performance knobs that bite</h3>
+        <ul>
+          <li><b>fsGroup ownership change.</b> If the pod sets <code>securityContext.fsGroup</code>, the kubelet may <code>chown</code> every file in the volume on each mount. On a volume with millions of files, pod start can take minutes. Set <code>fsGroupChangePolicy: OnRootMismatch</code> so it only walks the tree when the top directory is wrong.</li>
+          <li><b>Attach limits per node.</b> Cloud VMs can attach only a limited number of disks (the limit depends on instance type). The CSI node plugin reports it, and the scheduler counts it. Pods can be Pending with "node(s) exceed max volume count" even when CPU is free.</li>
+          <li><b>emptyDir on memory.</b> <code>emptyDir: { medium: Memory }</code> is a tmpfs; what you write there counts against the container's <b>memory limit</b>. Fill it and you get <a href="{{BASE}}interview/glossary#oomkilled">OOMKilled</a>, not "disk full". Set <code>sizeLimit</code>.</li>
+          <li><b>Ephemeral storage limits.</b> Container logs, the writable layer and disk-backed emptyDir all use node disk. Set <code>resources.requests/limits.ephemeral-storage</code>, or a noisy pod can trigger node <code>DiskPressure</code> and evictions of its neighbours (see <a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>).</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>"Volume moves when the pod moves" is not free. Detaching means the old node must finish <code>umount</code> - which flushes dirty pages - and the cloud API must confirm the detach before attaching to the new node. If the old node is <i>dead</i>, nobody can run umount, so the system waits (by default for minutes) to be sure it is not still writing. It is the same fear you have with a dual-homed SCSI disk: two hosts writing the same block device without a cluster filesystem corrupts it. Kubernetes chooses waiting over corruption.</p>
+        </div>
+      

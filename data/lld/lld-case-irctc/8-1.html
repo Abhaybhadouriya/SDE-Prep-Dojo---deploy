@@ -1,0 +1,800 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+      <p><b>irctc.py</b> - the full model, inventory, strategies (as plain functions) and service, with a <code>threading.Lock</code> per journey.</p>
+<pre><code class="language-python">"""Train ticket booking (IRCTC-style): segment bitmasks per berth, RAC halves, waitlist promotion."""
+from __future__ import annotations
+
+import itertools
+import threading
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
+from enum import Enum
+from typing import Callable, Optional
+
+
+class BerthType(Enum):
+    LOWER = "LOWER"; MIDDLE = "MIDDLE"; UPPER = "UPPER"; SIDE_LOWER = "SIDE_LOWER"; SIDE_UPPER = "SIDE_UPPER"
+
+
+class Quota(Enum):
+    GENERAL = "GENERAL"; TATKAL = "TATKAL"
+
+
+class Status(Enum):
+    CNF = "CNF"; RAC = "RAC"; WL = "WL"; CANCELLED = "CAN"
+
+
+class NoSeats(Exception):
+    pass
+
+
+class BookingClosed(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Station:
+    code: str
+    km: int
+
+
+class Route:
+    def __init__(self, stops: list[Station]):
+        if not 2 &lt;= len(stops) &lt;= 64:
+            raise ValueError("2..64 stops")
+        self.stops = list(stops)
+        self.index = {s.code: i for i, s in enumerate(stops)}
+        if len(self.index) != len(stops):
+            raise ValueError("repeated stop")
+
+    def serves(self, a: str, b: str) -&gt; bool:
+        return a in self.index and b in self.index and self.index[a] &lt; self.index[b]
+
+    def km(self, i: int, j: int) -&gt; int:
+        return self.stops[j].km - self.stops[i].km
+
+    @staticmethod
+    def mask(i: int, j: int) -&gt; int:
+        """Bits i..j-1: the segments a trip from stop i to stop j occupies."""
+        return ((1 &lt;&lt; j) - 1) &amp; ~((1 &lt;&lt; i) - 1)
+
+
+@dataclass(frozen=True)
+class Berth:
+    no: int
+    type: BerthType
+    quota: Quota = Quota.GENERAL
+    rac: bool = False
+
+
+@dataclass(frozen=True)
+class TrainClass:
+    code: str
+    ac: bool
+    berths: tuple[Berth, ...]
+    waitlist_limit: int
+    paise_per_km: int
+
+
+@dataclass(frozen=True)
+class Train:
+    number: str
+    route: Route
+    classes: dict
+
+
+@dataclass(frozen=True)
+class Passenger:
+    name: str
+    preference: Optional[BerthType] = None
+
+
+@dataclass(eq=False)
+class Ticket:
+    passenger: Passenger
+    booking: "Booking" = None
+    status: Optional[Status] = None
+    berth: Optional[Berth] = None
+    half: int = -1
+    number: int = 0
+
+    def describe(self) -&gt; str:
+        if self.status is Status.CNF:
+            return f"CNF B1-{self.berth.no} {self.berth.type.value}"
+        if self.status is Status.RAC:
+            return f"RAC {self.number} (B1-{self.berth.no})"
+        if self.status is Status.WL:
+            return f"WL {self.number}"
+        return "CAN"
+
+
+@dataclass(eq=False)
+class Booking:
+    pnr: str
+    train_no: str
+    day: date
+    cls: str
+    src: str
+    dst: str
+    i: int
+    j: int
+    quota: Quota
+    fare: int
+    tickets: list = field(default_factory=list)
+
+    @property
+    def mask(self) -&gt; int:
+        return Route.mask(self.i, self.j)
+
+
+# ---- strategies ----
+
+def best_fit_picker(free: list[tuple[Berth, int]], pref: Optional[BerthType]):
+    """Preference first, then the berth already busiest on other segments, then lowest number."""
+    if not free:
+        return None
+    return min(free, key=lambda c: (c[0].type is not pref, -bin(c[1]).count("1"), c[0].no))
+
+
+def distance_fare(cls: TrainClass, km: int, quota: Quota) -&gt; int:
+    return max(100, km * cls.paise_per_km // 100)
+
+
+def tatkal_surcharge(inner, percent=30, lo=400, hi=500):
+    def fare(cls, km, quota):
+        base = inner(cls, km, quota)
+        return base if quota is not Quota.TATKAL else base + min(hi, max(lo, base * percent // 100))
+    return fare
+
+
+# ---- the contended core ----
+
+class JourneyInventory:
+    """One class of one train on one date. One lock; nothing slow happens while it is held."""
+
+    def __init__(self, cls: TrainClass, picker=best_fit_picker):
+        self.cls, self.picker = cls, picker
+        self.lock = threading.Lock()
+        self.berths = [b for b in cls.berths if not b.rac]
+        self.occ = {b.no: 0 for b in self.berths}
+        self.rac_berths = [b for b in cls.berths if b.rac]
+        self.rac_occ = {b.no: [0, 0] for b in self.rac_berths}
+        self.rac_q: list[Ticket] = []
+        self.wl_q: list[Ticket] = []
+        self.bookings: list[Booking] = []
+
+    def allocate(self, b: Booking) -&gt; list:
+        with self.lock:
+            placed = []
+            for t in b.tickets:
+                if self._confirm(t, b.mask, b.quota) or (b.quota is Quota.GENERAL and self._rac(t, b.mask)):
+                    placed.append(t)
+                    continue
+                if b.quota is Quota.GENERAL and len(self.wl_q) &lt; self.cls.waitlist_limit:
+                    t.status = Status.WL
+                    self.wl_q.append(t)
+                    placed.append(t)
+                    continue
+                for p in placed:  # all or nothing
+                    self._release(p, b.mask)
+                    p.status = None
+                raise NoSeats("REGRET: tatkal quota full" if b.quota is Quota.TATKAL else "REGRET: waitlist full")
+            self.bookings.append(b)
+            self._renumber()
+            return [(b, t, "NEW", t.describe()) for t in b.tickets]
+
+    def cancel(self, b: Booking) -&gt; list:
+        with self.lock:
+            events = []
+            for t in b.tickets:
+                if t.status in (None, Status.CANCELLED):
+                    continue
+                before = t.describe()
+                self._release(t, b.mask)
+                t.status = Status.CANCELLED
+                events.append((b, t, before, "CAN"))
+            moved = self._promote()
+            self._renumber()
+            return events + [(t.booking, t, before, t.describe()) for t, before in moved]
+
+    def availability(self, i: int, j: int) -&gt; dict:
+        need = Route.mask(i, j)
+        with self.lock:
+            gen = sum(1 for b in self.berths if b.quota is Quota.GENERAL and not self.occ[b.no] &amp; need)
+            tq = sum(1 for b in self.berths if b.quota is Quota.TATKAL and not self.occ[b.no] &amp; need)
+            rac = sum(1 for h in self.rac_occ.values() for x in h if not x &amp; need)
+            return {"general": gen, "tatkal": tq, "rac": rac, "wl": len(self.wl_q), "wl_limit": self.cls.waitlist_limit}
+
+    # -- under the lock --
+    def _confirm(self, t: Ticket, need: int, quota: Quota) -&gt; bool:
+        free = [(b, self.occ[b.no]) for b in self.berths if b.quota is quota and not self.occ[b.no] &amp; need]
+        pick = self.picker(free, t.passenger.preference)
+        if pick is None:
+            return False
+        self.occ[pick[0].no] |= need
+        t.status, t.berth, t.half = Status.CNF, pick[0], -1
+        return True
+
+    def _rac(self, t: Ticket, need: int) -&gt; bool:
+        for b in self.rac_berths:
+            for h in (0, 1):
+                if not self.rac_occ[b.no][h] &amp; need:
+                    self.rac_occ[b.no][h] |= need
+                    t.status, t.berth, t.half = Status.RAC, b, h
+                    self.rac_q.append(t)
+                    return True
+        return False
+
+    def _release(self, t: Ticket, need: int) -&gt; None:
+        if t.status is Status.CNF:
+            self.occ[t.berth.no] &amp;= ~need
+        elif t.status is Status.RAC:
+            self.rac_occ[t.berth.no][t.half] &amp;= ~need
+            self.rac_q.remove(t)
+        elif t.status is Status.WL:
+            self.wl_q.remove(t)
+
+    def _promote(self) -&gt; list:
+        moved = []
+        for t in list(self.rac_q):
+            before, berth, half = t.describe(), t.berth, t.half
+            if self._confirm(t, t.booking.mask, Quota.GENERAL):
+                self.rac_occ[berth.no][half] &amp;= ~t.booking.mask
+                self.rac_q.remove(t)
+                moved.append((t, before))
+        for t in list(self.wl_q):
+            before = t.describe()
+            if self._confirm(t, t.booking.mask, Quota.GENERAL) or self._rac(t, t.booking.mask):
+                self.wl_q.remove(t)
+                moved.append((t, before))
+        return moved
+
+    def _renumber(self) -&gt; None:
+        for n, t in enumerate(self.rac_q, 1):
+            t.number = n
+        for n, t in enumerate(self.wl_q, 1):
+            t.number = n
+
+    def check_invariants(self) -&gt; None:
+        with self.lock:
+            cnf = {b.no: 0 for b in self.berths}
+            rac = {b.no: [0, 0] for b in self.rac_berths}
+            for bk in self.bookings:
+                for t in bk.tickets:
+                    if t.status is Status.CNF:
+                        assert not cnf[t.berth.no] &amp; bk.mask, "berth sold twice"
+                        cnf[t.berth.no] |= bk.mask
+                    elif t.status is Status.RAC:
+                        assert not rac[t.berth.no][t.half] &amp; bk.mask, "RAC half sold twice"
+                        rac[t.berth.no][t.half] |= bk.mask
+            assert cnf == self.occ and rac == self.rac_occ, "mask drift"
+            assert len(self.wl_q) &lt;= self.cls.waitlist_limit
+            for t in self.rac_q + self.wl_q:
+                m = t.booking.mask
+                assert not any(b.quota is Quota.GENERAL and not self.occ[b.no] &amp; m for b in self.berths), "missed promotion"
+
+
+class ReservationService:
+    def __init__(self, clock: Callable[[], datetime], fare=tatkal_surcharge(distance_fare), picker=best_fit_picker):
+        self.clock, self.fare, self.picker = clock, fare, picker
+        self.trains: dict[str, Train] = {}
+        self.by_station: dict[str, set] = {}
+        self.inventories: dict[str, JourneyInventory] = {}
+        self.bookings: dict[str, Booking] = {}
+        self.listeners: list = []
+        self._lock = threading.Lock()
+        self._pnr = itertools.count(4_000_000_001)
+
+    def add_train(self, t: Train) -&gt; None:
+        self.trains[t.number] = t
+        for s in t.route.stops:
+            self.by_station.setdefault(s.code, set()).add(t.number)
+
+    def search(self, a: str, b: str) -&gt; list[str]:
+        both = self.by_station.get(a, set()) &amp; self.by_station.get(b, set())
+        return sorted(n for n in both if self.trains[n].route.serves(a, b))
+
+    def inventory(self, train_no: str, cls: str, day: date) -&gt; JourneyInventory:
+        key = f"{train_no}|{day}|{cls}"
+        with self._lock:
+            if key not in self.inventories:
+                self.inventories[key] = JourneyInventory(self.trains[train_no].classes[cls], self.picker)
+            return self.inventories[key]
+
+    def availability(self, train_no, day, cls, a, b) -&gt; dict:
+        r = self._train(train_no, a, b).route
+        return self.inventory(train_no, cls, day).availability(r.index[a], r.index[b])
+
+    @staticmethod
+    def tatkal_opens(tc: TrainClass, day: date) -&gt; datetime:
+        return datetime.combine(day - timedelta(days=1), time(10 if tc.ac else 11, 0))
+
+    def book(self, user, train_no, day, cls, a, b, quota, passengers) -&gt; Booking:
+        t = self._train(train_no, a, b)
+        tc = t.classes[cls]
+        limit = 4 if quota is Quota.TATKAL else 6
+        if not 1 &lt;= len(passengers) &lt;= limit:
+            raise ValueError(f"1..{limit} passengers")
+        now = self.clock()
+        if now &gt;= datetime.combine(day, time(0, 0)):
+            raise BookingClosed("train has left")
+        if quota is Quota.TATKAL and now &lt; self.tatkal_opens(tc, day):
+            raise BookingClosed(f"tatkal opens at {self.tatkal_opens(tc, day)}")
+        i, j = t.route.index[a], t.route.index[b]
+        with self._lock:
+            pnr = str(next(self._pnr))
+        bk = Booking(pnr, train_no, day, cls, a, b, i, j, quota, self.fare(tc, t.route.km(i, j), quota) * len(passengers))
+        bk.tickets = [Ticket(p, bk) for p in passengers]
+        events = self.inventory(train_no, cls, day).allocate(bk)
+        self.bookings[pnr] = bk
+        self._publish(events)
+        return bk
+
+    def cancel(self, pnr: str) -&gt; Booking:
+        bk = self.bookings.get(pnr)
+        if bk is None:
+            raise ValueError(f"no PNR {pnr}")
+        self._publish(self.inventory(bk.train_no, bk.cls, bk.day).cancel(bk))
+        return bk
+
+    def _train(self, n, a, b) -&gt; Train:
+        t = self.trains.get(n)
+        if t is None or not t.route.serves(a, b):
+            raise ValueError(f"{n} does not run {a}-&gt;{b}")
+        return t
+
+    def _publish(self, events) -&gt; None:  # outside the inventory lock
+        for e in events:
+            for listener in self.listeners:
+                listener(*e)
+
+
+def coach() -&gt; TrainClass:
+    G, T = Quota.GENERAL, Quota.TATKAL
+    L, M, U, SL, SU = BerthType.LOWER, BerthType.MIDDLE, BerthType.UPPER, BerthType.SIDE_LOWER, BerthType.SIDE_UPPER
+    return TrainClass("3A", True, (Berth(1, L), Berth(2, M), Berth(3, U), Berth(4, L), Berth(5, M, T), Berth(6, U, T),
+                                   Berth(7, SL, G, True), Berth(8, SU)), 3, 250)
+
+
+def demo_service(clock) -&gt; ReservationService:
+    s = ReservationService(clock)
+    st = [Station("NDLS", 0), Station("AGC", 195), Station("GWL", 313), Station("BPL", 701), Station("NGP", 1091)]
+    s.add_train(Train("12627", Route(st), {"3A": coach()}))
+    s.add_train(Train("12001", Route(st[:4]), {"3A": coach()}))
+    s.add_train(Train("12951", Route([st[0], Station("KOTA", 465), Station("BCT", 1386)]), {"3A": coach()}))
+    return s</code></pre>
+      <p><b>main.py</b> - demo driver, including a 100-thread tatkal rush.</p>
+<pre><code class="language-python">"""Demo driver: the same story as the Java Main, with assertions."""
+import random
+import threading
+from datetime import date, datetime
+
+from irctc import BookingClosed, NoSeats, Passenger, Quota, Status, demo_service
+
+
+def check(cond, msg="check failed"):
+    """Like assert, but never stripped by python -O: the call inside it always runs."""
+    if not cond:
+        raise AssertionError(msg)
+
+now = [datetime(2026, 12, 1, 9, 0)]
+irctc = demo_service(lambda: now[0])
+sms = []
+irctc.listeners.append(lambda b, t, before, after: sms.append(f"{t.passenger.name}: {before} -&gt; {after}"))
+DAY, T = date(2026, 12, 10), "12627"
+
+
+def show(b):
+    return f"  PNR {b.pnr} {b.src}-&gt;{b.dst} Rs {b.fare}: " + " ".join(f"{t.passenger.name}={t.describe()}" for t in b.tickets)
+
+
+def book(src, dst, *names, quota=Quota.GENERAL, day=DAY, train=T):
+    return irctc.book("u", train, day, "3A", src, dst, quota, [Passenger(n) for n in names])
+
+
+print("== search and segment reuse ==")
+check(irctc.search("NDLS", "BPL") == ["12001", "12627"])
+alice = irctc.book("u1", T, DAY, "3A", "NDLS", "GWL", Quota.GENERAL, [Passenger("Alice")])
+bob = book("GWL", "NGP", "Bob")
+print(show(alice)); print(show(bob))
+check(alice.tickets[0].berth.no == bob.tickets[0].berth.no == 1)
+
+print("== CNF, RAC, WL, regret ==")
+family = book("NDLS", "NGP", "Chitra", "Chirag", "Chetan", "Chhavi")
+rac = book("NDLS", "NGP", "Dev", "Esha")
+wl = book("NDLS", "NGP", "Farah", "Gopal")
+hari = book("NDLS", "NGP", "Hari")
+for b in (family, rac, wl, hari):
+    print(show(b))
+try:
+    book("NDLS", "NGP", "Ira")
+    raise AssertionError("expected regret")
+except NoSeats as e:
+    print("  rejected as expected:", e)
+
+print("== cancel and promote ==")
+sms.clear()
+irctc.cancel(family.pnr)
+for m in sms:
+    print("  SMS", m)
+check([t.status for t in rac.tickets + wl.tickets] == [Status.CNF] * 4)
+check(hari.tickets[0].describe() == "RAC 1 (B1-7)")
+
+print("== tatkal rush: 100 threads, 2 berths ==")
+now[0] = datetime(2026, 12, 9, 9, 59)
+try:
+    book("NDLS", "NGP", "Early", quota=Quota.TATKAL)
+    raise AssertionError("expected closed")
+except BookingClosed as e:
+    print("  rejected as expected:", e)
+now[0] = datetime(2026, 12, 9, 10, 0)
+won, start = [], threading.Barrier(100)
+
+
+def rush(i):
+    start.wait()
+    try:
+        won.append(book("NDLS", "NGP", f"T{i}", quota=Quota.TATKAL))
+    except NoSeats:
+        pass
+
+
+threads = [threading.Thread(target=rush, args=(i,)) for i in range(100)]
+for t in threads: t.start()
+for t in threads: t.join()
+print(f"  confirmed {len(won)}, regret {100 - len(won)}")
+check(len(won) == 2)
+irctc.inventory(T, "3A", DAY).check_invariants()
+
+print("== random race on another day ==")
+now[0] = datetime(2026, 12, 1, 9, 0)
+stops = ["NDLS", "AGC", "GWL", "BPL", "NGP"]
+made = []
+
+
+def rnd(i):
+    r = random.Random(i)
+    a = r.randrange(4)
+    b = r.randrange(a + 1, 5)
+    try:
+        made.append(book(stops[a], stops[b], f"R{i}", day=date(2026, 12, 11)))
+    except NoSeats:
+        pass
+
+
+threads = [threading.Thread(target=rnd, args=(i,)) for i in range(300)]
+for t in threads: t.start()
+for t in threads: t.join()
+inv = irctc.inventory(T, "3A", date(2026, 12, 11))
+inv.check_invariants()
+threads = [threading.Thread(target=irctc.cancel, args=(b.pnr,)) for b in made[::2]]
+for t in threads: t.start()
+for t in threads: t.join()
+inv.check_invariants()
+print(f"  booked {len(made)}, cancelled {len(made[::2])}; no double sale, no missed promotion")
+print("PYTHON DEMO OK")</code></pre>
+      <p><b>test_irctc.py</b> - unit tests: masks, segment reuse, RAC/WL/regret, all-or-nothing, promotion order, short trip in a gap, tatkal fare, wrong direction.</p>
+<pre><code class="language-python">import unittest
+from datetime import date, datetime
+
+from irctc import NoSeats, Passenger, Quota, Route, Status, demo_service
+
+DAY = date(2026, 12, 10)
+
+
+class IrctcTest(unittest.TestCase):
+    def setUp(self):
+        self.s = demo_service(lambda: datetime(2026, 12, 1, 9, 0))
+
+    def book(self, a, b, *names):
+        return self.s.book("u", "12627", DAY, "3A", a, b, Quota.GENERAL, [Passenger(n) for n in names])
+
+    def test_mask(self):
+        self.assertEqual(Route.mask(0, 2), 0b11)
+        self.assertEqual(Route.mask(2, 4), 0b1100)
+        self.assertEqual(Route.mask(0, 2) &amp; Route.mask(2, 4), 0)
+
+    def test_segment_reuse_and_best_fit(self):
+        a = self.book("NDLS", "GWL", "A")
+        b = self.book("GWL", "NGP", "B")
+        self.assertEqual(a.tickets[0].berth, b.tickets[0].berth)
+
+    def test_rac_then_wl_then_regret(self):
+        self.book("NDLS", "NGP", "a", "b", "c", "d", "e")
+        r = self.book("NDLS", "NGP", "r1", "r2")
+        self.assertEqual([t.status for t in r.tickets], [Status.RAC, Status.RAC])
+        w = self.book("NDLS", "NGP", "w1", "w2", "w3")
+        self.assertEqual([t.describe() for t in w.tickets], ["WL 1", "WL 2", "WL 3"])
+        with self.assertRaises(NoSeats):
+            self.book("NDLS", "NGP", "x")
+
+    def test_all_or_nothing(self):
+        self.book("NDLS", "NGP", "a", "b", "c", "d", "e")
+        self.book("NDLS", "NGP", "r1", "r2", "w1", "w2")
+        with self.assertRaises(NoSeats):
+            self.book("NDLS", "NGP", "w3", "w4")
+        self.assertEqual(self.s.availability("12627", DAY, "3A", "NDLS", "NGP")["wl"], 2)
+
+    def test_promotion_order(self):
+        first = self.book("NDLS", "NGP", "a", "b", "c", "d", "e")
+        r = self.book("NDLS", "NGP", "r1", "r2")
+        w = self.book("NDLS", "NGP", "w1")
+        self.s.cancel(first.pnr)
+        self.assertTrue(all(t.status is Status.CNF for t in r.tickets + w.tickets))
+        self.s.inventory("12627", "3A", DAY).check_invariants()
+
+    def test_short_trip_takes_gap(self):
+        self.book("NDLS", "NGP", "a", "b", "c", "d")
+        x = self.book("GWL", "NGP", "x")
+        self.book("NDLS", "GWL", "y")  # fills berth 8 end to end with x
+        r = self.book("NDLS", "NGP", "r")
+        self.assertEqual(r.tickets[0].status, Status.RAC)
+        self.s.cancel(x.pnr)
+        self.assertEqual(r.tickets[0].status, Status.RAC)  # GWL-NGP gap does not fit NDLS-NGP
+        g = self.book("BPL", "NGP", "g")
+        self.assertEqual(g.tickets[0].status, Status.CNF)
+
+    def test_tatkal_fare_cap(self):
+        s = demo_service(lambda: datetime(2026, 12, 9, 12, 0))
+        b = s.book("u", "12001", DAY, "3A", "NDLS", "BPL", Quota.TATKAL, [Passenger("n")])
+        self.assertEqual(b.fare, 1752 + 500)
+
+    def test_wrong_direction(self):
+        self.assertEqual(self.s.search("BPL", "NDLS"), [])
+        with self.assertRaises(ValueError):
+            self.book("NGP", "NDLS", "x")
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+      <p>Run: <code>python main.py</code> and <code>python -m unittest -v test_irctc</code></p>
+<pre class="terminal"><code>== search and segment reuse ==
+  PNR 4000000001 NDLS-&gt;GWL Rs 782: Alice=CNF B1-1 LOWER
+  PNR 4000000002 GWL-&gt;NGP Rs 1945: Bob=CNF B1-1 LOWER
+== CNF, RAC, WL, regret ==
+  PNR 4000000003 NDLS-&gt;NGP Rs 10908: Chitra=CNF B1-2 MIDDLE Chirag=CNF B1-3 UPPER Chetan=CNF B1-4 LOWER Chhavi=CNF B1-8 SIDE_UPPER
+  PNR 4000000004 NDLS-&gt;NGP Rs 5454: Dev=RAC 1 (B1-7) Esha=RAC 2 (B1-7)
+  PNR 4000000005 NDLS-&gt;NGP Rs 5454: Farah=WL 1 Gopal=WL 2
+  PNR 4000000006 NDLS-&gt;NGP Rs 2727: Hari=WL 3
+  rejected as expected: REGRET: waitlist full
+== cancel and promote ==
+  SMS Chitra: CNF B1-2 MIDDLE -&gt; CAN
+  SMS Chirag: CNF B1-3 UPPER -&gt; CAN
+  SMS Chetan: CNF B1-4 LOWER -&gt; CAN
+  SMS Chhavi: CNF B1-8 SIDE_UPPER -&gt; CAN
+  SMS Dev: RAC 1 (B1-7) -&gt; CNF B1-2 MIDDLE
+  SMS Esha: RAC 2 (B1-7) -&gt; CNF B1-3 UPPER
+  SMS Farah: WL 1 -&gt; CNF B1-4 LOWER
+  SMS Gopal: WL 2 -&gt; CNF B1-8 SIDE_UPPER
+  SMS Hari: WL 3 -&gt; RAC 1 (B1-7)
+== tatkal rush: 100 threads, 2 berths ==
+  rejected as expected: tatkal opens at 2026-12-09 10:00:00
+  confirmed 2, regret 98
+== random race on another day ==
+  booked 20, cancelled 10; no double sale, no missed promotion
+PYTHON DEMO OK</code></pre>
+<pre class="terminal"><code>test_all_or_nothing (test_irctc.IrctcTest.test_all_or_nothing) ... ok
+test_mask (test_irctc.IrctcTest.test_mask) ... ok
+test_promotion_order (test_irctc.IrctcTest.test_promotion_order) ... ok
+test_rac_then_wl_then_regret (test_irctc.IrctcTest.test_rac_then_wl_then_regret) ... ok
+test_segment_reuse_and_best_fit (test_irctc.IrctcTest.test_segment_reuse_and_best_fit) ... ok
+test_short_trip_takes_gap (test_irctc.IrctcTest.test_short_trip_takes_gap) ... ok
+test_tatkal_fare_cap (test_irctc.IrctcTest.test_tatkal_fare_cap) ... ok
+test_wrong_direction (test_irctc.IrctcTest.test_wrong_direction) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.001s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><b>main.cpp</b> - the allocator core: per-berth <code>uint64_t</code> masks, RAC halves, queues, promotion, and the picker as a virtual interface (a hand-written vtable in C). Single-threaded; the comment at the top says where the mutex goes.</p>
+<pre><code class="language-cpp">// IRCTC core in C++14: per-berth segment bitmasks, RAC halves, waitlist promotion.
+// Locking: every public JourneyInventory method body runs under one mutex per (train, date, class) - one
+// inventory object - exactly like the Java ReentrantLock: check-and-claim of a berth mask is one step.
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+
+enum class Status { CNF, RAC, WL, CAN };
+
+// CHECK, not assert: the calls inside have side effects and must survive -DNDEBUG.
+#define CHECK(x) do { if (!(x)) { std::cerr &lt;&lt; "FAILED: " #x "\n"; return 1; } } while (0)
+
+static uint64_t segMask(int from, int to) { return ((1ULL &lt;&lt; to) - 1) &amp; ~((1ULL &lt;&lt; from) - 1); }
+
+static int popcount64(uint64_t x) { int n = 0; while (x) { x &amp;= x - 1; ++n; } return n; }
+
+struct Berth { int no; std::string type; bool tatkal; bool rac; };
+
+struct Ticket {
+    std::string name;
+    uint64_t mask;
+    Status status = Status::CAN;
+    int berth = -1;   // index into berths (CNF) or racBerths (RAC)
+    int half = -1;
+    int number = 0;
+    std::string describe(const std::vector&lt;Berth&gt;&amp; b, const std::vector&lt;Berth&gt;&amp; rb) const {
+        switch (status) {
+            case Status::CNF: return "CNF B1-" + std::to_string(b[berth].no) + " " + b[berth].type;
+            case Status::RAC: return "RAC " + std::to_string(number) + " (B1-" + std::to_string(rb[berth].no) + ")";
+            case Status::WL: return "WL " + std::to_string(number);
+            default: return "CAN";
+        }
+    }
+};
+
+// Strategy as an interface: the C++ vtable you would write by hand as a struct of function pointers.
+struct BerthPicker {
+    virtual ~BerthPicker() {}
+    virtual int pick(const std::vector&lt;int&gt;&amp; freeIdx, const std::vector&lt;uint64_t&gt;&amp; occ) const = 0;
+};
+struct BestFit : BerthPicker {
+    int pick(const std::vector&lt;int&gt;&amp; freeIdx, const std::vector&lt;uint64_t&gt;&amp; occ) const override {
+        int best = -1;
+        for (int i : freeIdx)
+            if (best &lt; 0 || popcount64(occ[i]) &gt; popcount64(occ[best])) best = i;
+        return best;
+    }
+};
+
+class JourneyInventory {
+public:
+    JourneyInventory(std::vector&lt;Berth&gt; all, int wlLimit, std::unique_ptr&lt;BerthPicker&gt; p)
+        : wlLimit_(wlLimit), picker_(std::move(p)) {
+        for (auto&amp; b : all) (b.rac ? racBerths_ : berths_).push_back(b);
+        occ_.assign(berths_.size(), 0);
+        racOcc_.assign(racBerths_.size() * 2, 0);
+    }
+
+    // All passengers of one booking are placed, or none (rollback).
+    bool allocate(std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;&amp; tickets, bool tatkal) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt; placed;
+        for (auto&amp; t : tickets) {
+            if (confirm(*t, tatkal) || (!tatkal &amp;&amp; rac(t))) { placed.push_back(t); continue; }
+            if (!tatkal &amp;&amp; (int)wl_.size() &lt; wlLimit_) { t-&gt;status = Status::WL; wl_.push_back(t); placed.push_back(t); continue; }
+            for (auto&amp; p : placed) { release(p); p-&gt;status = Status::CAN; }
+            return false;
+        }
+        renumber();
+        return true;
+    }
+
+    void cancel(std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;&amp; tickets) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        for (auto&amp; t : tickets) { release(t); t-&gt;status = Status::CAN; }
+        for (auto t : std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;(racQ_)) {   // RAC -&gt; CNF
+            int rb = t-&gt;berth, h = t-&gt;half;
+            if (confirm(*t, false)) { racOcc_[rb * 2 + h] &amp;= ~t-&gt;mask; erase(racQ_, t); }
+        }
+        for (auto t : std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;(wl_))       // WL -&gt; CNF or RAC
+            if (confirm(*t, false) || rac(t)) erase(wl_, t);
+        renumber();
+    }
+
+    int freeGeneral(uint64_t need) const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        int n = 0;
+        for (size_t i = 0; i &lt; berths_.size(); ++i) if (!berths_[i].tatkal &amp;&amp; !(occ_[i] &amp; need)) ++n;
+        return n;
+    }
+    std::string show(const Ticket&amp; t) const { return t.describe(berths_, racBerths_); }
+
+private:
+    bool confirm(Ticket&amp; t, bool tatkal) {
+        std::vector&lt;int&gt; freeIdx;
+        for (size_t i = 0; i &lt; berths_.size(); ++i)
+            if (berths_[i].tatkal == tatkal &amp;&amp; !(occ_[i] &amp; t.mask)) freeIdx.push_back((int)i);
+        int i = picker_-&gt;pick(freeIdx, occ_);
+        if (i &lt; 0) return false;
+        occ_[i] |= t.mask; t.status = Status::CNF; t.berth = i; t.half = -1;
+        return true;
+    }
+    bool rac(const std::shared_ptr&lt;Ticket&gt;&amp; t) {
+        for (size_t i = 0; i &lt; racOcc_.size(); ++i)
+            if (!(racOcc_[i] &amp; t-&gt;mask)) {
+                racOcc_[i] |= t-&gt;mask; t-&gt;status = Status::RAC; t-&gt;berth = (int)i / 2; t-&gt;half = (int)i % 2;
+                racQ_.push_back(t);
+                return true;
+            }
+        return false;
+    }
+    void release(const std::shared_ptr&lt;Ticket&gt;&amp; t) {
+        if (t-&gt;status == Status::CNF) occ_[t-&gt;berth] &amp;= ~t-&gt;mask;
+        else if (t-&gt;status == Status::RAC) { racOcc_[t-&gt;berth * 2 + t-&gt;half] &amp;= ~t-&gt;mask; erase(racQ_, t); }
+        else if (t-&gt;status == Status::WL) erase(wl_, t);
+    }
+    static void erase(std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;&amp; v, const std::shared_ptr&lt;Ticket&gt;&amp; t) {
+        v.erase(std::remove(v.begin(), v.end(), t), v.end());
+    }
+    void renumber() {
+        for (size_t i = 0; i &lt; racQ_.size(); ++i) racQ_[i]-&gt;number = (int)i + 1;
+        for (size_t i = 0; i &lt; wl_.size(); ++i) wl_[i]-&gt;number = (int)i + 1;
+    }
+
+    std::vector&lt;Berth&gt; berths_, racBerths_;
+    std::vector&lt;uint64_t&gt; occ_, racOcc_;
+    std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt; racQ_, wl_;
+    int wlLimit_;
+    std::unique_ptr&lt;BerthPicker&gt; picker_;
+    mutable Mutex mu_;                     // one lock per journey inventory
+};
+
+using Booking = std::vector&lt;std::shared_ptr&lt;Ticket&gt;&gt;;
+
+static Booking make(std::initializer_list&lt;const char*&gt; names, int from, int to) {
+    Booking b;
+    for (auto n : names) { auto t = std::make_shared&lt;Ticket&gt;(); t-&gt;name = n; t-&gt;mask = segMask(from, to); b.push_back(t); }
+    return b;
+}
+
+int main() {
+    // stops: 0 NDLS, 1 AGC, 2 GWL, 3 BPL, 4 NGP
+    std::vector&lt;Berth&gt; coach = {{1, "LOWER", false, false}, {2, "MIDDLE", false, false}, {3, "UPPER", false, false},
+                                {4, "LOWER", false, false}, {5, "MIDDLE", true, false},  {6, "UPPER", true, false},
+                                {7, "SIDE_LOWER", false, true}, {8, "SIDE_UPPER", false, false}};
+    JourneyInventory inv(coach, 3, std::unique_ptr&lt;BerthPicker&gt;(new BestFit()));
+    auto print = [&amp;](const char* tag, const Booking&amp; b) {
+        std::cout &lt;&lt; "  " &lt;&lt; tag &lt;&lt; ":";
+        for (auto&amp; t : b) std::cout &lt;&lt; " " &lt;&lt; t-&gt;name &lt;&lt; "=" &lt;&lt; inv.show(*t);
+        std::cout &lt;&lt; "\n";
+    };
+
+    Booking alice = make({"Alice"}, 0, 2), bob = make({"Bob"}, 2, 4);
+    CHECK(inv.allocate(alice, false) &amp;&amp; inv.allocate(bob, false));
+    print("NDLS-&gt;GWL", alice); print("GWL-&gt;NGP", bob);
+    CHECK(alice[0]-&gt;berth == bob[0]-&gt;berth);
+
+    Booking family = make({"Chitra", "Chirag", "Chetan", "Chhavi"}, 0, 4);
+    Booking rac = make({"Dev", "Esha"}, 0, 4), wl = make({"Farah", "Gopal", "Hari"}, 0, 4);
+    CHECK(inv.allocate(family, false) &amp;&amp; inv.allocate(rac, false) &amp;&amp; inv.allocate(wl, false));
+    print("family", family); print("rac", rac); print("wl", wl);
+    Booking ira = make({"Ira"}, 0, 4);
+    CHECK(!inv.allocate(ira, false));
+    std::cout &lt;&lt; "  Ira: REGRET (waitlist full)\n";
+
+    inv.cancel(family);
+    std::cout &lt;&lt; "  after family cancels:\n";
+    print("rac", rac); print("wl", wl);
+    CHECK(rac[0]-&gt;status == Status::CNF &amp;&amp; wl[1]-&gt;status == Status::CNF &amp;&amp; wl[2]-&gt;status == Status::RAC);
+
+    Booking t1 = make({"T1"}, 0, 4), t2 = make({"T2"}, 0, 4), t3 = make({"T3"}, 0, 4);
+    CHECK(inv.allocate(t1, true) &amp;&amp; inv.allocate(t2, true) &amp;&amp; !inv.allocate(t3, true));
+    print("tatkal", t1); print("tatkal", t2);
+    std::cout &lt;&lt; "  T3: REGRET (tatkal quota full)\n";
+    CHECK(inv.freeGeneral(segMask(2, 3)) == 0);
+    std::cout &lt;&lt; "C++ demo OK\n";
+    return 0;
+}</code></pre>
+      <p>Build: <code>g++ -std=c++14 -Wall -O2 main.cpp -o irctc &amp;&amp; ./irctc</code></p>
+<pre class="terminal"><code>  NDLS-&gt;GWL: Alice=CNF B1-1 LOWER
+  GWL-&gt;NGP: Bob=CNF B1-1 LOWER
+  family: Chitra=CNF B1-2 MIDDLE Chirag=CNF B1-3 UPPER Chetan=CNF B1-4 LOWER Chhavi=CNF B1-8 SIDE_UPPER
+  rac: Dev=RAC 1 (B1-7) Esha=RAC 2 (B1-7)
+  wl: Farah=WL 1 Gopal=WL 2 Hari=WL 3
+  Ira: REGRET (waitlist full)
+  after family cancels:
+  rac: Dev=CNF B1-2 MIDDLE Esha=CNF B1-3 UPPER
+  wl: Farah=CNF B1-4 LOWER Gopal=CNF B1-8 SIDE_UPPER Hari=RAC 1 (B1-7)
+  tatkal: T1=CNF B1-5 MIDDLE
+  tatkal: T2=CNF B1-6 UPPER
+  T3: REGRET (tatkal quota full)
+C++ demo OK</code></pre>
+    </div>
+  </div>

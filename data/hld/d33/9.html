@@ -1,0 +1,127 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements.</strong> Places or people or both? Radius range? Filters? Freshness needed for new businesses? Scale (DAU, number of businesses).</li>
+          <li><strong>5-10 min: estimation.</strong> ~20k QPS read-heavy; index fits in RAM. For friends: 334k writes/s and 13M deliveries/s.</li>
+          <li><strong>10-15 min: API + data model.</strong> Search endpoint; business, geo_index, review tables; Redis TTL key for live location.</li>
+          <li><strong>15-25 min: high-level design.</strong> LBS vs Business Service; read replicas and cache; WebSocket + pub/sub for friends.</li>
+          <li><strong>25-40 min: deep dives.</strong> Geohash vs quadtree (with the boundary problem), index refresh, ratings, pub/sub sizing, draining.</li>
+          <li><strong>40-45 min: wrap up.</strong> Failure modes, multi-region, what you would monitor (<a href="{{BASE}}interview/glossary#p99">p99</a> search latency - p99 = 99% of searches are faster than this; the slowest 1% are what users complain about - index age, push lag).</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Split search (a read-heavy location service) from business CRUD, index businesses by geohash, query the user's cell plus its 8 neighbours, filter by exact distance and cache results; friends' locations live in Redis with a TTL and are pushed over WebSockets."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"I choose geohash vs quadtree vs S2/H3 from data density and update rate, rebuild the in-memory index on the side and swap it in, size the friends tier (334k writes/s, about 13M pushes/s) on Redis pub/sub channels per user, and drain WebSocket servers gently on deploys."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> doing <code>lat BETWEEN ... AND lng BETWEEN ...</code> and calling it done; using a geohash prefix without the 8 neighbours; putting 334k location writes/s into MySQL; polling for friends' locations; using Kafka with replay for the live push; ignoring that WebSocket servers are stateful when scaling down; forgetting privacy (opt-in, TTL).</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Meta">
+          <summary>Design a service that returns businesses near a user (Yelp / Google Places).</summary>
+          <div class="answer">
+            <p>Clarify radius, filters, scale (100M DAU, 200M businesses) and freshness (next day is fine). Estimate ~20k peak QPS and a 3-4 GB geohash index. Split into a stateless LBS (search) and a Business Service (CRUD, details) over SQL with read replicas. LBS maps radius to geohash length, reads the 9 cells from an in-memory or Redis index, batch-loads summaries from cache, filters by exact distance and category, ranks and returns 20 with a cursor. Index updates are async (nightly or <a href="{{BASE}}interview/glossary#cdc">CDC</a>). Shard and replicate by region.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the shape first (read-heavy, static data), then the index choice with the boundary problem, then caching. Volunteer "I would use Redis GEO or PostGIS in real life; here is what they do inside".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the 9 cells return only 3 results?</li><li>How fast can a new restaurant appear?</li><li>How would you add text search ("spicy ramen")?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Uber">
+          <summary>Geohash or quadtree? Defend your choice.</summary>
+          <div class="answer">
+            <p>Geohash if I want simplicity and cheap updates: it is a string column on a normal index or a Redis sorted set, updating a business is recomputing one string, and the boundary problem is fixed with the 9-cell query. Quadtree if density is very uneven and I want "give me the nearest 20" with similar cost in Manhattan and in Nevada: it adapts cell size to data. But it lives in memory, takes minutes to build for 200M points, and needs a careful refresh (snapshot + swap). For Yelp-like static data both work; I default to geohash and mention quadtree for density. For moving points I prefer geohash/H3 cells because updates are just "remove from old cell, add to new cell".</p>
+            <div class="approach"><h5>How to answer</h5><p>Give one win and one cost for each, then decide based on the requirements you wrote down. Interviewers want reasoning, not a favourite.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does S2 or H3 add?</li><li>How do you update a quadtree without downtime?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>Design "nearby friends". Why not just store locations in the database and poll?</summary>
+          <div class="answer">
+            <p>10M concurrent users updating every 30 s is ~334k writes/s, and polling every few seconds would add millions of mostly empty reads per second. Instead: WebSocket connections; each update goes to a Redis location cache with a TTL (stale data expires itself), optionally to history via Kafka into Cassandra, and to the user's own Redis pub/sub channel. Each WebSocket server subscribes to the channels of the online friends of its connected users, filters by distance and pushes. Redis pub/sub is fire-and-forget, which matches the data: the next update arrives in 30 s.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the write QPS first; it justifies everything else. Then draw the one-update path (phone, WS server, cache, channel, friend's WS server, phone).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many pub/sub servers do you need?</li><li>What happens when a WebSocket server dies?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta">
+          <summary>How do you size the pub/sub tier?</summary>
+          <div class="answer">
+            <p>Memory: 100M channels x ~2 KB (record + subscriber list) is about 200 GB, so a few big boxes. CPU: 334k updates/s x ~40 online friends is ~13M deliveries/s; at an assumed ~100k pushes/s per node that is ~130 nodes. So it is CPU-bound and needs a cluster. Shard channels by user ID with consistent hashing, store the ring in etcd/ZooKeeper, and avoid resizing at peak because moving a channel forces re-subscription.</p>
+            <div class="approach"><h5>How to answer</h5><p>Compute both memory and CPU; the "aha" is that the smaller-looking number (memory) is not the bottleneck. State your per-node assumption out loud.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you use Kafka instead?</li><li>How do you handle a user with 5,000 friends?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>How do you keep the average rating fast and enforce one review per user?</summary>
+          <div class="answer">
+            <p>Never compute AVG at read time. Keep <code>rating_sum</code> and <code>rating_count</code> on the business and update them atomically in the same transaction as the review insert. Enforce uniqueness with a primary key on (business_id, user_id), so the DB rejects duplicates even under concurrent requests; return 409 and offer edit. If reviews are sharded separately, publish a "review added" event and update the aggregate idempotently using the review ID.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know check-then-insert races and that constraints beat application checks.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle a review edit (4 stars to 2)?</li><li>How do you detect fake reviews?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>The 9 cells around the user return only 3 restaurants. What now?</summary>
+          <div class="answer">
+            <p>Expand the search: drop one geohash character (cells about 32x bigger) and query the 9 bigger cells, repeat until you have enough or hit the maximum radius. With a quadtree, keep adding neighbouring leaves. Always filter by the real distance at the end and tell the client the effective radius. Cache "sparse area" results, since they rarely change.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention expansion before the interviewer asks; it shows you thought past the happy path.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the user asked for "the nearest 10" with no radius?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Swiggy">
+          <summary>How would you change the design if the points move (drivers, delivery riders) instead of businesses?</summary>
+          <div class="answer">
+            <p>Moving points flip the read/write ratio. Drop the nightly rebuild and the quadtree; use cells (geohash or H3) where an update is "remove from old cell, add to new cell", in memory (Redis GEO or a sharded in-memory index keyed by cell), with a TTL so silent drivers disappear. Shard by region or cell. Keep SQL only for trips and payments. This is the core of <a href="{{BASE}}hld/d06">ride hailing</a> and <a href="{{BASE}}hld/d07">food delivery</a>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "static vs dynamic data" explicitly and show which parts change.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid two riders being assigned the same driver?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do you shard the geo index across regions without hot spots?</summary>
+          <div class="answer">
+            <p>The index is small, so first replicate it per region for locality. If one region still needs sharding, shard by contiguous ranges of cells balanced by load (queries and businesses per cell), not by equal area or the first geohash character. S2's Hilbert-curve ordering is useful here: cells that are close on the map are close in ID order, so a shard is a contiguous ID range (Tinder grouped S2 cells this way). Queries near a shard boundary scatter to two shards and merge.</p>
+            <div class="approach"><h5>How to answer</h5><p>Call out the "shard by first character" trap, then propose load-based ranges.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you rebalance when a city grows?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>How do you scale down WebSocket servers without dropping users?</summary>
+          <div class="answer">
+            <p>Mark the server draining: its readiness check fails so the load balancer sends no new connections, then ask connected clients to reconnect (or wait for natural churn), with jitter so they do not all land at once. Give the pod a long termination grace period. On reconnect, the new server reloads friends, fetches their cached locations and re-subscribes. Because state lives in the location cache and pub/sub, the server itself holds nothing that cannot be rebuilt.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mention "stateful tier" and "drain" explicitly; that is the word interviewers listen for.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to updates during the reconnect gap?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Meta,Google">
+          <summary>Extend nearby friends to "show random people near me who opted in".</summary>
+          <div class="answer">
+            <p>There is no friend list to define channels, so make channels per geohash cell. A phone publishes its location to its current cell's channel and subscribes to its cell plus the 8 neighbours. When it crosses into a new cell it unsubscribes from the old set and subscribes to the new one. Choose a cell size near the radius so 9 cells cover it. Dense cells (a stadium) get many publishers, so sample or rate-limit, and filter by exact distance on the receiving server.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you can swap the "channel key" from user ID to cell ID and reason about the consequences.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Privacy: how do you avoid exposing exact positions? (round coordinates, show only distance bands)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: a new restaurant complains it never shows up</h4>
+          <div class="situation"><p>An owner added a business two days ago. It is in the database but missing from search. Other new businesses appear fine.</p></div>
+          <div class="bad"><p>Weak answer: "Clear the cache and rebuild the index."</p></div>
+          <div class="good"><p>Strong answer: check the pipeline step by step. Is the change event in the <code>business-changes</code> topic? Did the indexer consume it (<a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a>, <a href="{{BASE}}interview/glossary#dlq">dead-letter queue</a>)? Is the geohash computed from swapped lat/lng (a classic bug: a place in Mumbai indexed in the Arabian Sea)? Is it in the geo set for the right category? Then fix the root cause, add a reconciliation job that compares DB rows with index entries nightly, and alert on index age and count drift.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you make new businesses visible within a minute?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: New Year's Eve, push lag climbs to 40 seconds</h4>
+          <div class="situation"><p>Nearby-friends updates arrive 40 s late in a few big cities. WebSocket servers look healthy; two Redis pub/sub nodes are at 100% CPU.</p></div>
+          <div class="bad"><p>Weak answer: "Add more WebSocket servers."</p></div>
+          <div class="good"><p>Strong answer: the pub/sub tier is CPU-bound and two nodes own hot channels (popular users in dense cities). Short term: shed load by lowering update frequency server-side (ask clients for 60 s instead of 30 s), drop updates older than one interval instead of queueing them, and rate-limit fan-out for users with very many friends. Longer term: more pub/sub nodes with more virtual nodes on the ring, resized before the event, and a load test of peak fan-out. Freshness is the requirement, so dropping stale updates is correct, not a bug.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metric would have warned you a week earlier?</li></ul></div>
+        </div>
+      

@@ -1,0 +1,671 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java is split by concern: model, unit parsing, specifications, the inverted index, query and ranking, the engine and facade, and a demo driver with checks. Python and C++14 follow the same design.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <h3>Java</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java: Model.java">
+<pre><code class="language-java">import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+
+enum ListingType { RENT, SELL }
+
+enum ListingStatus { AVAILABLE, SOLD }
+
+/**
+ * One property listing. Immutable: an edit creates a new Listing with the same id and a newer
+ * updatedAt, and the engine re-indexes it. Readers can therefore hold a Listing without locks.
+ */
+final class Listing {
+    final long id;
+    final String owner, title, description, location;   // location is stored lower-case
+    final Set&lt;String&gt; nearby;                            // lower-case localities close to this one
+    final ListingType type;
+    final long price;                                    // rupees (rent per month, or sale price)
+    final int sizeSqft, bhk;
+    final ListingStatus status;
+    final long createdAt, updatedAt;                     // logical clock ticks
+
+    Listing(long id, String owner, String title, String description, String location, Set&lt;String&gt; nearby,
+            ListingType type, long price, int sizeSqft, int bhk, ListingStatus status, long createdAt, long updatedAt) {
+        if (price &lt;= 0 || sizeSqft &lt;= 0 || bhk &lt;= 0) throw new IllegalArgumentException("price, size and bhk must be &gt; 0");
+        this.id = id; this.owner = owner; this.title = title; this.description = description;
+        this.location = location.trim().toLowerCase(Locale.ROOT);
+        Set&lt;String&gt; nb = new LinkedHashSet&lt;&gt;();
+        for (String n : nearby) nb.add(n.trim().toLowerCase(Locale.ROOT));
+        this.nearby = Collections.unmodifiableSet(nb);
+        this.type = type; this.price = price; this.sizeSqft = sizeSqft; this.bhk = bhk; this.status = status;
+        this.createdAt = createdAt; this.updatedAt = updatedAt;
+    }
+
+    Listing withStatus(ListingStatus s, long now) {
+        return new Listing(id, owner, title, description, location, nearby, type, price, sizeSqft, bhk, s, createdAt, now);
+    }
+
+    Listing withPrice(long p, long now) {
+        return new Listing(id, owner, title, description, location, nearby, type, p, sizeSqft, bhk, status, createdAt, now);
+    }
+
+    @Override public String toString() {
+        return String.format("#%d %-32s %-11s %s %,10d  %4d sqft %dBHK%s", id, title, location, type, price, sizeSqft, bhk,
+                status == ListingStatus.SOLD ? "  [SOLD]" : "");
+    }
+}
+
+/** A search result: the listing, its text score, and whether it matched only via a nearby locality. */
+final class Hit {
+    final Listing listing; final double score; final boolean nearbyOnly;
+    Hit(Listing listing, double score, boolean nearbyOnly) { this.listing = listing; this.score = score; this.nearbyOnly = nearbyOnly; }
+    @Override public String toString() {
+        return listing + (score &gt; 0 ? String.format("  score=%.0f", score) : "") + (nearbyOnly ? "  (nearby)" : "");
+    }
+}
+
+/** One page of results plus the total, so the caller can render "page 2 of 5". */
+final class Page&lt;T&gt; {
+    final List&lt;T&gt; items; final int total, page, size;
+    Page(List&lt;T&gt; items, int total, int page, int size) { this.items = items; this.total = total; this.page = page; this.size = size; }
+    boolean hasNext() { return (long) (page + 1) * size &lt; total; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Units.java">
+<pre><code class="language-java">import java.util.Locale;
+
+/** Input parsing for the Flipkart bonus: prices like 40k / 60L / 2Cr, sizes in sq ft / sq m / sq yd, ranges "X-Y" or "X". */
+final class Units {
+    private Units() {}
+
+    /** "40000" -&gt; 40000, "40k" -&gt; 40000, "60L" -&gt; 6000000, "2Cr" -&gt; 20000000, "1.5L" -&gt; 150000. */
+    static long parsePrice(String s) {
+        String t = s.trim().toLowerCase(Locale.ROOT).replace(",", "");
+        long mult = 1;
+        if (t.endsWith("cr")) { mult = 10_000_000L; t = t.substring(0, t.length() - 2); }
+        else if (t.endsWith("l")) { mult = 100_000L; t = t.substring(0, t.length() - 1); }
+        else if (t.endsWith("k")) { mult = 1_000L; t = t.substring(0, t.length() - 1); }
+        try {
+            double v = Double.parseDouble(t.trim());
+            if (v &lt;= 0) throw new IllegalArgumentException("price must be &gt; 0: " + s);
+            return Math.round(v * mult);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("bad price: " + s);
+        }
+    }
+
+    /** "1200 sqft" / "100 sqm" / "150 sqyd" -&gt; square feet (rounded). A bare number means sq ft. */
+    static int parseSizeSqft(String s) {
+        String t = s.trim().toLowerCase(Locale.ROOT).replace(" ", "").replace(".", "");
+        double factor = 1.0;
+        if (t.endsWith("sqm")) { factor = 10.7639; t = t.substring(0, t.length() - 3); }
+        else if (t.endsWith("sqyd")) { factor = 9.0; t = t.substring(0, t.length() - 4); }
+        else if (t.endsWith("sqft")) { t = t.substring(0, t.length() - 4); }
+        try {
+            return (int) Math.round(Double.parseDouble(t) * factor);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("bad size: " + s);
+        }
+    }
+
+    /** "20k-40k" -&gt; {20000, 40000}; "50L" -&gt; {5000000, MAX} (at least X). */
+    static long[] parsePriceRange(String s) {
+        String[] p = s.split("-");
+        if (p.length == 1) return new long[] {parsePrice(p[0]), Long.MAX_VALUE};
+        long lo = parsePrice(p[0]), hi = parsePrice(p[1]);
+        if (lo &gt; hi) throw new IllegalArgumentException("empty range: " + s);
+        return new long[] {lo, hi};
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Spec.java">
+<pre><code class="language-java">import java.util.Set;
+
+/**
+ * Specification pattern: each filter is a small object with one test(); and/or/not combine them.
+ * A new filter (pets allowed, furnished, metro distance) is a new Spec, not a new if in search().
+ */
+@FunctionalInterface
+interface Spec&lt;T&gt; {
+    boolean test(T t);
+    default Spec&lt;T&gt; and(Spec&lt;T&gt; o) { return x -&gt; test(x) &amp;&amp; o.test(x); }
+    default Spec&lt;T&gt; or(Spec&lt;T&gt; o) { return x -&gt; test(x) || o.test(x); }
+    default Spec&lt;T&gt; not() { return x -&gt; !test(x); }
+    static &lt;T&gt; Spec&lt;T&gt; all() { return x -&gt; true; }
+}
+
+final class ListingSpecs {
+    private ListingSpecs() {}
+    static Spec&lt;Listing&gt; available() { return l -&gt; l.status == ListingStatus.AVAILABLE; }
+    static Spec&lt;Listing&gt; type(ListingType t) { return l -&gt; l.type == t; }
+    static Spec&lt;Listing&gt; priceBetween(long lo, long hi) { return l -&gt; l.price &gt;= lo &amp;&amp; l.price &lt;= hi; }
+    static Spec&lt;Listing&gt; sizeBetween(int lo, int hi) { return l -&gt; l.sizeSqft &gt;= lo &amp;&amp; l.sizeSqft &lt;= hi; }
+    static Spec&lt;Listing&gt; bhkIn(Set&lt;Integer&gt; bhks) { return l -&gt; bhks.contains(l.bhk); }
+    /** Exact locality match, or (if includeNearby) a listing that names one of the localities as nearby. */
+    static Spec&lt;Listing&gt; locationIn(Set&lt;String&gt; locs, boolean includeNearby) {
+        return l -&gt; locs.contains(l.location) || (includeNearby &amp;&amp; l.nearby.stream().anyMatch(locs::contains));
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: TextIndex.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.NavigableMap;
+import java.util.TreeMap;
+
+/**
+ * Inverted index: term -&gt; (docId -&gt; weighted term frequency), plus a forward map docId -&gt; terms so
+ * remove() deletes exactly the postings it added. Knows nothing about listings, so the same class
+ * powers the Razorpay "blog search" variant. Not thread-safe on its own; the engine guards it.
+ */
+final class TextIndex {
+    static final int TITLE_WEIGHT = 3, BODY_WEIGHT = 1;
+    private final TreeMap&lt;String, Map&lt;Long, Integer&gt;&gt; postings = new TreeMap&lt;&gt;();   // sorted: prefix scans
+    private final Map&lt;Long, Map&lt;String, Integer&gt;&gt; forward = new HashMap&lt;&gt;();
+
+    static List&lt;String&gt; tokenize(String text) {
+        List&lt;String&gt; out = new ArrayList&lt;&gt;();
+        for (String t : text.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) if (!t.isEmpty()) out.add(t);
+        return out;
+    }
+
+    void add(long id, String title, String body) {
+        if (forward.containsKey(id)) remove(id);                 // re-index = remove + add
+        Map&lt;String, Integer&gt; tf = new HashMap&lt;&gt;();
+        for (String t : tokenize(title)) tf.merge(t, TITLE_WEIGHT, Integer::sum);
+        for (String t : tokenize(body)) tf.merge(t, BODY_WEIGHT, Integer::sum);
+        forward.put(id, tf);
+        tf.forEach((term, w) -&gt; postings.computeIfAbsent(term, k -&gt; new HashMap&lt;&gt;()).put(id, w));
+    }
+
+    void remove(long id) {
+        Map&lt;String, Integer&gt; tf = forward.remove(id);
+        if (tf == null) return;
+        for (String term : tf.keySet()) {
+            Map&lt;Long, Integer&gt; p = postings.get(term);
+            p.remove(id);
+            if (p.isEmpty()) postings.remove(term);               // no empty posting lists left behind
+        }
+    }
+
+    /**
+     * AND search: docs containing every term. If prefixLast, the last term matches any word that starts
+     * with it (search-as-you-type). Returns docId -&gt; score (sum of weighted frequencies).
+     */
+    Map&lt;Long, Double&gt; matchAll(List&lt;String&gt; terms, boolean prefixLast) {
+        if (terms.isEmpty()) return Collections.emptyMap();
+        List&lt;Map&lt;Long, Integer&gt;&gt; lists = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; terms.size(); i++) {
+            boolean prefix = prefixLast &amp;&amp; i == terms.size() - 1;
+            Map&lt;Long, Integer&gt; p = prefix ? prefixPostings(terms.get(i)) : postings.get(terms.get(i));
+            if (p == null || p.isEmpty()) return Collections.emptyMap();   // one missing term -&gt; no AND match
+            lists.add(p);
+        }
+        lists.sort((a, b) -&gt; Integer.compare(a.size(), b.size()));         // intersect from the rarest term
+        Map&lt;Long, Double&gt; out = new HashMap&lt;&gt;();
+        outer:
+        for (Map.Entry&lt;Long, Integer&gt; e : lists.get(0).entrySet()) {
+            double score = e.getValue();
+            for (int i = 1; i &lt; lists.size(); i++) {
+                Integer w = lists.get(i).get(e.getKey());
+                if (w == null) continue outer;
+                score += w;
+            }
+            out.put(e.getKey(), score);
+        }
+        return out;
+    }
+
+    private Map&lt;Long, Integer&gt; prefixPostings(String prefix) {
+        NavigableMap&lt;String, Map&lt;Long, Integer&gt;&gt; range = postings.subMap(prefix, true, prefix + Character.MAX_VALUE, false);
+        Map&lt;Long, Integer&gt; merged = new HashMap&lt;&gt;();
+        for (Map&lt;Long, Integer&gt; p : range.values()) p.forEach((id, w) -&gt; merged.merge(id, w, Integer::sum));
+        return merged;
+    }
+
+    int termCount() { return postings.size(); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Search.java">
+<pre><code class="language-java">import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.Locale;
+import java.util.Set;
+
+/** Ranking strategies. Every comparator ends with id so the order (and therefore paging) is stable. */
+enum SortBy {
+    RELEVANCE(Comparator.comparingDouble((Hit h) -&gt; -h.score).thenComparing(h -&gt; -h.listing.updatedAt)),
+    PRICE_ASC(Comparator.comparingLong((Hit h) -&gt; h.listing.price)),
+    SIZE_ASC(Comparator.comparingInt((Hit h) -&gt; h.listing.sizeSqft)),
+    NEWEST(Comparator.comparingLong((Hit h) -&gt; -h.listing.updatedAt));
+
+    final Comparator&lt;Hit&gt; order;
+    SortBy(Comparator&lt;Hit&gt; c) { this.order = c; }
+
+    /** Exact-location matches always come before nearby-only matches (Flipkart bonus), then this order, then id. */
+    Comparator&lt;Hit&gt; full() {
+        return Comparator.comparing((Hit h) -&gt; h.nearbyOnly).thenComparing(order).thenComparingLong(h -&gt; h.listing.id);
+    }
+}
+
+/** Immutable query built with a Builder: every parameter is optional, as the statement says. */
+final class SearchQuery {
+    final String text; final boolean prefixLast;
+    final Set&lt;String&gt; locations; final boolean includeNearby;
+    final ListingType type;
+    final long minPrice, maxPrice; final int minSize, maxSize;
+    final Set&lt;Integer&gt; bhks;
+    final SortBy sortBy; final int page, pageSize;
+
+    private SearchQuery(Builder b) {
+        text = b.text; prefixLast = b.prefixLast; locations = b.locations; includeNearby = b.includeNearby; type = b.type;
+        minPrice = b.minPrice; maxPrice = b.maxPrice; minSize = b.minSize; maxSize = b.maxSize; bhks = b.bhks;
+        sortBy = b.sortBy; page = b.page; pageSize = b.pageSize;
+    }
+
+    static Builder builder() { return new Builder(); }
+
+    /** Turns the query into one composed Specification. */
+    Spec&lt;Listing&gt; toSpec() {
+        Spec&lt;Listing&gt; s = ListingSpecs.available();
+        if (type != null) s = s.and(ListingSpecs.type(type));
+        if (!locations.isEmpty()) s = s.and(ListingSpecs.locationIn(locations, includeNearby));
+        if (minPrice &gt; 0 || maxPrice &lt; Long.MAX_VALUE) s = s.and(ListingSpecs.priceBetween(minPrice, maxPrice));
+        if (minSize &gt; 0 || maxSize &lt; Integer.MAX_VALUE) s = s.and(ListingSpecs.sizeBetween(minSize, maxSize));
+        if (!bhks.isEmpty()) s = s.and(ListingSpecs.bhkIn(bhks));
+        return s;
+    }
+
+    static final class Builder {
+        private String text = ""; private boolean prefixLast;
+        private final Set&lt;String&gt; locations = new LinkedHashSet&lt;&gt;(); private boolean includeNearby;
+        private ListingType type;
+        private long minPrice = 0, maxPrice = Long.MAX_VALUE; private int minSize = 0, maxSize = Integer.MAX_VALUE;
+        private final Set&lt;Integer&gt; bhks = new LinkedHashSet&lt;&gt;();
+        private SortBy sortBy = SortBy.RELEVANCE; private int page = 0, pageSize = 10;
+
+        Builder text(String t) { text = t; return this; }
+        Builder typeahead(String t) { text = t; prefixLast = true; return this; }
+        /** "bellandur, hsr" -&gt; two localities (comma-separated, case-insensitive). */
+        Builder locations(String csv) {
+            for (String l : csv.split(",")) if (!l.trim().isEmpty()) locations.add(l.trim().toLowerCase(Locale.ROOT));
+            return this;
+        }
+        Builder includeNearby() { includeNearby = true; return this; }
+        Builder type(ListingType t) { type = t; return this; }
+        Builder price(String range) { long[] r = Units.parsePriceRange(range); minPrice = r[0]; maxPrice = r[1]; return this; }
+        Builder size(String lo, String hi) { minSize = Units.parseSizeSqft(lo); maxSize = hi == null ? Integer.MAX_VALUE : Units.parseSizeSqft(hi); return this; }
+        Builder bhk(Integer... b) { for (Integer x : b) bhks.add(x); return this; }
+        Builder sortBy(SortBy s) { sortBy = s; return this; }
+        Builder page(int p, int size) {
+            if (p &lt; 0 || size &lt;= 0 || size &gt; 100) throw new IllegalArgumentException("bad page " + p + "/" + size);
+            page = p; pageSize = size; return this;
+        }
+        SearchQuery build() { return new SearchQuery(this); }
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Platform.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * The search engine: a primary store plus two secondary indexes (text, location), all changed together
+ * under one write lock so a reader never sees a listing in one index and not the other.
+ * Searches take the read lock, so many run in parallel.
+ */
+final class ListingSearchEngine {
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+    private final Map&lt;Long, Listing&gt; byId = new HashMap&lt;&gt;();
+    private final TextIndex text = new TextIndex();
+    private final Map&lt;String, Set&lt;Long&gt;&gt; byLocation = new HashMap&lt;&gt;();   // locality -&gt; ids located there or nearby
+
+    void upsert(Listing l) {
+        rw.writeLock().lock();
+        try {
+            Listing old = byId.put(l.id, l);
+            if (old != null) unindexLocation(old);
+            indexLocation(l);
+            text.add(l.id, l.title, l.description);
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    boolean remove(long id) {
+        rw.writeLock().lock();
+        try {
+            Listing old = byId.remove(id);
+            if (old == null) return false;
+            unindexLocation(old);
+            text.remove(id);
+            return true;
+        } finally {
+            rw.writeLock().unlock();
+        }
+    }
+
+    Listing get(long id) {
+        rw.readLock().lock();
+        try { return byId.get(id); } finally { rw.readLock().unlock(); }
+    }
+
+    Page&lt;Hit&gt; search(SearchQuery q) {
+        List&lt;Hit&gt; hits = new ArrayList&lt;&gt;();
+        rw.readLock().lock();
+        try {
+            List&lt;String&gt; terms = TextIndex.tokenize(q.text);
+            Map&lt;Long, Double&gt; scores = terms.isEmpty() ? null : text.matchAll(terms, q.prefixLast);
+            Set&lt;Long&gt; candidates;
+            if (scores != null) candidates = scores.keySet();                 // most selective index first
+            else if (!q.locations.isEmpty()) {
+                candidates = new HashSet&lt;&gt;();
+                for (String loc : q.locations) candidates.addAll(byLocation.getOrDefault(loc, Collections.emptySet()));
+            } else candidates = byId.keySet();
+            Spec&lt;Listing&gt; spec = q.toSpec();                                   // the rest is filtering
+            for (long id : candidates) {
+                Listing l = byId.get(id);
+                if (!spec.test(l)) continue;
+                boolean nearbyOnly = !q.locations.isEmpty() &amp;&amp; !q.locations.contains(l.location);
+                hits.add(new Hit(l, scores == null ? 0 : scores.get(id), nearbyOnly));
+            }
+        } finally {
+            rw.readLock().unlock();
+        }
+        hits.sort(q.sortBy.full());                                           // outside the lock: our own list
+        int from = Math.min(q.page * q.pageSize, hits.size()), to = Math.min(from + q.pageSize, hits.size());
+        return new Page&lt;&gt;(new ArrayList&lt;&gt;(hits.subList(from, to)), hits.size(), q.page, q.pageSize);
+    }
+
+    /** Full scan with a Specification (for admin views like "my listings"); sorted by id. */
+    List&lt;Listing&gt; find(Spec&lt;Listing&gt; spec) {
+        List&lt;Listing&gt; out = new ArrayList&lt;&gt;();
+        rw.readLock().lock();
+        try { for (Listing l : byId.values()) if (spec.test(l)) out.add(l); } finally { rw.readLock().unlock(); }
+        out.sort((a, b) -&gt; Long.compare(a.id, b.id));
+        return out;
+    }
+
+    int size() { rw.readLock().lock(); try { return byId.size(); } finally { rw.readLock().unlock(); } }
+
+    private void indexLocation(Listing l) {
+        byLocation.computeIfAbsent(l.location, k -&gt; new HashSet&lt;&gt;()).add(l.id);
+        for (String n : l.nearby) byLocation.computeIfAbsent(n, k -&gt; new HashSet&lt;&gt;()).add(l.id);
+    }
+
+    private void unindexLocation(Listing l) {
+        Set&lt;String&gt; keys = new LinkedHashSet&lt;&gt;(l.nearby);
+        keys.add(l.location);
+        for (String k : keys) {
+            Set&lt;Long&gt; s = byLocation.get(k);
+            if (s != null &amp;&amp; s.remove(l.id) &amp;&amp; s.isEmpty()) byLocation.remove(k);
+        }
+    }
+}
+
+/** Facade for the Flipkart "Property Hunt" commands: users, listing, search, shortlist, mark sold. */
+final class RentalPlatform {
+    private final ListingSearchEngine engine = new ListingSearchEngine();
+    private final Set&lt;String&gt; users = ConcurrentHashMap.newKeySet();
+    private final Set&lt;String&gt; active = ConcurrentHashMap.newKeySet();
+    private final Map&lt;String, Set&lt;Long&gt;&gt; shortlists = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicLong ids = new AtomicLong(), clock = new AtomicLong();
+
+    void register(String user) { if (!users.add(user)) throw new IllegalArgumentException("user exists: " + user); }
+    void login(String user) { if (!users.contains(user)) throw new IllegalArgumentException("unknown user " + user); active.add(user); }
+    void logout(String user) { active.remove(user); }
+
+    Listing list(String owner, String title, String description, String location, String nearbyCsv,
+                 ListingType type, String price, String size, int bhk) {
+        requireActive(owner);
+        Set&lt;String&gt; nearby = new LinkedHashSet&lt;&gt;();
+        for (String n : nearbyCsv.split(",")) if (!n.trim().isEmpty()) nearby.add(n.trim());
+        long now = clock.incrementAndGet();
+        Listing l = new Listing(ids.incrementAndGet(), owner, title, description, location, nearby, type,
+                Units.parsePrice(price), Units.parseSizeSqft(size), bhk, ListingStatus.AVAILABLE, now, now);
+        engine.upsert(l);
+        return l;
+    }
+
+    void markSold(String owner, long id) {
+        engine.upsert(owned(owner, id).withStatus(ListingStatus.SOLD, clock.incrementAndGet()));
+    }
+
+    void changePrice(String owner, long id, String price) {
+        engine.upsert(owned(owner, id).withPrice(Units.parsePrice(price), clock.incrementAndGet()));
+    }
+
+    Page&lt;Hit&gt; search(SearchQuery q) { return engine.search(q); }
+
+    void shortlist(String user, long id) {
+        requireActive(user);
+        if (engine.get(id) == null) throw new IllegalArgumentException("no listing " + id);
+        shortlists.computeIfAbsent(user, k -&gt; Collections.synchronizedSet(new LinkedHashSet&lt;&gt;())).add(id);
+    }
+
+    /** Shortlisted listings in their current state, sold ones included (the statement asks for that). */
+    List&lt;Listing&gt; shortlisted(String user) {
+        List&lt;Listing&gt; out = new ArrayList&lt;&gt;();
+        Set&lt;Long&gt; s = shortlists.getOrDefault(user, Collections.emptySet());
+        synchronized (s) { for (long id : s) { Listing l = engine.get(id); if (l != null) out.add(l); } }
+        return out;
+    }
+
+    /** All of an owner's listings, sold ones included. */
+    List&lt;Listing&gt; listedBy(String owner) { return engine.find(l -&gt; l.owner.equals(owner)); }
+
+    ListingSearchEngine engine() { return engine; }
+
+    private Listing owned(String owner, long id) {
+        requireActive(owner);
+        Listing l = engine.get(id);
+        if (l == null) throw new IllegalArgumentException("no listing " + id);
+        if (!l.owner.equals(owner)) throw new IllegalArgumentException(owner + " does not own listing " + id);
+        return l;
+    }
+
+    private void requireActive(String user) {
+        if (!active.contains(user)) throw new IllegalStateException(user + " is not logged in");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Demo driver + checks. Run: javac -d out *.java &amp;&amp; java -cp out Main */
+public class Main {
+    static int passed = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        passed++;
+    }
+
+    static void expectError(Runnable r) {
+        try { r.run(); } catch (RuntimeException e) { System.out.println("  rejected: " + e.getMessage()); passed++; return; }
+        throw new AssertionError("FAILED: expected an error");
+    }
+
+    static List&lt;Long&gt; ids(Page&lt;Hit&gt; p) {
+        List&lt;Long&gt; out = new ArrayList&lt;&gt;();
+        for (Hit h : p.items) out.add(h.listing.id);
+        return out;
+    }
+
+    static void show(String title, Page&lt;Hit&gt; p) {
+        System.out.println("== " + title + " (" + p.total + " found) ==");
+        for (Hit h : p.items) System.out.println("  " + h);
+    }
+
+    public static void main(String[] args) throws Exception {
+        RentalPlatform app = new RentalPlatform();
+        for (String u : new String[] {"asha", "ravi", "meera"}) { app.register(u); app.login(u); }
+
+        Listing a = app.list("asha", "2BHK near lake with balcony", "gym, pool, covered parking", "Bellandur", "Sarjapur Road, HSR Layout", ListingType.RENT, "32k", "1100 sqft", 2);
+        Listing b = app.list("asha", "Spacious 3BHK family flat", "gated society, gym, kids pool, pool view", "Bellandur", "", ListingType.RENT, "45k", "1650 sqft", 3);
+        Listing c = app.list("ravi", "Cosy 1BHK for bachelors", "metro 5 min, wifi", "HSR Layout", "Koramangala", ListingType.RENT, "18000", "550 sqft", 1);
+        Listing d = app.list("ravi", "2BHK budget flat", "no gym, quiet street", "Bellandur", "", ListingType.RENT, "24k", "100 sqm", 2);
+        Listing e = app.list("meera", "3BHK villa for sale", "private garden, pool", "Whitefield", "", ListingType.SELL, "1.8Cr", "2400 sqft", 3);
+        Listing f = app.list("meera", "2BHK apartment for sale", "balcony facing park", "HSR Layout", "Bellandur", ListingType.SELL, "95L", "1200 sqft", 2);
+        Listing g = app.list("ravi", "2BHK with balcony, pet friendly", "pool, gym", "Koramangala", "HSR Layout", ListingType.RENT, "38k", "1000 sqft", 2);
+
+        Page&lt;Hit&gt; p1 = app.search(SearchQuery.builder().locations("bellandur").type(ListingType.RENT)
+                .price("20k-40k").bhk(2, 3).sortBy(SortBy.PRICE_ASC).build());
+        show("Rent in Bellandur, 20k-40k, 2/3 BHK, by price", p1);
+        check(ids(p1).equals(Arrays.asList(d.id, a.id)), "d (24k) then a (32k); b is 45k");
+
+        Page&lt;Hit&gt; p2 = app.search(SearchQuery.builder().text("pool gym").type(ListingType.RENT).build());
+        show("Text \"pool gym\" (AND), by relevance", p2);
+        check(new HashSet&lt;&gt;(ids(p2)).equals(new HashSet&lt;&gt;(Arrays.asList(a.id, b.id, g.id))), "rentals mentioning both words (d says gym but not pool)");
+        check(p2.items.get(0).listing.id == b.id, "b mentions pool twice, so it ranks first");
+
+        Page&lt;Hit&gt; p3 = app.search(SearchQuery.builder().locations("HSR Layout").includeNearby().type(ListingType.RENT).sortBy(SortBy.PRICE_ASC).build());
+        show("Rent in HSR Layout incl. nearby (nearby last)", p3);
+        check(ids(p3).equals(Arrays.asList(c.id, a.id, g.id)), "exact match c first, then nearby a (32k), g (38k)");
+
+        Page&lt;Hit&gt; p4 = app.search(SearchQuery.builder().typeahead("balc").build());
+        show("Typeahead \"balc\" (prefix on last word)", p4);
+        check(ids(p4).size() == 3, "a, f, g mention balcony");
+
+        Page&lt;Hit&gt; p5 = app.search(SearchQuery.builder().size("100 sqm", null).bhk(2).sortBy(SortBy.SIZE_ASC).build());
+        show("At least 100 sq m (1076 sq ft), 2BHK, by size", p5);
+        check(ids(p5).equals(Arrays.asList(d.id, a.id, f.id)), "d is 1076 sq ft; g is 1000 so excluded");
+
+        Page&lt;Hit&gt; p6 = app.search(SearchQuery.builder().type(ListingType.SELL).price("1Cr").build());
+        show("Buy, at least 1Cr", p6);
+        check(ids(p6).equals(Collections.singletonList(e.id)), "only the 1.8Cr villa");
+
+        System.out.println("== Paging through all rentals, 2 per page, newest first ==");
+        List&lt;Long&gt; seen = new ArrayList&lt;&gt;();
+        for (int page = 0; ; page++) {
+            Page&lt;Hit&gt; p = app.search(SearchQuery.builder().type(ListingType.RENT).sortBy(SortBy.NEWEST).page(page, 2).build());
+            System.out.println("  page " + page + ": " + ids(p) + (p.hasNext() ? "" : " (last)"));
+            seen.addAll(ids(p));
+            if (!p.hasNext()) break;
+        }
+        check(seen.equals(Arrays.asList(g.id, d.id, c.id, b.id, a.id)), "pages join into one stable list, no repeats");
+
+        System.out.println("== Shortlist, then the owner marks it sold ==");
+        app.shortlist("meera", a.id);
+        app.shortlist("meera", c.id);
+        app.markSold("asha", a.id);
+        check(!ids(app.search(SearchQuery.builder().locations("bellandur").build())).contains(a.id), "sold listing drops out of search");
+        for (Listing l : app.shortlisted("meera")) System.out.println("  shortlisted " + l);
+        check(app.shortlisted("meera").get(0).status == ListingStatus.SOLD, "shortlist still shows it, as SOLD");
+        check(app.listedBy("asha").size() == 2, "asha's own view includes the sold one");
+
+        System.out.println("== Price change re-indexes ==");
+        app.changePrice("ravi", d.id, "28k");
+        check(app.search(SearchQuery.builder().price("20k-25k").build()).total == 0, "old price no longer matches");
+        check(app.search(SearchQuery.builder().price("26k-30k").build()).items.get(0).listing.id == d.id, "new price matches");
+
+        System.out.println("== Remove deletes every posting ==");
+        ListingSearchEngine eng = app.engine();
+        int sizeBefore = eng.size();
+        check(eng.remove(g.id), "removed g");
+        check(app.search(SearchQuery.builder().text("pet").build()).total == 0, "'pet' only appeared in g");
+        check(eng.size() == sizeBefore - 1 &amp;&amp; !eng.remove(g.id), "second remove is a no-op");
+
+        System.out.println("== Errors ==");
+        app.logout("ravi");
+        expectError(() -&gt; app.markSold("ravi", c.id));
+        expectError(() -&gt; app.markSold("asha", c.id));
+        expectError(() -&gt; app.search(SearchQuery.builder().price("abc").build()));
+        expectError(() -&gt; app.search(SearchQuery.builder().price("40k-20k").build()));
+        expectError(() -&gt; app.search(SearchQuery.builder().page(-1, 10).build()));
+
+        System.out.println("== Blog search (Razorpay variant) with the same TextIndex ==");
+        TextIndex blog = new TextIndex();
+        blog.add(1, "Kafka at scale", "kafka partitions and kafka consumers");
+        blog.add(2, "Intro to Java", "java streams and kafka clients");
+        blog.add(3, "Postgres tips", "indexes and vacuum");
+        Map&lt;Long, Double&gt; r = blog.matchAll(TextIndex.tokenize("kafka"), false);
+        List&lt;Long&gt; byFreq = new ArrayList&lt;&gt;(r.keySet());
+        byFreq.sort((x, y) -&gt; Double.compare(r.get(y), r.get(x)));
+        System.out.println("  'kafka' by frequency: " + byFreq + " scores " + r);
+        check(byFreq.equals(Arrays.asList(1L, 2L)), "doc 1 (title + 2 in body) before doc 2");
+        check(blog.matchAll(TextIndex.tokenize("java kafka"), false).keySet().equals(Collections.singleton(2L)), "AND search");
+        int terms = blog.termCount();
+        blog.remove(1);
+        check(blog.matchAll(TextIndex.tokenize("partitions"), false).isEmpty() &amp;&amp; blog.termCount() &lt; terms, "delete removes the doc's terms");
+
+        System.out.println("== Concurrency: 4 writers change prices while 4 readers search 20k-40k ==");
+        ListingSearchEngine live = new ListingSearchEngine();
+        for (int i = 1; i &lt;= 200; i++)
+            live.upsert(new Listing(i, "o", "flat " + i, "gym pool", "bellandur", Collections.emptySet(), ListingType.RENT,
+                    10_000 + (i * 397) % 80_000, 900, 2, ListingStatus.AVAILABLE, i, i));
+        AtomicBoolean stop = new AtomicBoolean();
+        AtomicInteger searches = new AtomicInteger(), bad = new AtomicInteger(), writes = new AtomicInteger();
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int w = 0; w &lt; 4; w++) {
+            int seed = w;
+            ts.add(new Thread(() -&gt; {
+                Random rnd = new Random(seed);
+                long tick = 1000;
+                while (!stop.get()) {
+                    Listing old = live.get(1 + rnd.nextInt(200));
+                    live.upsert(old.withPrice(10_000 + rnd.nextInt(80_000), tick++));
+                    writes.incrementAndGet();
+                }
+            }));
+        }
+        for (int rIdx = 0; rIdx &lt; 4; rIdx++) {
+            ts.add(new Thread(() -&gt; {
+                SearchQuery q = SearchQuery.builder().text("gym").price("20k-40k").sortBy(SortBy.PRICE_ASC).page(0, 100).build();
+                while (!stop.get()) {
+                    for (Hit h : live.search(q).items) if (h.listing.price &lt; 20_000 || h.listing.price &gt; 40_000) bad.incrementAndGet();
+                    searches.incrementAndGet();
+                }
+            }));
+        }
+        ts.forEach(Thread::start);
+        Thread.sleep(400);
+        stop.set(true);
+        for (Thread t : ts) t.join();
+        check(bad.get() == 0, "every hit matched the filter it was searched with");
+        check(searches.get() &gt; 0 &amp;&amp; writes.get() &gt; 0, "both sides made progress");
+        System.out.println("  " + writes.get() + " writes, " + searches.get() + " searches, 0 inconsistent hits");
+        System.out.println("checks passed: " + passed);
+    }
+}</code></pre>
+    </div>
+  </div>
+  

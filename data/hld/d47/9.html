@@ -1,0 +1,122 @@
+
+        <h2>Interview: drive the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min</strong> Scope: chat + history + streaming + tiers; model is a black box. Name TTFT and TPOT as the latency SLOs.</li>
+          <li><strong>5-10 min</strong> Numbers: 20K prompts/s, 120K concurrent streams by Little's law, 10M tokens/s, KV-cache per token.</li>
+          <li><strong>10-25 min</strong> Boxes: gateway, chat service, history store, scheduler, GPU workers, stream buffer, Kafka for usage.</li>
+          <li><strong>25-40 min</strong> Deep dives: continuous batching + PagedAttention, scheduling/routing, token limits, streaming resume.</li>
+          <li><strong>40-45 min</strong> Cost and failure: what you monitor (TTFT/TPOT p99, queue depth, KV utilisation, tokens per GPU-second).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "The model is a black box; I am designing the serving system. Clients stream answers over SSE through a gateway that enforces token-based limits per tier. A chat service builds the prompt from history and routes it, with prefix affinity, to a scheduler that queues by tier. GPU workers run continuous batching with a paged KV cache, because decode is memory-bandwidth bound and the batch size is limited by KV memory. Tokens go through a resumable buffer so a dropped phone connection can continue. Usage and finished messages go to Kafka for billing and storage in a wide-column store. I watch TTFT and TPOT p99, queue depth and KV utilisation."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: SSE streaming, token-based rate limits, a queue in front of GPUs, conversation storage by user and conversation, the idea that batching raises throughput. SDE-2 adds: the KV-cache memory maths, continuous batching vs static batching, PagedAttention, prefix-aware routing, prefill/decode split (DistServe), preemption under memory pressure, and cancellation freeing GPU slots.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a normal request/response web service with a model behind it.</b> In CRUD services, requests per second is the capacity unit. Here the unit is <b>tokens</b> (and KV memory): one request with a 100K-token context can cost more than a thousand short ones. Also do not confuse <b>TTFT</b> (time to first token, set by prefill and queueing) with <b>TPOT</b> (time per output token, set by decode and batch size); they are tuned differently.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>Why stream tokens instead of returning the full answer?</summary>
+          <div class="answer">
+            <p>Total generation time is the same, but perceived latency drops from "whole answer" to "first token". Hugging Face's example: at 100 tokens/s a 1,000-token answer takes 10 s; with streaming the user sees text immediately and half of it by 5 s. It also lets users stop a bad answer early, which saves GPU time. Use SSE: one HTTP response with incremental events, works through proxies, auto-reconnects.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate TTFT from total time, give the numeric example, pick SSE and say why not WebSocket.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you resume a stream after a network drop?</li><li>What if a proxy buffers the response?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>What is continuous batching and why does it matter so much?</summary>
+          <div class="answer">
+            <p>Decode is memory-bandwidth bound: each step reads all weights once regardless of batch size, so bigger batches are nearly free throughput. Static batching keeps a batch until its longest member finishes, leaving finished slots idle. Continuous (iteration-level) batching, from the Orca paper, re-forms the batch every decode step so finished sequences leave and waiting ones join. Orca reported 36.9x over FasterTransformer on GPT-3 175B; Anyscale measured up to 23x over naive batching with vLLM.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with "memory-bound", then the idle-slot picture, then the numbers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What limits batch size?</li><li>How does a long prefill hurt the others in the batch?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>Explain the KV cache and PagedAttention to someone who knows operating systems.</summary>
+          <div class="answer">
+            <p>The KV cache holds each layer's Key and Value vectors for every token so far, about 0.8 MB per token for a 13B fp16 model, so it is the dominant memory cost and grows unpredictably. Contiguous per-request allocation wastes 60-80% to fragmentation and over-reservation (vLLM's measurement). PagedAttention stores it in fixed-size blocks with a per-sequence block table, like pages and a page table: allocate on demand, no external fragmentation, share prefix blocks copy-on-write, swap to CPU under pressure. Waste drops under 4%, batches grow, and throughput rises 2-4x versus prior systems at the same latency.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the per-token size math out loud, then map every vLLM idea to an OS idea.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the block size trade-off?</li><li>What happens when GPU memory is full?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>How do you route requests across 1,000 GPU replicas?</summary>
+          <div class="answer">
+            <p>A scheduler per model holds tiered queues. Workers report free KV blocks, batch size and which prefixes they cache. The router prefers the worker that served this conversation last (prefix-cache hit saves prefill), falls back to the one with the most free KV memory, and never admits more than memory allows. Use weighted fair queuing between users and preempt free-tier sequences under pressure. Long prompts may go to a prefill pool if you disaggregate.</p>
+            <div class="approach"><h5>How to answer</h5><p>Make "admission by KV memory" and "prefix affinity" your two key ideas.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not plain round robin?</li><li>How do you avoid a hot worker for a viral shared prompt?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>Design rate limiting for an LLM API. Why tokens and not requests?</summary>
+          <div class="answer">
+            <p>Cost scales with tokens: a 100K-token prompt costs vastly more than a tiny one. Keep both RPM and TPM buckets per user/org in Redis; the first one exhausted wins. On admission reserve input tokens + max_tokens, refund the unused output at the end. Return 429 with Retry-After and remaining-token headers. Tie bucket sizes to tiers, and add a global concurrency cap per tier so a spike cannot starve paid users.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the reserve/refund trick: it is the detail that separates a generic rate limiter answer from an LLM-aware one.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you count tokens before tokenizing?</li><li>How do you make the bucket consistent across regions?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>The user's Wi-Fi drops halfway through an answer. What happens?</summary>
+          <div class="answer">
+            <p>Generation continues on the GPU; tokens are written to a per-message buffer (Redis stream, TTL ~10 min) with sequence ids. The browser's EventSource reconnects and sends Last-Event-ID; any edge node reads from that id and continues. If the user never returns, the final message is still saved. If they cancel, the cancel propagates to the worker to free the slot.</p>
+            <div class="approach"><h5>How to answer</h5><p>Decouple "generation" from "connection" and say where the buffer lives.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you deploy edge nodes without cutting streams?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>Long prompts are making everyone's streaming stutter. Why, and what do you do?</summary>
+          <div class="answer">
+            <p>A prefill of a long prompt is one big compute-heavy step. When it runs in the same iteration as decode steps, every streaming user in the batch waits for it, so TPOT spikes. Fixes: chunked prefill (slice the prefill and interleave with decode), cap prompt size per tier, or disaggregate prefill and decode onto separate GPU pools and transfer the KV cache; DistServe reports up to 7.4x more requests within SLO. Prefix caching also shrinks how much prefill is needed for multi-turn chats.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the two phases and their different bottlenecks (compute vs memory) first.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does disaggregation cost?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>How do you store and load conversation history?</summary>
+          <div class="answer">
+            <p>Wide-column store: conversations partitioned by user_id sorted by updated_at; messages partitioned by conv_id sorted by sequence. ~4 TB/day of appends. Write the assistant message as <code>streaming</code> at start and finalize at the end. When building a prompt, load the last N turns plus a stored rolling summary of older ones to fit the context window.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with access patterns, then keys, then the context-window budget.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you delete a user's data on request?</li><li>How would you add search over history?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>How do you autoscale GPU workers?</summary>
+          <div class="answer">
+            <p>On queue depth / waiting time and KV-cache utilisation, not CPU. GPU nodes are slow to start (driver, multi-GB image, tens of GB of weights), so keep warm headroom, pre-pull images, cache weights on local disk, and scale ahead using daily traffic patterns. Readiness probes keep traffic off loading workers. Graceful termination lets in-flight answers finish.</p>
+            <div class="approach"><h5>How to answer</h5><p>Pick the right signal and talk about cold start honestly.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What do you do when there are simply no more GPUs?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Microsoft,Google,Amazon">
+          <summary>Estimate how many concurrent sequences one GPU can hold.</summary>
+          <div class="answer">
+            <p>Free memory after weights / (KV bytes per token x average context length). Anyscale's 13B example: 40 GB A100, 26 GB weights, ~14 GB free, ~1 MB/token, so ~14K tokens: ~28 sequences of 512 tokens or 7 of 2,048. That is why long contexts are expensive and why paging, quantized KV and grouped-query attention (fewer K/V heads) matter.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the formula, plug in numbers, and draw the consequence.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does tensor parallelism across 8 GPUs change this?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: launch day, TTFT goes from 0.8 s to 20 s</h4>
+          <div class="situation"><p>A new model launches. Traffic triples. Queues are long, streams time out, paid users complain.</p></div>
+          <div class="bad"><p>Weak answer: "Add more GPUs."</p></div>
+          <div class="good"><p>Strong answer: GPUs cannot appear in minutes, so protect the SLO with policy. Enforce tier priority (paid queue first), lower free-tier max_tokens and context, shed free load with a clear "at capacity" message, turn on prefix caching for the common system prompt, check KV-cache utilisation and preemption rates, then add capacity that was pre-reserved. Afterwards, plan headroom from the launch forecast.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metric would have warned you first?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: GPU bill doubled but traffic did not</h4>
+          <div class="situation"><p>Same requests per second, twice the GPU hours.</p></div>
+          <div class="bad"><p>Weak answer: "Negotiate a discount."</p></div>
+          <div class="good"><p>Strong answer: look at tokens per GPU-second. Likely causes: average context grew (longer chats, a bigger system prompt), batch sizes fell (router broke prefix affinity, a config capped max sequences), or cancelled streams are not freeing GPU slots. Fix with context trimming/summaries, restore sticky routing, and verify cancel propagation.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you attribute GPU cost to features or customers?</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <div class="callout danger"><p><b>Common mistakes:</b> treating it as a normal CRUD service with "a model server"; rate-limiting by requests only; static batching; ignoring KV-cache memory; no cancel path; coupling the stream to one connection; scaling GPUs on CPU metrics.</p></div>
+      

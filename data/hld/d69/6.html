@@ -1,0 +1,132 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Push, watch or long-poll?</h3>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Model</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+          <tbody>
+            <tr><td><b>Periodic poll</b></td><td>Every 30 s: "give me config X"</td><td>Simplest; stateless servers; works through any proxy</td><td>Delay up to the interval; wasted requests; full payload each time unless you send ETags</td></tr>
+            <tr><td><b>Long-poll</b></td><td>"Anything newer than v41?"; server holds up to 60 s</td><td>Near-instant; plain HTTP; client decides the version it has, so no lost updates</td><td>Open connections per client; reconnect storms need jitter</td></tr>
+            <tr><td><b>Server push (gRPC stream / SSE / WebSocket)</b></td><td>Persistent stream; server sends changes</td><td>Fastest; efficient</td><td>Server must track per-stream state; resume after disconnect needs a revision anyway</td></tr>
+            <tr><td><b>Watch on etcd/ZooKeeper directly</b></td><td>Client SDK watches the consensus store</td><td>No extra tier; ordered, consistent notifications</td><td>Does not scale to a million clients; every client is load on the consensus leader</td></tr>
+          </tbody>
+        </table></div>
+        <p><b>My pick:</b> long-poll (or a gRPC stream) to a <b>distributor tier</b>, with the client always stating the version or revision it has. That makes delivery <i>level-triggered</i>: if a notification is lost, the next request still says "I have v41" and gets v42. Edge-triggered "here is a change" messages alone can be missed forever. The distributors are the only watchers of the store.</p>
+        <div class="callout warn"><p><b>Watch gotchas you should name.</b> Classic ZooKeeper watches are one-time triggers: after firing, the client must re-read and re-register, and changes in between are seen only as the latest value (persistent watches arrived in 3.6). etcd watches resume from a revision, but if that revision was compacted away the watch fails and the client must re-fetch a full snapshot. Both are fine for a few thousand watchers, not a million.</p></div>
+
+        <h3>2. The client SDK: cache, last-known-good, never block</h3>
+        <p>The SDK matters more than the server. Its rules:</p>
+        <ol class="steps">
+          <li><strong>Reads are local.</strong> <code>config.get("timeout_ms")</code> reads an in-memory, immutable snapshot. Zero network calls on the request path.</li>
+          <li><strong>Startup order:</strong> try the service (snapshot); if it fails, load last-known-good from local disk; if there is none, use defaults compiled into the binary and raise an alert. Never refuse to start because the config service is down (unless a config is marked "required fresh", like a kill switch for a security issue).</li>
+          <li><strong>Validate before swap.</strong> Checksum, schema, and the service's own validator. If v42 fails validation, keep v41, report "rejected v42", and let the rollout controller see it.</li>
+          <li><strong>Atomic swap</strong> of the whole snapshot (a pointer replace), so a request never sees half of v41 and half of v42.</li>
+          <li><strong>Jittered reconnect</strong> with exponential backoff, so a distributor restart does not become a thundering herd.</li>
+          <li><strong>Report the applied version</strong> (metrics or a heartbeat), so the control plane knows rollout progress and stragglers.</li>
+        </ol>
+        <p>This is a good candidate for "implement a small component", which one Microsoft L61/L62 round asked for after the HLD (<a href="https://leetcode.com/discuss/post/8477383/" target="_blank" rel="noopener">post</a>). A compact version:</p>
+        <pre><code class="language-python">import json, os, random, threading, time, hashlib
+
+class ConfigClient:
+    """Watches one config via long-poll; reads are local and lock-free."""
+
+    def __init__(self, fetch, key, lkg_path, validate, defaults):
+        self._fetch = fetch            # fetch(key, have_version, timeout) -&gt; (ver, text, sha) or None
+        self._key, self._lkg, self._validate = key, lkg_path, validate
+        self._snap = (0, defaults)     # (version, dict) - replaced atomically, never mutated
+        self._stop = threading.Event()
+        self._load_lkg()
+
+    def get(self, name, default=None):  # request path: no network, no lock
+        return self._snap[1].get(name, default)
+
+    def version(self):
+        return self._snap[0]
+
+    def _load_lkg(self):
+        try:
+            with open(self._lkg, encoding="utf-8") as f:
+                saved = json.load(f)
+            self._snap = (saved["version"], saved["content"])
+        except (OSError, ValueError, KeyError):
+            pass                         # keep compiled-in defaults
+
+    def _apply(self, ver, text, sha):
+        if hashlib.sha256(text.encode()).hexdigest() != sha:
+            return False                 # corrupted download
+        try:
+            content = json.loads(text)
+        except ValueError:
+            return False                 # unparseable: keep current
+        if ver &lt;= self._snap[0] or not self._validate(content):
+            return False                 # stale or invalid: keep current
+        self._snap = (ver, content)      # atomic reference swap
+        tmp = self._lkg + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": ver, "content": content}, f)
+        os.replace(tmp, self._lkg)       # atomic on the same filesystem
+        return True
+
+    def stop(self):
+        self._stop.set()                 # run() exits after the current poll
+
+    def run(self):
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                res = self._fetch(self._key, self._snap[0], timeout=60)
+                if res and not self._apply(*res):
+                    # Stale (lagging distributor), corrupt or invalid: do not
+                    # re-poll at once, or we hot-loop against the distributor.
+                    self._stop.wait(backoff * random.uniform(0.5, 1.5))
+                    backoff = min(backoff * 2, 60)
+                    continue
+                backoff = 1.0            # None means "304: nothing newer"
+            except Exception:
+                self._stop.wait(backoff * random.uniform(0.5, 1.5))   # jitter
+                backoff = min(backoff * 2, 60)</code></pre>
+
+        <h3>3. Staged rollout and automatic rollback</h3>
+        <p>Configuration changes deserve the same rollout discipline as code. AWS AppConfig is a good public model: a deployment strategy has a growth rate, a step interval and a <b>bake time</b>, during which AppConfig keeps watching CloudWatch alarms after reaching 100%, and rolls back automatically if an alarm fires. Its predefined strategies include <code>AppConfig.Canary10Percent20Minutes</code> and <code>AppConfig.Linear20PercentEvery6Minutes</code>, and AWS labels the fastest one as suitable only for testing.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="Rollout percentage over time with canary, waves, bake time and a rollback">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M60 200 L840 200"/><text class="label small" x="800" y="220">time</text>
+            <path class="arrow" d="M60 200 L60 20"/><text class="label small start" x="68" y="30">% of instances on v42</text>
+            <path class="arrow ok" d="M60 190 L140 190 L140 170 L300 170 L300 120 L460 120 L460 40 L700 40"/>
+            <text class="label small" x="220" y="160">canary 10%</text>
+            <text class="label small" x="380" y="110">wave 2: 50%</text>
+            <text class="label small" x="580" y="32">100% + bake</text>
+            <path class="arrow bad dashed" d="M520 40 L520 190 L700 190"/>
+            <text class="label small bad start" x="530" y="150">alarm in bake: pointer back to v41</text>
+            <rect class="box queue" x="460" y="50" width="240" height="20"/>
+            <text class="label small" x="580" y="65">bake time (alarms watched)</text>
+            <circle class="packet ok" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M60 190 L140 190 L140 170 L300 170 L300 120 L460 120 L460 40 L520 40"/></circle>
+          </svg>
+          <figcaption>Each step waits for its bake time while alarms are watched. One red alarm anywhere returns every pointer to the previous version through the same delivery path.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Who is in the canary?</b> Pick instances by a stable hash (instance id mod 100 &lt; 10), so the same 10% stays on v42 during the step, and include each region and each service that reads the config. For feature flags, hash the <i>user</i> id instead, so a user sees a consistent experience.</li>
+          <li><b>What does "healthy" mean?</b> The service's own SLO alarms (error rate, latency) plus config-specific signals: SDK "rejected" reports, crash loops right after applying. Compare canary with control, not with yesterday.</li>
+          <li><b>Rollback is a forward move of the pointer to an old immutable version</b>, recorded as a new revision. Nothing is deleted or edited.</li>
+          <li><b>Emergency path:</b> a kill-switch flag may skip the waves (with extra approval), because sometimes "turn it off everywhere now" is the safe action.</li>
+          <li><b>Mixed versions are normal.</b> During a rollout, some instances run v41 and some v42. Every config change must be safe to run mixed; if not (two services must agree), roll the consumer first, or put both values in one config with a switch-over time.</li>
+        </ul>
+
+        <h3>4. Consistency: strong at write, eventual at read</h3>
+        <ul>
+          <li><b>Writes</b> go through one linearizable path (Raft leader or a single primary) with compare-and-set on the version. No lost updates; one total order of revisions. Two edits never interleave.</li>
+          <li><b>Reads</b> are served from distributor caches and client memory, so different instances can be a few seconds apart. That is acceptable because the service is designed for mixed versions.</li>
+          <li><b>Monotonic reads per client:</b> the client sends its version; a distributor that is behind (it has only v41) must not "downgrade" a client to v41. It either holds the request until it catches up or redirects the client.</li>
+          <li><b>Read-your-writes for the author:</b> the admin UI reads from the store's leader (or waits for its revision), so the engineer sees v42 immediately after saving.</li>
+          <li><b>Multi-region:</b> one writer region (or one consensus group per region for region-scoped configs), asynchronous replication of versions to other regions, each with its own distributors. Global configs roll out region by region anyway, so cross-region lag is absorbed by the rollout plan.</li>
+        </ul>
+
+        <h3>5. Security, access control and audit</h3>
+        <ul>
+          <li><b>RBAC per namespace and environment:</b> the payments team can edit <code>payments/*</code>; prod requires a second approver; read access for service identities is limited to the configs they subscribe to (clients authenticate with mTLS or workload identity).</li>
+          <li><b>Secrets are not configs.</b> Store a reference (<code>secret://payments/db-password</code>) and let the SDK resolve it from a secrets manager (Azure Key Vault, AWS Secrets Manager, Vault) with its own audit and rotation.</li>
+          <li><b>Audit</b> every read of sensitive configs and every write: who, what diff, why, which ticket, which deployment. Append-only, shipped to write-once storage.</li>
+          <li><b>Validation as code:</b> schemas and validators live next to the config and run in CI and again at publish time. Facebook's Configerator compiles configs from code and runs validators before they can be committed.</li>
+        </ul>
+      

@@ -1,0 +1,73 @@
+
+        <h2>The idempotent sink: effectively-once into Postgres</h2>
+        <p>The postgres-sink cannot join a Kafka transaction, because Postgres is not Kafka. So it uses the oldest reliable recipe in distributed systems:</p>
+        <div class="callout interview"><p><b>At-least-once delivery + idempotent write = effectively exactly-once.</b> Commit the offset only <em>after</em> the database commit, and make the database write safe to repeat.</p></div>
+        <p>The "safe to repeat" part is a SQL <b>upsert</b> keyed on <code>order_id</code>, the table's primary key:</p>
+<pre><code class="language-sql">-- services/postgres-sink/sink.py (the UPSERT statement)
+INSERT INTO orders (order_id, customer_id, total_cents, currency, items, created_at,
+                    kafka_partition, kafka_offset)
+VALUES (%(order_id)s, %(customer_id)s, %(total_cents)s, %(currency)s, %(items)s,
+        %(created_at)s, %(kafka_partition)s, %(kafka_offset)s)
+ON CONFLICT (order_id) DO UPDATE SET
+    total_cents = EXCLUDED.total_cents,
+    items       = EXCLUDED.items,
+    kafka_partition = EXCLUDED.kafka_partition,
+    kafka_offset    = EXCLUDED.kafka_offset,
+    updated_at  = now()
+-- Only move forward: an older copy never overwrites a newer one.
+WHERE orders.kafka_offset &lt;= EXCLUDED.kafka_offset</code></pre>
+        <p>The last line is a nice extra: if an <em>older</em> copy of an order arrives after a newer one (for example during a replay), it does not overwrite the newer row. That works because the same <code>order_id</code> always has the same key, so it is always in the same partition, so its offsets can be compared.</p>
+        <p>The loop then commits in the right order:</p>
+<pre><code class="language-python"># services/postgres-sink/sink.py (excerpt)
+        while stop.running:
+            try:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.executemany(UPSERT, rows)
+                break
+            except psycopg.OperationalError as exc:
+                # DB down: keep the batch, reconnect, try again. Lag grows meanwhile
+                # (that is backpressure - Kafka buffers for us).
+                DB_ERRORS.inc()
+                time.sleep(2)
+                conn = connect()
+        else:
+            break  # shutting down without writing: do NOT commit offsets
+        WRITTEN.inc(len(rows))
+        consumer.commit(asynchronous=False)  # commit AFTER the DB commit</code></pre>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Timeline of the sink: poll, database commit, offset commit, with three crash points and what happens after each">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M20 70 L840 70"/>
+            <rect class="box kafka" x="40" y="45" width="150" height="50"/><text class="label" x="115" y="70">consume batch</text>
+            <rect class="box db" x="330" y="45" width="170" height="50"/><text class="label" x="415" y="70">DB txn COMMIT</text>
+            <rect class="box queue" x="630" y="45" width="190" height="50"/><text class="label" x="725" y="70">consumer.commit()</text>
+
+            <text class="emoji" x="260" y="125">⚡</text>
+            <text class="label small" x="260" y="150">Crash A</text>
+            <text class="label small" x="260" y="172">nothing written,</text>
+            <text class="label small" x="260" y="192">offset not moved:</text>
+            <text class="label ok" x="260" y="215">re-read, write once</text>
+
+            <text class="emoji" x="565" y="125">⚡</text>
+            <text class="label small" x="565" y="150">Crash B</text>
+            <text class="label small" x="565" y="172">rows written,</text>
+            <text class="label small" x="565" y="192">offset not moved:</text>
+            <text class="label ok" x="565" y="215">re-read, upsert = same row</text>
+
+            <text class="emoji" x="840" y="125">⚡</text>
+            <text class="label small end" x="845" y="150">Crash C</text>
+            <text class="label small end" x="845" y="172">both done:</text>
+            <text class="label ok end" x="845" y="215">nothing to repeat</text>
+          </svg>
+          <figcaption>Crash at any point and the result in Postgres is the same. Crash B is the one that would create duplicates with a plain INSERT; the upsert turns it into a harmless rewrite.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The sink's own docstring says it: like a NIC driver that only advances the RX ring head after the packet was copied into the socket buffer, and the copy is safe to repeat. The primary key is the sequence number a TCP receiver uses to drop retransmitted segments. Where it breaks: TCP sequence numbers are per connection, but <code>order_id</code> is global and lives forever in the table, so it also catches duplicates from client retries days apart.</p>
+        </div>
+        <p>Notice what the sink does when the database is down: it keeps the batch, reconnects every 2 seconds, and does <b>not</b> commit offsets. Kafka holds the records. Lag grows. That is <b><a href="{{BASE}}interview/glossary#backpressure">backpressure</a></b> done right: the slow part slows only itself, and the upstream order-api keeps accepting orders. The <a href="{{BASE}}devops/pipeline-05">failure drills page</a> lets you watch this happen.</p>
+        <p>The same idea is behind a payment ledger's idempotency key; see <a href="{{BASE}}hld/d41">Digital Wallet &amp; Ledger</a>.</p>
+      

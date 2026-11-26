@@ -1,0 +1,980 @@
+
+  <h2>Full code</h2>
+  <p>The same design in three languages. Java is the main version (one file, compile with <code>javac -d out Main.java &amp;&amp; java -cp out Main</code>). It ends with a demo that also checks itself: if any check fails it throws. Python ships a module, a demo and a <code>unittest</code> suite. The C++14 version is single-threaded because the MinGW 6.3 toolchain on this machine has no <code>std::thread</code>; it replaces the async queue with a printk-style ring buffer.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code> (bottom of Main.java): the demo steps.</li><li><code>Logger.log</code> and <code>LogHandler.handle</code>: the cheap level check, then the chain of handlers.</li><li><code>AsyncSink</code>: bounded queue, writer thread, poison pill, drop counter, and the read-write gate on close. This is the heart.</li><li>The formatters and sinks: small, one job each.</li><li>Skip on first read: <code>LogLevel</code>, <code>LogMessage</code>, the builder.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongSupplier;
+
+// ---------- model ----------
+enum LogLevel {
+    DEBUG(10), INFO(20), WARN(30), ERROR(40), FATAL(50);
+    final int weight;
+    LogLevel(int weight) { this.weight = weight; }
+    boolean atLeast(LogLevel other) { return weight &gt;= other.weight; }
+}
+
+final class LogMessage {                       // immutable: safe to hand to another thread
+    final long epochMillis;
+    final LogLevel level;
+    final String logger, thread, text;
+    LogMessage(long epochMillis, LogLevel level, String logger, String thread, String text) {
+        this.epochMillis = epochMillis; this.level = level;
+        this.logger = logger; this.thread = thread; this.text = text;
+    }
+}
+
+// ---------- Strategy 1: how a line looks ----------
+interface LogFormatter { String format(LogMessage m); }
+
+final class PlainFormatter implements LogFormatter {
+    public String format(LogMessage m) {
+        return String.format("%d [%-5s] %s - %s", m.epochMillis, m.level, m.logger, m.text);
+    }
+}
+
+final class JsonFormatter implements LogFormatter {
+    private static String esc(String s) { return s.replace("\\", "\\\\").replace("\"", "\\\""); }
+    public String format(LogMessage m) {
+        return "{\"ts\":" + m.epochMillis + ",\"level\":\"" + m.level + "\",\"logger\":\""
+                + esc(m.logger) + "\",\"msg\":\"" + esc(m.text) + "\"}";
+    }
+}
+
+// ---------- Strategy 2: where a line goes ----------
+interface LogSink extends Closeable {
+    void write(String line);
+    default void close() {}
+}
+
+final class ConsoleSink implements LogSink {
+    public synchronized void write(String line) { System.out.println(line); }
+}
+
+final class MemorySink implements LogSink {      // test double; also a "ring buffer" style sink
+    private final List&lt;String&gt; lines = new ArrayList&lt;&gt;();
+    public synchronized void write(String line) { lines.add(line); }
+    public synchronized List&lt;String&gt; lines() { return new ArrayList&lt;&gt;(lines); }
+}
+
+final class FileSink implements LogSink {
+    private final BufferedWriter out;
+    FileSink(Path path) throws IOException {
+        out = Files.newBufferedWriter(path, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+    }
+    public synchronized void write(String line) {
+        try { out.write(line); out.newLine(); } catch (IOException e) { System.err.println("log write failed: " + e); }
+    }
+    public synchronized void close() {
+        try { out.close(); } catch (IOException e) { System.err.println("log close failed: " + e); }
+    }
+}
+
+// Follow-up sink (Swiggy asked "search logs by a word"): an inverted index word -&gt; line numbers.
+final class SearchIndexSink implements LogSink {
+    private final List&lt;String&gt; lines = new ArrayList&lt;&gt;();
+    private final Map&lt;String, Set&lt;Integer&gt;&gt; index = new HashMap&lt;&gt;();
+    public synchronized void write(String line) {
+        int no = lines.size();
+        lines.add(line);
+        for (String w : line.toLowerCase().split("[^a-z0-9]+"))
+            if (!w.isEmpty()) index.computeIfAbsent(w, k -&gt; new TreeSet&lt;&gt;()).add(no);
+    }
+    public synchronized List&lt;String&gt; search(String word) {
+        List&lt;String&gt; hits = new ArrayList&lt;&gt;();
+        for (int no : index.getOrDefault(word.toLowerCase(), Collections.emptySet())) hits.add(lines.get(no));
+        return hits;
+    }
+}
+
+// Decorator: same LogSink interface, but writes happen on a background thread.
+final class AsyncSink implements LogSink {
+    private static final String POISON = "\u0000STOP";
+    private final LogSink target;
+    private final BlockingQueue&lt;String&gt; queue;
+    private final AtomicLong dropped = new AtomicLong();
+    private final Thread worker;
+    private volatile boolean closed;
+    // write() holds the read side, close() the write side: close cannot slip in between a writer's
+    // "closed?" check and its offer(), so no line can land behind the POISON pill and vanish.
+    private final ReentrantReadWriteLock gate = new ReentrantReadWriteLock();
+
+    AsyncSink(LogSink target, int capacity) {
+        this.target = target;
+        this.queue = new ArrayBlockingQueue&lt;&gt;(capacity);
+        this.worker = new Thread(this::drain, "log-writer");
+        this.worker.setDaemon(true);
+        this.worker.start();
+    }
+    public void write(String line) {
+        gate.readLock().lock();                 // shared: writers never wait for each other
+        try {
+            if (closed || !queue.offer(line)) dropped.incrementAndGet();   // never block on a full queue
+        } finally { gate.readLock().unlock(); }
+    }
+    private void drain() {
+        try {
+            while (true) {
+                String line = queue.take();
+                if (line == POISON) break;
+                target.write(line);
+            }
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+    public synchronized void close() {
+        if (closed) return;                      // idempotent: safe to close twice
+        gate.writeLock().lock();                 // waits only for writers already inside write()
+        try { closed = true; } finally { gate.writeLock().unlock(); }
+        try {
+            queue.put(POISON);          // everything queued before this is written first
+            worker.join();
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        target.close();
+    }
+    long dropped() { return dropped.get(); }
+}
+
+// ---------- Chain of Responsibility: one handler per destination ----------
+abstract class LogHandler {
+    private final LogLevel threshold;
+    private LogHandler next;
+    protected LogHandler(LogLevel threshold) { this.threshold = threshold; }
+    LogHandler setNext(LogHandler next) { this.next = next; return next; }   // returns next for chaining
+    final void handle(LogMessage m) {
+        if (m.level.atLeast(threshold)) emit(m);
+        if (next != null) next.handle(m);       // pass-through chain: later handlers also see it
+    }
+    protected abstract void emit(LogMessage m);
+    void closeAll() { close(); if (next != null) next.closeAll(); }
+    protected void close() {}
+}
+
+final class SinkHandler extends LogHandler {
+    private final LogFormatter formatter;
+    private final LogSink sink;
+    SinkHandler(LogLevel threshold, LogFormatter formatter, LogSink sink) {
+        super(threshold); this.formatter = formatter; this.sink = sink;
+    }
+    protected void emit(LogMessage m) { sink.write(formatter.format(m)); }
+    protected void close() { sink.close(); }
+}
+
+// ---------- configuration (Builder) ----------
+final class LoggerConfig {
+    final LogLevel minLevel;
+    final LogHandler head;
+    final LongSupplier clock;
+    private LoggerConfig(Builder b) { minLevel = b.minLevel; head = b.head; clock = b.clock; }
+
+    static Builder builder() { return new Builder(); }
+    static final class Builder {
+        private LogLevel minLevel = LogLevel.INFO;
+        private LogHandler head, tail;
+        private LongSupplier clock = System::currentTimeMillis;
+        Builder minLevel(LogLevel l) { minLevel = l; return this; }
+        Builder clock(LongSupplier c) { clock = c; return this; }
+        Builder handler(LogLevel threshold, LogFormatter f, LogSink s) {
+            LogHandler h = new SinkHandler(threshold, f, s);
+            if (head == null) head = tail = h; else tail = tail.setNext(h);
+            return this;
+        }
+        LoggerConfig build() {
+            if (head == null) throw new IllegalStateException("at least one handler needed");
+            return new LoggerConfig(this);
+        }
+    }
+}
+
+// ---------- the API callers see ----------
+final class Logger {
+    private final String name;
+    private final LogManager manager;
+    Logger(String name, LogManager manager) { this.name = name; this.manager = manager; }
+
+    void log(LogLevel level, String text) {
+        LoggerConfig cfg = manager.config();               // one volatile read per call
+        if (!level.atLeast(cfg.minLevel)) return;          // cheap early exit, no allocation
+        cfg.head.handle(new LogMessage(cfg.clock.getAsLong(), level, name,
+                Thread.currentThread().getName(), text));
+    }
+    void debug(String t) { log(LogLevel.DEBUG, t); }
+    void info(String t)  { log(LogLevel.INFO, t); }
+    void warn(String t)  { log(LogLevel.WARN, t); }
+    void error(String t) { log(LogLevel.ERROR, t); }
+}
+
+// Singleton + registry of named loggers (a "multiton").
+final class LogManager {
+    private static final LogManager INSTANCE = new LogManager();   // eager: JVM class init is thread-safe
+    private final ConcurrentHashMap&lt;String, Logger&gt; loggers = new ConcurrentHashMap&lt;&gt;();
+    private volatile LoggerConfig config = LoggerConfig.builder()
+            .handler(LogLevel.INFO, new PlainFormatter(), new ConsoleSink()).build();
+
+    private LogManager() {}
+    static LogManager get() { return INSTANCE; }
+
+    Logger getLogger(String name) { return loggers.computeIfAbsent(name, n -&gt; new Logger(n, this)); }
+    LoggerConfig config() { return config; }
+    void configure(LoggerConfig next) {                   // swap atomically; old chain is closed
+        LoggerConfig old = config;
+        config = next;
+        if (old != next) old.head.closeAll();
+    }
+    void shutdown() { config.head.closeAll(); }
+}
+
+// ---------- demo + checks ----------
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    public static void main(String[] args) throws Exception {
+        AtomicLong fakeTime = new AtomicLong(1_700_000_000_000L);
+        MemorySink all = new MemorySink();
+        MemorySink alerts = new MemorySink();
+
+        LogManager lm = LogManager.get();
+        lm.configure(LoggerConfig.builder()
+                .minLevel(LogLevel.DEBUG)
+                .clock(fakeTime::incrementAndGet)                         // deterministic timestamps
+                .handler(LogLevel.INFO,  new PlainFormatter(), new ConsoleSink())
+                .handler(LogLevel.DEBUG, new JsonFormatter(),  all)
+                .handler(LogLevel.ERROR, new PlainFormatter(), alerts)
+                .build());
+
+        Logger pay = lm.getLogger("payments");
+        check(pay == lm.getLogger("payments"), "same name gives same logger");
+
+        System.out.println("== 1. levels walk the chain ==");
+        pay.debug("cache warm");
+        pay.info("charge started id=42");
+        pay.warn("retrying gateway");
+        pay.error("gateway timeout id=42");
+        check(all.lines().size() == 4, "json sink saw all 4");
+        check(alerts.lines().size() == 1, "alert sink saw only ERROR");
+        check(alerts.lines().get(0).contains("[ERROR] payments - gateway timeout"), "alert text");
+        System.out.println("json sink line 1: " + all.lines().get(0));
+
+        System.out.println("== 2. raise the level at runtime ==");
+        MemorySink quiet = new MemorySink();
+        lm.configure(LoggerConfig.builder().minLevel(LogLevel.WARN)
+                .clock(fakeTime::incrementAndGet)
+                .handler(LogLevel.DEBUG, new PlainFormatter(), quiet).build());
+        pay.info("hidden");
+        pay.warn("shown");
+        check(quiet.lines().size() == 1 &amp;&amp; quiet.lines().get(0).contains("shown"), "min level filter");
+        System.out.println("after WARN filter: " + quiet.lines());
+
+        System.out.println("== 3. async sink, 4 threads x 2500 lines ==");
+        MemorySink slow = new MemorySink();
+        AsyncSink async = new AsyncSink(slow, 20_000);
+        lm.configure(LoggerConfig.builder().minLevel(LogLevel.INFO)
+                .clock(fakeTime::incrementAndGet)
+                .handler(LogLevel.INFO, new PlainFormatter(), async).build());
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        for (int t = 0; t &lt; 4; t++) {
+            final int id = t;
+            pool.submit(() -&gt; {
+                Logger l = lm.getLogger("worker-" + id);
+                for (int i = 0; i &lt; 2500; i++) l.info("job " + i);
+            });
+        }
+        pool.shutdown();
+        check(pool.awaitTermination(10, TimeUnit.SECONDS), "workers finished");
+        lm.shutdown();                                   // drains the queue before returning
+        check(slow.lines().size() + async.dropped() == 10_000, "every line written or counted as dropped");
+        check(async.dropped() == 0, "queue was big enough: nothing dropped");
+        System.out.println("async lines written: " + slow.lines().size() + ", dropped: " + async.dropped());
+
+        System.out.println("== 4. tiny queue drops instead of blocking ==");
+        MemorySink sink2 = new MemorySink();
+        AsyncSink tiny = new AsyncSink(line -&gt; { sleepQuietly(1); sink2.write(line); }, 4);
+        for (int i = 0; i &lt; 200; i++) tiny.write("burst " + i);
+        tiny.close();
+        check(sink2.lines().size() + tiny.dropped() == 200, "written + dropped == sent");
+        check(tiny.dropped() &gt; 0, "some lines dropped under burst");
+        System.out.println("burst of 200: written + dropped = " + (sink2.lines().size() + tiny.dropped()) + ", some dropped = " + (tiny.dropped() &gt; 0));
+
+        System.out.println("== 4b. close() races with writers ==");
+        MemorySink sink3 = new MemorySink();
+        AsyncSink racing = new AsyncSink(sink3, 1_000);
+        AtomicLong attempted = new AtomicLong();
+        ExecutorService writers = Executors.newFixedThreadPool(4);
+        CountDownLatch started = new CountDownLatch(4);
+        for (int t = 0; t &lt; 4; t++) writers.submit(() -&gt; {
+            started.countDown();
+            for (int i = 0; i &lt; 5_000; i++) { racing.write("w " + i); attempted.incrementAndGet(); }
+        });
+        started.await();
+        racing.close();                                  // lands in the middle of the writes
+        writers.shutdown();
+        check(writers.awaitTermination(10, TimeUnit.SECONDS), "racing writers finished");
+        check(sink3.lines().size() + racing.dropped() == attempted.get(), "close during writes: written + dropped == attempted");
+        System.out.println("close during writes: written + dropped == attempted (" + attempted.get() + "): "
+                + (sink3.lines().size() + racing.dropped() == attempted.get()));
+
+        System.out.println("== 5. file sink ==");
+        Path tmp = Files.createTempFile("lld-logger", ".log");
+        lm.configure(LoggerConfig.builder().clock(fakeTime::incrementAndGet)
+                .handler(LogLevel.INFO, new PlainFormatter(), new FileSink(tmp)).build());
+        lm.getLogger("orders").info("order placed");
+        lm.getLogger("orders").error("order failed");
+        lm.shutdown();
+        List&lt;String&gt; fileLines = Files.readAllLines(tmp);
+        check(fileLines.size() == 2, "two lines in file");
+        Files.delete(tmp);
+        System.out.println("file had " + fileLines.size() + " lines");
+
+        System.out.println("== 6. follow-up: search logs by word ==");
+        SearchIndexSink idx = new SearchIndexSink();
+        lm.configure(LoggerConfig.builder().clock(fakeTime::incrementAndGet)
+                .handler(LogLevel.INFO, new PlainFormatter(), idx).build());
+        Logger api = lm.getLogger("api");
+        api.info("user 7 login ok");
+        api.error("user 9 login failed");
+        api.info("cart updated");
+        check(idx.search("login").size() == 2, "two lines contain login");
+        check(idx.search("FAILED").size() == 1, "search ignores case");
+        System.out.println("search 'login' -&gt; " + idx.search("login").size() + " hits; 'failed' -&gt; " + idx.search("failed"));
+
+        System.out.println("All " + checks + " checks passed");
+    }
+
+    static void sleepQuietly(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<p><code>logger.py</code></p>
+<pre><code class="language-python">"""Logging framework: levels, Chain of Responsibility handlers, formatter/sink Strategy,
+async sink Decorator, and a Singleton LogManager. Standard library only."""
+from __future__ import annotations
+
+import enum
+import itertools
+import json
+import queue
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, List, Optional
+
+
+class LogLevel(enum.IntEnum):
+    DEBUG = 10
+    INFO = 20
+    WARN = 30
+    ERROR = 40
+    FATAL = 50
+
+
+@dataclass(frozen=True)
+class LogMessage:            # immutable: safe to pass to the writer thread
+    ts: int
+    level: LogLevel
+    logger: str
+    thread: str
+    text: str
+
+
+# ---- Strategy 1: formatting ----
+class Formatter(ABC):
+    @abstractmethod
+    def format(self, m: LogMessage) -&gt; str: ...
+
+
+class PlainFormatter(Formatter):
+    def format(self, m: LogMessage) -&gt; str:
+        return f"{m.ts} [{m.level.name:&lt;5}] {m.logger} - {m.text}"
+
+
+class JsonFormatter(Formatter):
+    def format(self, m: LogMessage) -&gt; str:
+        return json.dumps({"ts": m.ts, "level": m.level.name, "logger": m.logger, "msg": m.text},
+                          separators=(",", ":"))
+
+
+# ---- Strategy 2: destination ----
+class Sink(ABC):
+    @abstractmethod
+    def write(self, line: str) -&gt; None: ...
+
+    def close(self) -&gt; None:
+        pass
+
+
+class ConsoleSink(Sink):
+    def __init__(self) -&gt; None:
+        self._lock = threading.Lock()
+
+    def write(self, line: str) -&gt; None:
+        with self._lock:
+            print(line)
+
+
+class MemorySink(Sink):
+    def __init__(self) -&gt; None:
+        self._lock = threading.Lock()
+        self._lines: List[str] = []
+
+    def write(self, line: str) -&gt; None:
+        with self._lock:
+            self._lines.append(line)
+
+    @property
+    def lines(self) -&gt; List[str]:
+        with self._lock:
+            return list(self._lines)
+
+
+class FileSink(Sink):
+    def __init__(self, path: str) -&gt; None:
+        self._lock = threading.Lock()
+        self._f = open(path, "a", encoding="utf-8")
+
+    def write(self, line: str) -&gt; None:
+        with self._lock:
+            self._f.write(line + "\n")
+
+    def close(self) -&gt; None:
+        with self._lock:
+            if not self._f.closed:
+                self._f.close()
+
+
+class AsyncSink(Sink):
+    """Decorator: same Sink interface, the real write happens on a background thread."""
+    _STOP = object()
+
+    def __init__(self, target: Sink, capacity: int = 10_000) -&gt; None:
+        self._target = target
+        self._q: "queue.Queue[object]" = queue.Queue(maxsize=capacity)
+        self._dropped = 0
+        self._drop_lock = threading.Lock()
+        self._closed = False
+        # write() and close() share this lock, so close() cannot slip in between a writer's
+        # "closed?" check and its put: no line can land behind the stop marker and vanish.
+        self._gate = threading.Lock()
+        self._worker = threading.Thread(target=self._drain, name="log-writer", daemon=True)
+        self._worker.start()
+
+    def write(self, line: str) -&gt; None:
+        with self._gate:                    # put_nowait never blocks, so the lock is held only briefly
+            try:
+                if self._closed:
+                    raise queue.Full
+                self._q.put_nowait(line)    # never block the caller
+            except queue.Full:
+                with self._drop_lock:
+                    self._dropped += 1
+
+    def _drain(self) -&gt; None:
+        while True:
+            item = self._q.get()
+            if item is self._STOP:
+                return
+            self._target.write(item)  # type: ignore[arg-type]
+
+    def close(self) -&gt; None:
+        with self._gate:
+            if self._closed:
+                return
+            self._closed = True             # from here every write() counts as dropped
+        self._q.put(self._STOP)             # queued lines are written first
+        self._worker.join()
+        self._target.close()
+
+    @property
+    def dropped(self) -&gt; int:
+        with self._drop_lock:
+            return self._dropped
+
+
+# ---- Chain of Responsibility ----
+class Handler:
+    def __init__(self, threshold: LogLevel, formatter: Formatter, sink: Sink) -&gt; None:
+        self.threshold, self.formatter, self.sink = threshold, formatter, sink
+        self.next: Optional[Handler] = None
+
+    def set_next(self, h: "Handler") -&gt; "Handler":
+        self.next = h
+        return h
+
+    def handle(self, m: LogMessage) -&gt; None:
+        if m.level &gt;= self.threshold:
+            self.sink.write(self.formatter.format(m))
+        if self.next:                       # pass-through: later handlers also see it
+            self.next.handle(m)
+
+    def close_all(self) -&gt; None:
+        h: Optional[Handler] = self
+        while h:
+            h.sink.close()
+            h = h.next
+
+
+class LoggerConfig:
+    def __init__(self, min_level: LogLevel, head: Handler, clock: Callable[[], int]) -&gt; None:
+        self.min_level, self.head, self.clock = min_level, head, clock
+
+    class Builder:
+        def __init__(self) -&gt; None:
+            self._min = LogLevel.INFO
+            self._head: Optional[Handler] = None
+            self._tail: Optional[Handler] = None
+            self._clock: Callable[[], int] = lambda: int(time.time() * 1000)
+
+        def min_level(self, lvl: LogLevel) -&gt; "LoggerConfig.Builder":
+            self._min = lvl
+            return self
+
+        def clock(self, c: Callable[[], int]) -&gt; "LoggerConfig.Builder":
+            self._clock = c
+            return self
+
+        def handler(self, threshold: LogLevel, fmt: Formatter, sink: Sink) -&gt; "LoggerConfig.Builder":
+            h = Handler(threshold, fmt, sink)
+            if self._head is None:
+                self._head = self._tail = h
+            else:
+                self._tail = self._tail.set_next(h)  # type: ignore[union-attr]
+            return self
+
+        def build(self) -&gt; "LoggerConfig":
+            if self._head is None:
+                raise ValueError("at least one handler needed")
+            return LoggerConfig(self._min, self._head, self._clock)
+
+
+class Logger:
+    def __init__(self, name: str, manager: "LogManager") -&gt; None:
+        self.name, self._manager = name, manager
+
+    def log(self, level: LogLevel, text: str) -&gt; None:
+        cfg = self._manager.config          # one attribute read; swaps are atomic
+        if level &lt; cfg.min_level:
+            return
+        cfg.head.handle(LogMessage(cfg.clock(), level, self.name,
+                                   threading.current_thread().name, text))
+
+    def debug(self, t: str) -&gt; None: self.log(LogLevel.DEBUG, t)
+    def info(self, t: str) -&gt; None: self.log(LogLevel.INFO, t)
+    def warn(self, t: str) -&gt; None: self.log(LogLevel.WARN, t)
+    def error(self, t: str) -&gt; None: self.log(LogLevel.ERROR, t)
+
+
+class LogManager:
+    """Singleton registry of named loggers."""
+    _instance: Optional["LogManager"] = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self) -&gt; None:
+        self._loggers: dict = {}
+        self._lock = threading.Lock()
+        self.config = LoggerConfig.Builder().handler(LogLevel.INFO, PlainFormatter(), ConsoleSink()).build()
+
+    @classmethod
+    def get(cls) -&gt; "LogManager":
+        if cls._instance is None:
+            with cls._instance_lock:          # double-checked locking
+                if cls._instance is None:
+                    cls._instance = LogManager()
+        return cls._instance
+
+    def get_logger(self, name: str) -&gt; Logger:
+        with self._lock:
+            if name not in self._loggers:
+                self._loggers[name] = Logger(name, self)
+            return self._loggers[name]
+
+    def configure(self, cfg: LoggerConfig) -&gt; None:
+        old, self.config = self.config, cfg
+        if old is not cfg:
+            old.head.close_all()
+
+    def shutdown(self) -&gt; None:
+        self.config.head.close_all()
+
+
+def counter_clock(start: int = 1_700_000_000_000) -&gt; Callable[[], int]:
+    c = itertools.count(start + 1)
+    lock = threading.Lock()
+
+    def tick() -&gt; int:
+        with lock:
+            return next(c)
+    return tick</code></pre>
+<p><code>main.py</code></p>
+<pre><code class="language-python">from concurrent.futures import ThreadPoolExecutor
+
+from logger import (AsyncSink, ConsoleSink, JsonFormatter, LogLevel, LoggerConfig, LogManager,
+                    MemorySink, PlainFormatter, counter_clock)
+
+
+def main() -&gt; None:
+    clock = counter_clock()
+    all_sink, alerts = MemorySink(), MemorySink()
+    lm = LogManager.get()
+    lm.configure(LoggerConfig.Builder().min_level(LogLevel.DEBUG).clock(clock)
+                 .handler(LogLevel.INFO, PlainFormatter(), ConsoleSink())
+                 .handler(LogLevel.DEBUG, JsonFormatter(), all_sink)
+                 .handler(LogLevel.ERROR, PlainFormatter(), alerts)
+                 .build())
+    pay = lm.get_logger("payments")
+    assert pay is lm.get_logger("payments")
+
+    print("== 1. levels walk the chain ==")
+    pay.debug("cache warm")
+    pay.info("charge started id=42")
+    pay.warn("retrying gateway")
+    pay.error("gateway timeout id=42")
+    assert len(all_sink.lines) == 4 and len(alerts.lines) == 1
+    print("json sink line 1:", all_sink.lines[0])
+
+    print("== 2. async sink, 4 threads x 2500 lines ==")
+    slow = MemorySink()
+    async_sink = AsyncSink(slow, capacity=20_000)
+    lm.configure(LoggerConfig.Builder().clock(clock)
+                 .handler(LogLevel.INFO, PlainFormatter(), async_sink).build())
+
+    def work(i: int) -&gt; None:
+        log = lm.get_logger(f"worker-{i}")
+        for n in range(2500):
+            log.info(f"job {n}")
+
+    with ThreadPoolExecutor(4) as ex:
+        list(ex.map(work, range(4)))
+    lm.shutdown()
+    assert len(slow.lines) + async_sink.dropped == 10_000
+    print("async lines written:", len(slow.lines), "dropped:", async_sink.dropped)
+    print("All checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p><code>test_logger.py</code></p>
+<pre><code class="language-python">import threading
+import os
+import tempfile
+import time
+import unittest
+
+from logger import (AsyncSink, JsonFormatter, LogLevel, LoggerConfig, LogManager, MemorySink,
+                    PlainFormatter, Sink, counter_clock, FileSink)
+
+
+class SlowSink(Sink):
+    def __init__(self, inner: Sink) -&gt; None:
+        self.inner = inner
+
+    def write(self, line: str) -&gt; None:
+        time.sleep(0.001)
+        self.inner.write(line)
+
+
+class LoggerTest(unittest.TestCase):
+    def setUp(self) -&gt; None:
+        self.lm = LogManager.get()
+        self.clock = counter_clock()
+
+    def test_singleton_and_named_loggers(self):
+        self.assertIs(LogManager.get(), LogManager.get())
+        self.assertIs(self.lm.get_logger("a"), self.lm.get_logger("a"))
+        self.assertIsNot(self.lm.get_logger("a"), self.lm.get_logger("b"))
+
+    def test_handler_thresholds(self):
+        everything, errors = MemorySink(), MemorySink()
+        self.lm.configure(LoggerConfig.Builder().min_level(LogLevel.DEBUG).clock(self.clock)
+                          .handler(LogLevel.DEBUG, PlainFormatter(), everything)
+                          .handler(LogLevel.ERROR, PlainFormatter(), errors).build())
+        log = self.lm.get_logger("t")
+        log.debug("d"); log.info("i"); log.error("e")
+        self.assertEqual(len(everything.lines), 3)
+        self.assertEqual(len(errors.lines), 1)
+        self.assertIn("[ERROR] t - e", errors.lines[0])
+
+    def test_min_level_short_circuits(self):
+        sink = MemorySink()
+        self.lm.configure(LoggerConfig.Builder().min_level(LogLevel.WARN).clock(self.clock)
+                          .handler(LogLevel.DEBUG, PlainFormatter(), sink).build())
+        self.lm.get_logger("t").info("hidden")
+        self.assertEqual(sink.lines, [])
+
+    def test_json_escapes_quotes(self):
+        sink = MemorySink()
+        self.lm.configure(LoggerConfig.Builder().clock(self.clock)
+                          .handler(LogLevel.INFO, JsonFormatter(), sink).build())
+        self.lm.get_logger("t").info('say "hi"')
+        self.assertIn('"msg":"say \\"hi\\""', sink.lines[0])
+
+    def test_async_drops_instead_of_blocking(self):
+        out = MemorySink()
+        a = AsyncSink(SlowSink(out), capacity=4)
+        for i in range(200):
+            a.write(f"b{i}")
+        a.close()
+        self.assertEqual(len(out.lines) + a.dropped, 200)
+        self.assertGreater(a.dropped, 0)
+
+    def test_close_is_idempotent_and_drains(self):
+        out = MemorySink()
+        a = AsyncSink(out, capacity=100)
+        for i in range(50):
+            a.write(str(i))
+        a.close(); a.close()
+        self.assertEqual(out.lines, [str(i) for i in range(50)])   # order kept
+        a.write("late")
+        self.assertEqual(a.dropped, 1)
+
+    def test_close_racing_writers_loses_nothing(self):
+        out = MemorySink()
+        a = AsyncSink(out, capacity=500)
+        attempted = [0] * 4
+        started = threading.Barrier(5)
+
+        def writer(k):
+            started.wait()
+            for i in range(3000):
+                a.write(f"w{k} {i}")
+                attempted[k] += 1
+        threads = [threading.Thread(target=writer, args=(k,)) for k in range(4)]
+        for th in threads:
+            th.start()
+        started.wait()
+        a.close()                             # lands in the middle of the writes
+        for th in threads:
+            th.join()
+        self.assertEqual(len(out.lines) + a.dropped, sum(attempted))
+
+    def test_file_sink(self):
+        fd, path = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        try:
+            self.lm.configure(LoggerConfig.Builder().clock(self.clock)
+                              .handler(LogLevel.INFO, PlainFormatter(), FileSink(path)).build())
+            self.lm.get_logger("f").info("one")
+            self.lm.shutdown()
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(len(f.read().splitlines()), 1)
+        finally:
+            os.remove(path)
+
+    def test_builder_requires_handler(self):
+        with self.assertRaises(ValueError):
+            LoggerConfig.Builder().build()
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Logging framework in C++14: levels, CoR handlers, formatter/sink Strategy,
+// a ring-buffer sink Decorator and a Meyers Singleton. Build: g++ -std=c++14 -O2 main.cpp
+// Note: the MinGW 6.3 toolchain here has no std::thread, so this demo is single-threaded.
+// The buffered sink keeps the printk shape: writers append to a bounded ring, a "klogd"
+// step (flush) drains it. The Java and Python tabs show the real background-thread version.
+#include &lt;cassert&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;sstream&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class Level { DEBUG = 10, INFO = 20, WARN = 30, ERROR = 40 };
+static const char* name(Level l) {
+    switch (l) { case Level::DEBUG: return "DEBUG"; case Level::INFO: return "INFO ";
+                 case Level::WARN: return "WARN "; default: return "ERROR"; }
+}
+
+struct LogMessage { long long ts; Level level; std::string logger, text; };
+
+// Strategy 1: the "how it looks" vtable
+struct Formatter { virtual ~Formatter() = default; virtual std::string format(const LogMessage&amp;) const = 0; };
+struct PlainFormatter : Formatter {
+    std::string format(const LogMessage&amp; m) const override {
+        std::ostringstream o; o &lt;&lt; m.ts &lt;&lt; " [" &lt;&lt; name(m.level) &lt;&lt; "] " &lt;&lt; m.logger &lt;&lt; " - " &lt;&lt; m.text;
+        return o.str();
+    }
+};
+
+// Strategy 2: the "where it goes" vtable (think struct file_operations: write + release)
+struct Sink { virtual ~Sink() = default; virtual void write(const std::string&amp;) = 0; virtual void close() {} };
+struct ConsoleSink : Sink { void write(const std::string&amp; s) override { std::cout &lt;&lt; s &lt;&lt; "\n"; } };
+struct MemorySink : Sink { std::vector&lt;std::string&gt; lines; void write(const std::string&amp; s) override { lines.push_back(s); } };
+
+// Decorator: bounded ring of lines; when full, the oldest line is overwritten and counted,
+// exactly like the kernel log buffer. flush() is the reader that drains it.
+class RingBufferSink : public Sink {
+    std::shared_ptr&lt;Sink&gt; target_;
+    std::vector&lt;std::string&gt; ring_;
+    size_t head_ = 0, count_ = 0;
+    long lost_ = 0;
+public:
+    RingBufferSink(std::shared_ptr&lt;Sink&gt; t, size_t cap) : target_(std::move(t)), ring_(cap) {}
+    void write(const std::string&amp; s) override {
+        size_t tail = (head_ + count_) % ring_.size();
+        ring_[tail] = s;
+        if (count_ == ring_.size()) { head_ = (head_ + 1) % ring_.size(); ++lost_; }   // overwrite oldest
+        else ++count_;
+    }
+    void flush() {
+        while (count_) { target_-&gt;write(ring_[head_]); head_ = (head_ + 1) % ring_.size(); --count_; }
+    }
+    void close() override { flush(); target_-&gt;close(); }
+    long lost() const { return lost_; }
+};
+
+// Chain of Responsibility node
+class Handler {
+    Level threshold_; std::shared_ptr&lt;Formatter&gt; fmt_; std::shared_ptr&lt;Sink&gt; sink_;
+    std::unique_ptr&lt;Handler&gt; next_;
+public:
+    Handler(Level t, std::shared_ptr&lt;Formatter&gt; f, std::shared_ptr&lt;Sink&gt; s)
+        : threshold_(t), fmt_(std::move(f)), sink_(std::move(s)) {}
+    Handler* setNext(std::unique_ptr&lt;Handler&gt; n) { next_ = std::move(n); return next_.get(); }
+    void handle(const LogMessage&amp; m) {
+        if (static_cast&lt;int&gt;(m.level) &gt;= static_cast&lt;int&gt;(threshold_)) sink_-&gt;write(fmt_-&gt;format(m));
+        if (next_) next_-&gt;handle(m);          // pass-through: the next handler also sees it
+    }
+    void closeAll() { sink_-&gt;close(); if (next_) next_-&gt;closeAll(); }
+};
+
+class LogManager {
+    Level min_ = Level::INFO;
+    std::shared_ptr&lt;Handler&gt; head_;
+    long long clock_ = 1700000000000LL;
+    LogManager() = default;
+public:
+    static LogManager&amp; get() { static LogManager inst; return inst; }   // init is thread-safe since C++11
+    LogManager(const LogManager&amp;) = delete;
+    LogManager&amp; operator=(const LogManager&amp;) = delete;
+
+    void configure(Level min, std::shared_ptr&lt;Handler&gt; head) {
+        if (head_) head_-&gt;closeAll();
+        min_ = min; head_ = std::move(head);
+    }
+    bool enabled(Level l) const { return head_ &amp;&amp; static_cast&lt;int&gt;(l) &gt;= static_cast&lt;int&gt;(min_); }
+    void log(Level l, const std::string&amp; logger, const std::string&amp; text) {
+        if (!enabled(l)) return;
+        head_-&gt;handle(LogMessage{++clock_, l, logger, text});
+    }
+    void shutdown() { if (head_) head_-&gt;closeAll(); }
+};
+
+// printk-style macro: the message is only formatted when the level is enabled
+#define LOG(lvl, logger, expr) do { if (LogManager::get().enabled(Level::lvl)) { \
+    std::ostringstream o_; o_ &lt;&lt; expr; LogManager::get().log(Level::lvl, logger, o_.str()); } } while (0)
+
+int main() {
+    auto plain = std::make_shared&lt;PlainFormatter&gt;();
+    auto all = std::make_shared&lt;MemorySink&gt;();
+    auto alerts = std::make_shared&lt;MemorySink&gt;();
+    auto head = std::make_shared&lt;Handler&gt;(Level::INFO, plain, std::make_shared&lt;ConsoleSink&gt;());
+    head-&gt;setNext(std::unique_ptr&lt;Handler&gt;(new Handler(Level::DEBUG, plain, all)))
+        -&gt;setNext(std::unique_ptr&lt;Handler&gt;(new Handler(Level::ERROR, plain, alerts)));
+    LogManager&amp; lm = LogManager::get();
+    lm.configure(Level::DEBUG, head);
+
+    std::cout &lt;&lt; "== 1. levels walk the chain ==\n";
+    LOG(DEBUG, "payments", "cache warm");
+    LOG(INFO, "payments", "charge started id=" &lt;&lt; 42);
+    LOG(ERROR, "payments", "gateway timeout id=" &lt;&lt; 42);
+    assert(all-&gt;lines.size() == 3 &amp;&amp; alerts-&gt;lines.size() == 1);
+
+    std::cout &lt;&lt; "== 2. min level WARN hides INFO ==\n";
+    auto quiet = std::make_shared&lt;MemorySink&gt;();
+    lm.configure(Level::WARN, std::make_shared&lt;Handler&gt;(Level::DEBUG, plain, quiet));
+    int built = 0;
+    LOG(INFO, "payments", "hidden " &lt;&lt; ++built);   // expression never evaluated
+    LOG(WARN, "payments", "shown");
+    assert(quiet-&gt;lines.size() == 1 &amp;&amp; built == 0);
+    std::cout &lt;&lt; "INFO skipped without formatting: " &lt;&lt; (built == 0 ? "yes" : "no") &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "== 3. ring buffer of 8 lines, 20 writes ==\n";
+    auto out = std::make_shared&lt;MemorySink&gt;();
+    auto ring = std::make_shared&lt;RingBufferSink&gt;(out, 8);
+    lm.configure(Level::INFO, std::make_shared&lt;Handler&gt;(Level::INFO, plain, ring));
+    for (int i = 0; i &lt; 20; ++i) LOG(INFO, "net", "pkt " &lt;&lt; i);
+    lm.shutdown();                                // flushes the ring
+    assert(out-&gt;lines.size() == 8 &amp;&amp; ring-&gt;lost() == 12);
+    std::cout &lt;&lt; "kept " &lt;&lt; out-&gt;lines.size() &lt;&lt; ", lost " &lt;&lt; ring-&gt;lost()
+              &lt;&lt; ", oldest kept: " &lt;&lt; out-&gt;lines.front() &lt;&lt; "\n";
+    std::cout &lt;&lt; "All checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Demo output</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre class="terminal"><code>== 1. levels walk the chain ==
+1700000000002 [INFO ] payments - charge started id=42
+1700000000003 [WARN ] payments - retrying gateway
+1700000000004 [ERROR] payments - gateway timeout id=42
+json sink line 1: {"ts":1700000000001,"level":"DEBUG","logger":"payments","msg":"cache warm"}
+== 2. raise the level at runtime ==
+after WARN filter: [1700000000005 [WARN ] payments - shown]
+== 3. async sink, 4 threads x 2500 lines ==
+async lines written: 10000, dropped: 0
+== 4. tiny queue drops instead of blocking ==
+burst of 200: written + dropped = 200, some dropped = true
+== 4b. close() races with writers ==
+close during writes: written + dropped == attempted (20000): true
+== 5. file sink ==
+file had 2 lines
+== 6. follow-up: search logs by word ==
+search 'login' -&gt; 2 hits; 'failed' -&gt; [1700000010009 [ERROR] api - user 9 login failed]
+All 15 checks passed</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre class="terminal"><code>== 1. levels walk the chain ==
+1700000000002 [INFO ] payments - charge started id=42
+1700000000003 [WARN ] payments - retrying gateway
+1700000000004 [ERROR] payments - gateway timeout id=42
+json sink line 1: {"ts":1700000000001,"level":"DEBUG","logger":"payments","msg":"cache warm"}
+== 2. async sink, 4 threads x 2500 lines ==
+async lines written: 10000 dropped: 0
+All checks passed</code></pre>
+<pre class="terminal"><code>.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.031s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre class="terminal"><code>== 1. levels walk the chain ==
+1700000000002 [INFO ] payments - charge started id=42
+1700000000003 [ERROR] payments - gateway timeout id=42
+== 2. min level WARN hides INFO ==
+INFO skipped without formatting: yes
+== 3. ring buffer of 8 lines, 20 writes ==
+kept 8, lost 12, oldest kept: 1700000000017 [INFO ] net - pkt 12
+All checks passed</code></pre>
+    </div>
+  </div>

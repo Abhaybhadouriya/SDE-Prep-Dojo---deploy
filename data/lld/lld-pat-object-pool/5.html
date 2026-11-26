@@ -1,0 +1,444 @@
+
+  <h2>Code: a bounded blocking pool with leak detection</h2>
+  <p>All three programs were compiled and run; output is shown under each. Java is the full interview answer: a fair semaphore bounds the pool, <code>acquire</code> times out, validation happens on borrow and on return, a Lease makes try-with-resources possible, and a report lists leases held too long. Python is the same with a context manager. C++14 is kernel flavoured: a slab with a free list and a mempool-style reserve (single-threaded, because the MinGW g++ 6.3 here has no <code>std::thread</code>; the blocking logic is in the other two tabs). Files live in <code>lld-code/lld-pat-object-pool/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>PoolDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Reusable object</td><td><code>Connection</code></td><td>9-16</td><td>expensive to create, has per-user state</td></tr>
+    <tr><td>Handle</td><td><code>Lease</code></td><td>19-28</td><td>close() returns it to the pool</td></tr>
+    <tr><td>Pool</td><td><code>BlockingPool</code></td><td>30-90</td><td>acquire with timeout; release never loses a permit</td></tr>
+    <tr><td>Client</td><td><code>main</code></td><td>92-134</td><td>try-with-resources</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.*;
+
+public class PoolDemo {
+
+    // The expensive thing we want to reuse (think: a DB connection).
+    static final class Connection {
+        private static final AtomicInteger NEXT = new AtomicInteger(1);
+        final int id = NEXT.getAndIncrement();
+        String session = "";              // per-user state that MUST be reset on return
+        boolean broken = false;
+        Connection() { System.out.println("  [create] conn-" + id + " (slow handshake)"); }
+        String query(String sql) { return "conn-" + id + " ran '" + sql + "' as " + session; }
+    }
+
+    // A borrowed object. AutoCloseable so try-with-resources always gives it back.
+    static final class Lease&lt;T&gt; implements AutoCloseable {
+        private final BlockingPool&lt;T&gt; pool;
+        private final T obj;
+        final long borrowedAt = System.nanoTime();
+        final String borrower = Thread.currentThread().getName();
+        private boolean returned = false;
+        Lease(BlockingPool&lt;T&gt; pool, T obj) { this.pool = pool; this.obj = obj; }
+        T get() { if (returned) throw new IllegalStateException("used after release"); return obj; }
+        @Override public void close() { if (!returned) { returned = true; pool.release(this); } }
+    }
+
+    static final class BlockingPool&lt;T&gt; {
+        private final Supplier&lt;T&gt; factory;
+        private final Predicate&lt;T&gt; validate;     // still healthy?
+        private final Consumer&lt;T&gt; reset;         // wipe the previous user's state
+        private final int max;
+        private final BlockingQueue&lt;T&gt; idle;
+        private final Semaphore permits;         // bounds idle + in-use together
+        private final Set&lt;Lease&lt;T&gt;&gt; inUse = ConcurrentHashMap.newKeySet();
+        private final AtomicInteger created = new AtomicInteger();
+
+        BlockingPool(int max, Supplier&lt;T&gt; factory, Predicate&lt;T&gt; validate, Consumer&lt;T&gt; reset) {
+            this.max = max; this.factory = factory; this.validate = validate; this.reset = reset;
+            this.idle = new ArrayBlockingQueue&lt;&gt;(max);
+            this.permits = new Semaphore(max, true);   // fair: waiters served in order
+        }
+
+        Lease&lt;T&gt; acquire(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException {
+            if (!permits.tryAcquire(timeout, unit))
+                throw new TimeoutException("pool exhausted: " + max + " in use");
+            try {
+                T obj = idle.poll();
+                while (obj != null &amp;&amp; !validate.test(obj)) {        // validate on borrow
+                    System.out.println("  [evict] dropping a broken idle object");
+                    created.decrementAndGet();
+                    obj = idle.poll();
+                }
+                if (obj == null) { obj = factory.get(); created.incrementAndGet(); }  // lazy growth
+                Lease&lt;T&gt; lease = new Lease&lt;&gt;(this, obj);
+                inUse.add(lease);
+                return lease;
+            } catch (RuntimeException e) {
+                permits.release();                                // never lose a permit
+                throw e;
+            }
+        }
+
+        private void release(Lease&lt;T&gt; lease) {
+            if (!inUse.remove(lease)) throw new IllegalStateException("double release");
+            T obj = lease.obj;
+            try {
+                if (validate.test(obj)) { reset.accept(obj); idle.offer(obj); }   // &lt;-- the pattern: reset, reuse
+                else { created.decrementAndGet(); System.out.println("  [evict] broken on return, destroyed"); }
+            } catch (RuntimeException e) {                          // reset failed: destroy, do not reuse
+                created.decrementAndGet();
+                System.out.println("  [evict] reset failed, destroyed: " + e.getMessage());
+            } finally {
+                permits.release();                                  // release must never lose a permit
+            }
+        }
+
+        // Leak detection: anything held longer than the threshold is reported.
+        List&lt;String&gt; suspectedLeaks(long thresholdMillis) {
+            long now = System.nanoTime();
+            List&lt;String&gt; out = new ArrayList&lt;&gt;();
+            for (Lease&lt;T&gt; l : inUse)
+                if (TimeUnit.NANOSECONDS.toMillis(now - l.borrowedAt) &gt; thresholdMillis)
+                    out.add("held by " + l.borrower);
+            return out;
+        }
+        String stats() { return "created=" + created.get() + " idle=" + idle.size() + " inUse=" + inUse.size(); }
+    }
+
+    public static void main(String[] args) throws Exception {
+        BlockingPool&lt;Connection&gt; pool = new BlockingPool&lt;&gt;(2, Connection::new,
+                c -&gt; !c.broken, c -&gt; c.session = "");
+
+        System.out.println("1) Borrow, use, return (try-with-resources):");
+        try (Lease&lt;Connection&gt; l = pool.acquire(1, TimeUnit.SECONDS)) {
+            l.get().session = "asha";
+            System.out.println("  " + l.get().query("SELECT 1"));
+        }
+        try (Lease&lt;Connection&gt; l = pool.acquire(1, TimeUnit.SECONDS)) {
+            System.out.println("  reused conn-" + l.get().id + ", session reset to '" + l.get().session + "'");
+        }
+        System.out.println("  " + pool.stats());
+
+        System.out.println("2) Exhaustion: 2 held, a third caller times out:");
+        Lease&lt;Connection&gt; a = pool.acquire(1, TimeUnit.SECONDS);
+        Lease&lt;Connection&gt; b = pool.acquire(1, TimeUnit.SECONDS);
+        try { pool.acquire(200, TimeUnit.MILLISECONDS); }
+        catch (TimeoutException e) { System.out.println("  " + e.getMessage()); }
+
+        System.out.println("3) A waiter is unblocked when someone releases:");
+        ExecutorService ex = Executors.newSingleThreadExecutor(r -&gt; new Thread(r, "worker-1"));
+        Future&lt;String&gt; f = ex.submit(() -&gt; {
+            try (Lease&lt;Connection&gt; l = pool.acquire(2, TimeUnit.SECONDS)) { return "  worker-1 got conn-" + l.get().id; }
+        });
+        Thread.sleep(100);
+        a.close();
+        System.out.println(f.get());
+
+        System.out.println("4) Leak detection (b was never closed):");
+        Thread.sleep(60);
+        System.out.println("  suspected leaks &gt; 50 ms: " + pool.suspectedLeaks(50));
+
+        System.out.println("5) Broken object is evicted, pool heals:");
+        b.get().broken = true;
+        b.close();
+        try (Lease&lt;Connection&gt; l1 = pool.acquire(1, TimeUnit.SECONDS);
+             Lease&lt;Connection&gt; l2 = pool.acquire(1, TimeUnit.SECONDS)) {
+            System.out.println("  two at once: conn-" + l1.get().id + ", conn-" + l2.get().id);
+        }
+        System.out.println("  " + pool.stats());
+        ex.shutdown();
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out PoolDemo.java &amp;&amp; java -cp out PoolDemo
+1) Borrow, use, return (try-with-resources):
+  [create] conn-1 (slow handshake)
+  conn-1 ran 'SELECT 1' as asha
+  reused conn-1, session reset to ''
+  created=1 idle=1 inUse=0
+2) Exhaustion: 2 held, a third caller times out:
+  [create] conn-2 (slow handshake)
+  pool exhausted: 2 in use
+3) A waiter is unblocked when someone releases:
+  worker-1 got conn-1
+4) Leak detection (b was never closed):
+  suspected leaks &gt; 50 ms: [held by main]
+5) Broken object is evicted, pool heals:
+  [evict] broken on return, destroyed
+  [create] conn-3 (slow handshake)
+  two at once: conn-1, conn-3
+  created=2 idle=2 inUse=0</code></pre>
+      <p>Read the output top to bottom: one handshake served two requests (step 1); the third caller got a clear error instead of hanging forever (step 2); a waiter was woken by a release (step 3); the lease that was never closed was reported with the thread that took it (step 4); a broken connection was destroyed on return and quietly replaced (step 5). Reading like a reviewer: <code>release()</code> must never lose a permit, even when <code>reset</code> throws (a rollback on a dead connection, say). That is why its body sits in <code>try</code> / <code>catch</code> / <code>finally</code>: a failed reset destroys the object and still returns the permit, otherwise the pool shrinks by one for ever.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Object Pool in Python: bounded, blocking, context-manager leases, leak report."""
+import queue
+import threading
+import time
+from contextlib import contextmanager
+
+
+class Buffer:
+    created = 0
+
+    def __init__(self, size=4096):
+        Buffer.created += 1
+        self.id = Buffer.created
+        self.data = bytearray(size)       # the "expensive" allocation
+        self.used = 0
+        print(f"  [create] buf-{self.id}")
+
+    def reset(self):
+        self.used = 0                     # do not leak the last user's state
+
+
+class Pool:
+    def __init__(self, factory, max_size):
+        self._factory = factory
+        self._idle = queue.LifoQueue()    # LIFO: most recently used first (cache friendly)
+        self._slots = threading.BoundedSemaphore(max_size)
+        self._out = {}                    # id(obj) -&gt; (borrower, time)
+        self._lock = threading.Lock()
+
+    def acquire(self, timeout=None):
+        if not self._slots.acquire(timeout=timeout):
+            raise TimeoutError("pool exhausted")
+        try:
+            obj = self._idle.get_nowait()
+        except queue.Empty:
+            obj = self._factory()
+        with self._lock:
+            self._out[id(obj)] = (threading.current_thread().name, time.monotonic())
+        return obj
+
+    def release(self, obj):
+        with self._lock:
+            if self._out.pop(id(obj), None) is None:
+                raise RuntimeError("release of an object this pool did not lend")
+        try:
+            obj.reset()                   # may raise: then drop obj, never reuse it
+            self._idle.put(obj)
+        finally:
+            self._slots.release()         # release must never lose a slot
+
+    @contextmanager
+    def lease(self, timeout=None):
+        obj = self.acquire(timeout)
+        try:
+            yield obj
+        finally:                          # returned even if the body raises
+            self.release(obj)
+
+    def leaks(self, older_than):
+        now = time.monotonic()
+        with self._lock:
+            return [who for who, t in self._out.values() if now - t &gt; older_than]
+
+
+if __name__ == "__main__":
+    pool = Pool(Buffer, max_size=2)
+    for i in range(3):                    # three requests, one allocation
+        with pool.lease() as buf:
+            buf.used = 100 * (i + 1)
+            print(f"  request {i} used buf-{buf.id} ({buf.used} bytes)")
+
+    held = pool.acquire()                 # forgot to release: a leak
+    with pool.lease() as b2:
+        print(f"  second buffer is buf-{b2.id}")
+        try:
+            pool.acquire(timeout=0.1)
+        except TimeoutError as e:
+            print(f"  third caller: {e}")
+    time.sleep(0.05)
+    print(f"  leaks older than 20 ms: {pool.leaks(0.02)}")
+    print(f"  total buffers ever created: {Buffer.created}")</code></pre>
+<pre class="terminal"><code>$ python pool.py
+  [create] buf-1
+  request 0 used buf-1 (100 bytes)
+  request 1 used buf-1 (200 bytes)
+  request 2 used buf-1 (300 bytes)
+  [create] buf-2
+  second buffer is buf-2
+  third caller: pool exhausted
+  leaks older than 20 ms: ['MainThread']
+  total buffers ever created: 2</code></pre>
+      <p><code>with pool.lease() as buf:</code> is Python's version of try-with-resources: the <code>finally</code> inside the context manager returns the object even if the body raises. <code>LifoQueue</code> hands back the most recently used object first, which keeps it warm in CPU caches, so the rarely used ones stay at the bottom, where an idle-timeout evictor (not implemented here) could close them. <code>release()</code> puts the slot back in a <code>finally</code>, so a <code>reset()</code> that raises drops the object but never shrinks the pool.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<div class="callout note"><p><b>C++ you need here:</b> <code>std::unique_ptr&lt;T&gt;</code> = an owning pointer that frees its object when it goes out of scope (a <code>kfree()</code> that runs itself on every exit path). A <b>lambda</b> <code>[](args){ body }</code> = an anonymous function: a function pointer plus any variables it captured in the brackets, like a callback with its <code>void *ctx</code> built in. <code>std::function&lt;R(Args)&gt;</code> = a typed slot that can hold any callable (function pointer, lambda, functor). Ownership and RAII in more depth: <a href="{{BASE}}lld/lld-oop-from-c#kref">kref and shared ownership</a>.</p></div>
+<pre><code class="language-cpp">// Object Pool in C++14, kernel flavoured (single-threaded on purpose: the blocking,
+// multi-threaded pool is in the Java and Python tabs).
+//  1) SlabPool: all objects allocated once, a free list hands them out (like kmem_cache).
+//  2) ReservePool: normal allocation first, a pre-filled reserve when allocation fails
+//     (the idea behind mempool_t). An RAII handle returns objects automatically.
+// Build: g++ -std=c++14 -Wall pool.cpp -o pool
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;new&gt;
+#include &lt;vector&gt;
+
+struct Packet {                        // think: a small skb-like buffer
+    char data[256];
+    int len = 0;
+    void reset() { len = 0; }
+};
+
+// ---------- 1) slab-style pool with a free list ----------
+template &lt;typename T&gt;
+class SlabPool {
+    std::vector&lt;T&gt; slab_;              // one big allocation up front
+    std::vector&lt;T*&gt; free_;             // free list, used as a stack (LIFO = cache-hot)
+    std::size_t outstanding_ = 0;
+public:
+    struct Releaser {                  // custom deleter: "delete" means "give back"
+        SlabPool* pool;
+        void operator()(T* p) const { pool-&gt;release(p); }
+    };
+    using Handle = std::unique_ptr&lt;T, Releaser&gt;;
+
+    explicit SlabPool(std::size_t n) : slab_(n) {
+        for (auto&amp; o : slab_) free_.push_back(&amp;o);
+    }
+    Handle acquire() {                 // fail fast when empty (like GFP_ATOMIC)
+        if (free_.empty()) return Handle(nullptr, Releaser{this});
+        T* p = free_.back();
+        free_.pop_back();
+        ++outstanding_;
+        return Handle(p, Releaser{this});
+    }
+    std::size_t available() const { return free_.size(); }
+    std::size_t outstanding() const { return outstanding_; }
+    ~SlabPool() {                      // leak check at teardown, like kmem_cache_destroy
+        if (outstanding_) std::cout &lt;&lt; "BUG: pool destroyed with " &lt;&lt; outstanding_ &lt;&lt; " objects out\n";
+    }
+private:
+    void release(T* p) {
+        p-&gt;reset();                    // wipe state before the next user sees it
+        free_.push_back(p);
+        --outstanding_;
+    }
+};
+
+// ---------- 2) mempool-style reserve ----------
+static bool g_memory_pressure = false;            // simulate a failing allocator
+
+Packet* try_alloc() {
+    if (g_memory_pressure) return nullptr;
+    return new (std::nothrow) Packet();
+}
+
+class ReservePool {
+    std::vector&lt;Packet*&gt; reserve_;                 // pre-allocated, kept for emergencies
+    std::size_t min_nr_;
+public:
+    explicit ReservePool(std::size_t min_nr) : min_nr_(min_nr) {
+        for (std::size_t i = 0; i &lt; min_nr; ++i) reserve_.push_back(new Packet());
+    }
+    ~ReservePool() { for (auto* p : reserve_) delete p; }
+
+    Packet* alloc(const char* who) {
+        if (Packet* p = try_alloc()) { std::cout &lt;&lt; "  " &lt;&lt; who &lt;&lt; ": normal allocation\n"; return p; }
+        if (!reserve_.empty()) {                   // allocator failed: dip into the reserve
+            Packet* p = reserve_.back();
+            reserve_.pop_back();
+            std::cout &lt;&lt; "  " &lt;&lt; who &lt;&lt; ": from reserve (" &lt;&lt; reserve_.size() &lt;&lt; " left)\n";
+            return p;
+        }
+        std::cout &lt;&lt; "  " &lt;&lt; who &lt;&lt; ": reserve empty, must wait for a free\n";
+        return nullptr;                            // the kernel would sleep here instead
+    }
+    void free(Packet* p) {
+        p-&gt;reset();
+        if (reserve_.size() &lt; min_nr_) reserve_.push_back(p);   // refill the reserve first
+        else delete p;
+    }
+};
+
+int main() {
+    std::cout &lt;&lt; "SlabPool with 2 objects:\n";
+    {
+        SlabPool&lt;Packet&gt; pool(2);
+        auto a = pool.acquire();
+        auto b = pool.acquire();
+        a-&gt;len = 64;
+        std::cout &lt;&lt; "  two out, available=" &lt;&lt; pool.available() &lt;&lt; "\n";
+        auto c = pool.acquire();
+        std::cout &lt;&lt; "  third acquire " &lt;&lt; (c ? "succeeded" : "failed fast (pool empty)") &lt;&lt; "\n";
+        a.reset();                                 // unique_ptr::reset -&gt; Releaser -&gt; back to pool
+        auto d = pool.acquire();
+        std::cout &lt;&lt; "  after one release: got one, len reset to " &lt;&lt; d-&gt;len &lt;&lt; "\n";
+        b.reset();
+        d.reset();
+        Packet* leaked = pool.acquire().release(); // detach from RAII: a deliberate leak
+        (void)leaked;
+        std::cout &lt;&lt; "  outstanding=" &lt;&lt; pool.outstanding() &lt;&lt; " (the leaked one)\n";
+    }                                              // destructor reports what was never returned
+
+    std::cout &lt;&lt; "ReservePool with min_nr=2 (mempool idea):\n";
+    ReservePool rp(2);
+    Packet* p1 = rp.alloc("io-1");
+    g_memory_pressure = true;                      // allocator now fails
+    Packet* p2 = rp.alloc("io-2");
+    Packet* p3 = rp.alloc("io-3");
+    Packet* p4 = rp.alloc("io-4");
+    rp.free(p2);                                   // a completed I/O refills the reserve
+    Packet* p5 = rp.alloc("io-5");
+    rp.free(p1); rp.free(p3); rp.free(p5);
+    (void)p4;
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall pool.cpp -o pool &amp;&amp; ./pool
+SlabPool with 2 objects:
+  two out, available=0
+  third acquire failed fast (pool empty)
+  after one release: got one, len reset to 0
+  outstanding=1 (the leaked one)
+BUG: pool destroyed with 1 objects out
+ReservePool with min_nr=2 (mempool idea):
+  io-1: normal allocation
+  io-2: from reserve (1 left)
+  io-3: from reserve (0 left)
+  io-4: reserve empty, must wait for a free
+  io-5: from reserve (0 left)</code></pre>
+      <p><code>std::unique_ptr</code> with a custom deleter is the C++ idiom for "release when the scope ends": the deleter does not free memory, it pushes the pointer back on the free list. The destructor check is the same idea as the kernel complaining when you destroy a slab cache that still has objects allocated.</p>
+    </div>
+  </div>
+  <h3>The same idea in C</h3>
+  <p>Object Pool in plain C: the <code>kmem_cache_create</code> / <code>kmem_cache_alloc</code> / <code>kmem_cache_free</code> shape rebuilt in user space as a free list. Six allocations, two real objects. Illustrative, not real kernel code; it compiles and runs (<code>lld-code/lld-pat-object-pool/pool_sketch.c</code>).</p>
+<pre><code class="language-c">/* Object Pool in C: the kmem_cache shape, rebuilt in user space.
+   Illustrative, not real kernel code. In a module you would write:
+     cache = kmem_cache_create("my_flow", sizeof(struct flow), 0, SLAB_HWCACHE_ALIGN, NULL);
+     f = kmem_cache_alloc(cache, GFP_KERNEL);  ...  kmem_cache_free(cache, f);
+   Build: gcc -std=c99 -Wall pool_sketch.c -o pool_sketch */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+struct flow { struct flow *next_free; int sport, dport; };
+
+struct cache { struct flow *free_list; int created, in_use; };
+
+static struct flow *cache_alloc(struct cache *c)
+{
+    struct flow *f = c-&gt;free_list;
+    if (f) c-&gt;free_list = f-&gt;next_free;              /* reuse: pop the free list */
+    else { f = malloc(sizeof *f); c-&gt;created++; }    /* grow only when empty */
+    c-&gt;in_use++;
+    return f;
+}
+
+static void cache_free(struct cache *c, struct flow *f)
+{
+    f-&gt;sport = f-&gt;dport = 0;                         /* reset: no state leaks to the next user */
+    f-&gt;next_free = c-&gt;free_list;                     /* push back, do not free() */
+    c-&gt;free_list = f;
+    c-&gt;in_use--;
+}
+
+int main(void)
+{
+    struct cache c = { NULL, 0, 0 };
+    for (int round = 0; round &lt; 3; round++) {
+        struct flow *a = cache_alloc(&amp;c), *b = cache_alloc(&amp;c);
+        a-&gt;sport = 1000 + round; b-&gt;sport = 2000 + round;
+        cache_free(&amp;c, a); cache_free(&amp;c, b);
+    }
+    printf("6 allocations, %d objects ever created, %d in use\n", c.created, c.in_use);
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ gcc -std=c99 -Wall pool_sketch.c -o pool_sketch &amp;&amp; ./pool_sketch
+6 allocations, 2 objects ever created, 0 in use</code></pre>

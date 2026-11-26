@@ -1,0 +1,127 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Sync vs async - and the hybrid</h3>
+        <p>The Acko SDE-1 round was mostly about this. Lay out the options:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Style</th><th>How</th><th>Good when</th><th>Breaks when</th></tr></thead>
+            <tbody>
+              <tr><td>Fully synchronous</td><td>Upload request calls scan, OCR and vendor inline, returns the result</td><td>Tiny volume, fast steps, user must know now</td><td>Any step is slow or flaky: threads pile up, timeouts, vendor outage = upload outage</td></tr>
+              <tr><td>Fully asynchronous</td><td>Return 202 + id; queue + workers; notify later</td><td>Slow or unreliable steps, spikes, many steps</td><td>User genuinely needs an instant answer (then the UX feels slow)</td></tr>
+              <tr><td>Hybrid</td><td>Start async; the API waits up to ~3 s for completion and returns the result if done, else 202</td><td>Most jobs finish fast, a few do not</td><td>Adds complexity; still needs the async path</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Decision rule to say out loud: <b>if a step is slow, external or can fail, take it off the request path</b>. The 2-3 s vendor call is all three.</p>
+
+        <h3>2. Queues: visibility timeout, retries and the DLQ</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 240" role="img" aria-label="A message is received, hidden during the visibility timeout, deleted on success, or redelivered and finally moved to a dead-letter queue">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box queue" x="20" y="90" width="140" height="56"/>
+            <text class="label" x="90" y="113">Queue</text>
+            <text class="label small" x="90" y="133">msg doc_7Q</text>
+            <rect class="box k8s" x="240" y="90" width="150" height="56"/>
+            <text class="label" x="315" y="113">Worker</text>
+            <text class="label small" x="315" y="133">msg hidden 5 min</text>
+            <rect class="box ok" x="470" y="20" width="150" height="50"/>
+            <text class="label small" x="545" y="50">success: DeleteMessage</text>
+            <rect class="box warn" x="470" y="100" width="150" height="50"/>
+            <text class="label small" x="545" y="122">crash / timeout:</text>
+            <text class="label small" x="545" y="140">msg visible again</text>
+            <rect class="box fail" x="660" y="170" width="140" height="50"/>
+            <text class="label small" x="730" y="192">DLQ after</text>
+            <text class="label small" x="730" y="210">maxReceiveCount=5</text>
+            <path class="arrow" d="M160 118 L233 118"/>
+            <path class="arrow ok" d="M390 105 L463 50"/>
+            <path class="arrow bad" d="M390 125 L463 125"/>
+            <path class="arrow dashed" d="M470 140 C380 220 120 220 90 153"/>
+            <text class="label small" x="280" y="215">redelivered (receive count + 1)</text>
+            <path class="arrow bad" d="M620 140 L680 165"/>
+            <circle class="packet" r="6"><animateMotion dur="3.4s" repeatCount="indefinite" path="M160 118 L240 118 L390 125 L470 125 C380 220 120 220 90 153"/></circle>
+          </svg>
+          <figcaption>How SQS-style queues give at-least-once delivery: a received message is hidden, not removed. If the worker does not delete it before the visibility timeout ends, another worker gets it. After too many receives, a redrive policy moves it to the DLQ.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Visibility timeout</b> (SQS default 30 s, max 12 hours) must be longer than the slowest normal job. For a 3,000-page PDF OCR, either set it high or have the worker extend it periodically (a heartbeat) while it works.</li>
+          <li><b>At-least-once</b> means duplicates will happen (crash after the work but before delete). So every worker must be <b><a href="{{BASE}}interview/glossary#idempotent">idempotent</a></b> (next deep dive).</li>
+          <li><b>Retries with exponential backoff and jitter</b>: wait <code>random(0, min(cap, base x 2^attempt))</code> ("full jitter", recommended in the AWS Builders' Library) so 10,000 failed jobs do not retry in lockstep and hammer the recovering vendor.</li>
+          <li><b>Classify errors.</b> Retry transient ones (timeout, 429, 503). Do <b>not</b> retry permanent ones (corrupt PDF, password-protected file, vendor says "invalid ID") - mark REJECTED at once.</li>
+          <li><b>DLQ</b> after <code>maxReceiveCount</code> (say 5). Alarm on DLQ depth &gt; 0. Provide a "redrive" tool to replay after a fix. SQS keeps messages 4 days by default, up to 14 days - set the DLQ to 14 so you have time to react.</li>
+          <li><b>Pointers, not payloads.</b> The message is <code>{document_id, step}</code>. SQS's max message is 1 MiB; files are megabytes.</li>
+        </ul>
+
+        <h3>3. Idempotency: duplicate jobs, duplicate uploads, duplicate vendor calls</h3>
+        <ol class="steps">
+          <li><strong>Duplicate API calls.</strong> The client sends an <a href="{{BASE}}interview/glossary#idempotency-key">Idempotency-Key</a>; the server stores key -&gt; response and replays it. Stripe's version is a good model: keys up to 255 characters, kept at least 24 hours, and a reused key with different parameters is an error.</li>
+          <li><strong>Duplicate queue messages.</strong> Each step is a conditional transition: <code>UPDATE documents SET status='EXTRACTING', version=version+1 WHERE id=? AND status='UPLOADED'</code>. If 0 rows change, another worker already did it - acknowledge and stop.</li>
+          <li><strong>Duplicate side effects.</strong> Write results keyed by <code>(document_id, step)</code> so a rerun overwrites the same row. Notifications carry an <code>event_id</code>; the notifier and webhook receivers dedupe on it.</li>
+          <li><strong>Duplicate vendor calls (they cost money).</strong> Cache results by <code>(purpose, sha256)</code>; pass <code>document_id</code> as the vendor's idempotency/reference id if it supports one; record "call started" before calling so a restarted worker checks the vendor's status first.</li>
+          <li><strong>Duplicate uploads by the user.</strong> Same sha256 + same owner + same purpose within a window -&gt; return the existing document.</li>
+        </ol>
+        <div class="callout warn"><p>"Exactly-once processing" is not something a queue gives you. Say: <b>at-least-once delivery + idempotent consumers = exactly-once effects</b>. Interviewers listen for this sentence.</p></div>
+
+        <h3>4. Taming the slow third-party validator</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 230" role="img" aria-label="Validator workers pass through a token bucket rate limiter and a circuit breaker before calling the vendor">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box queue" x="20" y="85" width="130" height="56"/>
+            <text class="label" x="85" y="108">validate q</text>
+            <text class="label small" x="85" y="128">backlog 144K</text>
+            <rect class="box k8s" x="190" y="85" width="140" height="56"/>
+            <text class="label" x="260" y="108">workers</text>
+            <text class="label small" x="260" y="128">async I/O, 250 slots</text>
+            <rect class="box cache" x="370" y="85" width="130" height="56"/>
+            <text class="label" x="435" y="108">token bucket</text>
+            <text class="label small" x="435" y="128">60 calls/s</text>
+            <rect class="box svc" x="540" y="85" width="120" height="56"/>
+            <text class="label" x="600" y="108">breaker</text>
+            <text class="label small" x="600" y="128">open on 50% errs</text>
+            <rect class="box warn" x="700" y="85" width="105" height="56"/>
+            <text class="label" x="752" y="108">vendor</text>
+            <text class="label small" x="752" y="128">2-3 s</text>
+            <path class="arrow" d="M150 113 L183 113"/>
+            <path class="arrow" d="M330 113 L363 113"/>
+            <path class="arrow" d="M500 113 L533 113"/>
+            <path class="arrow" d="M660 113 L693 113"/>
+            <text class="label small" x="260" y="180">timeout 5 s per call</text>
+            <text class="label small" x="600" y="180">open: fail fast, job back to queue</text>
+            <text class="label small" x="435" y="210">in-flight = 60/s x 2.5 s = 150</text>
+            <circle class="packet alt" r="6"><animateMotion dur="2.8s" repeatCount="indefinite" path="M150 113 L700 113"/></circle>
+          </svg>
+          <figcaption>The vendor is the bottleneck you do not control. A <a href="{{BASE}}interview/glossary#token-bucket">token bucket</a> keeps you inside the contract, a <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a> stops you hammering it while it is down, and the queue holds the rest.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Concurrency from Little's law</b>: allowed rate 60/s x 2.5 s = 150 calls in flight. Size the worker pool to that, not to the queue depth.</li>
+          <li><b>Async I/O</b> (Netty, asyncio, Go routines): one pod holds hundreds of waiting HTTP calls; threads are not burned on sleeping.</li>
+          <li><b><a href="{{BASE}}interview/glossary#bulkhead">Bulkhead</a></b>: the validator has its own queue and pool, so a vendor outage does not stall virus scanning and OCR for other documents.</li>
+          <li><b>Breaker open</b>: stop calling; put jobs back with a delay (SQS message timers go up to 15 minutes); show users "verification delayed" instead of "failed".</li>
+          <li><b>Fallback vendor</b> for critical flows (KYC), with the same idempotency rules.</li>
+        </ul>
+
+        <h3>5. Telling the user: tracking link and event-driven notifications</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Who</th><th>Channel</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>User on the tracking page</td><td>Polling every 2-5 s, or <a href="{{BASE}}interview/glossary#sse">SSE</a></td><td>Polling is simplest and cacheable; SSE gives instant updates one-way.</td></tr>
+              <tr><td>User who left</td><td>Push / email / SMS</td><td>From the notifier consuming doc-events; see <a href="{{BASE}}hld/d03">Notification System</a>.</td></tr>
+              <tr><td>Partner business</td><td>Signed webhook</td><td>HMAC signature, event_id, retries with backoff, their endpoint must dedupe.</td></tr>
+              <tr><td>Other internal services</td><td>Subscribe to doc-events</td><td>Loan service starts underwriting when KYC is VERIFIED - no coupling to the document service.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The event must come from the same transaction as the status change. Writing the DB and then publishing to Kafka separately is a <a href="{{BASE}}interview/glossary#dual-write">dual write</a>: a crash in between leaves "VERIFIED" in the DB but no email. The <a href="{{BASE}}interview/glossary#outbox">outbox pattern</a> (or <a href="{{BASE}}interview/glossary#cdc">CDC</a>) fixes it.</p>
+
+        <h3>6. Scaling the workers</h3>
+        <ul>
+          <li><b>Scale on queue depth / age</b>, not CPU: the right signal is "messages waiting" or "age of oldest message". In Kubernetes, <a href="{{BASE}}interview/glossary#keda">KEDA</a> has an SQS and a Kafka scaler for exactly this.</li>
+          <li><b>One queue per stage</b> (scan, extract, validate). Each stage scales independently: OCR is CPU-heavy and scales wide; validation is I/O-bound and capped by the vendor quota.</li>
+          <li><b>Priority</b>: a separate high-priority queue for paying or time-critical customers, or weighted polling.</li>
+          <li><b>Spot / preemptible nodes</b> for OCR are fine because jobs are idempotent and requeued on loss.</li>
+        </ul>
+
+        <h3>7. Optional: OCR and LLM extraction</h3>
+        <p>Managed OCR has real limits you should quote. Amazon Textract's synchronous API takes one page, up to 10 MB; the asynchronous API takes PDFs and TIFFs up to 500 MB and 3,000 pages and notifies completion through SNS - itself an async job pattern. For LLM extraction: send the OCR text (or the image) with a strict JSON schema, get fields plus a confidence, validate with rules (PAN format, totals add up), and send low-confidence fields to <b>human review</b> (NEEDS_REVIEW). Treat document text as untrusted input: it must never be able to change the instructions given to the model.</p>
+      

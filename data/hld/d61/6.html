@@ -1,0 +1,142 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Fast play start: encoding, chunks, CDN and the client cache</h3>
+        <p><b>Encode once, many ways.</b> When a label delivers a master file, an ingestion pipeline transcodes it to every format and bitrate we support (for example Ogg Vorbis 96/160/320, AAC 128/256 for some devices, a 24 kbps low-data version), normalises loudness, encrypts each file and writes them to S3. This is a batch job on a worker fleet, triggered by a queue; see <a href="{{BASE}}hld/p07">Long-running Tasks</a>. Audio is immutable after that, which is why caching it is easy: a cached chunk is never stale.</p>
+        <p><b>Chunks, not whole files.</b> The player asks for byte ranges (HTTP <code>Range</code> requests) or for numbered segments listed in a manifest, as HLS and DASH do. The first request is small so the first sound comes quickly; the player then fills a buffer of several seconds ahead. Music is much lighter than video (160 kbps vs several Mbps), so a 5 MB song can be fully downloaded in a few seconds on a good network; chunks matter most for fast start, seeking, and weak mobile networks.</p>
+        <p><b>Adaptive bitrate.</b> The player measures download speed and buffer level. If the buffer drains, it fetches the next chunks at a lower bitrate; when the network recovers, it steps up. Users can also pin "very high" quality on Wi-Fi.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Adaptive bitrate: chunks switch quality as bandwidth changes">
+            <text class="label small" x="60" y="40">320</text>
+            <text class="label small" x="60" y="100">160</text>
+            <text class="label small" x="60" y="160">96</text>
+            <rect class="box db" x="100" y="80" width="70" height="36"/>
+            <rect class="box ok" x="180" y="20" width="70" height="36"/>
+            <rect class="box ok" x="260" y="20" width="70" height="36"/>
+            <rect class="box db" x="340" y="80" width="70" height="36"/>
+            <rect class="box warn" x="420" y="140" width="70" height="36"/>
+            <rect class="box warn" x="500" y="140" width="70" height="36"/>
+            <rect class="box db" x="580" y="80" width="70" height="36"/>
+            <rect class="box ok" x="660" y="20" width="70" height="36"/>
+            <text class="label small" x="135" y="103">c1</text>
+            <text class="label small" x="215" y="43">c2</text>
+            <text class="label small" x="295" y="43">c3</text>
+            <text class="label small" x="375" y="103">c4</text>
+            <text class="label small" x="455" y="163">c5</text>
+            <text class="label small" x="535" y="163">c6</text>
+            <text class="label small" x="615" y="103">c7</text>
+            <text class="label small" x="695" y="43">c8</text>
+            <text class="label small" x="135" y="210">fast start</text>
+            <text class="label small" x="495" y="210">train enters tunnel</text>
+            <text class="label small" x="695" y="210">back on Wi-Fi</text>
+          </svg>
+          <figcaption>Chunk by chunk the player picks a bitrate (kbps) from measured bandwidth and buffer level. The song never stops; only quality changes.</figcaption>
+        </figure>
+        <p><b>The CDN and the origin.</b> Spotify's engineering blog says audio streaming runs on Akamai and AWS as "business-critical" content, with Fastly used for other content such as images. A multi-CDN setup gives you failover if one provider has a bad day. Popular songs follow a power law: a small share of the catalogue gets most plays, so edge hit rates for audio are high; the long tail is fetched from S3 on a miss and cached. For a megastar's new album at midnight, <b>pre-warm</b> the CDN by pushing the files to edges before release.</p>
+        <p><b>The client cache.</b> The app keeps recently played and downloaded songs on disk (encrypted). Spotify's 2010 measurements found about 55% of played data came from the local cache. Repeat listening is very common in music, unlike video, so a disk cache of a few GB removes a large share of network traffic. The same paper measured a median play start of 265 ms (75th percentile 515 ms, 90th 1,047 ms), cached tracks included.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Prefetching the next track is the same trick as CPU prefetching or TCP slow-start avoidance: start the next transfer before you need it so its latency is hidden behind the current song. Adaptive bitrate is congestion control at the application layer: measure throughput, back off when the buffer (your queue) drains.</p>
+        </div>
+
+        <h3>2. Search under 200 ms: how Elasticsearch actually does it</h3>
+        <p>Two Flipkart candidates said they were grilled on Elasticsearch; one could not explain how search would work and did not move on. So go one level deeper than "use Elasticsearch".</p>
+        <ol class="steps">
+          <li><strong>Indexing</strong> Each track, artist and release becomes a document. The text is <b>analysed</b>: split into tokens, lower-cased, accents folded (so "beyonce" finds "Beyonc&eacute;"). For prefix matching while typing, an <b>edge n-gram</b> analyser also stores "sh", "sha", "shap", "shape". Each token points to the list of documents containing it: the inverted index.</li>
+          <li><strong>Fuzzy matching</strong> A fuzzy query allows a small <b>Levenshtein edit distance</b> (insert, delete, substitute, or swap two adjacent letters). With <code>fuzziness: AUTO</code> Elasticsearch allows 0 edits for terms of 1-2 characters, 1 edit for 3-5 characters, and 2 edits for longer terms. It expands the term into at most <code>max_expansions</code> (default 50) similar terms, so setting <code>prefix_length: 1</code> (first letter must match) keeps it fast.</li>
+          <li><strong>Ranking</strong> Text relevance (BM25) alone ranks an obscure cover above the hit. Combine it with a <b>popularity</b> signal (recent play counts) using a <code>function_score</code>, and boost exact title matches. Personal signals (artists you play) can re-rank the top 50 in the search service.</li>
+          <li><strong>Sharding</strong> 100M documents of about 1 KB is about 100 GB: a handful of primary shards with replicas. Replicas carry read QPS: at 35K QPS peak, add replicas until each node is comfortably under its measured capacity.</li>
+          <li><strong>Keeping it fresh</strong> The catalogue database is the source of truth. Changes flow out by <a href="{{BASE}}interview/glossary#cdc">change data capture</a> to Kafka, and an indexer updates Elasticsearch within seconds. Popularity is re-indexed in a periodic batch. Search is a derived view: if it is a little stale, nothing is lost.</li>
+          <li><strong>Latency tricks</strong> Cache results for the top few thousand queries (they are a large share of traffic), debounce keystrokes, return only ids and titles (hydrate cover art from the CDN), and set a timeout so one slow shard returns partial results instead of a late page.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Search pipeline from catalogue DB through CDC and Kafka to Elasticsearch and query path">
+            <rect class="box db" x="20" y="40" width="140" height="56"/>
+            <text class="label" x="90" y="64">Catalogue DB</text>
+            <text class="label small" x="90" y="84">source of truth</text>
+            <rect class="box kafka" x="210" y="40" width="130" height="56"/>
+            <text class="label" x="275" y="64">CDC to Kafka</text>
+            <text class="label small" x="275" y="84">changes</text>
+            <rect class="box svc" x="390" y="40" width="130" height="56"/>
+            <text class="label" x="455" y="64">Indexer</text>
+            <text class="label small" x="455" y="84">analyse, n-grams</text>
+            <rect class="box db" x="580" y="40" width="200" height="56"/>
+            <text class="label" x="680" y="64">Elasticsearch</text>
+            <text class="label small" x="680" y="84">shards + replicas</text>
+            <path class="arrow" d="M160 68 L206 68"/>
+            <path class="arrow" d="M340 68 L386 68"/>
+            <path class="arrow" d="M520 68 L576 68"/>
+            <rect class="box client" x="20" y="150" width="140" height="56"/>
+            <text class="label" x="90" y="183">"shap of yu"</text>
+            <rect class="box svc" x="300" y="150" width="200" height="56"/>
+            <text class="label" x="400" y="174">Search svc</text>
+            <text class="label small" x="400" y="194">cache, fuzzy, popularity</text>
+            <path class="arrow" d="M160 178 L296 178"/>
+            <path class="arrow both" d="M500 178 L680 100"/>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M160 178 L300 178 L500 178 L680 100"/></circle>
+          </svg>
+          <figcaption>Write path (top): the database changes, CDC carries the change, the indexer updates Elasticsearch. Read path (bottom): cache, then a fuzzy, popularity-boosted query.</figcaption>
+        </figure>
+        <pre><code class="language-json">{
+  "query": {
+    "function_score": {
+      "query": { "multi_match": {
+        "query": "shap of yu",
+        "fields": ["title^3", "artist_names^2", "release_title"],
+        "fuzziness": "AUTO", "prefix_length": 1
+      }},
+      "field_value_factor": { "field": "popularity_30d", "modifier": "log1p" },
+      "boost_mode": "multiply"
+    }
+  },
+  "size": 20
+}</code></pre>
+
+        <h3>3. Playlists: order, reshuffle, share</h3>
+        <p>Apple asked for exactly this service. The traps are <b>ordering</b> and <b>concurrent edits</b>.</p>
+        <ul>
+          <li><b>Order without renumbering.</b> If each item stores an integer position, moving song 900 to the top rewrites 900 rows. Instead store a sortable <b>rank</b> between neighbours: a fractional number or a string key (often called a LexoRank-style key; Jira uses this idea for ranking issues). Moving an item writes one row: its new rank sits between the two items it lands between. When ranks get too long, rebalance the playlist in the background.</li>
+          <li><b>Shuffle is a play order, not an edit.</b> "Shuffle play" generates a random permutation on the client (or the server, seeded) and does not change the saved order. "Reshuffle the playlist" (persist a new order) is a bulk rewrite of ranks in one transaction; fine, because playlists are small (thousands of items at most, and apps cap the size), so a full rewrite is bounded.</li>
+          <li><b>Concurrent edits.</b> Every playlist has a <code>version</code>. Clients send operations ("insert t_9 after item_41", "delete item_77"), not the whole list. The server applies operations in order inside a transaction, increments the version, and publishes a change event. Because operations reference item ids rather than positions, two friends adding songs at the same moment both succeed. Only a true conflict (moving an item someone just deleted) is rejected, and the client refreshes.</li>
+          <li><b>Sharing.</b> A <code>playlist_member(playlist_id, user_id, role)</code> table gives viewer or editor rights. A public link is a signed token. Followers get updates through the change event: push if they have the playlist open, otherwise they fetch on next open using the version number (send only changes since version N).</li>
+          <li><b>Big public playlists.</b> A chart playlist followed by 30M users is read-heavy and edited by one curator: cache the whole list at the CDN or in Redis keyed by version.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Fractional ranks: moving an item writes one row">
+            <rect class="box svc" x="40" y="40" width="130" height="50"/>
+            <text class="label" x="105" y="70">A rank 1.0</text>
+            <rect class="box svc" x="200" y="40" width="130" height="50"/>
+            <text class="label" x="265" y="70">B rank 2.0</text>
+            <rect class="box svc" x="360" y="40" width="130" height="50"/>
+            <text class="label" x="425" y="70">C rank 3.0</text>
+            <rect class="box svc" x="520" y="40" width="130" height="50"/>
+            <text class="label" x="585" y="70">D rank 4.0</text>
+            <rect class="box ok" x="120" y="130" width="160" height="50"/>
+            <text class="label" x="200" y="160">D now rank 1.5</text>
+            <path class="arrow" d="M585 90 C 560 150 360 160 284 155"/>
+            <text class="label small" x="470" y="190">move D between A and B: one UPDATE</text>
+          </svg>
+          <figcaption>Ranks leave gaps, so a move or insert touches only the moved row. Order is <code>ORDER BY rank</code>.</figcaption>
+        </figure>
+
+        <h3>4. Listening history, play counts and consistency</h3>
+        <p>Plays are a firehose (about 140K per second at peak in our estimate). The client batches events and sends them every few seconds; if offline, it stores them and sends later, which is also how offline plays are counted. The events API writes to Kafka keyed by <code>user_id</code> (keeps each user's history in order) and returns at once.</p>
+        <ul>
+          <li><b>Recent history</b>: a consumer writes to Cassandra, partition <code>(user_id, month)</code>, newest first. "Recently played" is one partition read.</li>
+          <li><b>Play counts and likes</b>: a stream job counts per track per minute and adds to counters; the number shown on an artist page may lag by minutes, which is fine. Use <a href="{{BASE}}hld/d39">distributed counter</a> techniques for hot tracks (shard the counter).</li>
+          <li><b>Royalties</b>: money depends on plays, so the authoritative count is a daily batch job over the complete event log in the data lake, with de-duplication by <code>playId</code>. "Eventual" here means late but complete, never lossy.</li>
+          <li><b>Recommendations</b>: the same log feeds feature pipelines and models (Discover Weekly style). Spotify's event delivery reached about 8M events per second at peak in 2019, moving from Kafka to Google Cloud Pub/Sub to make it happen.</li>
+        </ul>
+        <div class="callout interview"><p>The Amazon report asked where you would pick eventual vs strong consistency. Give a rule, then examples: <b>"Strong where a wrong answer costs money or access: payments, subscription status, login, licensing. Eventual where a slightly stale answer is harmless: play counts, likes, follower counts, search index, playlist followers' copies. Read-your-writes for the user's own edits: after I add a song to my playlist, I must see it."</b></p></div>
+
+        <h3>5. "Alexa, play Believer": the voice flow</h3>
+        <p>An Amazon SDE-2 phone screen for an Alexa team asked how audio plays when you ask Alexa for music. Walk it as a pipeline:</p>
+        <ol class="steps">
+          <li><strong>Wake word on device</strong> The Echo detects "Alexa" locally and starts streaming the voice clip to the cloud.</li>
+          <li><strong>Speech to intent</strong> Speech recognition turns audio into text; language understanding turns text into an intent like <code>PlayMusic(song="Believer", artist="Imagine Dragons")</code>.</li>
+          <li><strong>Resolve the entity</strong> The music skill calls the same search service (with spoken-form tweaks: numbers, homophones) to get a <code>track_id</code>, using the user's history to break ties ("play my workout playlist").</li>
+          <li><strong>Entitlement and URL</strong> The playback service checks the subscription and returns a signed stream URL, exactly as for the phone app.</li>
+          <li><strong>Directive to the device</strong> The cloud sends the device a play directive with the stream URL (the Alexa Skills Kit has an <code>AudioPlayer.Play</code> directive for this), and the device streams from the CDN. Play events flow back just like the app's.</li>
+        </ol>
+        <p>The lesson: voice is only a different front door. Search, entitlement and the CDN path are shared.</p>
+      

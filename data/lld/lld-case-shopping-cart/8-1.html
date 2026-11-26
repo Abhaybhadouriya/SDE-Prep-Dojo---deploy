@@ -1,0 +1,398 @@
+<h3>C++14</h3>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>All 4 checks passed</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Shopping cart with coupons - C++14 version.
+// Specification (Rule), Strategy (DiscountStrategy), Decorator (PriceCalculator layers).
+// The MinGW 6.3 toolchain here has no std::thread / std::mutex, so this version is single-threaded;
+// the Java and Python tabs show the locking.
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: one facade lock, a real std::recursive_mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). Recursive because public methods call each other,
+// just as Java's synchronized is re-entrant. MinGW.org g++ 6.3 (win32 thread model) has no std::mutex and
+// -pthread fails to link there, so the default build uses a no-op Mutex with the same lock()/unlock():
+// the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::recursive_mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+typedef long long Paise;
+
+std::string fmt(Paise p) {
+    std::string cents = std::to_string(p % 100);       // MinGW printf has no %lld
+    return std::to_string(p / 100) + "." + (cents.size() &lt; 2 ? "0" : "") + cents;
+}
+Paise rupees(long long r) { return r * 100; }
+
+struct ShopError : std::runtime_error {
+    explicit ShopError(const std::string&amp; m) : std::runtime_error(m) {}
+};
+
+enum class Category { ELECTRONICS, FASHION, GROCERY };
+const char* name(Category c) {
+    switch (c) {
+        case Category::ELECTRONICS: return "ELECTRONICS";
+        case Category::FASHION: return "FASHION";
+        default: return "GROCERY";
+    }
+}
+
+struct Product {
+    std::string id, name;
+    Category category;
+    Paise price;
+};
+
+struct CartLine {
+    const Product* product;
+    int qty;
+    Paise total() const { return product-&gt;price * qty; }
+};
+
+// Dates as yyyymmdd integers keep the demo free of &lt;ctime&gt; quirks.
+struct PricingContext {
+    std::string user;
+    int today;
+    int pastOrders;
+    std::map&lt;std::string, int&gt; couponUses;
+    std::vector&lt;CartLine&gt; lines;
+    Paise subtotal() const {
+        Paise s = 0;
+        for (const auto&amp; l : lines) s += l.total();
+        return s;
+    }
+    Paise subtotalOf(Category c) const {
+        Paise s = 0;
+        for (const auto&amp; l : lines) if (l.product-&gt;category == c) s += l.total();
+        return s;
+    }
+};
+
+// ---------- Specification: "" = satisfied, otherwise the reason ----------
+struct Rule {
+    std::function&lt;std::string(const PricingContext&amp;)&gt; violation;
+    Rule operator&amp;&amp;(const Rule&amp; other) const {
+        auto a = violation, b = other.violation;
+        return Rule{[a, b](const PricingContext&amp; c) { std::string v = a(c); return v.empty() ? b(c) : v; }};
+    }
+};
+Rule minSubtotal(Paise p) {
+    return Rule{[p](const PricingContext&amp; c) {
+        return c.subtotal() &gt;= p ? std::string() : "needs a cart value of at least " + fmt(p);
+    }};
+}
+Rule hasCategory(Category cat) {
+    return Rule{[cat](const PricingContext&amp; c) {
+        return c.subtotalOf(cat) &gt; 0 ? std::string() : std::string("needs a ") + name(cat) + " item in the cart";
+    }};
+}
+Rule firstOrderOnly() {
+    return Rule{[](const PricingContext&amp; c) { return c.pastOrders == 0 ? std::string() : std::string("is for the first order only"); }};
+}
+Rule validUntil(int yyyymmdd) {
+    return Rule{[yyyymmdd](const PricingContext&amp; c) {
+        if (c.today &lt;= yyyymmdd) return std::string();
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "expired on %04d-%02d-%02d", yyyymmdd / 10000, yyyymmdd / 100 % 100, yyyymmdd % 100);
+        return std::string(buf);
+    }};
+}
+
+// ---------- Strategy ----------
+struct DiscountStrategy {
+    virtual ~DiscountStrategy() {}
+    virtual Paise discount(const PricingContext&amp; ctx, Paise running) const = 0;
+};
+struct FlatOff : DiscountStrategy {
+    Paise amount;
+    explicit FlatOff(Paise a) : amount(a) {}
+    Paise discount(const PricingContext&amp;, Paise running) const override { return std::min(amount, running); }
+};
+struct PercentOff : DiscountStrategy {
+    long long bp; Paise cap;
+    PercentOff(long long b, Paise c) : bp(b), cap(c) {}
+    Paise discount(const PricingContext&amp;, Paise running) const override {
+        Paise d = running * bp / 10000;
+        return cap &gt; 0 ? std::min(d, cap) : d;
+    }
+};
+struct CategoryPercentOff : DiscountStrategy {
+    Category cat; long long bp;
+    CategoryPercentOff(Category c, long long b) : cat(c), bp(b) {}
+    Paise discount(const PricingContext&amp; ctx, Paise running) const override {
+        return std::min(ctx.subtotalOf(cat) * bp / 10000, running);
+    }
+};
+
+struct Coupon {
+    std::string code;
+    Rule rule;
+    std::shared_ptr&lt;DiscountStrategy&gt; strategy;
+    int priority;
+    bool stackable;
+    int maxUsesPerUser;
+    std::string whyNot(const PricingContext&amp; ctx) const {
+        auto it = ctx.couponUses.find(code);
+        if (it != ctx.couponUses.end() &amp;&amp; it-&gt;second &gt;= maxUsesPerUser) return "already used";
+        return rule.violation(ctx);
+    }
+};
+
+struct Bill {
+    Paise subtotal = 0;
+    std::vector&lt;std::pair&lt;std::string, Paise&gt;&gt; discounts;
+    std::vector&lt;std::string&gt; notes;
+    Paise total() const {
+        Paise t = subtotal;
+        for (const auto&amp; d : discounts) t -= d.second;
+        return t;
+    }
+};
+
+// ---------- Decorator ----------
+struct PriceCalculator {
+    virtual ~PriceCalculator() {}
+    virtual Bill calculate(const PricingContext&amp; ctx) const = 0;
+};
+struct BasePrice : PriceCalculator {
+    Bill calculate(const PricingContext&amp; ctx) const override { Bill b; b.subtotal = ctx.subtotal(); return b; }
+};
+struct CouponLayer : PriceCalculator {
+    std::unique_ptr&lt;PriceCalculator&gt; inner;
+    const Coupon* coupon;
+    CouponLayer(std::unique_ptr&lt;PriceCalculator&gt; in, const Coupon* c) : inner(std::move(in)), coupon(c) {}
+    Bill calculate(const PricingContext&amp; ctx) const override {
+        Bill b = inner-&gt;calculate(ctx);
+        std::string why = coupon-&gt;whyNot(ctx);
+        if (!why.empty()) { b.notes.push_back(coupon-&gt;code + " not applied: " + why); return b; }
+        Paise d = std::min(coupon-&gt;strategy-&gt;discount(ctx, b.total()), b.total());
+        if (d &gt; 0) b.discounts.push_back(std::make_pair(coupon-&gt;code, d));
+        else b.notes.push_back(coupon-&gt;code + " gives nothing on this cart");
+        return b;
+    }
+};
+
+struct Cart {
+    std::vector&lt;CartLine&gt; lines;       // keeps insertion order
+    std::vector&lt;std::string&gt; coupons;
+    int qtyOf(const std::string&amp; pid) const {
+        for (const auto&amp; l : lines) if (l.product-&gt;id == pid) return l.qty;
+        return 0;
+    }
+    void setQty(const Product* p, int qty) {
+        if (qty &lt; 0) throw ShopError("quantity cannot be negative");
+        for (auto it = lines.begin(); it != lines.end(); ++it)
+            if (it-&gt;product-&gt;id == p-&gt;id) {
+                if (qty == 0) lines.erase(it); else it-&gt;qty = qty;
+                return;
+            }
+        if (qty &gt; 0) lines.push_back(CartLine{p, qty});
+    }
+};
+
+struct Order { std::string id; Bill bill; };
+
+class ShopService {
+    mutable Mutex mu_;   // the facade lock: every public call holds it
+    std::map&lt;std::string, Product&gt; catalog;
+    std::map&lt;std::string, int&gt; stock;
+    std::map&lt;std::string, Coupon&gt; coupons;
+    std::map&lt;std::string, Cart&gt; carts;
+    std::map&lt;std::string, std::map&lt;std::string, int&gt;&gt; uses;
+    std::map&lt;std::string, int&gt; orders;
+    int seq = 0;
+
+public:
+    int today;
+    explicit ShopService(int t) : today(t) {}
+
+    void addProduct(const Product&amp; p, int qty) { LockGuard g(mu_); catalog[p.id] = p; stock[p.id] += qty; }
+    void addCoupon(const Coupon&amp; c) { LockGuard g(mu_); coupons[c.code] = c; }
+    int stockOf(const std::string&amp; pid) const { LockGuard g(mu_); auto it = stock.find(pid); return it == stock.end() ? 0 : it-&gt;second; }
+
+    const Product* product(const std::string&amp; id) const { LockGuard g(mu_);
+        auto it = catalog.find(id);
+        if (it == catalog.end()) throw ShopError("unknown product " + id);
+        return &amp;it-&gt;second;
+    }
+    void addItem(const std::string&amp; u, const std::string&amp; pid, int qty) { LockGuard g(mu_);
+        if (qty &lt;= 0) throw ShopError("quantity must be positive");
+        const Product* p = product(pid);
+        Cart&amp; c = carts[u];
+        int want = c.qtyOf(pid) + qty;
+        if (want &gt; stockOf(pid)) throw ShopError("only " + std::to_string(stockOf(pid)) + " " + p-&gt;name + " left");
+        c.setQty(p, want);
+    }
+    void removeItem(const std::string&amp; u, const std::string&amp; pid) { LockGuard g(mu_); carts[u].setQty(product(pid), 0); }
+
+    PricingContext context(const std::string&amp; u) { LockGuard g(mu_);
+        return PricingContext{u, today, orders[u], uses[u], carts[u].lines};
+    }
+    void applyCoupon(const std::string&amp; u, const std::string&amp; code) { LockGuard g(mu_);
+        auto it = coupons.find(code);
+        if (it == coupons.end()) throw ShopError("unknown coupon " + code);
+        const Coupon&amp; k = it-&gt;second;
+        Cart&amp; c = carts[u];
+        if (std::find(c.coupons.begin(), c.coupons.end(), code) != c.coupons.end()) throw ShopError(code + " is already applied");
+        bool exclusiveThere = false;
+        std::string list;
+        for (const auto&amp; x : c.coupons) {
+            if (!coupons[x].stackable) exclusiveThere = true;
+            list += (list.empty() ? "" : ",") + x;
+        }
+        if (!c.coupons.empty() &amp;&amp; (!k.stackable || exclusiveThere)) throw ShopError(code + " cannot be combined with " + list);
+        std::string why = k.whyNot(context(u));
+        if (!why.empty()) throw ShopError(code + " " + why);
+        c.coupons.push_back(code);
+    }
+    Bill price(const std::string&amp; u) { LockGuard g(mu_);
+        std::vector&lt;const Coupon*&gt; layers;
+        for (const auto&amp; x : carts[u].coupons) layers.push_back(&amp;coupons[x]);
+        std::sort(layers.begin(), layers.end(), [](const Coupon* a, const Coupon* b) {
+            return a-&gt;priority != b-&gt;priority ? a-&gt;priority &lt; b-&gt;priority : a-&gt;code &lt; b-&gt;code;
+        });
+        std::unique_ptr&lt;PriceCalculator&gt; calc(new BasePrice());
+        for (const Coupon* k : layers) calc.reset(new CouponLayer(std::move(calc), k));
+        return calc-&gt;calculate(context(u));
+    }
+    Order checkout(const std::string&amp; u) { LockGuard g(mu_);
+        Cart&amp; c = carts[u];
+        if (c.lines.empty()) throw ShopError("cart is empty");
+        Bill bill = price(u);
+        for (const auto&amp; l : c.lines)                         // check all first
+            if (stockOf(l.product-&gt;id) &lt; l.qty) throw ShopError("out of stock: " + l.product-&gt;name);
+        for (const auto&amp; l : c.lines) stock[l.product-&gt;id] -= l.qty;   // then apply
+        for (const auto&amp; d : bill.discounts) uses[u][d.first]++;
+        orders[u]++;
+        c = Cart();
+        return Order{"O" + std::to_string(++seq), bill};
+    }
+};
+
+static int checks = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::cerr &lt;&lt; "check failed: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++checks;
+}
+void show(ShopService&amp; s, const std::string&amp; u) {
+    Bill b = s.price(u);
+    std::printf("  %-22s %10s\n", "Subtotal", fmt(b.subtotal).c_str());
+    for (const auto&amp; d : b.discounts) std::printf("  %-22s %10s\n", ("- " + d.first).c_str(), fmt(d.second).c_str());
+    for (const auto&amp; n : b.notes) std::printf("  note: %s\n", n.c_str());
+    std::printf("  %-22s %10s\n", "Total", fmt(b.total()).c_str());
+}
+void tryApply(ShopService&amp; s, const std::string&amp; u, const std::string&amp; code) {
+    try { s.applyCoupon(u, code); std::cout &lt;&lt; "apply " &lt;&lt; code &lt;&lt; " -&gt; ok\n"; }
+    catch (const ShopError&amp; e) { std::cout &lt;&lt; "apply " &lt;&lt; code &lt;&lt; " -&gt; rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+}
+
+int main() {
+    ShopService shop(20261123);
+    shop.addProduct(Product{"P1", "Laptop", Category::ELECTRONICS, rupees(50000)}, 2);
+    shop.addProduct(Product{"P2", "Headphones", Category::ELECTRONICS, rupees(2000)}, 5);
+    shop.addProduct(Product{"P3", "T-shirt", Category::FASHION, rupees(799)}, 10);
+    shop.addCoupon(Coupon{"FASHION20", hasCategory(Category::FASHION),
+                          std::make_shared&lt;CategoryPercentOff&gt;(Category::FASHION, 2000), 10, true, 99});
+    shop.addCoupon(Coupon{"SAVE10", validUntil(20261130), std::make_shared&lt;PercentOff&gt;(1000, rupees(500)), 20, true, 99});
+    shop.addCoupon(Coupon{"FLAT200", minSubtotal(rupees(1000)), std::make_shared&lt;FlatOff&gt;(rupees(200)), 30, false, 99});
+    shop.addCoupon(Coupon{"NEWUSER", firstOrderOnly() &amp;&amp; validUntil(20261231), std::make_shared&lt;FlatOff&gt;(rupees(100)), 30, true, 1});
+
+    std::cout &lt;&lt; "== u1: Laptop x1, T-shirt x2\n";
+    shop.addItem("u1", "P1", 1);
+    shop.addItem("u1", "P3", 2);
+    tryApply(shop, "u1", "FASHION20");
+    tryApply(shop, "u1", "SAVE10");
+    tryApply(shop, "u1", "FLAT200");
+    show(shop, "u1");
+    Order o1 = shop.checkout("u1");
+    std::cout &lt;&lt; "checkout u1 -&gt; " &lt;&lt; o1.id &lt;&lt; " paid " &lt;&lt; fmt(o1.bill.total()) &lt;&lt; "\n";
+    check(o1.bill.total() == 5077840, "u1 total");
+    check(shop.stockOf("P1") == 1 &amp;&amp; shop.stockOf("P3") == 8, "stock decremented");
+
+    std::cout &lt;&lt; "== u2: small cart, then the cart changes after a coupon\n";
+    shop.addItem("u2", "P3", 1);
+    tryApply(shop, "u2", "FLAT200");
+    tryApply(shop, "u2", "FASHION20");
+    tryApply(shop, "u2", "NEWUSER");
+    shop.addItem("u2", "P2", 1);
+    shop.removeItem("u2", "P3");
+    show(shop, "u2");
+    Order o2 = shop.checkout("u2");
+    std::cout &lt;&lt; "checkout u2 -&gt; " &lt;&lt; o2.id &lt;&lt; " paid " &lt;&lt; fmt(o2.bill.total()) &lt;&lt; "\n";
+    check(o2.bill.total() == rupees(1900), "FASHION20 dropped, NEWUSER kept");
+    shop.addItem("u2", "P3", 1);
+    tryApply(shop, "u2", "NEWUSER");
+
+    std::cout &lt;&lt; "== last laptop, two buyers (sequential here)\n";
+    shop.addItem("u3", "P1", 1);
+    shop.addItem("u4", "P1", 1);
+    shop.checkout("u3");
+    try { shop.checkout("u4"); } catch (const ShopError&amp; e) { std::cout &lt;&lt; "u4 -&gt; " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    check(shop.stockOf("P1") == 0, "no oversell");
+    std::cout &lt;&lt; "All " &lt;&lt; checks &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it runs 4 of Java's 9 checks: no thread race for the last laptop (it shows the same rule sequentially), no expired-coupon case, and the two discount-arithmetic checks are folded into the u1 total. Same Rule, DiscountStrategy and checkout order.</p></div>
+
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== u1: Laptop x1, T-shirt x2
+apply FASHION20 -&gt; ok
+apply SAVE10 -&gt; ok
+apply FLAT200 -&gt; rejected: FLAT200 cannot be combined with FASHION20,SAVE10
+  Subtotal                 51598.00
+  - FASHION20                319.60
+  - SAVE10                   500.00
+  Total                    50778.40
+checkout u1 -&gt; O1 paid 50778.40
+== u2: small cart, then the cart changes after a coupon
+apply FLAT200 -&gt; rejected: FLAT200 needs a cart value of at least 1000.00
+apply FASHION20 -&gt; ok
+apply NEWUSER -&gt; ok
+  Subtotal                  2000.00
+  - NEWUSER                  100.00
+  note: FASHION20 not applied: needs a FASHION item in the cart
+  Total                     1900.00
+checkout u2 -&gt; O2 paid 1900.00
+apply NEWUSER -&gt; rejected: NEWUSER already used
+== bad input
+add 9 Headphones -&gt; only 4 Headphones left
+checkout empty cart -&gt; cart is empty
+apply SAVE10 -&gt; rejected: SAVE10 expired on 2026-11-30
+== race: u3 and u4 both buy the last laptop
+succeeded: 1, out of stock: 1, laptops left: 0
+All 9 checks passed
+
+$ python main.py | tail -3; python -m unittest test_main
+== race: u3 and u4 both buy the last laptop
+succeeded: 1, out of stock: 1, laptops left: 0
+demo OK
+........
+----------------------------------------------------------------------
+Ran 8 tests in 0.004s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main | tail -3
+== last laptop, two buyers (sequential here)
+u4 -&gt; out of stock: Laptop
+All 4 checks passed</code></pre>
+  <div class="callout note"><p>Read the u2 block closely: FASHION20 was valid when it was applied (a T-shirt was in the cart), then the T-shirt was removed. The coupon stays attached, gives nothing, and the bill explains why. That is the "cart changed after applying" edge case most candidates never test.</p></div>

@@ -1,0 +1,141 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> 1:1 + groups + receipts + offline; ask "store history on server or store-and-forward?" and "how big can groups be?". State latency, durability and ordering goals.</li>
+          <li><strong>5-10 min: numbers</strong> ~230K msg/s average, ~700K peak, 150M concurrent connections, ~300 gateways, heartbeats dominate. Say what each number changes.</li>
+          <li><strong>10-15 min: API + data model</strong> The WebSocket frames, <code>client_msg_id</code>, <code>seq</code>, the messages table keyed by <code>(chat_id, bucket)</code>.</li>
+          <li><strong>15-25 min: high-level flow</strong> Draw the stepper: LB -&gt; gateway -&gt; chat service -&gt; store -&gt; registry -&gt; gateway -&gt; receiver. Then the offline path.</li>
+          <li><strong>25-40 min: deep dives</strong> Pick two: routing, delivery + dedupe, ordering, group fan-out, presence. Lead them yourself.</li>
+          <li><strong>40-45 min: wrap up</strong> Failures per box, monitoring (connections per gateway, delivery latency p99, inbox backlog, reconnect rate), what you would build next.</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"Clients keep a WebSocket to a gateway. A chat service stores each message in Cassandra keyed by chat id, looks up the receiver's gateway in Redis and pushes it. If offline, it stays in the inbox and we send a push notification. Ticks come from acks." Clear, correct, complete.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"The real cost is 150M connections and 5M heartbeats/s, so gateways are dumb and drain slowly on deploy. We get at-least-once plus dedupe with a client id, per-chat seq for ordering, quorum writes before the ack, async group fan-out via Kafka keyed by chat, and presence only for watchers." Numbers, failure modes, trade-offs, unprompted.</p></div>
+        </div>
+        <h3>The 60-second answer (say it out loud)</h3>
+        <div class="callout interview"><p>"Each device keeps one WebSocket to a dumb gateway behind an L4 load balancer. A stateless chat service stores the message with a quorum write in a wide-column store keyed by chat and time bucket, then acks the sender (one tick). It looks up the receiver's gateway in a Redis session registry and pushes; offline users get an inbox entry plus an APNs/FCM push. A <code>client_msg_id</code> dedupes retries and a per-chat <code>seq</code> gives order. Groups fan out through Kafka. The hard numbers are 150M open connections and 5M heartbeats a second, so gateways stay simple and drain slowly on deploy."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> using HTTP polling every second (battery and server cost); sorting by the phone's clock; acking before the write is durable; one database row per message per member for big groups; forgetting the offline path; sending media through the chat servers; ignoring reconnect storms; spending 15 minutes on encryption maths instead of the system.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Microsoft,Amazon,Flipkart">
+          <summary>Why WebSocket instead of normal HTTP requests for chat?</summary>
+          <div class="answer">
+            <p>Chat needs the <b>server</b> to send data whenever a message arrives. With plain HTTP the client must ask repeatedly (polling), which wastes battery, bandwidth and server capacity, and adds up to one polling interval of delay. Long polling helps but still re-opens a request after every message. A WebSocket upgrades one HTTP connection into a two-way TCP stream that stays open, with a few bytes of framing per message. SSE (server-sent events) is one-way, which is fine for feeds but chat also sends upstream.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the need (server push), compare 3 options in one line each, pick WebSocket, and mention long polling as a fallback for networks that block it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What load balancer do you put in front of WebSockets? (L4, or L7 with upgrade support and long idle timeouts.)</li><li>How do you detect a dead connection? (Heartbeats.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Amazon">
+          <summary>How does the server know which machine Ben is connected to?</summary>
+          <div class="answer">
+            <p>On connect, Ben's gateway writes <code>ben:device1 -&gt; gw17</code> into a session registry (Redis) with a TTL around 60 s, refreshed by heartbeats. The chat service looks it up and sends the message to gw17 over an internal RPC. If there is no entry, Ben is offline: the message stays in his inbox and we send a push. Alternatives are consistent hashing of users to gateways (no lookup, but painful rebalancing) or per-user pub/sub topics that gateways subscribe to.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the registry answer first, then say what happens when the entry is stale (send fails, treat as offline, TTL clears it).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if Redis is down?</li><li>How does Slack do it? (Channel servers on a consistent hash ring.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>Explain the one tick, two ticks and blue ticks. Who sends what?</summary>
+          <div class="answer">
+            <p>One tick: the server acks the sender after the message is durably stored. Two ticks: the receiver's device acks receipt to the server, which forwards a "delivered" receipt to the sender. Blue: the receiver's app sends a "read" receipt when the chat is opened. Receipts are cumulative (<code>up_to_seq</code>), so one receipt covers many messages, and they travel through the same path as messages (and the inbox if the sender is offline).</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw three arrows on a sequence diagram. Stress "ack only after durable".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do ticks work in a group? (Per member; show blue when all members read.)</li><li>Privacy setting to hide read receipts?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon,Google">
+          <summary>The network drops after the server stored the message but before the ack arrived. What happens?</summary>
+          <div class="answer">
+            <p>The app times out and resends with the same <code>client_msg_id</code>. The server checks <code>(chat_id, client_msg_id)</code>, sees it already exists, does not create a new row, and returns the original <code>seq</code> as the ack. Delivery to Ben may also happen twice (live push and later sync), so Ben's app ignores a <code>msg_id</code> it already has. Net effect: at-least-once delivery, exactly-once display.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "at-least-once plus idempotency" in the first sentence, then show both dedupe points.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep dedupe keys?</li><li>Is exactly-once delivery possible? (Not over an unreliable network; you fake it with dedupe.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Microsoft,Flipkart">
+          <summary>How do you keep messages in order?</summary>
+          <div class="answer">
+            <p>Order only matters within one chat. The server assigns a per-chat sequence number (atomic increment) when it stores a message; clients sort by it and can detect gaps (they have 4180 and 4182, so they fetch 4181). Never trust phone clocks. Keep one chat's events on one ordered path, such as a Kafka partition keyed by <code>chat_id</code>. Snowflake ids are an alternative when a counter per chat is too costly; they are only roughly ordered across servers.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Global order is not needed; per-chat order is." Then sequence numbers, then gap detection.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Two people send at the same instant - who is first? (Whoever got the lower seq; both see the same order.)</li><li>Where does the counter live?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon,Microsoft">
+          <summary>How would you design group chat for 1,000 members, and what changes at 1 million?</summary>
+          <div class="answer">
+            <p>For about 1,000 members: store the message once under the group, then fan out asynchronously (Kafka keyed by group) to each member's gateway if online or inbox pointer if offline. At 1 million followers (a broadcast channel), writing a million inbox entries per post is too much; switch to fan-out on read: members fetch the channel's latest messages when they open it, and you push only a lightweight "channel updated" hint to online members who have it open. It is the push-vs-pull trade-off from news feeds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the numbers (1 x 1,000 vs 1 x 1,000,000), then the switch point.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do read receipts work for big groups? (Aggregate counts, not per-person ticks.)</li><li>How does encryption work in groups? (Sender keys.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>How do you build "online" and "last seen" without melting the servers?</summary>
+          <div class="answer">
+            <p>Heartbeats refresh a presence key with a TTL in Redis; when the key expires, write "last seen". Do not broadcast changes to every contact. Push presence only to users who are currently viewing that person (subscribe on chat open, unsubscribe on close), debounce offline by a few seconds, and batch updates. Accept that presence is eventually consistent and lossy.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with "presence is the hidden fan-out problem", give the math (500 contacts x millions of flaps), then the subscribe-on-view fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How often do heartbeats go? Trade-off of battery vs accuracy.</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>A user has a phone, a laptop and a tablet. How does sync work?</summary>
+          <div class="answer">
+            <p>Treat each device as its own endpoint: the registry key is <code>user:device</code>, each device keeps its own sync cursor, and messages are delivered to every connected device. Messages you send from one device are also delivered to your other devices. Offline devices catch up via <code>/sync?since_cursor=</code>. With end-to-end encryption each device has its own key pair, so senders encrypt for each device, which is one reason the number of linked devices is limited.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Device, not user, is the unit of delivery." Then cursors.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How is a read on the laptop reflected on the phone? (Read receipts also sync to your own devices.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,k8s" data-company="Amazon,Microsoft,Uber">
+          <summary>You need to deploy a new gateway version. How do you avoid a reconnect storm?</summary>
+          <div class="answer">
+            <p>Roll very slowly (one pod at a time, PodDisruptionBudget), and in <code>preStop</code> ask connected clients to reconnect elsewhere gradually over several minutes instead of closing all sockets at once. Clients use exponential backoff with random jitter. Keep business logic out of gateways so they rarely need deploying. Protect the sync API with rate limits and watch reconnect rate and sync latency during the rollout.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure (thundering herd), then server side (drain), client side (jitter), and protection (rate limit).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What metric would page you?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart,Walmart">
+          <summary>SQL or NoSQL for the messages? Defend it in one sentence.</summary>
+          <div class="answer">
+            <p>"Messages are an append-heavy stream read by chat in time order with no joins, at hundreds of thousands of writes per second, so a wide-column store partitioned by <code>(chat_id, bucket)</code> fits; users and groups are small and relational, so they stay in SQL." Discord's public write-up of moving trillions of messages from Cassandra to ScyllaDB is a good real example to cite.</p>
+            <div class="approach"><h5>How to answer</h5><p>Access pattern first, then scale, then the choice. Mention the hot-partition risk and the bucket fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What consistency level do you use?</li><li>How do you delete a message for everyone?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,kafka" data-company="Meta,Uber,Microsoft">
+          <summary>Would you put Kafka between the chat service and delivery? Argue both sides.</summary>
+          <div class="answer">
+            <p><b>For:</b> a durable, replayable buffer; consumers (persist, deliver, push, analytics) scale independently; ordering per chat via the partition key; survives a delivery-tier outage. <b>Against:</b> extra hops add milliseconds to the most latency-sensitive path; partition count limits parallelism; a slow consumer causes head-of-line blocking for every chat on that partition. My pick: write to the store and push directly for 1:1 (fast path), and use Kafka for async work (group fan-out, push, analytics), where delay is acceptable.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the trade-off sentence pattern, and finish with a hybrid decision.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many partitions would you create, and keyed by what?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Meta,Google,Microsoft">
+          <summary>Asha is in India and Ben is in the US. Where is the message stored and how fast is delivery?</summary>
+          <div class="answer">
+            <p>Each user is homed in the region nearest to them; their gateway is local. The chat (or the sender's region) owns the write; the message is stored there and replicated asynchronously to the other region. Delivery crosses regions once via an internal backbone, so expect the cross-region round trip (tens of ms within a continent, about 150-250 ms India to US East) on top of local hops. If a region fails, users reconnect to another region and sync; a few seconds of not-yet-replicated messages may be delayed, which is why the client keeps unsent/unacked messages and retries.</p>
+            <div class="approach"><h5>How to answer</h5><p>Home region + async replication + client retry. Be honest that physics sets the floor.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Active-active or active-passive? See <a href="{{BASE}}hld/hld-13">Multi-Region &amp; DR</a>.</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: messages show two ticks late for users in one city</h4>
+          <div class="situation"><p>Support reports that in one city, messages take 20-30 seconds to show "delivered". Sending still works.</p></div>
+          <div class="bad"><p>Weak answer: "Add more chat servers."</p></div>
+          <div class="good"><p>Strong answer: delivered receipts depend on the receiver's connection. Check gateway metrics for that region: connection count, reconnect rate, heartbeat timeouts. A likely cause is a mobile carrier killing idle connections faster than our heartbeat interval, so devices are "online" in the registry but the socket is dead until the next ping fails. Confirm with per-carrier reconnect graphs; fix by shortening heartbeat interval for that network or using push-to-wake, and make sends to a dead socket fail fast to the offline path.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you detect this automatically next time?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: New Year's Eve, midnight</h4>
+          <div class="situation"><p>Traffic jumps 5x in one minute in one time zone. Sync latency rises and some sends time out.</p></div>
+          <div class="bad"><p>Weak answer: "Autoscaling will handle it."</p></div>
+          <div class="good"><p>Strong answer: autoscaling reacts in minutes, the spike is in seconds and is predictable. Pre-scale chat service, store and Kafka ahead of time per time zone; degrade non-essential features (typing indicators, presence updates, link previews) behind feature flags; keep group fan-out async so 1:1 sends stay fast; rate-limit sync per device; watch inbox backlog and drain it after the peak.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which features would you turn off first, and why those?</li></ul></div>
+        </div>
+      

@@ -1,0 +1,1066 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+      <p><code>python/qa.py</code></p>
+<pre><code class="language-python">"""Stack Overflow / Flipkart Overflow style Q&amp;A platform - in-memory, thread-safe."""
+from __future__ import annotations
+
+import itertools
+import re
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, Iterable, List, Optional, Set
+
+Listener = Callable[[str, str], None]          # (user name, message)
+QuestionFilter = Callable[["Question"], bool]
+
+
+class QaError(Exception):
+    pass
+
+
+class VoteType(Enum):
+    UP = 1
+    DOWN = -1
+
+
+class Action(Enum):
+    ASK = "ask"
+    ANSWER = "answer"
+    COMMENT = "comment"
+    UPVOTE = "upvote"
+    DOWNVOTE = "downvote"
+    ACCEPT = "accept"
+
+
+class User:
+    def __init__(self, uid: str, name: str) -&gt; None:
+        self.id, self.name = uid, name
+        self.topics: Set[str] = set()
+        self._rep = 1
+        self._lock = threading.Lock()
+
+    @property
+    def reputation(self) -&gt; int:
+        return self._rep
+
+    def add_reputation(self, delta: int) -&gt; int:
+        with self._lock:                       # floor at 1, like Stack Overflow
+            self._rep = max(1, self._rep + delta)
+            return self._rep
+
+
+@dataclass
+class Comment:
+    id: str
+    author: User
+    text: str
+    at: int
+
+
+@dataclass(eq=False)
+class Post:
+    id: str
+    author: User
+    body: str
+    created_at: int
+    votes: Dict[str, VoteType] = field(default_factory=dict)   # voter id -&gt; vote, guarded by lock
+    comments: List[Comment] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def score(self) -&gt; int:
+        with self.lock:
+            return sum(v.value for v in self.votes.values())
+
+    def question(self) -&gt; "Question":
+        raise NotImplementedError
+
+
+@dataclass(eq=False)
+class Question(Post):
+    title: str = ""
+    tags: frozenset = frozenset()
+    answers: List["Answer"] = field(default_factory=list)
+    followers: Set[str] = field(default_factory=set)
+    accepted: Optional["Answer"] = None
+
+    def question(self) -&gt; "Question":
+        return self
+
+    def answered(self) -&gt; bool:
+        return bool(self.answers)
+
+
+@dataclass(eq=False)
+class Answer(Post):
+    parent: Optional[Question] = None
+
+    def question(self) -&gt; Question:
+        return self.parent
+
+
+# ---------- strategies and policies ----------
+class ReputationPolicy(ABC):
+    @abstractmethod
+    def for_author(self, is_question: bool, v: VoteType) -&gt; int: ...
+
+    @abstractmethod
+    def for_voter(self, is_question: bool, v: VoteType) -&gt; int: ...
+
+    accepted = 15
+    acceptor = 2
+
+
+class StackOverflowReputation(ReputationPolicy):
+    def for_author(self, is_question, v):
+        return 10 if v is VoteType.UP else -2
+
+    def for_voter(self, is_question, v):
+        return -1 if (not is_question and v is VoteType.DOWN) else 0
+
+
+class PermissionRule(ABC):
+    @abstractmethod
+    def check(self, user: User, action: Action, tags: Iterable[str]) -&gt; None: ...
+
+
+class ReputationPrivileges(PermissionRule):
+    MIN = {Action.UPVOTE: 15, Action.DOWNVOTE: 125}
+
+    def check(self, user, action, tags):
+        need = self.MIN.get(action)
+        if need is not None and user.reputation &lt; need:
+            raise QaError(f"{user.name} needs {need} reputation to {action.value}")
+
+
+class TopicSubscriptionRule(PermissionRule):
+    def check(self, user, action, tags):
+        if action is Action.ACCEPT:
+            return
+        tags = set(tags)
+        if not tags &amp; user.topics:
+            raise QaError(f"{user.name} is not subscribed to any of {sorted(tags)}")
+
+
+def any_topic(topics: Iterable[str]) -&gt; QuestionFilter:
+    want = set(topics)
+    return lambda q: bool(q.tags &amp; want)
+
+
+def answered(yes: bool) -&gt; QuestionFilter:
+    return lambda q: q.answered() == yes
+
+
+def everything(q: Question) -&gt; bool:
+    return True
+
+
+def answer_order(q: Question) -&gt; List[Answer]:
+    """Accepted first, then highest score, then oldest."""
+    acc = q.accepted
+    return sorted(q.answers, key=lambda a: (a is not acc, -a.score(), a.created_at))
+
+
+def words(text: str) -&gt; List[str]:
+    return [w for w in re.split(r"[^a-z0-9+#]+", text.lower()) if len(w) &gt; 1]
+
+
+# ---------- service (facade) ----------
+class QaService:
+    def __init__(self, reputation: ReputationPolicy, rules: List[PermissionRule]) -&gt; None:
+        self._rep = reputation
+        self._rules = rules
+        self._users: Dict[str, User] = {}
+        self._questions: Dict[str, Question] = {}
+        self._posts: Dict[str, Post] = {}
+        self._index: Dict[str, Set[str]] = {}
+        self._listeners: List[Listener] = []
+        self._ids = threading.Lock()             # guards counters, maps and the word index
+        self._clock = itertools.count(1)
+        self._counters = {k: itertools.count(1) for k in "UQAC"}
+
+    def _next(self, kind: str) -&gt; str:
+        with self._ids:
+            return f"{kind}{next(self._counters[kind])}"
+
+    def _tick(self) -&gt; int:
+        with self._ids:
+            return next(self._clock)
+
+    def add_listener(self, listener: Listener) -&gt; None:
+        self._listeners.append(listener)
+
+    def register(self, name: str) -&gt; str:
+        uid = self._next("U")
+        with self._ids:
+            self._users[uid] = User(uid, name)
+        return uid
+
+    def subscribe(self, uid: str, *topics: str) -&gt; None:
+        self._user(uid).topics.update(topics)
+
+    def unsubscribe(self, uid: str, topic: str) -&gt; None:
+        self._user(uid).topics.discard(topic)
+
+    def bonus(self, uid: str, points: int) -&gt; None:
+        self._user(uid).add_reputation(points)
+
+    def ask(self, uid: str, title: str, body: str, *tags: str) -&gt; str:
+        u = self._user(uid)
+        if not title.strip():
+            raise QaError("title is empty")
+        if not tags:
+            raise QaError("a question needs at least one tag")
+        self._allow(u, Action.ASK, tags)       # validate before taking an id
+        q = Question(self._next("Q"), u, body, self._tick(), title=title.strip(), tags=frozenset(tags))
+        q.followers.add(u.id)
+        with self._ids:
+            self._questions[q.id] = q
+            self._posts[q.id] = q
+            for w in words(q.title + " " + q.body):
+                self._index.setdefault(w, set()).add(q.id)
+        return q.id
+
+    def answer(self, uid: str, qid: str, body: str) -&gt; str:
+        u, q = self._user(uid), self._question(qid)
+        if not body.strip():
+            raise QaError("answer is empty")
+        self._allow(u, Action.ANSWER, q.tags)
+        a = Answer(self._next("A"), u, body.strip(), self._tick(), parent=q)
+        with self._ids:
+            self._posts[a.id] = a
+        with q.lock:
+            q.answers.append(a)
+            q.followers.add(u.id)
+            targets = [f for f in q.followers if f != u.id]
+        self._fire([(f, f"{u.name} answered {q.id}: {q.title}") for f in sorted(targets)])
+        return a.id
+
+    def comment(self, uid: str, post_id: str, text: str) -&gt; str:
+        u, p = self._user(uid), self._post(post_id)
+        self._allow(u, Action.COMMENT, p.question().tags)
+        c = Comment(self._next("C"), u, text, self._tick())
+        with p.lock:
+            p.comments.append(c)
+        if p.author.id != u.id:
+            self._fire([(p.author.id, f"{u.name} commented on {p.id}")])
+        return c.id
+
+    def vote(self, uid: str, post_id: str, v: VoteType) -&gt; None:
+        u, p = self._user(uid), self._post(post_id)
+        if p.author.id == u.id:
+            raise QaError(f"{u.name} cannot vote on own post")
+        self._allow(u, Action.UPVOTE if v is VoteType.UP else Action.DOWNVOTE, p.question().tags)
+        with p.lock:
+            old = p.votes.get(u.id)
+            if old is v:
+                raise QaError(f"{u.name} already voted {v.name} on {p.id}")
+            p.votes[u.id] = v
+            if old is not None:
+                self._apply(u, p, old, -1)
+            self._apply(u, p, v, +1)
+
+    def retract_vote(self, uid: str, post_id: str) -&gt; None:
+        u, p = self._user(uid), self._post(post_id)
+        with p.lock:
+            old = p.votes.pop(u.id, None)
+            if old is None:
+                raise QaError(f"{u.name} has no vote on {p.id}")
+            self._apply(u, p, old, -1)
+
+    def accept(self, uid: str, answer_id: str) -&gt; None:
+        u, p = self._user(uid), self._post(answer_id)
+        if not isinstance(p, Answer):
+            raise QaError(f"{answer_id} is not an answer")
+        q = p.parent
+        if q.author.id != u.id:
+            raise QaError(f"only {q.author.name} can accept answers on {q.id}")
+        self._allow(u, Action.ACCEPT, q.tags)
+        events = []
+        with q.lock:
+            old = q.accepted
+            if old is p:
+                return
+            old_paid = old is not None and old.author.id != u.id    # own answers earn nothing
+            new_pays = p.author.id != u.id
+            if old_paid:
+                old.author.add_reputation(-self._rep.accepted)
+            u.add_reputation(self._rep.acceptor * (int(new_pays) - int(old_paid)))
+            q.accepted = p
+            if new_pays:
+                p.author.add_reputation(self._rep.accepted)
+                events.append((p.author.id, f"your answer {p.id} was accepted on {q.id}"))
+        self._fire(events)
+
+    def feed(self, uid: str, flt: QuestionFilter = everything) -&gt; List[Question]:
+        u = self._user(uid)
+        mine = any_topic(u.topics)
+        with self._ids:
+            qs = list(self._questions.values())
+        return sorted((q for q in qs if mine(q) and flt(q)), key=lambda q: -q.created_at)
+
+    def search(self, text: str, flt: QuestionFilter = everything) -&gt; List[Question]:
+        with self._ids:
+            ids: Optional[Set[str]] = None
+            for w in words(text):
+                hit = self._index.get(w, set())
+                ids = set(hit) if ids is None else ids &amp; hit
+            pool = list(self._questions.values()) if ids is None else [self._questions[i] for i in ids]
+        return sorted((q for q in pool if flt(q)), key=lambda q: (-q.score(), -q.created_at))
+
+    def show(self, qid: str) -&gt; str:
+        q = self._question(qid)
+        lines = [f"{q.id} [{q.score()}] {q.title} {sorted(q.tags)} by {q.author.name}"]
+        for a in answer_order(q):
+            mark = "* " if a is q.accepted else "  "
+            lines.append(f"   {mark}{a.id} [{a.score()}] {a.body} - {a.author.name}")
+            lines.extend(f"        {c.author.name}: {c.text}" for c in a.comments)
+        return "\n".join(lines)
+
+    def reputation_of(self, uid: str) -&gt; int:
+        return self._user(uid).reputation
+
+    def score_of(self, post_id: str) -&gt; int:
+        return self._post(post_id).score()
+
+    # ----- helpers -----
+    def _apply(self, voter: User, p: Post, v: VoteType, sign: int) -&gt; None:
+        is_q = isinstance(p, Question)
+        p.author.add_reputation(sign * self._rep.for_author(is_q, v))
+        voter.add_reputation(sign * self._rep.for_voter(is_q, v))
+
+    def _allow(self, u: User, action: Action, tags: Iterable[str]) -&gt; None:
+        for r in self._rules:
+            r.check(u, action, tags)
+
+    def _fire(self, events) -&gt; None:           # no lock held here
+        for uid, msg in events:
+            for listener in self._listeners:
+                listener(self._users[uid].name, msg)
+
+    def _user(self, uid: str) -&gt; User:
+        try:
+            return self._users[uid]
+        except KeyError:
+            raise QaError(f"unknown user {uid}") from None
+
+    def _question(self, qid: str) -&gt; Question:
+        try:
+            return self._questions[qid]
+        except KeyError:
+            raise QaError(f"unknown question {qid}") from None
+
+    def _post(self, pid: str) -&gt; Post:
+        try:
+            return self._posts[pid]
+        except KeyError:
+            raise QaError(f"unknown post {pid}") from None</code></pre>
+      <p><code>python/main.py</code></p>
+<pre><code class="language-python">"""Demo driver: the Flipkart Overflow test sequence, Stack Overflow reputation, and a vote race."""
+import threading
+
+from qa import (QaError, QaService, ReputationPrivileges, StackOverflowReputation,
+                TopicSubscriptionRule, VoteType, answered, any_topic)
+
+
+def check(cond, msg="check failed"):
+    """Like assert, but never stripped by python -O: the call inside it always runs."""
+    if not cond:
+        raise AssertionError(msg)
+
+
+def ids(qs):
+    return [q.id for q in qs]
+
+
+def rejected(fn, label):
+    try:
+        fn()
+    except QaError as e:
+        print(f"{label} -&gt; rejected: {e}")
+        return True
+    return False
+
+
+def demo() -&gt; None:
+    inbox = []
+
+    def console(user, msg):
+        print(f"  [notify {user}] {msg}")
+        inbox.append(f"{user}: {msg}")
+
+    print("== Flipkart Overflow: topics, feed, filters ==")
+    flip = QaService(StackOverflowReputation(), [TopicSubscriptionRule()])
+    flip.add_listener(console)
+    asha, bala, chen = flip.register("asha"), flip.register("bala"), flip.register("chen")
+    flip.subscribe(asha, "java", "hadoop", "jdk")
+    q1 = flip.ask(asha, "What are new open source JDKs?", "Looking beyond Oracle.", "java", "jdk")
+    q2 = flip.ask(asha, "Does Hadoop work on JDK 11?", "Cluster upgrade.", "hadoop", "jdk")
+    print("feed asha         ", ids(flip.feed(asha)))
+    print("feed asha [java]  ", ids(flip.feed(asha, any_topic(["java"]))))
+    print("feed asha answered", ids(flip.feed(asha, answered(True))))
+    check(ids(flip.feed(asha, any_topic(["java"]))) == [q1])
+    flip.subscribe(bala, "apache", "hadoop")
+    check(ids(flip.feed(bala)) == [q2])
+    check(rejected(lambda: flip.ask(bala, "Best JVM flags?", "", "java"), "bala asks in [java]"))
+    q3 = flip.ask(bala, "Does Apache Spark stream from HDFS?", "", "apache", "hadoop")
+    a1 = flip.answer(bala, q2, "Yes, Hadoop 3 and above supports it.")
+    print("feed bala         ", ids(flip.feed(bala)))
+    check(ids(flip.feed(asha, answered(True))) == [q2])
+    flip.subscribe(chen, "apache", "hadoop", "java")
+    check(len(flip.feed(chen)) == 3)
+    flip.vote(chen, q2, VoteType.UP)
+    flip.vote(chen, a1, VoteType.UP)
+    check(rejected(lambda: flip.vote(chen, a1, VoteType.UP), "chen upvotes A1 again"))
+    a2 = flip.answer(chen, q2, "Only from Hadoop 3.3 for runtime.")
+    flip.vote(bala, a2, VoteType.UP)
+    flip.vote(asha, a2, VoteType.UP)
+    flip.accept(asha, a1)
+    print(flip.show(q2))
+    check(flip.show(q2).splitlines()[1].strip().startswith("* " + a1))
+    check("asha: bala answered Q2: Does Hadoop work on JDK 11?" in inbox)
+    _ = q3
+
+    print("\n== Stack Overflow: reputation and privileges ==")
+    so = QaService(StackOverflowReputation(), [ReputationPrivileges()])
+    ann, ben, cat, dev = (so.register(n) for n in ("ann", "ben", "cat", "dev"))
+    sq = so.ask(ann, "Why does my C struct have padding?", "sizeof is bigger than the sum", "c", "memory")
+    sa = so.answer(ben, sq, "Alignment: each field starts at a multiple of its size.")
+    check(rejected(lambda: so.vote(cat, sa, VoteType.UP), "cat (rep 1) upvotes"))
+    so.bonus(cat, 100)
+    so.bonus(dev, 200)
+    so.vote(cat, sa, VoteType.UP)
+    so.vote(dev, sa, VoteType.UP)
+    so.vote(dev, sa, VoteType.DOWN)
+    print("dev flips to DOWN: ben", so.reputation_of(ben), "dev", so.reputation_of(dev))
+    check((so.reputation_of(ben), so.reputation_of(dev)) == (9, 200))
+    so.accept(ann, sa)
+    print("ann accepts: ben", so.reputation_of(ben), "ann", so.reputation_of(ann))
+    check((so.reputation_of(ben), so.reputation_of(ann)) == (24, 3))
+    print("search 'struct padding':", ids(so.search("struct padding")))
+
+    print("\n== Concurrency: 100 voters at once ==")
+    rush = QaService(StackOverflowReputation(), [])
+    asker, author = rush.register("asker"), rush.register("author")
+    rq = rush.ask(asker, "Hot question", "", "c")
+    ra = rush.answer(author, rq, "Hot answer")
+    voters = [rush.register(f"v{i}") for i in range(100)]
+    go = threading.Event()
+
+    def worker(v):
+        go.wait()
+        rush.vote(v, ra, VoteType.UP)
+
+    threads = [threading.Thread(target=worker, args=(v,)) for v in voters]
+    for t in threads:
+        t.start()
+    go.set()
+    for t in threads:
+        t.join()
+    print("answer score", rush.score_of(ra), "author rep", rush.reputation_of(author))
+    check(rush.score_of(ra) == 100 and rush.reputation_of(author) == 1001)
+    print("demo OK")
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+      <p><code>python/test_qa.py</code></p>
+<pre><code class="language-python">import threading
+import unittest
+
+from qa import (QaError, QaService, ReputationPrivileges, StackOverflowReputation,
+                TopicSubscriptionRule, VoteType, answered, any_topic)
+
+
+class FlipkartOverflowTest(unittest.TestCase):
+    def setUp(self):
+        self.inbox = []
+        self.svc = QaService(StackOverflowReputation(), [TopicSubscriptionRule()])
+        self.svc.add_listener(lambda u, m: self.inbox.append(f"{u}: {m}"))
+        self.a, self.b = self.svc.register("asha"), self.svc.register("bala")
+        self.svc.subscribe(self.a, "java", "jdk")
+        self.svc.subscribe(self.b, "jdk")
+        self.q = self.svc.ask(self.a, "JDK 21 features?", "virtual threads", "java", "jdk")
+
+    def test_feed_filters(self):
+        self.assertEqual([q.id for q in self.svc.feed(self.b)], [self.q])
+        self.assertEqual(self.svc.feed(self.b, any_topic(["spring"])), [])
+        self.assertEqual(self.svc.feed(self.a, answered(True)), [])
+        self.svc.answer(self.b, self.q, "Virtual threads and records patterns")
+        self.assertEqual(len(self.svc.feed(self.a, answered(True))), 1)
+
+    def test_subscription_rules(self):
+        with self.assertRaises(QaError):
+            self.svc.ask(self.b, "Spring?", "", "spring")
+        self.svc.unsubscribe(self.b, "jdk")
+        with self.assertRaises(QaError):
+            self.svc.answer(self.b, self.q, "no longer allowed")
+
+    def test_no_duplicate_or_self_vote(self):
+        a1 = self.svc.answer(self.b, self.q, "Loom")
+        self.svc.vote(self.a, a1, VoteType.UP)
+        with self.assertRaises(QaError):
+            self.svc.vote(self.a, a1, VoteType.UP)
+        with self.assertRaises(QaError):
+            self.svc.vote(self.b, a1, VoteType.UP)
+        self.assertEqual(self.svc.score_of(a1), 1)
+
+    def test_answer_order_and_accept(self):
+        a1 = self.svc.answer(self.b, self.q, "first")
+        c = self.svc.register("chen")
+        self.svc.subscribe(c, "java")
+        a2 = self.svc.answer(c, self.q, "second")
+        self.svc.vote(self.a, a2, VoteType.UP)
+        self.assertIn(a2, self.svc.show(self.q).splitlines()[1])
+        with self.assertRaises(QaError):
+            self.svc.accept(c, a1)                       # only the asker
+        self.svc.accept(self.a, a1)
+        self.assertIn("* " + a1, self.svc.show(self.q).splitlines()[1])
+        self.assertIn("bala: your answer A1 was accepted on Q1", self.inbox)
+
+
+class ReputationTest(unittest.TestCase):
+    def setUp(self):
+        self.svc = QaService(StackOverflowReputation(), [ReputationPrivileges()])
+        self.ann, self.ben, self.cat = (self.svc.register(n) for n in ("ann", "ben", "cat"))
+        self.q = self.svc.ask(self.ann, "Padding in structs", "", "c")
+        self.a = self.svc.answer(self.ben, self.q, "alignment")
+
+    def test_privileges(self):
+        with self.assertRaises(QaError):
+            self.svc.vote(self.cat, self.a, VoteType.UP)
+        self.svc.bonus(self.cat, 14)                       # now 15
+        self.svc.vote(self.cat, self.a, VoteType.UP)
+        with self.assertRaises(QaError):
+            self.svc.vote(self.cat, self.a, VoteType.DOWN)    # needs 125
+
+    def test_flip_retract_and_floor(self):
+        self.svc.bonus(self.cat, 200)
+        self.svc.vote(self.cat, self.a, VoteType.UP)
+        self.assertEqual(self.svc.reputation_of(self.ben), 11)
+        self.svc.vote(self.cat, self.a, VoteType.DOWN)
+        self.assertEqual(self.svc.reputation_of(self.ben), 1)        # 11 - 10 - 2, floored at 1
+        self.assertEqual(self.svc.reputation_of(self.cat), 200)
+        self.svc.retract_vote(self.cat, self.a)
+        self.assertEqual(self.svc.reputation_of(self.cat), 201)
+
+    def test_moving_accept(self):
+        self.svc.bonus(self.cat, 10)
+        a2 = self.svc.answer(self.cat, self.q, "offsetof")
+        self.svc.accept(self.ann, self.a)
+        self.svc.accept(self.ann, a2)
+        self.assertEqual(self.svc.reputation_of(self.ben), 1)
+        self.assertEqual(self.svc.reputation_of(self.cat), 26)
+        self.assertEqual(self.svc.reputation_of(self.ann), 3)        # acceptor bonus counted once
+
+    def test_search(self):
+        self.assertEqual([q.id for q in self.svc.search("structs padding")], [self.q])
+        self.assertEqual(self.svc.search("golang"), [])
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_same_user_many_clicks(self):
+        svc = QaService(StackOverflowReputation(), [])
+        a, b = svc.register("a"), svc.register("b")
+        q = svc.ask(a, "hot", "", "c")
+        dup = []
+        go = threading.Event()
+
+        def click():
+            go.wait()
+            try:
+                svc.vote(b, q, VoteType.UP)
+            except QaError:
+                dup.append(1)
+
+        ts = [threading.Thread(target=click) for _ in range(20)]
+        for t in ts:
+            t.start()
+        go.set()
+        for t in ts:
+            t.join()
+        self.assertEqual(svc.score_of(q), 1)
+        self.assertEqual(len(dup), 19)
+        self.assertEqual(svc.reputation_of(a), 11)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>$ python main.py
+== Flipkart Overflow: topics, feed, filters ==
+feed asha          ['Q2', 'Q1']
+feed asha [java]   ['Q1']
+feed asha answered []
+bala asks in [java] -&gt; rejected: bala is not subscribed to any of ['java']
+  [notify asha] bala answered Q2: Does Hadoop work on JDK 11?
+feed bala          ['Q3', 'Q2']
+chen upvotes A1 again -&gt; rejected: chen already voted UP on A1
+  [notify asha] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] your answer A1 was accepted on Q2
+Q2 [1] Does Hadoop work on JDK 11? ['hadoop', 'jdk'] by asha
+   * A1 [1] Yes, Hadoop 3 and above supports it. - bala
+     A2 [2] Only from Hadoop 3.3 for runtime. - chen
+
+== Stack Overflow: reputation and privileges ==
+cat (rep 1) upvotes -&gt; rejected: cat needs 15 reputation to upvote
+dev flips to DOWN: ben 9 dev 200
+ann accepts: ben 24 ann 3
+search 'struct padding': ['Q1']
+
+== Concurrency: 100 voters at once ==
+answer score 100 author rep 1001
+demo OK</code></pre>
+<pre class="terminal"><code>$ python -m unittest -v test_qa
+test_same_user_many_clicks (test_qa.ConcurrencyTest.test_same_user_many_clicks) ... ok
+test_answer_order_and_accept (test_qa.FlipkartOverflowTest.test_answer_order_and_accept) ... ok
+test_feed_filters (test_qa.FlipkartOverflowTest.test_feed_filters) ... ok
+test_no_duplicate_or_self_vote (test_qa.FlipkartOverflowTest.test_no_duplicate_or_self_vote) ... ok
+test_subscription_rules (test_qa.FlipkartOverflowTest.test_subscription_rules) ... ok
+test_flip_retract_and_floor (test_qa.ReputationTest.test_flip_retract_and_floor) ... ok
+test_moving_accept (test_qa.ReputationTest.test_moving_accept) ... ok
+test_privileges (test_qa.ReputationTest.test_privileges) ... ok
+test_search (test_qa.ReputationTest.test_search) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.004s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><code>cpp/main.cpp</code></p>
+<pre><code class="language-cpp">// Stack Overflow / Flipkart Overflow Q&amp;A platform - C++14, single file.
+// Locking, as in the Java version: each Post has its own mutex (votes, comments, accepted answer), so votes on
+// different posts never wait for each other; User::reputation is a std::atomic&lt;int&gt; updated with a
+// compare-exchange loop (like atomic_cmpxchg() in the kernel); one service mutex mu_ guards the maps, the word
+// index and the id counters. Lock order: mu_ before a post lock, never the reverse. Listeners run after unlock.
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;atomic&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;iterator&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;set&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+
+struct QaError : std::runtime_error { explicit QaError(const std::string&amp; m) : std::runtime_error(m) {} };
+
+enum class VoteType { UP, DOWN };
+enum class Action { ASK, ANSWER, COMMENT, UPVOTE, DOWNVOTE, ACCEPT };
+
+struct User {
+    std::string id, name;
+    std::set&lt;std::string&gt; topics;
+    std::atomic&lt;int&gt; reputation{1};
+    User(std::string i, std::string n) : id(std::move(i)), name(std::move(n)) {}
+    void addReputation(int d) {                 // lock-free, floor at 1: retry until no other thread got in between
+        int cur = reputation.load();
+        while (!reputation.compare_exchange_weak(cur, std::max(1, cur + d))) {}
+    }
+};
+
+struct Question;
+struct Post {                                   // base of Question and Answer
+    std::string id; User* author; std::string body; long createdAt;
+    std::map&lt;std::string, VoteType&gt; votes;      // voter id -&gt; vote
+    std::vector&lt;std::pair&lt;User*, std::string&gt;&gt; comments;
+    mutable Mutex mu;                           // guards votes, comments (and answers/accepted on a Question)
+    Post(std::string i, User* a, std::string b, long t) : id(std::move(i)), author(a), body(std::move(b)), createdAt(t) {}
+    virtual ~Post() {}
+    virtual Question* question() = 0;
+    virtual bool isQuestion() const = 0;
+    int score() const {
+        std::lock_guard&lt;Mutex&gt; g(mu);
+        int s = 0;
+        for (const auto&amp; kv : votes) s += kv.second == VoteType::UP ? 1 : -1;
+        return s;
+    }
+};
+
+struct Answer;
+struct Question : Post {
+    std::string title; std::set&lt;std::string&gt; tags;
+    std::vector&lt;Answer*&gt; answers; std::set&lt;std::string&gt; followers; Answer* accepted = nullptr;
+    Question(std::string i, User* a, std::string ti, std::string b, std::set&lt;std::string&gt; tg, long t)
+        : Post(std::move(i), a, std::move(b), t), title(std::move(ti)), tags(std::move(tg)) {}
+    Question* question() override { return this; }
+    bool isQuestion() const override { return true; }
+};
+
+struct Answer : Post {
+    Question* parent;
+    Answer(std::string i, User* a, Question* q, std::string b, long t) : Post(std::move(i), a, std::move(b), t), parent(q) {}
+    Question* question() override { return parent; }
+    bool isQuestion() const override { return false; }
+};
+
+// ---------- strategies and policies ----------
+struct ReputationPolicy {
+    virtual ~ReputationPolicy() {}
+    virtual int forAuthor(bool isQ, VoteType v) const = 0;
+    virtual int forVoter(bool isQ, VoteType v) const = 0;
+    virtual int forAccepted() const { return 15; }
+    virtual int forAcceptor() const { return 2; }
+};
+struct StackOverflowReputation : ReputationPolicy {
+    int forAuthor(bool, VoteType v) const override { return v == VoteType::UP ? 10 : -2; }
+    int forVoter(bool isQ, VoteType v) const override { return (!isQ &amp;&amp; v == VoteType::DOWN) ? -1 : 0; }
+};
+
+struct PermissionRule {                         // like a netfilter hook: each may drop the request
+    virtual ~PermissionRule() {}
+    virtual void check(const User&amp; u, Action a, const std::set&lt;std::string&gt;&amp; tags) const = 0;
+};
+struct ReputationPrivileges : PermissionRule {
+    void check(const User&amp; u, Action a, const std::set&lt;std::string&gt;&amp;) const override {
+        if (a == Action::UPVOTE &amp;&amp; u.reputation &lt; 15) throw QaError(u.name + " needs 15 reputation to upvote");
+        if (a == Action::DOWNVOTE &amp;&amp; u.reputation &lt; 125) throw QaError(u.name + " needs 125 reputation to downvote");
+    }
+};
+struct TopicSubscriptionRule : PermissionRule {
+    void check(const User&amp; u, Action a, const std::set&lt;std::string&gt;&amp; tags) const override {
+        if (a == Action::ACCEPT) return;
+        for (const auto&amp; t : tags) if (u.topics.count(t)) return;
+        throw QaError(u.name + " is not subscribed to a topic of this question");
+    }
+};
+
+using Filter = std::function&lt;bool(const Question&amp;)&gt;;
+static Filter anyTopic(std::set&lt;std::string&gt; want) {
+    return [want](const Question&amp; q) { for (const auto&amp; t : q.tags) if (want.count(t)) return true; return false; };
+}
+static Filter answered(bool yes) { return [yes](const Question&amp; q) { return q.answers.empty() != yes; }; }
+static Filter everything() { return [](const Question&amp;) { return true; }; }
+
+static std::vector&lt;std::string&gt; words(const std::string&amp; text) {
+    std::vector&lt;std::string&gt; r; std::string w;
+    for (char c : text + " ") {
+        unsigned char u = static_cast&lt;unsigned char&gt;(c);
+        if (std::isalnum(u) || c == '+' || c == '#') w += static_cast&lt;char&gt;(std::tolower(u));
+        else { if (w.size() &gt; 1) r.push_back(w); w.clear(); }
+    }
+    return r;
+}
+
+// ---------- service (facade) ----------
+class QaService {
+public:
+    using Listener = std::function&lt;void(const std::string&amp;, const std::string&amp;)&gt;;
+    QaService(std::unique_ptr&lt;ReputationPolicy&gt; rep, std::vector&lt;std::unique_ptr&lt;PermissionRule&gt;&gt; rules)
+        : rep_(std::move(rep)), rules_(std::move(rules)) {}
+
+    void addListener(Listener l) { listeners_.push_back(std::move(l)); }
+
+    std::string registerUser(const std::string&amp; name) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::string id = "U" + std::to_string(nu_++);
+        users_.emplace(std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple(id, name));
+        return id;
+    }
+    void subscribe(const std::string&amp; uid, std::initializer_list&lt;std::string&gt; ts) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        for (auto&amp; t : ts) user(uid).topics.insert(t);
+    }
+    void bonus(const std::string&amp; uid, int pts) { userRef(uid).addReputation(pts); }
+
+    std::string ask(const std::string&amp; uid, const std::string&amp; title, const std::string&amp; body, std::set&lt;std::string&gt; tags) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        User&amp; u = user(uid);
+        if (title.empty()) throw QaError("title is empty");
+        if (tags.empty()) throw QaError("a question needs at least one tag");
+        allow(u, Action::ASK, tags);
+        std::string id = "Q" + std::to_string(nq_++);
+        std::unique_ptr&lt;Question&gt; q(new Question(id, &amp;u, title, body, tags, ++clock_));
+        q-&gt;followers.insert(u.id);
+        for (const auto&amp; w : words(title + " " + body)) index_[w].insert(id);
+        questions_[id] = q.get();
+        posts_[id] = std::move(q);
+        return id;
+    }
+
+    std::string answer(const std::string&amp; uid, const std::string&amp; qid, const std::string&amp; body) {
+        Notes notes;
+        std::string id;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);
+            User&amp; u = user(uid);
+            Question&amp; q = question(qid);
+            if (body.empty()) throw QaError("answer is empty");
+            allow(u, Action::ANSWER, q.tags);
+            id = "A" + std::to_string(na_++);
+            std::unique_ptr&lt;Answer&gt; a(new Answer(id, &amp;u, &amp;q, body, ++clock_));
+            {
+                std::lock_guard&lt;Mutex&gt; pg(q.mu);                 // mu_ then the post lock: the one lock order
+                q.answers.push_back(a.get());
+                q.followers.insert(u.id);
+                for (const auto&amp; f : q.followers)
+                    if (f != u.id) notes.push_back({users_.at(f).name, u.name + " answered " + q.id + ": " + q.title});
+            }
+            posts_[id] = std::move(a);
+        }
+        fire(notes);                                             // after every unlock
+        return id;
+    }
+
+    void comment(const std::string&amp; uid, const std::string&amp; pid, const std::string&amp; text) {
+        User* up; Post* pp;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);
+            up = &amp;user(uid); pp = &amp;post(pid);
+            allow(*up, Action::COMMENT, pp-&gt;question()-&gt;tags);
+        }
+        { std::lock_guard&lt;Mutex&gt; g(pp-&gt;mu); pp-&gt;comments.push_back({up, text}); }
+        if (pp-&gt;author != up) fire({{pp-&gt;author-&gt;name, up-&gt;name + " commented on " + pp-&gt;id}});
+    }
+
+    void vote(const std::string&amp; uid, const std::string&amp; pid, VoteType v) {
+        User* up; Post* pp;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);                       // map lookup + permission check only
+            up = &amp;user(uid); pp = &amp;post(pid);
+            if (pp-&gt;author == up) throw QaError(up-&gt;name + " cannot vote on own post");
+            allow(*up, v == VoteType::UP ? Action::UPVOTE : Action::DOWNVOTE, pp-&gt;question()-&gt;tags);
+        }
+        User&amp; u = *up; Post&amp; p = *pp;
+        std::lock_guard&lt;Mutex&gt; g(p.mu);                          // read old vote + write new vote: one step
+        auto it = p.votes.find(u.id);
+        if (it != p.votes.end() &amp;&amp; it-&gt;second == v) throw QaError(u.name + " already voted on " + p.id);
+        if (it != p.votes.end()) apply(u, p, it-&gt;second, -1);
+        p.votes[u.id] = v;
+        apply(u, p, v, +1);
+    }
+
+    void retractVote(const std::string&amp; uid, const std::string&amp; pid) {
+        User* up; Post* pp;
+        { std::lock_guard&lt;Mutex&gt; g(mu_); up = &amp;user(uid); pp = &amp;post(pid); }
+        User&amp; u = *up; Post&amp; p = *pp;
+        std::lock_guard&lt;Mutex&gt; g(p.mu);
+        auto it = p.votes.find(u.id);
+        if (it == p.votes.end()) throw QaError(u.name + " has no vote on " + p.id);
+        VoteType old = it-&gt;second;
+        p.votes.erase(it);
+        apply(u, p, old, -1);
+    }
+
+    void accept(const std::string&amp; uid, const std::string&amp; aid) {
+        User* up; Post* pp;
+        { std::lock_guard&lt;Mutex&gt; g(mu_); up = &amp;user(uid); pp = &amp;post(aid); }
+        User&amp; u = *up; Post&amp; p = *pp;
+        if (p.isQuestion()) throw QaError(aid + " is not an answer");
+        Answer&amp; a = static_cast&lt;Answer&amp;&gt;(p);
+        Question&amp; q = *a.parent;
+        if (q.author != &amp;u) throw QaError("only " + q.author-&gt;name + " can accept answers on " + q.id);
+        bool newPays;
+        {
+            std::lock_guard&lt;Mutex&gt; g(q.mu);                      // the question's lock guards q.accepted
+            Answer* old = q.accepted;
+            if (old == &amp;a) return;
+            bool oldPaid = old &amp;&amp; old-&gt;author != &amp;u;
+            newPays = a.author != &amp;u;
+            if (oldPaid) old-&gt;author-&gt;addReputation(-rep_-&gt;forAccepted());
+            u.addReputation(rep_-&gt;forAcceptor() * ((newPays ? 1 : 0) - (oldPaid ? 1 : 0)));
+            q.accepted = &amp;a;
+            if (newPays) a.author-&gt;addReputation(rep_-&gt;forAccepted());
+        }
+        if (newPays) fire({{a.author-&gt;name, "your answer " + a.id + " was accepted on " + q.id}});
+    }
+
+    std::vector&lt;const Question*&gt; feed(const std::string&amp; uid, const Filter&amp; f) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        Filter mine = anyTopic(user(uid).topics);
+        std::vector&lt;const Question*&gt; r;
+        for (const auto&amp; kv : questions_) if (mine(*kv.second) &amp;&amp; f(*kv.second)) r.push_back(kv.second);
+        std::sort(r.begin(), r.end(), [](const Question* a, const Question* b) { return a-&gt;createdAt &gt; b-&gt;createdAt; });
+        return r;
+    }
+
+    std::vector&lt;const Question*&gt; search(const std::string&amp; text) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::set&lt;std::string&gt; ids; bool first = true;
+        for (const auto&amp; w : words(text)) {
+            const std::set&lt;std::string&gt;&amp; hit = index_[w];
+            if (first) { ids = hit; first = false; continue; }
+            std::set&lt;std::string&gt; both;
+            std::set_intersection(ids.begin(), ids.end(), hit.begin(), hit.end(), std::inserter(both, both.begin()));
+            ids.swap(both);
+        }
+        std::vector&lt;const Question*&gt; r;
+        for (const auto&amp; id : ids) r.push_back(questions_[id]);
+        std::sort(r.begin(), r.end(), [](const Question* a, const Question* b) {
+            return a-&gt;score() != b-&gt;score() ? a-&gt;score() &gt; b-&gt;score() : a-&gt;createdAt &gt; b-&gt;createdAt; });
+        return r;
+    }
+
+    std::string show(const std::string&amp; qid) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        Question&amp; q = question(qid);
+        std::vector&lt;Answer*&gt; as;
+        Answer* acc;
+        { std::lock_guard&lt;Mutex&gt; pg(q.mu); as = q.answers; acc = q.accepted; }
+        std::stable_sort(as.begin(), as.end(), [acc](const Answer* a, const Answer* b) {
+            if ((a == acc) != (b == acc)) return a == acc;
+            if (a-&gt;score() != b-&gt;score()) return a-&gt;score() &gt; b-&gt;score();
+            return a-&gt;createdAt &lt; b-&gt;createdAt;
+        });
+        std::ostringstream os;
+        os &lt;&lt; q.id &lt;&lt; " [" &lt;&lt; q.score() &lt;&lt; "] " &lt;&lt; q.title &lt;&lt; " by " &lt;&lt; q.author-&gt;name;
+        for (const Answer* a : as) {
+            os &lt;&lt; "\n   " &lt;&lt; (a == acc ? "* " : "  ") &lt;&lt; a-&gt;id &lt;&lt; " [" &lt;&lt; a-&gt;score() &lt;&lt; "] " &lt;&lt; a-&gt;body &lt;&lt; " - " &lt;&lt; a-&gt;author-&gt;name;
+            std::lock_guard&lt;Mutex&gt; ag(a-&gt;mu);
+            for (const auto&amp; c : a-&gt;comments) os &lt;&lt; "\n        " &lt;&lt; c.first-&gt;name &lt;&lt; ": " &lt;&lt; c.second;
+        }
+        return os.str();
+    }
+
+    int reputationOf(const std::string&amp; uid) { return userRef(uid).reputation.load(); }
+    int scoreOf(const std::string&amp; pid) { Post* p; { std::lock_guard&lt;Mutex&gt; g(mu_); p = &amp;post(pid); } return p-&gt;score(); }
+
+private:
+    void apply(User&amp; voter, Post&amp; p, VoteType v, int sign) {
+        p.author-&gt;addReputation(sign * rep_-&gt;forAuthor(p.isQuestion(), v));
+        voter.addReputation(sign * rep_-&gt;forVoter(p.isQuestion(), v));
+    }
+    void allow(const User&amp; u, Action a, const std::set&lt;std::string&gt;&amp; tags) { for (const auto&amp; r : rules_) r-&gt;check(u, a, tags); }
+    using Notes = std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;;   // (user name, message), sent after unlock
+    void fire(const Notes&amp; notes) { for (const auto&amp; n : notes) for (auto&amp; l : listeners_) l(n.first, n.second); }
+    User&amp; userRef(const std::string&amp; id) { std::lock_guard&lt;Mutex&gt; g(mu_); return user(id); }
+    User&amp; user(const std::string&amp; id) {
+        auto it = users_.find(id);
+        if (it == users_.end()) throw QaError("unknown user " + id);
+        return it-&gt;second;
+    }
+    Question&amp; question(const std::string&amp; id) {
+        auto it = questions_.find(id);
+        if (it == questions_.end()) throw QaError("unknown question " + id);
+        return *it-&gt;second;
+    }
+    Post&amp; post(const std::string&amp; id) {
+        auto it = posts_.find(id);
+        if (it == posts_.end()) throw QaError("unknown post " + id);
+        return *it-&gt;second;
+    }
+
+    std::unique_ptr&lt;ReputationPolicy&gt; rep_;
+    std::vector&lt;std::unique_ptr&lt;PermissionRule&gt;&gt; rules_;
+    std::map&lt;std::string, User&gt; users_;
+    std::map&lt;std::string, std::unique_ptr&lt;Post&gt;&gt; posts_;   // owns every question and answer
+    std::map&lt;std::string, Question*&gt; questions_;
+    std::map&lt;std::string, std::set&lt;std::string&gt;&gt; index_;   // word -&gt; question ids
+    std::vector&lt;Listener&gt; listeners_;
+    long clock_ = 0;
+    int nu_ = 1, nq_ = 1, na_ = 1;
+    Mutex mu_;                                             // guards the maps, index_, clock_ and the id counters
+};
+
+// ---------- demo driver with checks ----------
+static int checks = 0;
+static void check(bool ok, const char* what) {
+    if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++checks;
+}
+static std::string ids(const std::vector&lt;const Question*&gt;&amp; qs) {
+    std::string s = "[";
+    for (size_t i = 0; i &lt; qs.size(); ++i) s += (i ? ", " : "") + qs[i]-&gt;id;
+    return s + "]";
+}
+template &lt;class F&gt; static bool rejected(F f, const std::string&amp; label) {
+    try { f(); } catch (const QaError&amp; e) { std::cout &lt;&lt; label &lt;&lt; " -&gt; rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; return true; }
+    return false;
+}
+
+int main() {
+    auto console = [](const std::string&amp; u, const std::string&amp; m) { std::cout &lt;&lt; "  [notify " &lt;&lt; u &lt;&lt; "] " &lt;&lt; m &lt;&lt; "\n"; };
+
+    std::cout &lt;&lt; "== Flipkart Overflow ==\n";
+    std::vector&lt;std::unique_ptr&lt;PermissionRule&gt;&gt; fr;
+    fr.emplace_back(new TopicSubscriptionRule());
+    QaService flip(std::unique_ptr&lt;ReputationPolicy&gt;(new StackOverflowReputation()), std::move(fr));
+    flip.addListener(console);
+    std::string asha = flip.registerUser("asha"), bala = flip.registerUser("bala"), chen = flip.registerUser("chen");
+    flip.subscribe(asha, {"java", "hadoop", "jdk"});
+    std::string q1 = flip.ask(asha, "What are new open source JDKs?", "Looking beyond Oracle.", {"java", "jdk"});
+    std::string q2 = flip.ask(asha, "Does Hadoop work on JDK 11?", "Cluster upgrade.", {"hadoop", "jdk"});
+    std::cout &lt;&lt; "feed asha          " &lt;&lt; ids(flip.feed(asha, everything())) &lt;&lt; "\n";
+    std::cout &lt;&lt; "feed asha [java]   " &lt;&lt; ids(flip.feed(asha, anyTopic({"java"}))) &lt;&lt; "\n";
+    check(flip.feed(asha, anyTopic({"java"})).size() == 1, "topic filter");
+    flip.subscribe(bala, {"apache", "hadoop"});
+    check(rejected([&amp;] { flip.ask(bala, "Best JVM flags?", "", {"java"}); }, "bala asks in [java]"), "ask needs subscription");
+    std::string a1 = flip.answer(bala, q2, "Yes, Hadoop 3 and above supports it.");
+    std::cout &lt;&lt; "feed asha answered " &lt;&lt; ids(flip.feed(asha, answered(true))) &lt;&lt; "\n";
+    check(flip.feed(asha, answered(true)).size() == 1, "answered filter");
+    flip.subscribe(chen, {"hadoop", "java"});
+    flip.vote(chen, a1, VoteType::UP);
+    check(rejected([&amp;] { flip.vote(chen, a1, VoteType::UP); }, "chen upvotes A1 again"), "no duplicate vote");
+    std::string a2 = flip.answer(chen, q2, "Only from Hadoop 3.3 for runtime.");
+    flip.vote(bala, a2, VoteType::UP);
+    flip.vote(asha, a2, VoteType::UP);
+    flip.accept(asha, a1);
+    std::cout &lt;&lt; flip.show(q2) &lt;&lt; "\n";
+    check(flip.show(q2).find("* " + a1) != std::string::npos, "accepted first");
+    (void)q1;
+
+    std::cout &lt;&lt; "\n== Stack Overflow reputation ==\n";
+    std::vector&lt;std::unique_ptr&lt;PermissionRule&gt;&gt; sr;
+    sr.emplace_back(new ReputationPrivileges());
+    QaService so(std::unique_ptr&lt;ReputationPolicy&gt;(new StackOverflowReputation()), std::move(sr));
+    std::string ann = so.registerUser("ann"), ben = so.registerUser("ben"), cat = so.registerUser("cat"), dev = so.registerUser("dev");
+    std::string sq = so.ask(ann, "Why does my C struct have padding?", "sizeof is bigger than the sum", {"c", "memory"});
+    std::string sa = so.answer(ben, sq, "Alignment: each field starts at a multiple of its size.");
+    check(rejected([&amp;] { so.vote(cat, sa, VoteType::UP); }, "cat (rep 1) upvotes"), "upvote needs 15");
+    so.bonus(cat, 100);
+    so.bonus(dev, 200);
+    so.vote(cat, sa, VoteType::UP);
+    so.vote(dev, sa, VoteType::UP);
+    so.vote(dev, sa, VoteType::DOWN);
+    std::cout &lt;&lt; "dev flips to DOWN: ben " &lt;&lt; so.reputationOf(ben) &lt;&lt; ", dev " &lt;&lt; so.reputationOf(dev) &lt;&lt; "\n";
+    check(so.reputationOf(ben) == 9 &amp;&amp; so.reputationOf(dev) == 200, "flip math");
+    so.retractVote(dev, sa);
+    so.accept(ann, sa);
+    std::cout &lt;&lt; "ann accepts: ben " &lt;&lt; so.reputationOf(ben) &lt;&lt; ", ann " &lt;&lt; so.reputationOf(ann) &lt;&lt; "\n";
+    check(so.reputationOf(ben) == 26 &amp;&amp; so.reputationOf(ann) == 3, "+15 / +2");
+    std::cout &lt;&lt; "search 'struct padding': " &lt;&lt; ids(so.search("struct padding")) &lt;&lt; "\n";
+    check(so.search("kubernetes").empty(), "no match");
+
+    std::cout &lt;&lt; "All " &lt;&lt; checks &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -O2 main.cpp -o qa &amp;&amp; ./qa
+== Flipkart Overflow ==
+feed asha          [Q2, Q1]
+feed asha [java]   [Q1]
+bala asks in [java] -&gt; rejected: bala is not subscribed to a topic of this question
+  [notify asha] bala answered Q2: Does Hadoop work on JDK 11?
+feed asha answered [Q2]
+chen upvotes A1 again -&gt; rejected: chen already voted on A1
+  [notify asha] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] chen answered Q2: Does Hadoop work on JDK 11?
+  [notify bala] your answer A1 was accepted on Q2
+Q2 [0] Does Hadoop work on JDK 11? by asha
+   * A1 [1] Yes, Hadoop 3 and above supports it. - bala
+     A2 [2] Only from Hadoop 3.3 for runtime. - chen
+
+== Stack Overflow reputation ==
+cat (rep 1) upvotes -&gt; rejected: cat needs 15 reputation to upvote
+dev flips to DOWN: ben 9, dev 200
+ann accepts: ben 26, ann 3
+search 'struct padding': [Q1]
+All 9 checks passed</code></pre>
+    </div>
+  </div>

@@ -1,0 +1,83 @@
+
+        <h2>Architecture: one Place Order click</h2>
+        <p>Step through what happens after the customer clicks <b>Place your order</b>. The checkout orchestrator runs a <b>saga</b>: a sequence of local transactions, each with an undo step.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 430" role="img" aria-label="Checkout saga step by step">
+            <rect class="box client" x="10" y="180" width="100" height="60"/>
+            <text class="label" x="60" y="203">Client</text>
+            <text class="label small" x="60" y="223">+ idem key</text>
+            <rect class="box svc" x="140" y="180" width="110" height="60"/>
+            <text class="label" x="195" y="203">Gateway</text>
+            <text class="label small" x="195" y="223">auth, rate limit</text>
+            <path class="arrow" d="M110 210 L132 210"/>
+
+            <g data-step="1">
+              <rect class="box svc" x="290" y="175" width="150" height="70"/>
+              <text class="label" x="365" y="202">Checkout</text>
+              <text class="label small" x="365" y="224">orchestrator</text>
+              <rect class="box db" x="290" y="320" width="150" height="56"/>
+              <text class="label" x="365" y="342">Orders DB</text>
+              <text class="label small" x="365" y="362">key UNIQUE</text>
+              <path class="arrow" d="M250 210 L282 210"/>
+              <path class="arrow both" d="M365 245 L365 312"/>
+            </g>
+            <g data-step="2">
+              <rect class="box cache" x="290" y="30" width="150" height="56"/>
+              <text class="label" x="365" y="52">Pricing + promo</text>
+              <text class="label small" x="365" y="72">quote still valid?</text>
+              <path class="arrow both" d="M365 175 L365 94"/>
+            </g>
+            <g data-step="3">
+              <rect class="box db" x="490" y="30" width="140" height="56"/>
+              <text class="label" x="560" y="52">Inventory</text>
+              <text class="label small" x="560" y="72">reserve, TTL 15m</text>
+              <path class="arrow" d="M440 190 L520 94"/>
+            </g>
+            <g data-step="4">
+              <rect class="box svc" x="490" y="180" width="140" height="60"/>
+              <text class="label" x="560" y="203">Payment svc</text>
+              <text class="label small" x="560" y="223">authorise only</text>
+              <rect class="box client" x="660" y="180" width="130" height="60"/>
+              <text class="label" x="725" y="203">PSP / bank</text>
+              <text class="label small" x="725" y="223">same key</text>
+              <path class="arrow" d="M440 210 L482 210"/>
+              <path class="arrow both" d="M630 210 L652 210"/>
+            </g>
+            <g data-step-only="5">
+              <path class="arrow bad dashed" d="M520 180 C 600 140, 600 110, 580 94"/>
+              <text class="label small bad" x="690" y="140">declined: release hold</text>
+            </g>
+            <g data-step="6">
+              <text class="label small" x="365" y="300">CONFIRMED + outbox</text>
+            </g>
+            <g data-step="7">
+              <rect class="box kafka" x="490" y="320" width="140" height="56"/>
+              <text class="label" x="560" y="342">Kafka</text>
+              <text class="label small" x="560" y="362">order-events</text>
+              <path class="arrow" d="M440 348 L482 348"/>
+              <rect class="box svc" x="660" y="290" width="130" height="44"/>
+              <text class="label small" x="725" y="312">fulfilment / WMS</text>
+              <rect class="box svc" x="660" y="345" width="130" height="44"/>
+              <text class="label small" x="725" y="367">email, analytics</text>
+              <path class="arrow" d="M630 340 L652 314"/>
+              <path class="arrow" d="M630 356 L652 366"/>
+              <circle class="packet alt" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M440 348 L560 348 L660 312"/></circle>
+            </g>
+            <g data-step-only="8">
+              <text class="label small" x="400" y="404">at shipment: capture the payment</text>
+              <text class="label small" x="400" y="422">reservation -&gt; CONFIRMED, on_hand - qty</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Claim the key.</b> The orchestrator inserts a PENDING order row with <code>(customer_id, idempotency_key)</code> UNIQUE and a hash of the request. If the insert conflicts, this is a retry: return the saved response (or "still processing") and stop.</li>
+            <li><b>Check the price.</b> Pricing confirms that quote <code>q_9</code> has not expired and the coupon is still redeemable for this user. If anything changed, end with <code>409 PRICE_CHANGED</code>. Nothing has been reserved yet, so there is nothing to undo.</li>
+            <li><b>Reserve stock.</b> For each line, a conditional update in the inventory service: <code>reserved = reserved + qty WHERE on_hand - reserved &gt;= qty</code>, plus a reservation row that expires in 15 minutes. Its undo step is "release the reservation".</li>
+            <li><b>Authorise the payment.</b> The payment service asks the provider to <em>authorise</em> (hold) the amount, using the order id as the provider-side idempotency key. Money is not captured yet. Its undo step is "void the authorisation".</li>
+            <li><b>If payment is declined:</b> run the compensations in reverse order (release the reservations), mark the order PAYMENT_FAILED, and tell the customer to try another method. Nothing is half-done.</li>
+            <li><b>Commit the order.</b> In one local transaction: order status = CONFIRMED, store the response for the idempotency key, and insert an <code>order.confirmed</code> outbox row. This is the <b>pivot</b>: after it, the saga only moves forward.</li>
+            <li><b>Fan out.</b> A relay (a poller or Debezium CDC) publishes the outbox row to Kafka, keyed by orderId. Fulfilment picks a warehouse, email sends the confirmation, analytics and recommendations update. Each consumer is idempotent.</li>
+            <li><b>At shipment:</b> the warehouse ships, the payment is <em>captured</em>, the reservation becomes CONFIRMED and <code>on_hand</code> goes down. Capturing at shipment means a cancelled order only needs a void, not a refund.</li>
+          </ol>
+        </div>
+        <div class="callout note"><p><b>The whiteboard version:</b> Client -&gt; Gateway -&gt; Checkout orchestrator (+ Orders DB with key) -&gt; [Pricing, Inventory, Payment] -&gt; outbox -&gt; Kafka -&gt; Fulfilment/Email. Six boxes and three side calls.</p></div>
+      

@@ -1,0 +1,191 @@
+
+        <h2>The ladder: naive to best</h2>
+
+        <h3>Rung 0 - Bytes in the database</h3>
+        <p>A <code>BYTEA</code> or <code>BLOB</code> column is fine for a 20 KB avatar in a small app. It breaks as files grow: rows get huge, backups and replicas carry every byte, and the database's expensive storage and memory is spent on data nobody queries. <b>Breaks at:</b> roughly megabytes per object or gigabytes in total.</p>
+
+        <h3>Rung 1 - Split metadata from bytes</h3>
+        <p>Store the bytes in an object store under a key, and store a <strong>metadata row</strong> in your database: <code>file_id, owner_id, blob_key, size, content_type, sha256, status, created_at</code>. Every query (list my files, search by name, permissions) hits the small row; only an actual download touches the blob. Dropbox describes exactly this split: its Magic Pocket system stores only file contents (as blocks), while file and user metadata live elsewhere and file changes are recorded in a separate journal. The <a href="{{BASE}}hld/d36">S3 design</a> applies the same split inside the storage system itself.</p>
+        <p><b>Breaks when:</b> bytes still flow through the API to reach the store.</p>
+
+        <h3>Rung 2 - Presigned URLs (the valet key)</h3>
+        <p>Microsoft's Azure guide names this the <strong>Valet Key pattern</strong>: give the client a token that grants time-limited access to one specific resource for only the needed operation, so the client moves data directly and the application stays out of the data path. Creating the key is just signing a string, so it is cheap and needs no call to the store.</p>
+        <ul>
+          <li><b>Scope tightly.</b> One bucket, one object key you chose (never the client's file name as the key), one verb (<code>PUT</code> to upload, <code>GET</code> to download). Azure's sample grants only <em>create</em> permission (no overwrite, so the token is effectively single-use) for about three minutes.</li>
+          <li><b>Expire quickly.</b> AWS allows S3 presigned URLs up to 7 days with Signature V4 (SigV4, AWS's request-signing scheme: an HMAC over the method, path, chosen headers and expiry, so changing any of them breaks the signature) from the SDK or CLI (1 minute to 12 hours from the console), and a URL signed with temporary credentials dies when those credentials do. S3 checks expiry when the request starts: a download that began just before expiry finishes, but a retry after expiry fails.</li>
+          <li><b>Treat it as a bearer token.</b> Anyone holding the URL can use it until it expires. Use HTTPS, keep the URLs out of logs, and record which user each was issued to, because S3's logs identify the signer, not the person who used it.</li>
+          <li><b>Constrain size and type.</b> S3 presigned POST policies support a <code>content-length-range</code>; for a presigned PUT you can sign the exact <code>Content-Length</code> and <code>Content-Type</code> as signed headers, so S3 rejects an upload of any other size or type. Use POST when you need a size range rather than an exact size. Always validate after upload.</li>
+          <li><b>Browser uploads need <a href="{{BASE}}interview/glossary#cors">CORS</a></b> on the bucket, since the page and the bucket are different origins. (CORS, cross-origin resource sharing, is the browser rule that a page from site A may only call site B if B's response headers say A is allowed. An origin is scheme + host + port, so <code>https://app.example.com</code> and the bucket's host are different origins.) Allow <code>PUT</code> from your site's origin, and for multipart uploads add <code>ETag</code> to <code>ExposeHeaders</code>: each UploadPart response returns its ETag in a response header, and browsers hide headers from JavaScript unless the CORS rule exposes them. Without it the page cannot read the part ETags it must send to CompleteMultipartUpload. The "Bucket CORS" tab in the Kafka/Kubernetes/Docker section below shows the rule.</li>
+        </ul>
+        <p><b>Breaks when:</b> the file is large. A single 2 GB <code>PUT</code> that fails at 95% starts again from zero. AWS recommends considering multipart uploads once an object reaches about 100 MB.</p>
+
+        <h3>Rung 3 - Multipart and resumable uploads</h3>
+        <p>Split the file into parts, upload them independently (and in parallel), and assemble at the end. S3's limits: up to 10,000 parts per upload, each 5 MiB to 5 GiB (the last part can be smaller). Step through a full presigned multipart upload:</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 320" role="img" aria-label="Presigned multipart upload flow between client, API, metadata DB and blob store">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="130" width="130" height="60"/>
+            <text class="label" x="85" y="156">Client</text>
+            <text class="label small" x="85" y="176">video.mp4 2 GB</text>
+            <rect class="box svc" x="320" y="20" width="150" height="56"/>
+            <text class="label" x="395" y="53">Upload API</text>
+            <rect class="box db" x="600" y="20" width="180" height="56"/>
+            <text class="label" x="690" y="44">Metadata DB</text>
+            <text class="label small" x="690" y="64">file + part status</text>
+            <rect class="box cache" x="560" y="230" width="220" height="70"/>
+            <text class="label" x="670" y="258">Blob store</text>
+            <text class="label small" x="670" y="280">upload_id=U1</text>
+            <g data-step-only="1">
+              <path class="arrow" d="M150 145 L314 55"/>
+              <text class="label small" x="200" y="80">POST /uploads {size, sha256}</text>
+              <path class="arrow" d="M470 48 L594 48"/>
+              <text class="label small ok" x="535" y="100">row: status=PENDING</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow" d="M420 76 L600 230"/>
+              <text class="label small" x="560" y="150">CreateMultipartUpload</text>
+              <path class="arrow ok" d="M314 65 L150 155"/>
+              <text class="label small ok" x="240" y="135">upload_id + 200 signed part URLs</text>
+            </g>
+            <g data-step-only="3">
+              <path class="arrow ok thick" d="M150 165 L554 245"/>
+              <path class="arrow ok thick" d="M150 175 L554 262"/>
+              <path class="arrow ok thick" d="M150 185 L554 280"/>
+              <text class="label small" x="330" y="250">parts 1..200 in parallel (10 MB each)</text>
+              <circle class="packet" r="5"><animateMotion dur="1.6s" repeatCount="indefinite" path="M150 165 L560 245"/></circle>
+              <circle class="packet alt" r="5"><animateMotion dur="1.9s" repeatCount="indefinite" path="M150 175 L560 262"/></circle>
+              <circle class="packet gold" r="5"><animateMotion dur="2.2s" repeatCount="indefinite" path="M150 185 L560 280"/></circle>
+            </g>
+            <g data-step-only="4">
+              <rect class="box fail" x="200" y="200" width="260" height="40"/>
+              <text class="label bad" x="330" y="225">network drops at part 187</text>
+              <path class="arrow" d="M150 150 L314 60"/>
+              <text class="label small" x="215" y="110">GET /uploads/U1 - which parts done?</text>
+            </g>
+            <g data-step-only="5">
+              <path class="arrow ok thick" d="M150 175 L554 262"/>
+              <text class="label small" x="330" y="250">resend only parts 187..200</text>
+            </g>
+            <g data-step-only="6">
+              <path class="arrow" d="M150 145 L314 55"/>
+              <text class="label small" x="215" y="90">complete [part, ETag] x 200</text>
+              <path class="arrow" d="M420 76 L600 230"/>
+              <text class="label small" x="560" y="150">CompleteMultipartUpload</text>
+            </g>
+            <g data-step-only="7">
+              <path class="arrow kafka" d="M690 230 L690 82"/>
+              <text class="label small" x="610" y="160">ObjectCreated event</text>
+              <text class="label small ok" x="690" y="100">status=UPLOADED</text>
+              <text class="label small" x="395" y="110">-&gt; queue for scan / transcode</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Ask.</b> The client sends only metadata (size, type, a content hash). The API checks auth and quota, and writes a metadata row with status <code>PENDING</code>.</li>
+            <li><b>Initiate.</b> The API starts a multipart upload on the blob store (gets an <code>upload_id</code>) and returns presigned URLs, one per part. The API never sees a byte of video.</li>
+            <li><b>Upload parts in parallel.</b> The client sends parts straight to the store. Each part's response carries an ETag (a checksum) that the client keeps. ByteByteGo's example splits a 1.6 GB file into eight 200 MB parts.</li>
+            <li><b>Failure.</b> The connection drops. Nothing is lost except the part in flight. The client (or the API, from its record of confirmed parts) works out which parts are done.</li>
+            <li><b>Resume.</b> Only missing parts are re-sent. This is the whole point: a failure at 99% costs 1%.</li>
+            <li><b>Complete.</b> The client sends the list of part numbers and ETags; the store assembles the object in part order and verifies each part.</li>
+            <li><b>Sync state.</b> The store emits an object-created event; a consumer flips the metadata row to <code>UPLOADED</code> and queues follow-up work (virus scan, thumbnail, transcode). Hello Interview's YouTube breakdown uses exactly this: one object-level event starts processing.</li>
+          </ol>
+        </div>
+
+        <p>Two ways to know which parts are done after a crash:</p>
+        <ul>
+          <li><b>Ask the store.</b> S3's <code>ListParts</code> returns uploaded parts for an <code>upload_id</code> (paginated: at most 1,000 parts per call, so a larger upload needs follow-up calls with <code>PartNumberMarker</code> set from <code>NextPartNumberMarker</code>). Simple, but the client needs the <code>upload_id</code> saved locally.</li>
+          <li><b>Track in your DB.</b> Hello Interview's YouTube design keeps a chunk list per video in metadata, each with a fingerprint and status; the client reports part number + ETag after each part. This works across devices and lets the server show progress.</li>
+        </ul>
+        <p>Outside S3, the open <strong>tus</strong> protocol standardises resumable uploads over plain HTTP: <code>POST</code> creates an upload and returns its URL, <code>HEAD</code> returns the current <code>Upload-Offset</code>, and <code>PATCH</code> appends bytes from that offset (a wrong offset gets <code>409 Conflict</code>). Extensions add per-chunk checksums, server-side expiry of abandoned uploads, and parallel partial uploads that are concatenated. Google Cloud Storage offers its own resumable upload sessions.</p>
+
+        <div class="callout warn"><p><b>Clean up abandoned uploads.</b> Parts of an upload that is never completed still sit in the bucket and are billed. AWS recommends a lifecycle rule with <code>AbortIncompleteMultipartUpload</code> (their example uses 7 days). Likewise, a periodic job should expire <code>PENDING</code> metadata rows whose upload never finished.</p></div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 210" role="img" aria-label="File split into numbered parts uploaded in parallel; one failed part is retried">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="20" width="760" height="40"/>
+            <text class="label" x="400" y="46">video.mp4 (2 GB)</text>
+            <rect class="box queue" x="20" y="90" width="140" height="40"/><text class="label small" x="90" y="115">part 1</text>
+            <rect class="box queue" x="175" y="90" width="140" height="40"/><text class="label small" x="245" y="115">part 2</text>
+            <rect class="box fail" x="330" y="90" width="140" height="40"/><text class="label small bad" x="400" y="115">part 3 (retry)</text>
+            <rect class="box queue" x="485" y="90" width="140" height="40"/><text class="label small" x="555" y="115">part 4</text>
+            <rect class="box ghost" x="640" y="90" width="140" height="40"/><text class="label small" x="710" y="115">... part 200</text>
+            <rect class="box cache" x="20" y="160" width="760" height="40"/>
+            <text class="label" x="400" y="186">blob store assembles by part number on Complete</text>
+            <path class="arrow" d="M90 130 L90 154"/><path class="arrow" d="M245 130 L245 154"/><path class="arrow dashed" d="M400 130 L400 154"/><path class="arrow" d="M555 130 L555 154"/><path class="arrow" d="M710 130 L710 154"/>
+            <circle class="packet" r="5"><animateMotion dur="1.2s" repeatCount="indefinite" path="M90 130 L90 160"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M245 130 L245 160"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M400 130 L400 160"/></circle>
+            <circle class="packet gold" r="5"><animateMotion dur="1.3s" repeatCount="indefinite" path="M555 130 L555 160"/></circle>
+          </svg>
+          <figcaption>Parts are independent: each is retried on its own, and several upload at once to fill a long, fat network pipe. Part size is a trade: bigger parts mean fewer requests, smaller parts mean less re-sent work on failure and finer progress.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Why parallel parts are faster on one connection's worth of bandwidth: a single TCP flow is limited by its window divided by RTT (bandwidth-delay product), and one loss halves its congestion window. Several flows in parallel fill the pipe and a loss hurts only one. It is the same reason link aggregation and ECMP spread flows. And a per-part ETag is a per-frame CRC: detect a bad unit and resend just that unit, like selective ACK instead of go-back-N.</p>
+        </div>
+
+        <h3>Rung 4 - Content-addressed chunks and dedup</h3>
+        <p>For sync products (Dropbox, OneDrive, Google Drive) go one step further: split files into fixed-size blocks and name each block by the hash of its content. Dropbox's Magic Pocket stores blocks of up to 4 MB, compressed and encrypted, keyed typically by their SHA-256 hash; blocks are immutable once written, and the put path checks a block index before storing.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Two versions of a file share most block hashes; only the changed block is uploaded">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="40">report v1</text>
+            <rect class="box db" x="140" y="20" width="120" height="34"/><text class="label small mono" x="200" y="42">a1f3..</text>
+            <rect class="box db" x="270" y="20" width="120" height="34"/><text class="label small mono" x="330" y="42">7c09..</text>
+            <rect class="box db" x="400" y="20" width="120" height="34"/><text class="label small mono" x="460" y="42">e44b..</text>
+            <text class="label left" x="20" y="110">report v2</text>
+            <rect class="box db" x="140" y="90" width="120" height="34"/><text class="label small mono" x="200" y="112">a1f3..</text>
+            <rect class="box hot" x="270" y="90" width="120" height="34"/><text class="label small mono" x="330" y="112">5d2e..</text>
+            <rect class="box db" x="400" y="90" width="120" height="34"/><text class="label small mono" x="460" y="112">e44b..</text>
+            <rect class="box svc" x="590" y="40" width="190" height="70"/>
+            <text class="label" x="685" y="68">block index</text>
+            <text class="label small" x="685" y="90">"have a1f3, e44b"</text>
+            <path class="arrow" d="M520 107 L584 85"/>
+            <rect class="box cache" x="140" y="180" width="380" height="50"/>
+            <text class="label" x="330" y="210">upload only 5d2e.. (one 4 MB block)</text>
+            <path class="arrow ok" d="M330 124 L330 174"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M330 124 L330 180"/></circle>
+          </svg>
+          <figcaption>Content-addressed blocks. The client hashes each block and asks which hashes the server already has; only new blocks travel. Editing one page of a 1 GB file re-uploads one block, and identical files from many users are stored once.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Dedup</b> across versions and users for free: same bytes, same hash, one copy. (Cross-user dedup has privacy implications - it can leak "someone already has this file" - so many products dedup only within one account.)</li>
+          <li><b>Integrity</b> for free: the name is the checksum.</li>
+          <li><b>Immutable blocks</b> are easy to cache, replicate and erasure-code. Deletion becomes garbage collection of blocks no file version references.</li>
+          <li><b>Fixed vs content-defined chunking:</b> fixed 4 MB blocks are simple, but inserting one byte at the front shifts every boundary. Content-defined chunking (rolling hash, as in rsync-style tools) keeps boundaries stable. Mention it as a refinement.</li>
+        </ul>
+
+        <div class="callout tip"><p><b>Docker does this too.</b> A container image is a list of layers, and each layer is a blob named by its <code>sha256</code> digest. <code>docker push</code> asks the registry which digests it already has and uploads only the missing layers, in chunks, then commits by digest. That is why rebuilding an image with one changed layer pushes in seconds. See <a href="{{BASE}}devops/docker-02">Images &amp; Layers</a>.</p></div>
+
+        <h3>Rung 5 - Downloads: CDN, signed URLs, range requests</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Client gets a signed CDN URL from the API, then fetches byte ranges from the nearest edge; misses go to the origin bucket">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="100" width="120" height="56"/><text class="label" x="80" y="126">Viewer</text><text class="label small" x="80" y="145">Chennai</text>
+            <rect class="box svc" x="220" y="20" width="150" height="50"/><text class="label" x="295" y="50">API (auth)</text>
+            <rect class="box cache" x="300" y="150" width="190" height="60"/><text class="label" x="395" y="175">CDN edge</text><text class="label small" x="395" y="195">Mumbai</text>
+            <rect class="box db" x="610" y="150" width="170" height="60"/><text class="label" x="695" y="175">Origin bucket</text><text class="label small" x="695" y="195">private</text>
+            <path class="arrow" d="M120 100 L214 55"/>
+            <text class="label small" x="120" y="60">1 may I watch?</text>
+            <path class="arrow ok" d="M214 65 L140 110"/>
+            <path class="arrow ok" d="M140 140 L294 175"/>
+            <text class="label small" x="170" y="190">2 GET signed URL</text>
+            <text class="label small" x="170" y="208">Range: bytes=0-1048575</text>
+            <path class="arrow dashed" d="M490 180 L604 180"/>
+            <text class="label small" x="548" y="168">miss only</text>
+            <circle class="packet ok" r="6"><animateMotion dur="1.4s" repeatCount="indefinite" path="M300 180 L140 140"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M610 180 L490 180"/></circle>
+          </svg>
+          <figcaption>Authorise in the API, deliver from the edge. The API returns a short-lived signed CDN URL; the edge serves cached bytes and fetches from the private origin only on a miss. Range requests (HTTP 206) let players seek and let clients resume or parallelise downloads.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Public content</b> (product images, avatars): put a CDN in front with long cache lifetimes and versioned keys (<code>img/sku123_v4.jpg</code>), so a change is a new key and you never purge. See <a href="{{BASE}}hld/p04">Scaling Reads</a>.</li>
+          <li><b>Private content:</b> keep the bucket private; serve through the CDN with signed URLs or signed cookies (CloudFront supports both, and lets only the CDN read the origin), or a presigned GET straight from the store for low-volume cases.</li>
+          <li><b>Range requests:</b> <code>Range: bytes=start-end</code> returns <code>206 Partial Content</code>. Players seek, download managers resume, and clients fetch several ranges in parallel. Video goes further: transcode into short segments (<a href="{{BASE}}interview/glossary#hls-dash">HLS</a>/DASH: HTTP streaming formats where a video is cut into segment files of 2-10 seconds each, plus a playlist file that lists them; the player fetches the playlist, then segments one by one, switching quality between segments) so each segment is a small, cacheable object (<a href="{{BASE}}hld/d12">Video Streaming</a>).</li>
+          <li><b>Pre-position the hot set:</b> Netflix's Open Connect fills its appliances inside ISP networks ahead of demand, instead of pulling on a miss.</li>
+        </ul>
+        <div class="callout tip"><p><b>Go deeper.</b> Presigned URLs, multipart uploads and lifecycle rules on real S3 are in <a href="{{BASE}}devops/devops-aws-03">S3 in Practice</a>.</p></div>
+      

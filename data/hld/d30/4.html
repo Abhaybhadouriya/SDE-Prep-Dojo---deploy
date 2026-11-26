@@ -1,0 +1,36 @@
+
+        <h2>Data model</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Pipeline definitions</td><td>The app's own Git repo</td><td>repo + path</td><td>Versioned with the code; reviewed in PRs.</td></tr>
+              <tr><td>Runs, steps, status</td><td>PostgreSQL (sharded by tenant if needed)</td><td><code>run_id</code>; index (repo, commit_sha)</td><td>Relational queries ("all failed runs for repo X this week"), transactions for state changes.</td></tr>
+              <tr><td>Live execution state</td><td>Kubernetes objects (PipelineRun / Job / Pod)</td><td>namespace + name</td><td>The cluster is the source of truth while running; a controller mirrors it into Postgres.</td></tr>
+              <tr><td>Events</td><td>Kafka <code>ci.events</code>, <code>ci.run-status</code></td><td>repo (webhooks), run_id (status)</td><td>Durable buffer between webhooks, schedulers, notifiers and analytics.</td></tr>
+              <tr><td>Logs, test reports</td><td>Object storage</td><td><code>run_id/step</code></td><td>Large, write-once, cheap.</td></tr>
+              <tr><td>Images, SBOMs, signatures</td><td>OCI registry</td><td>repository + digest</td><td>Content-addressed blobs; signatures and SBOMs stored next to the image.</td></tr>
+              <tr><td>Desired deploy state</td><td>GitOps repo (manifests / Helm values)</td><td>service + env</td><td>Audit trail and rollback = <code>git revert</code>.</td></tr>
+              <tr><td>Build caches</td><td>Registry cache refs / remote cache service</td><td>content hash</td><td>Same inputs → same outputs → reuse.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">CREATE TABLE runs (
+  run_id       BIGINT PRIMARY KEY,
+  tenant       TEXT NOT NULL,           -- team / namespace
+  repo         TEXT NOT NULL,
+  commit_sha   CHAR(40) NOT NULL,
+  trigger      TEXT NOT NULL,           -- push | pull_request | tag | schedule | manual
+  status       TEXT NOT NULL,           -- QUEUED | RUNNING | SUCCEEDED | FAILED | CANCELLED
+  queued_at    TIMESTAMPTZ NOT NULL,
+  started_at   TIMESTAMPTZ,
+  finished_at  TIMESTAMPTZ,
+  delivery_id  TEXT NOT NULL,           -- X-GitHub-Delivery / X-Gitlab-Event-UUID, or a generated id for schedule/manual
+  attempt      INT  NOT NULL DEFAULT 1, -- re-runs of the same commit get attempt 2, 3, ...
+  UNIQUE (delivery_id)                  -- a redelivered webhook cannot create a 2nd run
+);
+CREATE INDEX runs_repo_sha  ON runs (repo, commit_sha);
+CREATE INDEX runs_repo_time ON runs (repo, queued_at DESC);</code></pre>
+        <p>The <code>UNIQUE (delivery_id)</code> constraint is the <b><a href="{{BASE}}interview/glossary#idempotency-key">idempotency key</a></b>: Git hosts retry webhooks with the <i>same delivery id</i>, and our Kafka consumer is <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a>, so the same push can arrive twice. The second insert fails and is ignored. We deliberately do <b>not</b> make <code>(repo, commit_sha, trigger)</code> unique: a manual "re-run failed step" and a nightly schedule on an unchanged main commit are legitimate new runs of the same commit, so they get a new delivery id and the next <code>attempt</code> number.</p>
+        <div class="callout note"><p><b>SQL vs NoSQL:</b> run metadata is modest (50k rows/day ≈ 18M/year), relational and queried in many ways - PostgreSQL is the simple, correct choice. The heavy bytes (logs, images) never touch the database.</p></div>
+      

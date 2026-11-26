@@ -1,0 +1,900 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language so you can read it top to bottom. In the real round, split Java into <code>model/</code>, <code>strategy/</code>, <code>service/</code> and <code>Main</code> (see the code-layout lesson in the interview section). The same files live in <code>lld-code/lld-case-customer-issue/</code> in this repo; each was compiled and run, and the output below is the real output. The Java service is <code>synchronized</code>; the C++14 version takes the same locks with <code>std::lock_guard</code>. The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>).</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.Predicate;
+
+// ---------- model ----------
+enum IssueType { PAYMENT, MUTUAL_FUND, GOLD, INSURANCE }
+
+// Issue lifecycle as a small state machine: each status lists where it may go next.
+enum IssueStatus {
+    OPEN, WAITING, IN_PROGRESS, RESOLVED;
+    boolean canMoveTo(IssueStatus next) {
+        switch (this) {
+            case OPEN:        return next == WAITING || next == IN_PROGRESS;
+            case WAITING:     return next == IN_PROGRESS;
+            case IN_PROGRESS: return next == RESOLVED;
+            default:          return false;                 // RESOLVED is terminal
+        }
+    }
+}
+
+class IssueException extends RuntimeException {
+    IssueException(String msg) { super(msg); }
+}
+
+final class Issue {
+    final String id, transactionId, subject, description, customerEmail;
+    final IssueType type;
+    private IssueStatus status = IssueStatus.OPEN;
+    private String agentId;                                  // null until assigned
+    private String resolution = "";
+
+    Issue(String id, String txnId, IssueType type, String subject, String description, String email) {
+        this.id = id; this.transactionId = txnId; this.type = type;
+        this.subject = subject; this.description = description; this.customerEmail = email;
+    }
+    IssueStatus status() { return status; }
+    String agentId() { return agentId; }
+    String resolution() { return resolution; }
+
+    void moveTo(IssueStatus next) {                          // every status change goes through here
+        if (!status.canMoveTo(next))
+            throw new IssueException(id + ": cannot move " + status + " -&gt; " + next);
+        status = next;
+    }
+    void setAgent(String agentId) { this.agentId = agentId; }
+    void setResolution(String r) { this.resolution = r == null ? "" : r; }
+    @Override public String toString() { return id + "[" + type + "," + status + (agentId == null ? "" : "," + agentId) + "]"; }
+}
+
+final class Agent {
+    final String id, name;                                   // id = agent email
+    final Set&lt;IssueType&gt; expertise;
+    private String currentIssue;                             // one issue at a time
+    private final Deque&lt;String&gt; waitlist = new ArrayDeque&lt;&gt;();
+    private final List&lt;String&gt; history = new ArrayList&lt;&gt;();  // resolved issue ids, in order
+
+    Agent(String id, String name, Collection&lt;IssueType&gt; expertise) {
+        this.id = id; this.name = name; this.expertise = EnumSet.copyOf(expertise);
+    }
+    boolean isFree() { return currentIssue == null; }
+    boolean canHandle(IssueType t) { return expertise.contains(t); }
+    int waitlistSize() { return waitlist.size(); }
+    String currentIssue() { return currentIssue; }
+    List&lt;String&gt; history() { return Collections.unmodifiableList(history); }
+
+    void start(String issueId) { currentIssue = issueId; }
+    void enqueue(String issueId) { waitlist.addLast(issueId); }
+    String finishCurrent() {                                 // returns next waiting issue id, or null
+        history.add(currentIssue);
+        currentIssue = waitlist.pollFirst();
+        return currentIssue;
+    }
+}
+
+// ---------- assignment strategies ----------
+interface AssignmentStrategy {
+    /** Pick an agent for the issue from agents that have the expertise; empty if none qualify. */
+    Optional&lt;Agent&gt; pick(Issue issue, List&lt;Agent&gt; experts);
+}
+
+/** Default: any free expert (first onboarded wins); if all are busy, the expert with the shortest waitlist. */
+final class FreeFirstStrategy implements AssignmentStrategy {
+    public Optional&lt;Agent&gt; pick(Issue issue, List&lt;Agent&gt; experts) {
+        for (Agent a : experts) if (a.isFree()) return Optional.of(a);
+        return experts.stream().min(Comparator.comparingInt(Agent::waitlistSize));
+    }
+}
+
+/** Alternative: rotate through experts per issue type, free or not (spreads load, ignores busyness). */
+final class RoundRobinStrategy implements AssignmentStrategy {
+    private final Map&lt;IssueType, Integer&gt; next = new EnumMap&lt;&gt;(IssueType.class);
+    public Optional&lt;Agent&gt; pick(Issue issue, List&lt;Agent&gt; experts) {
+        if (experts.isEmpty()) return Optional.empty();
+        int i = next.getOrDefault(issue.type, 0);
+        next.put(issue.type, i + 1);
+        return Optional.of(experts.get(i % experts.size()));
+    }
+}
+
+// ---------- filters (small Specification) ----------
+final class IssueFilters {
+    static Predicate&lt;Issue&gt; all() { return i -&gt; true; }
+    static Predicate&lt;Issue&gt; byEmail(String e) { return i -&gt; i.customerEmail.equalsIgnoreCase(e); }
+    static Predicate&lt;Issue&gt; byType(IssueType t) { return i -&gt; i.type == t; }
+    static Predicate&lt;Issue&gt; byStatus(IssueStatus s) { return i -&gt; i.status() == s; }
+    static Predicate&lt;Issue&gt; byAgent(String a) { return i -&gt; a.equals(i.agentId()); }
+}
+
+// ---------- service (facade) ----------
+final class IssueService {
+    private final Map&lt;String, Issue&gt; issues = new LinkedHashMap&lt;&gt;();
+    private final Map&lt;String, Agent&gt; agents = new LinkedHashMap&lt;&gt;();
+    private final AssignmentStrategy strategy;
+    private int seq = 0;
+
+    IssueService(AssignmentStrategy strategy) { this.strategy = strategy; }
+
+    synchronized Issue createIssue(String txnId, IssueType type, String subject, String desc, String email) {
+        if (txnId == null || txnId.isBlank() || email == null || !email.contains("@"))
+            throw new IssueException("transactionId and a valid email are required");
+        Issue issue = new Issue("I" + (++seq), txnId, type, subject, desc, email);
+        issues.put(issue.id, issue);
+        return issue;
+    }
+
+    synchronized Agent addAgent(String email, String name, List&lt;IssueType&gt; expertise) {
+        if (agents.containsKey(email)) throw new IssueException("agent exists: " + email);
+        if (expertise == null || expertise.isEmpty()) throw new IssueException("agent needs at least one issue type");
+        Agent a = new Agent(email, name, expertise);
+        agents.put(email, a);
+        return a;
+    }
+
+    /** Returns the chosen agent id, or empty if no agent has the expertise (issue stays OPEN). */
+    synchronized Optional&lt;String&gt; assignIssue(String issueId) {
+        Issue issue = get(issueId);
+        if (issue.status() != IssueStatus.OPEN) throw new IssueException(issueId + " already " + issue.status());
+        List&lt;Agent&gt; experts = new ArrayList&lt;&gt;();
+        for (Agent a : agents.values()) if (a.canHandle(issue.type)) experts.add(a);
+        Optional&lt;Agent&gt; chosen = strategy.pick(issue, experts);
+        if (!chosen.isPresent()) return Optional.empty();
+        Agent a = chosen.get();
+        issue.setAgent(a.id);
+        if (a.isFree()) { issue.moveTo(IssueStatus.IN_PROGRESS); a.start(issue.id); }
+        else            { issue.moveTo(IssueStatus.WAITING);     a.enqueue(issue.id); }
+        return Optional.of(a.id);
+    }
+
+    synchronized List&lt;Issue&gt; getIssues(Predicate&lt;Issue&gt; filter) {
+        List&lt;Issue&gt; out = new ArrayList&lt;&gt;();
+        for (Issue i : issues.values()) if (filter.test(i)) out.add(i);
+        return out;
+    }
+
+    /** RESOLVED delegates to resolveIssue; same status = update the notes. Other moves belong to the system
+     *  (assignment and the waitlist), so a caller cannot push WAITING -&gt; IN_PROGRESS by hand. */
+    synchronized void updateIssue(String issueId, IssueStatus status, String resolution) {
+        if (status == IssueStatus.RESOLVED) { resolveIssue(issueId, resolution); return; }
+        Issue issue = get(issueId);
+        if (status != issue.status())
+            throw new IssueException(issueId + ": only the system moves " + issue.status() + " -&gt; " + status);
+        issue.setResolution(resolution);
+    }
+
+    synchronized void resolveIssue(String issueId, String resolution) {
+        Issue issue = get(issueId);
+        if (issue.status() == IssueStatus.RESOLVED) throw new IssueException(issueId + " is already RESOLVED");
+        Agent a = issue.agentId() == null ? null : agents.get(issue.agentId());
+        if (a == null || !issueId.equals(a.currentIssue()))
+            throw new IssueException(issueId + " is not the issue its agent is working on");
+        issue.moveTo(IssueStatus.RESOLVED);
+        issue.setResolution(resolution);
+        String next = a.finishCurrent();                     // agent pulls the next waiting issue
+        if (next != null) issues.get(next).moveTo(IssueStatus.IN_PROGRESS);
+    }
+
+    synchronized Map&lt;String, List&lt;String&gt;&gt; viewAgentsWorkHistory() {
+        Map&lt;String, List&lt;String&gt;&gt; out = new LinkedHashMap&lt;&gt;();
+        for (Agent a : agents.values()) out.put(a.id, new ArrayList&lt;&gt;(a.history()));
+        return out;
+    }
+
+    synchronized Agent agent(String id) { return agents.get(id); }
+
+    private Issue get(String id) {
+        Issue i = issues.get(id);
+        if (i == null) throw new IssueException("no such issue: " + id);
+        return i;
+    }
+}
+
+// ---------- demo driver with checks ----------
+public class Main {
+    static int passed = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        passed++;
+    }
+
+    public static void main(String[] args) throws Exception {
+        IssueService s = new IssueService(new FreeFirstStrategy());
+        Issue i1 = s.createIssue("T1", IssueType.PAYMENT, "Payment failed", "Money debited", "asha@test.com");
+        Issue i2 = s.createIssue("T2", IssueType.GOLD, "Gold not credited", "Bought 1g", "ben@test.com");
+        Issue i3 = s.createIssue("T3", IssueType.PAYMENT, "Pending txn", "Stuck 2 days", "ben@test.com");
+        Issue i4 = s.createIssue("T4", IssueType.INSURANCE, "Policy missing", "No PDF", "chitra@test.com");
+        Issue i5 = s.createIssue("T5", IssueType.GOLD, "Gold sell failed", "Error 500", "asha@test.com");
+        s.addAgent("a1@pp.com", "Agent1", Arrays.asList(IssueType.PAYMENT, IssueType.GOLD));
+        s.addAgent("a2@pp.com", "Agent2", Arrays.asList(IssueType.PAYMENT));
+        System.out.println("created " + s.getIssues(IssueFilters.all()));
+
+        for (Issue i : Arrays.asList(i1, i2, i3, i4, i5)) {
+            Optional&lt;String&gt; a = s.assignIssue(i.id);
+            System.out.println("assign " + i.id + " -&gt; " + (a.isPresent() ? a.get() : "no agent with expertise, stays OPEN"));
+        }
+        check(i1.status() == IssueStatus.IN_PROGRESS &amp;&amp; "a1@pp.com".equals(i1.agentId()), "I1 to free a1");
+        check(i2.status() == IssueStatus.WAITING &amp;&amp; "a1@pp.com".equals(i2.agentId()), "I2 waits on a1 (only gold expert)");
+        check(i3.status() == IssueStatus.IN_PROGRESS &amp;&amp; "a2@pp.com".equals(i3.agentId()), "I3 to free a2");
+        check(i4.status() == IssueStatus.OPEN, "I4 has no expert");
+        check(s.agent("a1@pp.com").waitlistSize() == 2, "a1 waitlist = I2, I5");
+
+        System.out.println("issues of ben@test.com: " + s.getIssues(IssueFilters.byEmail("ben@test.com")));
+        System.out.println("waiting gold issues:    " + s.getIssues(IssueFilters.byType(IssueType.GOLD).and(IssueFilters.byStatus(IssueStatus.WAITING))));
+        check(s.getIssues(IssueFilters.byEmail("BEN@test.com")).size() == 2, "filter by email ignores case");
+
+        s.resolveIssue("I1", "Refund initiated");
+        System.out.println("resolve I1 -&gt; a1 now on " + s.agent("a1@pp.com").currentIssue());
+        check(i2.status() == IssueStatus.IN_PROGRESS, "a1 picks I2 from its waitlist");
+        s.updateIssue("I3", IssueStatus.RESOLVED, "Bank reversed the txn");
+        s.resolveIssue("I2", "Gold credited");
+        s.resolveIssue("I5", "Sell retried");
+        check(s.agent("a1@pp.com").isFree(), "a1 free after waitlist drains");
+
+        try { s.resolveIssue("I1", "again"); check(false, "double resolve must fail"); }
+        catch (IssueException e) { System.out.println("rejected: " + e.getMessage()); passed++; }
+        try { s.updateIssue("I4", IssueStatus.RESOLVED, "x"); check(false, "resolve unassigned must fail"); }
+        catch (IssueException e) { System.out.println("rejected: " + e.getMessage()); passed++; }
+
+        s.updateIssue("I4", IssueStatus.OPEN, "Asked customer for policy number");
+        try { s.updateIssue("I4", IssueStatus.IN_PROGRESS, "x"); check(false, "manual move must fail"); }
+        catch (IssueException e) { System.out.println("rejected: " + e.getMessage()); passed++; }
+
+        s.addAgent("a3@pp.com", "Agent3", Arrays.asList(IssueType.INSURANCE));
+        System.out.println("assign I4 again -&gt; " + s.assignIssue("I4").get());
+        System.out.println("work history " + s.viewAgentsWorkHistory());
+        check(s.viewAgentsWorkHistory().get("a1@pp.com").equals(Arrays.asList("I1", "I2", "I5")), "a1 history in order");
+
+        // strategy swap: round robin spreads payment issues over a1 and a2 even when a1 is free
+        IssueService rr = new IssueService(new RoundRobinStrategy());
+        rr.addAgent("a1@pp.com", "Agent1", Arrays.asList(IssueType.PAYMENT));
+        rr.addAgent("a2@pp.com", "Agent2", Arrays.asList(IssueType.PAYMENT));
+        List&lt;String&gt; got = new ArrayList&lt;&gt;();
+        for (int k = 0; k &lt; 4; k++) got.add(rr.assignIssue(rr.createIssue("R" + k, IssueType.PAYMENT, "s", "d", "x@y.com").id).get());
+        System.out.println("round robin " + got);
+        check(got.equals(Arrays.asList("a1@pp.com", "a2@pp.com", "a1@pp.com", "a2@pp.com")), "round robin order");
+
+        // concurrency: 8 threads create+assign 400 issues; each agent works on at most one
+        IssueService c = new IssueService(new FreeFirstStrategy());
+        for (int k = 0; k &lt; 5; k++) c.addAgent("c" + k + "@pp.com", "C" + k, Arrays.asList(IssueType.PAYMENT));
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; 8; t++) fs.add(pool.submit(() -&gt; {
+            for (int k = 0; k &lt; 50; k++) c.assignIssue(c.createIssue("C", IssueType.PAYMENT, "s", "d", "c@y.com").id);
+        }));
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        long inProgress = c.getIssues(IssueFilters.byStatus(IssueStatus.IN_PROGRESS)).size();
+        long waiting = c.getIssues(IssueFilters.byStatus(IssueStatus.WAITING)).size();
+        System.out.println("concurrent: in progress=" + inProgress + " waiting=" + waiting);
+        check(inProgress == 5 &amp;&amp; waiting == 395, "one issue per agent, rest waiting");
+
+        System.out.println("All " + passed + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Customer Issue Resolution (PhonePe machine coding) - in-memory, thread safe, runnable."""
+from __future__ import annotations
+
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Deque, Dict, List, Optional
+
+
+class IssueType(Enum):
+    PAYMENT = "PAYMENT"
+    MUTUAL_FUND = "MUTUAL_FUND"
+    GOLD = "GOLD"
+    INSURANCE = "INSURANCE"
+
+
+class IssueStatus(Enum):
+    OPEN = "OPEN"
+    WAITING = "WAITING"
+    IN_PROGRESS = "IN_PROGRESS"
+    RESOLVED = "RESOLVED"
+
+
+# Issue lifecycle as a transition table (RESOLVED is terminal).
+ALLOWED = {
+    IssueStatus.OPEN: {IssueStatus.WAITING, IssueStatus.IN_PROGRESS},
+    IssueStatus.WAITING: {IssueStatus.IN_PROGRESS},
+    IssueStatus.IN_PROGRESS: {IssueStatus.RESOLVED},
+    IssueStatus.RESOLVED: set(),
+}
+
+
+class IssueError(Exception):
+    pass
+
+
+@dataclass
+class Issue:
+    id: str
+    transaction_id: str
+    type: IssueType
+    subject: str
+    description: str
+    email: str
+    status: IssueStatus = IssueStatus.OPEN
+    agent_id: Optional[str] = None
+    resolution: str = ""
+
+    def move_to(self, nxt: IssueStatus) -&gt; None:
+        if nxt not in ALLOWED[self.status]:
+            raise IssueError(f"{self.id}: cannot move {self.status.value} -&gt; {nxt.value}")
+        self.status = nxt
+
+    def __repr__(self) -&gt; str:
+        who = f",{self.agent_id}" if self.agent_id else ""
+        return f"{self.id}[{self.type.value},{self.status.value}{who}]"
+
+
+@dataclass
+class Agent:
+    id: str  # agent email
+    name: str
+    expertise: frozenset
+    current: Optional[str] = None
+    waitlist: Deque[str] = field(default_factory=deque)
+    history: List[str] = field(default_factory=list)
+
+    def is_free(self) -&gt; bool:
+        return self.current is None
+
+    def finish_current(self) -&gt; Optional[str]:
+        self.history.append(self.current)
+        self.current = self.waitlist.popleft() if self.waitlist else None
+        return self.current
+
+
+# ---------- assignment strategies ----------
+class AssignmentStrategy:
+    def pick(self, issue: Issue, experts: List[Agent]) -&gt; Optional[Agent]:
+        raise NotImplementedError
+
+
+class FreeFirstStrategy(AssignmentStrategy):
+    """Any free expert (first onboarded wins); else the expert with the shortest waitlist."""
+
+    def pick(self, issue, experts):
+        for a in experts:
+            if a.is_free():
+                return a
+        return min(experts, key=lambda a: len(a.waitlist), default=None)
+
+
+class RoundRobinStrategy(AssignmentStrategy):
+    """Rotate through experts per issue type, free or not."""
+
+    def __init__(self):
+        self._next: Dict[IssueType, int] = {}
+
+    def pick(self, issue, experts):
+        if not experts:
+            return None
+        i = self._next.get(issue.type, 0)
+        self._next[issue.type] = i + 1
+        return experts[i % len(experts)]
+
+
+# ---------- filters (small Specification: plain predicates that compose) ----------
+Filter = Callable[[Issue], bool]
+
+
+def by_email(e: str) -&gt; Filter:
+    return lambda i: i.email.lower() == e.lower()
+
+
+def by_type(t: IssueType) -&gt; Filter:
+    return lambda i: i.type == t
+
+
+def by_status(s: IssueStatus) -&gt; Filter:
+    return lambda i: i.status == s
+
+
+def all_of(*fs: Filter) -&gt; Filter:
+    return lambda i: all(f(i) for f in fs)
+
+
+# ---------- service (facade) ----------
+class IssueService:
+    def __init__(self, strategy: AssignmentStrategy):
+        self._issues: Dict[str, Issue] = {}
+        self._agents: Dict[str, Agent] = {}
+        self._strategy = strategy
+        self._seq = 0
+        self._lock = threading.RLock()
+
+    def create_issue(self, txn_id, issue_type, subject, description, email) -&gt; Issue:
+        if not txn_id or not email or "@" not in email:
+            raise IssueError("transaction id and a valid email are required")
+        with self._lock:
+            self._seq += 1
+            issue = Issue(f"I{self._seq}", txn_id, issue_type, subject, description, email)
+            self._issues[issue.id] = issue
+            return issue
+
+    def add_agent(self, email, name, expertise) -&gt; Agent:
+        if not expertise:
+            raise IssueError("agent needs at least one issue type")
+        with self._lock:
+            if email in self._agents:
+                raise IssueError(f"agent exists: {email}")
+            a = Agent(email, name, frozenset(expertise))
+            self._agents[email] = a
+            return a
+
+    def assign_issue(self, issue_id) -&gt; Optional[str]:
+        with self._lock:
+            issue = self._get(issue_id)
+            if issue.status != IssueStatus.OPEN:
+                raise IssueError(f"{issue_id} already {issue.status.value}")
+            experts = [a for a in self._agents.values() if issue.type in a.expertise]
+            a = self._strategy.pick(issue, experts)
+            if a is None:
+                return None  # no expert: stays OPEN
+            issue.agent_id = a.id
+            if a.is_free():
+                issue.move_to(IssueStatus.IN_PROGRESS)
+                a.current = issue.id
+            else:
+                issue.move_to(IssueStatus.WAITING)
+                a.waitlist.append(issue.id)
+            return a.id
+
+    def get_issues(self, flt: Filter = lambda i: True) -&gt; List[Issue]:
+        with self._lock:
+            return [i for i in self._issues.values() if flt(i)]
+
+    def update_issue(self, issue_id, status: IssueStatus, resolution: str) -&gt; None:
+        with self._lock:
+            if status == IssueStatus.RESOLVED:
+                self.resolve_issue(issue_id, resolution)
+                return
+            issue = self._get(issue_id)
+            if status != issue.status:
+                raise IssueError(f"{issue_id}: only the system moves {issue.status.value} -&gt; {status.value}")
+            issue.resolution = resolution
+
+    def resolve_issue(self, issue_id, resolution) -&gt; None:
+        with self._lock:
+            issue = self._get(issue_id)
+            if issue.status == IssueStatus.RESOLVED:
+                raise IssueError(f"{issue_id} is already RESOLVED")
+            a = self._agents.get(issue.agent_id) if issue.agent_id else None
+            if a is None or a.current != issue_id:
+                raise IssueError(f"{issue_id} is not the issue its agent is working on")
+            issue.move_to(IssueStatus.RESOLVED)
+            issue.resolution = resolution
+            nxt = a.finish_current()
+            if nxt is not None:
+                self._issues[nxt].move_to(IssueStatus.IN_PROGRESS)
+
+    def view_agents_work_history(self) -&gt; Dict[str, List[str]]:
+        with self._lock:
+            return {a.id: list(a.history) for a in self._agents.values()}
+
+    def agent(self, agent_id) -&gt; Agent:
+        return self._agents[agent_id]
+
+    def _get(self, issue_id) -&gt; Issue:
+        if issue_id not in self._issues:
+            raise IssueError(f"no such issue: {issue_id}")
+        return self._issues[issue_id]
+
+
+def demo() -&gt; None:
+    s = IssueService(FreeFirstStrategy())
+    s.create_issue("T1", IssueType.PAYMENT, "Payment failed", "Money debited", "asha@test.com")
+    s.create_issue("T2", IssueType.GOLD, "Gold not credited", "Bought 1g", "ben@test.com")
+    s.create_issue("T3", IssueType.PAYMENT, "Pending txn", "Stuck 2 days", "ben@test.com")
+    s.create_issue("T4", IssueType.INSURANCE, "Policy missing", "No PDF", "chitra@test.com")
+    s.create_issue("T5", IssueType.GOLD, "Gold sell failed", "Error 500", "asha@test.com")
+    s.add_agent("a1@pp.com", "Agent1", [IssueType.PAYMENT, IssueType.GOLD])
+    s.add_agent("a2@pp.com", "Agent2", [IssueType.PAYMENT])
+    for iid in ["I1", "I2", "I3", "I4", "I5"]:
+        print(f"assign {iid} -&gt;", s.assign_issue(iid) or "no agent with expertise, stays OPEN")
+    print("issues of ben@test.com:", s.get_issues(by_email("ben@test.com")))
+    print("waiting gold issues:   ", s.get_issues(all_of(by_type(IssueType.GOLD), by_status(IssueStatus.WAITING))))
+    s.resolve_issue("I1", "Refund initiated")
+    print("resolve I1 -&gt; a1 now on", s.agent("a1@pp.com").current)
+    s.update_issue("I3", IssueStatus.RESOLVED, "Bank reversed the txn")
+    s.resolve_issue("I2", "Gold credited")
+    s.resolve_issue("I5", "Sell retried")
+    try:
+        s.resolve_issue("I1", "again")
+    except IssueError as e:
+        print("rejected:", e)
+    s.add_agent("a3@pp.com", "Agent3", [IssueType.INSURANCE])
+    print("assign I4 again -&gt;", s.assign_issue("I4"))
+    print("work history", s.view_agents_work_history())
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+<p>Tests (<code>python -m unittest test_main</code>):</p>
+<pre><code class="language-python">import threading
+import unittest
+
+from main import (FreeFirstStrategy, IssueError, IssueService, IssueStatus, IssueType,
+                  RoundRobinStrategy, all_of, by_email, by_status, by_type)
+
+P, G, INS = IssueType.PAYMENT, IssueType.GOLD, IssueType.INSURANCE
+
+
+def fresh(strategy=None):
+    s = IssueService(strategy or FreeFirstStrategy())
+    s.add_agent("a1@pp.com", "Agent1", [P, G])
+    s.add_agent("a2@pp.com", "Agent2", [P])
+    return s
+
+
+def new(s, t=P, email="u@test.com"):
+    return s.create_issue("T", t, "subj", "desc", email).id
+
+
+class IssueServiceTest(unittest.TestCase):
+    def test_free_agent_then_waitlist(self):
+        s = fresh()
+        i1, i2, i3 = new(s, P), new(s, G), new(s, P)
+        self.assertEqual(s.assign_issue(i1), "a1@pp.com")
+        self.assertEqual(s.assign_issue(i2), "a1@pp.com")     # only gold expert is busy -&gt; waits
+        self.assertEqual(s.get_issues(by_status(IssueStatus.WAITING))[0].id, i2)
+        self.assertEqual(s.assign_issue(i3), "a2@pp.com")
+
+    def test_no_expert_stays_open(self):
+        s = fresh()
+        i = new(s, INS)
+        self.assertIsNone(s.assign_issue(i))
+        self.assertEqual(s.get_issues(by_type(INS))[0].status, IssueStatus.OPEN)
+
+    def test_resolve_pulls_next_from_waitlist(self):
+        s = fresh()
+        i1, i2 = new(s, G), new(s, G)
+        s.assign_issue(i1)
+        s.assign_issue(i2)
+        s.resolve_issue(i1, "done")
+        self.assertEqual(s.agent("a1@pp.com").current, i2)
+        self.assertEqual(s.view_agents_work_history()["a1@pp.com"], [i1])
+
+    def test_illegal_transitions(self):
+        s = fresh()
+        i1, i2 = new(s, G), new(s, G)
+        s.assign_issue(i1)
+        s.assign_issue(i2)
+        with self.assertRaises(IssueError):
+            s.resolve_issue(i2, "skip the queue")                  # waiting, not current
+        with self.assertRaises(IssueError):
+            s.update_issue(i2, IssueStatus.IN_PROGRESS, "x")       # only the system moves it
+        with self.assertRaises(IssueError):
+            s.assign_issue(i1)                                     # already assigned
+        s.resolve_issue(i1, "ok")
+        with self.assertRaises(IssueError):
+            s.resolve_issue(i1, "again")
+
+    def test_filters_compose(self):
+        s = fresh()
+        new(s, P, "ben@test.com")
+        new(s, G, "ben@test.com")
+        new(s, G, "asha@test.com")
+        self.assertEqual(len(s.get_issues(by_email("BEN@test.com"))), 2)
+        self.assertEqual(len(s.get_issues(all_of(by_email("ben@test.com"), by_type(G)))), 1)
+
+    def test_round_robin(self):
+        s = fresh(RoundRobinStrategy())
+        got = [s.assign_issue(new(s, P)) for _ in range(4)]
+        self.assertEqual(got, ["a1@pp.com", "a2@pp.com", "a1@pp.com", "a2@pp.com"])
+
+    def test_concurrent_assign(self):
+        s = IssueService(FreeFirstStrategy())
+        for k in range(5):
+            s.add_agent(f"c{k}@pp.com", f"C{k}", [P])
+
+        def work():
+            for _ in range(50):
+                s.assign_issue(new(s, P))
+
+        ts = [threading.Thread(target=work) for _ in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(len(s.get_issues(by_status(IssueStatus.IN_PROGRESS))), 5)
+        self.assertEqual(len(s.get_issues(by_status(IssueStatus.WAITING))), 395)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Customer Issue Resolution - C++14, single file. Build: g++ -std=c++14 -Wall -Wextra main.cpp -o main
+// Locking, as in the Java synchronized methods: every public IssueService method takes one mutex (mu_) at the
+// top with std::lock_guard. resolveIssue() marks the issue resolved AND pulls the next waitlisted issue in the
+// same critical section, so no other thread can grab the agent in between. The strategy runs under the lock (pure).
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;cstdlib&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+
+enum class IssueType { PAYMENT, MUTUAL_FUND, GOLD, INSURANCE };
+enum class Status { OPEN, WAITING, IN_PROGRESS, RESOLVED };
+
+const char* name(Status s) {
+    switch (s) {
+        case Status::OPEN: return "OPEN";
+        case Status::WAITING: return "WAITING";
+        case Status::IN_PROGRESS: return "IN_PROGRESS";
+        default: return "RESOLVED";
+    }
+}
+
+bool canMove(Status from, Status to) {
+    return (from == Status::OPEN &amp;&amp; (to == Status::WAITING || to == Status::IN_PROGRESS)) ||
+           (from == Status::WAITING &amp;&amp; to == Status::IN_PROGRESS) ||
+           (from == Status::IN_PROGRESS &amp;&amp; to == Status::RESOLVED);
+}
+
+struct IssueError : std::runtime_error { using std::runtime_error::runtime_error; };
+
+struct Issue {
+    std::string id, txn, subject, email, agent, resolution;
+    IssueType type;
+    Status status = Status::OPEN;
+    void moveTo(Status s) {
+        if (!canMove(status, s)) throw IssueError(id + ": cannot move " + name(status) + " -&gt; " + name(s));
+        status = s;
+    }
+};
+
+struct Agent {
+    std::string id, name;
+    std::set&lt;IssueType&gt; expertise;
+    std::string current;                 // empty = free
+    std::deque&lt;std::string&gt; waitlist;
+    std::vector&lt;std::string&gt; history;
+    bool isFree() const { return current.empty(); }
+};
+
+// Strategy: the C-style equivalent is a struct of function pointers; here a pure virtual interface.
+struct AssignmentStrategy {
+    virtual ~AssignmentStrategy() = default;
+    virtual Agent* pick(const Issue&amp; issue, const std::vector&lt;Agent*&gt;&amp; experts) = 0;
+};
+
+struct FreeFirstStrategy : AssignmentStrategy {
+    Agent* pick(const Issue&amp;, const std::vector&lt;Agent*&gt;&amp; experts) override {
+        for (Agent* a : experts) if (a-&gt;isFree()) return a;
+        Agent* best = nullptr;
+        for (Agent* a : experts) if (!best || a-&gt;waitlist.size() &lt; best-&gt;waitlist.size()) best = a;
+        return best;
+    }
+};
+
+using Filter = std::function&lt;bool(const Issue&amp;)&gt;;
+
+class IssueService {
+    std::map&lt;std::string, Issue&gt; issues_;           // ordered by id string; fine for a demo
+    std::vector&lt;std::string&gt; order_;                // creation order
+    std::vector&lt;std::unique_ptr&lt;Agent&gt;&gt; agents_;    // onboarding order; stable addresses
+    std::unique_ptr&lt;AssignmentStrategy&gt; strategy_;
+    int seq_ = 0;
+    Mutex mu_;                                      // guards everything above, including each Agent's queue
+
+    Issue&amp; get(const std::string&amp; id) {
+        auto it = issues_.find(id);
+        if (it == issues_.end()) throw IssueError("no such issue: " + id);
+        return it-&gt;second;
+    }
+    Agent* agentById(const std::string&amp; id) {
+        for (auto&amp; a : agents_) if (a-&gt;id == id) return a.get();
+        return nullptr;
+    }
+
+public:
+    explicit IssueService(std::unique_ptr&lt;AssignmentStrategy&gt; s) : strategy_(std::move(s)) {}
+
+    std::string createIssue(const std::string&amp; txn, IssueType t, const std::string&amp; subject, const std::string&amp; email) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (txn.empty() || email.find('@') == std::string::npos) throw IssueError("txn and valid email required");
+        Issue i;
+        i.id = "I" + std::to_string(++seq_); i.txn = txn; i.type = t; i.subject = subject; i.email = email;
+        order_.push_back(i.id);
+        issues_[i.id] = i;
+        return order_.back();
+    }
+
+    void addAgent(const std::string&amp; email, const std::string&amp; nm, std::set&lt;IssueType&gt; exp) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (agentById(email)) throw IssueError("agent exists: " + email);
+        std::unique_ptr&lt;Agent&gt; a(new Agent());
+        a-&gt;id = email; a-&gt;name = nm; a-&gt;expertise = std::move(exp);
+        agents_.push_back(std::move(a));
+    }
+
+    std::string assignIssue(const std::string&amp; id) {        // "" = no expert, stays OPEN
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        Issue&amp; i = get(id);
+        if (i.status != Status::OPEN) throw IssueError(id + " already " + name(i.status));
+        std::vector&lt;Agent*&gt; experts;
+        for (auto&amp; a : agents_) if (a-&gt;expertise.count(i.type)) experts.push_back(a.get());
+        Agent* a = strategy_-&gt;pick(i, experts);
+        if (!a) return "";
+        i.agent = a-&gt;id;
+        if (a-&gt;isFree()) { i.moveTo(Status::IN_PROGRESS); a-&gt;current = id; }
+        else { i.moveTo(Status::WAITING); a-&gt;waitlist.push_back(id); }
+        return a-&gt;id;
+    }
+
+    std::vector&lt;std::string&gt; getIssues(const Filter&amp; f) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::vector&lt;std::string&gt; out;
+        for (auto&amp; id : order_) {
+            const Issue&amp; i = issues_[id];
+            if (f(i)) out.push_back(i.id + "[" + name(i.status) + (i.agent.empty() ? "" : "," + i.agent) + "]");
+        }
+        return out;
+    }
+
+    void resolveIssue(const std::string&amp; id, const std::string&amp; resolution) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        Issue&amp; i = get(id);
+        if (i.status == Status::RESOLVED) throw IssueError(id + " is already RESOLVED");
+        Agent* a = i.agent.empty() ? nullptr : agentById(i.agent);
+        if (!a || a-&gt;current != id) throw IssueError(id + " is not the issue its agent is working on");
+        i.moveTo(Status::RESOLVED);
+        i.resolution = resolution;
+        a-&gt;history.push_back(id);
+        a-&gt;current.clear();
+        if (!a-&gt;waitlist.empty()) {
+            a-&gt;current = a-&gt;waitlist.front();
+            a-&gt;waitlist.pop_front();
+            get(a-&gt;current).moveTo(Status::IN_PROGRESS);
+        }
+    }
+
+    std::map&lt;std::string, std::vector&lt;std::string&gt;&gt; workHistory() {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::map&lt;std::string, std::vector&lt;std::string&gt;&gt; out;
+        for (auto&amp; a : agents_) out[a-&gt;id] = a-&gt;history;
+        return out;
+    }
+    std::string currentOf(const std::string&amp; agentId) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        return agentById(agentId)-&gt;current;
+    }
+};
+
+static int passed = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++passed;
+}
+void print(const std::string&amp; label, const std::vector&lt;std::string&gt;&amp; v) {
+    std::cout &lt;&lt; label;
+    for (auto&amp; s : v) std::cout &lt;&lt; " " &lt;&lt; s;
+    std::cout &lt;&lt; "\n";
+}
+
+int main() {
+    IssueService s(std::unique_ptr&lt;AssignmentStrategy&gt;(new FreeFirstStrategy()));
+    s.createIssue("T1", IssueType::PAYMENT, "Payment failed", "asha@test.com");
+    s.createIssue("T2", IssueType::GOLD, "Gold not credited", "ben@test.com");
+    s.createIssue("T3", IssueType::PAYMENT, "Pending txn", "ben@test.com");
+    s.createIssue("T4", IssueType::INSURANCE, "Policy missing", "chitra@test.com");
+    s.createIssue("T5", IssueType::GOLD, "Gold sell failed", "asha@test.com");
+    s.addAgent("a1@pp.com", "Agent1", {IssueType::PAYMENT, IssueType::GOLD});
+    s.addAgent("a2@pp.com", "Agent2", {IssueType::PAYMENT});
+    for (const char* id : {"I1", "I2", "I3", "I4", "I5"}) {
+        std::string a = s.assignIssue(id);
+        std::cout &lt;&lt; "assign " &lt;&lt; id &lt;&lt; " -&gt; " &lt;&lt; (a.empty() ? "no agent with expertise, stays OPEN" : a) &lt;&lt; "\n";
+    }
+    auto ben = s.getIssues([](const Issue&amp; i) { return i.email == "ben@test.com"; });
+    print("issues of ben@test.com:", ben);
+    check(ben.size() == 2, "two issues for ben");
+    s.resolveIssue("I1", "Refund initiated");
+    std::cout &lt;&lt; "resolve I1 -&gt; a1 now on " &lt;&lt; s.currentOf("a1@pp.com") &lt;&lt; "\n";
+    check(s.currentOf("a1@pp.com") == "I2", "a1 picks I2 from its waitlist");
+    s.resolveIssue("I3", "Bank reversed");
+    s.resolveIssue("I2", "Gold credited");
+    s.resolveIssue("I5", "Sell retried");
+    try { s.resolveIssue("I1", "again"); check(false, "double resolve"); }
+    catch (const IssueError&amp; e) { std::cout &lt;&lt; "rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; ++passed; }
+    auto h = s.workHistory();
+    print("a1 history:", h["a1@pp.com"]);
+    check(h["a1@pp.com"] == std::vector&lt;std::string&gt;({"I1", "I2", "I5"}), "a1 history in order");
+    std::cout &lt;&lt; "All " &lt;&lt; passed &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+created [I1[PAYMENT,OPEN], I2[GOLD,OPEN], I3[PAYMENT,OPEN], I4[INSURANCE,OPEN], I5[GOLD,OPEN]]
+assign I1 -&gt; a1@pp.com
+assign I2 -&gt; a1@pp.com
+assign I3 -&gt; a2@pp.com
+assign I4 -&gt; no agent with expertise, stays OPEN
+assign I5 -&gt; a1@pp.com
+issues of ben@test.com: [I2[GOLD,WAITING,a1@pp.com], I3[PAYMENT,IN_PROGRESS,a2@pp.com]]
+waiting gold issues:    [I2[GOLD,WAITING,a1@pp.com], I5[GOLD,WAITING,a1@pp.com]]
+resolve I1 -&gt; a1 now on I2
+rejected: I1 is already RESOLVED
+rejected: I4 is not the issue its agent is working on
+rejected: I4: only the system moves OPEN -&gt; IN_PROGRESS
+assign I4 again -&gt; a3@pp.com
+work history {a1@pp.com=[I1, I2, I5], a2@pp.com=[I3], a3@pp.com=[]}
+round robin [a1@pp.com, a2@pp.com, a1@pp.com, a2@pp.com]
+concurrent: in progress=5 waiting=395
+All 14 checks passed
+
+$ python main.py &amp;&amp; python -m unittest test_main
+assign I1 -&gt; a1@pp.com
+assign I2 -&gt; a1@pp.com
+assign I3 -&gt; a2@pp.com
+assign I4 -&gt; no agent with expertise, stays OPEN
+assign I5 -&gt; a1@pp.com
+issues of ben@test.com: [I2[GOLD,WAITING,a1@pp.com], I3[PAYMENT,IN_PROGRESS,a2@pp.com]]
+waiting gold issues:    [I2[GOLD,WAITING,a1@pp.com], I5[GOLD,WAITING,a1@pp.com]]
+resolve I1 -&gt; a1 now on I2
+rejected: I1 is already RESOLVED
+assign I4 again -&gt; a3@pp.com
+work history {'a1@pp.com': ['I1', 'I2', 'I5'], 'a2@pp.com': ['I3'], 'a3@pp.com': []}
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 0.004s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main
+assign I1 -&gt; a1@pp.com
+assign I2 -&gt; a1@pp.com
+assign I3 -&gt; a2@pp.com
+assign I4 -&gt; no agent with expertise, stays OPEN
+assign I5 -&gt; a1@pp.com
+issues of ben@test.com: I2[WAITING,a1@pp.com] I3[IN_PROGRESS,a2@pp.com]
+resolve I1 -&gt; a1 now on I2
+rejected: I1 is already RESOLVED
+a1 history: I1 I2 I5
+All 4 checks passed</code></pre>
+  <div class="callout note"><p>Read the output against the state diagram: I2 and I5 wait on a1 because a1 is the only GOLD expert; I4 stays OPEN until an INSURANCE agent is onboarded; resolving I1 makes a1 start I2 automatically; and 400 concurrent assignments over 5 agents end with exactly 5 in progress and 395 waiting.</p></div>

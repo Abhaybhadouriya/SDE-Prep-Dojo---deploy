@@ -1,0 +1,45 @@
+
+        <h2>Data model and SQL vs NoSQL</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Shape</th><th>Store</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Contact (the ticket)</td><td><code>contact_id PK, customer_id, channel, intent, queue_id, state, agent_id, enqueued_at, version</code></td><td><b>SQL</b> (Aurora/MySQL/Postgres), sharded by <code>contact_id</code> if needed</td><td>State machine with conditional updates; must be ACID.</td></tr>
+              <tr><td>Agent + capacity</td><td><code>agent_id PK, status, chat_slots_max, chat_slots_used, voice_busy, last_free_at, version</code></td><td><b>SQL</b> (source of truth) + Redis mirror for fast reads</td><td>Assign = "decrement slots AND set contact.agent" atomically.</td></tr>
+              <tr><td>Skills</td><td><code>agent_skill(agent_id, skill, proficiency)</code>, <code>queue(queue_id, skill, priority, max_wait)</code></td><td>SQL</td><td>Small, relational, joined by the router.</td></tr>
+              <tr><td>Waiting line</td><td>per queue: sorted by (priority, enqueued_at)</td><td>Redis sorted set, rebuilt from SQL on failure</td><td>O(log n) pop of oldest; the SQL row stays the truth.</td></tr>
+              <tr><td>Messages</td><td><code>PK contact_id, CK seq -&gt; sender, body, ts</code></td><td><b>NoSQL</b> wide-column / key-value (DynamoDB, Cassandra)</td><td>Append-only, huge, always read by one contact in order.</td></tr>
+              <tr><td>Presence / connection map</td><td><code>user_id -&gt; gateway_id, last_heartbeat</code></td><td>Redis with TTL</td><td>Ephemeral; rebuilt by heartbeats.</td></tr>
+              <tr><td>Attachments</td><td>object key in message body</td><td>S3 via <a href="{{BASE}}interview/glossary#presigned-url">pre-signed upload</a></td><td>Keep bytes out of the chat path.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>"Why SQL over NoSQL?"</b> - an Amazon interviewer asked exactly this. The honest answer is <b>both, for different data</b>. The contact and agent-capacity records sit on the <em>correctness</em> path: assigning a contact must, in one transaction, check the agent still has a free slot, take the slot, and move the contact from <code>QUEUED</code> to <code>OFFERED</code>. Two routers racing for the same agent must not both win. A relational database gives you that with a single transaction and row locks or a <a href="{{BASE}}interview/glossary#optimistic-locking">version check</a>. The volume is modest (tens of writes per second per queue), so SQL scale is not a problem. Messages are the opposite: high volume, append-only, never joined, read by one key in order - a natural fit for a partitioned NoSQL store.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 250" role="img" aria-label="Contact state machine: created, queued, offered, active, transferred back to queued, closed, with abandoned and callback exits">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="95" width="100" height="44"/><text class="label small" x="70" y="122">CREATED</text>
+            <rect class="box queue" x="170" y="95" width="100" height="44"/><text class="label small" x="220" y="122">QUEUED</text>
+            <rect class="box warn" x="320" y="95" width="100" height="44"/><text class="label small" x="370" y="122">OFFERED</text>
+            <rect class="box ok" x="470" y="95" width="100" height="44"/><text class="label small" x="520" y="122">ACTIVE</text>
+            <rect class="box svc" x="620" y="95" width="80" height="44"/><text class="label small" x="660" y="122">WRAP-UP</text>
+            <rect class="box db" x="730" y="95" width="80" height="44"/><text class="label small" x="770" y="122">CLOSED</text>
+            <rect class="box fail" x="170" y="195" width="140" height="40"/><text class="label small" x="240" y="220">ABANDONED</text>
+            <rect class="box plain" x="340" y="195" width="160" height="40"/><text class="label small" x="420" y="220">CALLBACK / EMAIL</text>
+            <path class="arrow" d="M120 117 L163 117"/>
+            <path class="arrow" d="M270 110 L313 110"/>
+            <path class="arrow" d="M420 117 L463 117"/>
+            <path class="arrow" d="M570 117 L613 117"/>
+            <path class="arrow" d="M700 117 L723 117"/>
+            <path class="arrow bad" d="M370 95 C370 50 220 50 220 88"/>
+            <text class="label small" x="295" y="45">reject / 15 s timeout</text>
+            <path class="arrow k8s" d="M520 95 C520 20 220 20 220 88"/>
+            <text class="label small" x="440" y="30">transfer</text>
+            <path class="arrow dashed" d="M220 139 L230 188"/>
+            <path class="arrow dashed" d="M250 139 L400 188"/>
+            <text class="label small" x="620" y="210">every arrow = conditional UPDATE</text>
+            <text class="label small" x="620" y="230">WHERE state = old AND version = v</text>
+          </svg>
+          <figcaption>The contact is never deleted or lost: it only moves between states. Reject, offer timeout and transfer all lead back to QUEUED. Leaving the system is always an explicit state (closed, abandoned by the customer, or converted to a callback).</figcaption>
+        </figure>
+      

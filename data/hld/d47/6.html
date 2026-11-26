@@ -1,0 +1,132 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Continuous batching: keeping the GPU full</h3>
+        <p>Decoding one token means reading <i>all</i> model weights from GPU memory once. Doing that for one sequence wastes the GPU's compute; doing it for 64 sequences at once costs almost the same memory traffic. That is why Anyscale calls LLM inference "memory-IO bound, not compute bound", and why batching is the main lever.</p>
+        <p><b>Static batching</b> waits until every sequence in the batch is done. A 20-token answer sits finished while a 900-token answer keeps the batch alive, and newcomers wait. <b>Continuous batching</b> (Orca's "iteration-level scheduling", OSDI 2022) re-forms the batch every iteration: finished sequences leave, waiting ones join immediately.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Static versus continuous batching over time">
+            <text class="label small left" x="20" y="24">time (decode iterations) &#8594;</text>
+            <text class="label left" x="20" y="60">Static</text>
+            <rect class="box svc" x="110" y="45" width="120" height="28"/>
+            <text class="label small" x="170" y="59">A (short)</text>
+            <rect class="box ghost" x="230" y="45" width="420" height="28"/>
+            <text class="label small" x="440" y="59">GPU slot idle, A finished</text>
+            <rect class="box svc" x="110" y="80" width="540" height="28"/>
+            <text class="label small" x="380" y="94">B (long)</text>
+            <rect class="box client" x="650" y="45" width="130" height="63"/>
+            <text class="label small" x="715" y="76">C finally starts</text>
+
+            <g data-step="2">
+              <text class="label left" x="20" y="170">Continuous</text>
+              <rect class="box svc" x="110" y="155" width="120" height="28"/>
+              <text class="label small" x="170" y="169">A</text>
+              <rect class="box svc" x="110" y="190" width="540" height="28"/>
+              <text class="label small" x="380" y="204">B</text>
+            </g>
+            <g data-step="3">
+              <rect class="box kafka" x="232" y="155" width="250" height="28"/>
+              <text class="label small" x="357" y="169">C joins at once</text>
+              <rect class="box queue" x="484" y="155" width="166" height="28"/>
+              <text class="label small" x="567" y="169">D joins</text>
+            </g>
+            <g data-step-only="4">
+              <rect class="box highlight" x="110" y="235" width="670" height="40"/>
+              <text class="label ok" x="445" y="255">No idle slots: same GPU, more sequences finished per second</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Static batching.</b> A and B start together. A finishes early but its slot stays empty until B finishes. C waits outside the whole time.</li>
+            <li><b>Continuous batching.</b> Same A and B, but the scheduler re-forms the batch every iteration.</li>
+            <li><b>Refill.</b> The moment A finishes, C takes its slot; when C finishes, D takes it. The GPU never runs a half-empty batch while work is waiting.</li>
+            <li><b>Result.</b> Orca reported 36.9x the throughput of FasterTransformer on GPT-3 175B at the same latency; Anyscale measured up to 23x over naive static batching with vLLM.</li>
+          </ol>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Static batching is like a DMA engine that only refills the TX ring when the whole ring has drained. Continuous batching refills each descriptor as soon as it completes. Same hardware, far better link utilisation.</p>
+        </div>
+
+        <h3>2. The KV cache and PagedAttention</h3>
+        <p>During decoding the model needs the Keys and Values of every earlier token. Recomputing them each step would be quadratic, so they are cached in GPU memory: the <b>KV cache</b>. It grows by one entry per token, and you do not know in advance how long an answer will be. Older servers reserved one contiguous chunk per request sized for the maximum length. The vLLM team measured that existing systems waste <b>60-80%</b> of KV-cache memory to fragmentation and over-reservation.</p>
+        <p><b>PagedAttention</b> (vLLM, SOSP 2023) borrows the operating system's virtual memory idea. The KV cache is split into fixed-size <b>blocks</b> (for example 16 tokens each). Each sequence has a <b>block table</b> mapping its logical blocks to physical blocks anywhere in GPU memory. Blocks are allocated only when needed, so waste drops to the last partly filled block: under 4% in vLLM's measurements. More sequences fit, so batches get bigger: the paper reports 2-4x throughput over FasterTransformer and Orca at the same latency, and the vLLM blog reports up to 24x over Hugging Face Transformers and up to 3.5x over TGI.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="PagedAttention block tables mapping sequences to physical GPU memory blocks">
+            <text class="label left" x="20" y="28">Block tables (logical)</text>
+            <rect class="box svc" x="20" y="50" width="70" height="34"/><text class="label small" x="55" y="67">A:0</text>
+            <rect class="box svc" x="95" y="50" width="70" height="34"/><text class="label small" x="130" y="67">A:1</text>
+            <rect class="box svc" x="170" y="50" width="70" height="34"/><text class="label small" x="205" y="67">A:2</text>
+            <rect class="box kafka" x="20" y="120" width="70" height="34"/><text class="label small" x="55" y="137">B:0</text>
+            <rect class="box kafka" x="95" y="120" width="70" height="34"/><text class="label small" x="130" y="137">B:1</text>
+            <rect class="box queue" x="20" y="190" width="70" height="34"/><text class="label small" x="55" y="207">C:0</text>
+
+            <rect class="zone" x="420" y="20" width="360" height="260"/>
+            <text class="zone-label" x="436" y="42">GPU memory: physical blocks</text>
+            <rect class="box kafka" x="440" y="60" width="70" height="40"/><text class="label small" x="475" y="80">#0 B</text>
+            <rect class="box svc" x="520" y="60" width="70" height="40"/><text class="label small" x="555" y="80">#1 A</text>
+            <rect class="box plain" x="600" y="60" width="70" height="40"/><text class="label small" x="635" y="80">free</text>
+            <rect class="box queue" x="680" y="60" width="70" height="40"/><text class="label small" x="715" y="80">#3 C</text>
+            <rect class="box svc" x="440" y="120" width="70" height="40"/><text class="label small" x="475" y="140">#4 A</text>
+            <rect class="box plain" x="520" y="120" width="70" height="40"/><text class="label small" x="555" y="140">free</text>
+            <rect class="box kafka" x="600" y="120" width="70" height="40"/><text class="label small" x="635" y="140">#6 B</text>
+            <rect class="box svc" x="680" y="120" width="70" height="40"/><text class="label small" x="715" y="140">#7 A</text>
+            <rect class="box plain" x="440" y="176" width="310" height="48"/><text class="label small" x="595" y="196">free blocks: any new token</text><text class="label small" x="595" y="214">can use any of them</text>
+
+            <path class="arrow" d="M55 84 C200 110 400 100 518 84"/>
+            <path class="arrow" d="M130 84 C260 140 380 140 440 140"/>
+            <path class="arrow" d="M205 84 C350 30 600 20 712 58"/>
+            <path class="arrow" d="M55 154 C200 120 350 90 440 80"/>
+            <path class="arrow" d="M130 154 C300 170 520 170 600 150"/>
+            <path class="arrow" d="M55 224 C300 260 600 240 700 100"/>
+            <text class="label small left" x="20" y="262">Only the last block of a sequence is partly empty, so waste is tiny.</text>
+          </svg>
+          <figcaption>Each sequence's KV cache is a list of fixed-size blocks scattered through GPU memory, found through a block table, exactly like pages and a page table.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is literally paging. Block table = page table, physical block = page frame, "allocate on first write" = demand paging. When two parallel samples share a prompt, vLLM shares the prompt's blocks with reference counts and copies a block only when one sample writes to it: <b>copy-on-write after fork()</b>. The vLLM blog says this sharing cuts memory by up to 55% for parallel sampling and beam search. When memory runs out, vLLM can preempt a sequence and swap its blocks to CPU memory or recompute them later, which is swapping.</p>
+        </div>
+
+        <h3>3. Scheduling and routing across GPU workers</h3>
+        <ul>
+          <li><b>Admission by memory, not by count.</b> A worker accepts a new sequence only if it has enough free KV blocks for the prompt plus some growth. Otherwise the request waits in the scheduler queue. TGI exposes this as a max-concurrent-requests limit and returns an <code>overloaded</code> error so clients can back off.</li>
+          <li><b>Prefix-cache-aware routing.</b> In a multi-turn chat, turn 7's prompt starts with turns 1-6. vLLM's automatic prefix caching hashes each full block together with everything before it, so a block is reused only if the whole prefix matches, and evicts unused blocks LRU. To benefit, route a conversation's next turn to the worker that served the last one (consistent hash on conversation id, with fallback when that worker is full). The shared system prompt is a prefix every request has.</li>
+          <li><b>Prefill vs decode.</b> Prefill is a big compute-heavy pass over the whole prompt; decode is many small memory-bound steps. Mixing them on one GPU makes ongoing streams stutter whenever a long prompt is prefilled. Two fixes: <b>chunked prefill</b> (split a long prefill into slices mixed with decode steps), or <b>disaggregation</b>, running prefill and decode on separate GPU pools and shipping the KV cache between them. DistServe (OSDI 2024) reports up to 7.4x more requests served within latency SLOs this way.</li>
+          <li><b>Priority and preemption.</b> Separate queues per tier; weighted fair queuing between users; under pressure, preempt free-tier sequences (swap or recompute) before paid ones.</li>
+          <li><b>Cancellation.</b> When the user clicks Stop or the SSE connection closes, the gateway sends a cancel to the worker, which drops the sequence from the next iteration and frees its blocks. Without this, abandoned answers keep burning GPU time.</li>
+        </ul>
+
+        <h3>4. Rate limits counted in tokens</h3>
+        <p>A request for a 5-word answer and a request with a 100K-token document are not the same cost. So limits are in <b>tokens per minute (TPM)</b> as well as requests per minute (RPM), and whichever is hit first applies, as in OpenAI's API.</p>
+        <ol class="steps">
+          <li><strong>Reserve</strong> At admission, debit input tokens + <code>max_tokens</code> from the user's token bucket in Redis (atomic Lua).</li>
+          <li><strong>Reconcile</strong> At finish, refund the unused part (<code>max_tokens - actual output</code>).</li>
+          <li><strong>Tier</strong> Bucket size and refill rate depend on the plan; paid tiers also get a higher scheduler priority.</li>
+          <li><strong>Signal</strong> Return <code>429</code> with <code>Retry-After</code> and remaining-token headers; clients must back off with jitter. OpenAI's docs point out that failed requests still count, so instant retries make things worse.</li>
+        </ol>
+        <p>More on the algorithms in <a href="{{BASE}}hld/d02">Distributed Rate Limiter</a>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is a token-bucket policer, the same one in a router's QoS config, except the "bytes" are model tokens and the burst size is the plan's TPM. Reserve-then-refund is like charging a frame's full size at enqueue and crediting back on early drop.</p>
+        </div>
+
+        <h3>5. Long conversations: cost without amnesia</h3>
+        <p>Every turn re-sends the whole history as the prompt, so turn 30 costs far more prefill than turn 1, and context windows have a hard limit. Options, cheapest first:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Technique</th><th>Saves</th><th>Costs</th></tr></thead>
+            <tbody>
+              <tr><td>Prefix caching + sticky routing</td><td>Prefill for repeated history (often most of it)</td><td>Only helps while the cache is warm on that worker</td></tr>
+              <tr><td>Sliding window (last N turns)</td><td>Bounded prompt size</td><td>Forgets early facts</td></tr>
+              <tr><td>Rolling summary of old turns</td><td>Keeps the gist in few tokens</td><td>An extra (small) model call; summary can lose detail</td></tr>
+              <tr><td>Retrieve relevant old turns (embeddings)</td><td>Recalls specific facts on demand</td><td>A vector index per user; more moving parts</td></tr>
+              <tr><td>Tiered KV cache (GPU -&gt; CPU RAM -&gt; SSD)</td><td>Avoids recomputing prefill for idle chats</td><td>Transfer time; capacity planning</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>6. Streams that survive reconnects and deploys</h3>
+        <p>Phones switch networks and edge nodes get redeployed mid-answer. Do not couple the stream to one TCP connection. The worker publishes tokens to a per-message buffer (a Redis stream with TTL, or a pub/sub topic); the edge node subscribes and writes SSE events with an <code>id:</code>. On reconnect, the browser's EventSource sends <code>Last-Event-ID</code> automatically (MDN documents this), any edge node reads the buffer from that id and continues. Generation on the GPU never stopped.</p>
+      

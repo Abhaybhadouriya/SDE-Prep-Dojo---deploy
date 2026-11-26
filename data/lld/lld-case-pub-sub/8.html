@@ -1,0 +1,1159 @@
+
+  <h2>Full code</h2>
+  <p>All three versions were compiled and run; the output shown is real. Java is the primary version (one file per class, Java 21 record for the message). Python mirrors it with <code>threading.Condition</code>. C++14 uses <code>std::thread</code>, <code>std::mutex</code> and <code>std::condition_variable</code>; MinGW.org g++ 6.3 has no <code>std::thread</code> (win32 thread model), so the C++ build was run with g++ 13 in WSL Ubuntu. To reproduce it on Windows: <code>wsl -d Ubuntu -- g++ -std=c++14 -O2 -Wall -Wextra -pthread main.cpp -o /tmp/pubsub &amp;&amp; wsl -d Ubuntu -- /tmp/pubsub</code> from the <code>cpp/</code> folder (the same command and its output are in <code>run-cpp.txt</code>). Files: <code>lld-code/lld-case-pub-sub/</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code> (Main.java): publish, consume, retry, dead letter, replay.</li><li>The write path: <code>Broker.publish</code>, <code>Topic.publish</code> (the partitioner picks a partition), <code>Partition.append</code>.</li><li>The read path: <code>ConsumerGroup.start</code>, <code>runWorker</code>, <code>deliver</code> (Partition.read, offsets, retries, DLQ). This is the heart.</li><li><code>KeyHashPartitioner</code> and <code>ExponentialBackoff</code>: the two strategies.</li><li>Skip on first read: the <code>Message</code> record and the <code>Subscriber</code> interface.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+      <p><b>Message.java</b></p>
+<pre><code class="language-java">/** One immutable record in a partition log. The partition assigns the offset when it appends. */
+record Message(String topic, int partition, long offset, String key, String value) {
+    @Override
+    public String toString() {
+        return topic + "-" + partition + "@" + offset + " " + key + "=" + value;
+    }
+}</code></pre>
+      <p><b>Partition.java</b></p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+/** Append-only log of one partition. Writers append; readers read by offset and never remove. */
+final class Partition {
+    private final String topic;
+    private final int id;
+    private final List&lt;Message&gt; log = new ArrayList&lt;&gt;();
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition grew = lock.newCondition();   // signalled on every append
+
+    Partition(String topic, int id) {
+        this.topic = topic;
+        this.id = id;
+    }
+
+    int id() { return id; }
+
+    Message append(String key, String value) {
+        lock.lock();
+        try {
+            Message m = new Message(topic, id, log.size(), key, value);
+            log.add(m);
+            grew.signalAll();                              // wake readers waiting at the tail
+            return m;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Up to max messages from offset; waits up to timeoutMs when the reader is already at the tail. */
+    List&lt;Message&gt; read(long offset, int max, long timeoutMs) throws InterruptedException {
+        lock.lock();
+        try {
+            long nanos = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+            while (log.size() &lt;= offset) {
+                if (nanos &lt;= 0) return List.of();
+                nanos = grew.awaitNanos(nanos);
+            }
+            int from = (int) offset;
+            int to = (int) Math.min(log.size(), offset + max);
+            return new ArrayList&lt;&gt;(log.subList(from, to)); // copy: safe to use after unlock
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    long endOffset() {
+        lock.lock();
+        try {
+            return log.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+      <p><b>Partitioner.java</b></p>
+<pre><code class="language-java">import java.util.concurrent.atomic.AtomicInteger;
+
+/** Strategy: which partition a message goes to. */
+interface Partitioner {
+    int partitionFor(String key, int numPartitions);
+}
+
+/** Same key -&gt; same partition -&gt; per-key order. No key -&gt; round robin. */
+final class KeyHashPartitioner implements Partitioner {
+    private final AtomicInteger next = new AtomicInteger();
+
+    /** Small stable hash (same result in the Java, Python and C++ versions of this demo). */
+    static int stableHash(String s) {
+        int h = 0;
+        for (char c : s.toCharArray()) h = (h * 31 + c) &amp; 0x7fffffff;
+        return h;
+    }
+
+    @Override
+    public int partitionFor(String key, int numPartitions) {
+        if (key == null) return Math.floorMod(next.getAndIncrement(), numPartitions);
+        return stableHash(key) % numPartitions;
+    }
+}</code></pre>
+      <p><b>RetryPolicy.java</b></p>
+<pre><code class="language-java">/** Strategy: how many times to try a delivery and how long to wait between tries. */
+interface RetryPolicy {
+    int maxAttempts();
+    long backoffMs(int failedAttempt);   // 1-based: wait after the first failure, the second, ...
+}
+
+final class ExponentialBackoff implements RetryPolicy {
+    private final int maxAttempts;
+    private final long baseMs;
+
+    ExponentialBackoff(int maxAttempts, long baseMs) {
+        if (maxAttempts &lt; 1) throw new IllegalArgumentException("maxAttempts &gt;= 1");
+        this.maxAttempts = maxAttempts;
+        this.baseMs = baseMs;
+    }
+
+    @Override public int maxAttempts() { return maxAttempts; }
+
+    @Override public long backoffMs(int failedAttempt) {
+        return baseMs &lt;&lt; (failedAttempt - 1);   // base, 2*base, 4*base ...
+    }
+}</code></pre>
+      <p><b>Subscriber.java</b></p>
+<pre><code class="language-java">/** Observer: the consumer callback. Throwing means "not processed", so the group retries. */
+@FunctionalInterface
+interface Subscriber {
+    void onMessage(Message m) throws Exception;
+}</code></pre>
+      <p><b>Topic.java</b></p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+/** A named set of partitions plus the strategy that picks one per message. */
+final class Topic {
+    private final String name;
+    private final List&lt;Partition&gt; partitions;
+    private final Partitioner partitioner;
+
+    Topic(String name, int numPartitions, Partitioner partitioner) {
+        if (numPartitions &lt; 1) throw new IllegalArgumentException("partitions &gt;= 1");
+        this.name = name;
+        this.partitioner = partitioner;
+        List&lt;Partition&gt; ps = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; numPartitions; i++) ps.add(new Partition(name, i));
+        this.partitions = Collections.unmodifiableList(ps);
+    }
+
+    String name() { return name; }
+    List&lt;Partition&gt; partitions() { return partitions; }
+
+    Message publish(String key, String value) {
+        int p = partitioner.partitionFor(key, partitions.size());
+        return partitions.get(p).append(key, value);
+    }
+}</code></pre>
+      <p><b>ConsumerGroup.java</b></p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+/**
+ * Consumers that share the work of one topic. Each partition is owned by exactly one member and
+ * served by one worker thread, so messages of a partition are handled one at a time, in order.
+ * Different groups keep their own offsets, so each group sees every message (fan-out).
+ */
+final class ConsumerGroup {
+    private final String groupId;
+    private final Topic topic;
+    private final RetryPolicy retry;
+    private final Broker broker;                                // for dead letters
+    private final Map&lt;String, Subscriber&gt; members = new LinkedHashMap&lt;&gt;();
+    private final Map&lt;Integer, AtomicLong&gt; nextOffset = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;Integer, String&gt; owner = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;Thread&gt; workers = new ArrayList&lt;&gt;();
+    private volatile boolean running;
+
+    final AtomicInteger delivered = new AtomicInteger();
+    final AtomicInteger retries = new AtomicInteger();
+    final AtomicInteger deadLettered = new AtomicInteger();
+
+    ConsumerGroup(String groupId, Topic topic, RetryPolicy retry, Broker broker) {
+        this.groupId = groupId;
+        this.topic = topic;
+        this.retry = retry;
+        this.broker = broker;
+        for (Partition p : topic.partitions()) nextOffset.put(p.id(), new AtomicLong(0));
+    }
+
+    String id() { return groupId; }
+
+    synchronized void join(String memberName, Subscriber s) {
+        if (running) throw new IllegalStateException("join before start (rebalance is a follow-up)");
+        members.put(memberName, s);
+    }
+
+    /** Round-robin assignment: partition p -&gt; member p % n. Then one worker thread per partition. */
+    synchronized void start() {
+        if (running) return;
+        if (members.isEmpty()) throw new IllegalStateException("group " + groupId + " has no members");
+        running = true;
+        List&lt;String&gt; names = new ArrayList&lt;&gt;(members.keySet());
+        for (Partition p : topic.partitions()) {
+            String name = names.get(p.id() % names.size());
+            owner.put(p.id(), name);
+            Subscriber s = members.get(name);
+            Thread t = new Thread(() -&gt; runWorker(p, s), groupId + "-p" + p.id());
+            t.setDaemon(true);
+            workers.add(t);
+            t.start();
+        }
+    }
+
+    private void runWorker(Partition p, Subscriber s) {
+        AtomicLong next = nextOffset.get(p.id());
+        while (running) {
+            List&lt;Message&gt; batch;
+            try {
+                batch = p.read(next.get(), 16, 50);
+            } catch (InterruptedException e) {
+                return;
+            }
+            for (Message m : batch) {
+                if (!running || next.get() != m.offset()) break;  // stopped, or someone seeked
+                deliver(m, s);
+                next.compareAndSet(m.offset(), m.offset() + 1);    // commit AFTER processing
+            }
+        }
+    }
+
+    /** At-least-once: retry with backoff; after the last attempt, park it in the DLQ and move on. */
+    private void deliver(Message m, Subscriber s) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                s.onMessage(m);
+                delivered.incrementAndGet();
+                return;
+            } catch (Exception e) {
+                if (attempt &gt;= retry.maxAttempts()) {
+                    deadLettered.incrementAndGet();
+                    broker.deadLetter(groupId, m, e.getMessage());
+                    return;
+                }
+                retries.incrementAndGet();
+                try {
+                    Thread.sleep(retry.backoffMs(attempt));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    /** Replay or skip: move this group's position in one partition. */
+    void seek(int partition, long offset) { nextOffset.get(partition).set(offset); }
+
+    long lag() {
+        long lag = 0;
+        for (Partition p : topic.partitions()) lag += p.endOffset() - nextOffset.get(p.id()).get();
+        return lag;
+    }
+
+    Map&lt;Integer, String&gt; assignment() { return new java.util.TreeMap&lt;&gt;(owner); }
+
+    void stop() {
+        running = false;
+        for (Thread t : workers) t.interrupt();
+        for (Thread t : workers) {
+            try { t.join(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+    }
+}</code></pre>
+      <p><b>Broker.java</b></p>
+<pre><code class="language-java">import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/** Facade the callers use: topics, publish, subscribe, dead letters, shutdown. */
+final class Broker {
+    private final Map&lt;String, Topic&gt; topics = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, ConsumerGroup&gt; groups = new ConcurrentHashMap&lt;&gt;();
+
+    Topic createTopic(String name, int partitions) {
+        return topics.computeIfAbsent(name, n -&gt; new Topic(n, partitions, new KeyHashPartitioner()));
+    }
+
+    Topic topic(String name) {
+        Topic t = topics.get(name);
+        if (t == null) throw new IllegalArgumentException("no topic " + name);
+        return t;
+    }
+
+    /** Never blocks on consumers: it only appends to a partition log. */
+    Message publish(String topic, String key, String value) {
+        return topic(topic).publish(key, value);
+    }
+
+    ConsumerGroup group(String topic, String groupId, RetryPolicy retry) {
+        Topic t = topic(topic);
+        return groups.computeIfAbsent(topic + "/" + groupId, k -&gt; new ConsumerGroup(groupId, t, retry, this));
+    }
+
+    /** Poison messages go to "&lt;topic&gt;.dlq", keyed by the group that gave up, with the reason. */
+    void deadLetter(String groupId, Message m, String reason) {
+        createTopic(m.topic() + ".dlq", 1)
+            .publish(groupId, m.value() + " (from " + m.topic() + "-" + m.partition() + "@" + m.offset()
+                     + ", " + reason + ")");
+    }
+
+    void shutdown() {
+        groups.values().forEach(ConsumerGroup::stop);
+    }
+}</code></pre>
+      <p><b>Main.java</b> (demo driver with assertions)</p>
+<pre><code class="language-java">import java.util.*;
+
+/** Demo driver with simple assertions. Build: javac -d out *.java   Run: java -cp out Main */
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static void awaitDrained(ConsumerGroup g, long timeoutMs) throws InterruptedException {
+        long end = System.currentTimeMillis() + timeoutMs;
+        while (g.lag() &gt; 0 &amp;&amp; System.currentTimeMillis() &lt; end) Thread.sleep(5);
+        Thread.sleep(20);   // let the last callback finish its bookkeeping
+    }
+
+    /** key -&gt; values in the order this group processed them. */
+    static Map&lt;String, List&lt;String&gt;&gt; byKey(List&lt;String[]&gt; seen) {
+        Map&lt;String, List&lt;String&gt;&gt; m = new TreeMap&lt;&gt;();
+        synchronized (seen) {
+            for (String[] r : seen) m.computeIfAbsent(r[1], k -&gt; new ArrayList&lt;&gt;()).add(r[2]);
+        }
+        return m;
+    }
+
+    public static void main(String[] args) throws Exception {
+        Broker broker = new Broker();
+        Topic orders = broker.createTopic("orders", 3);
+
+        // Group 1: billing, two members share the partitions.
+        List&lt;String[]&gt; billingSeen = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        ConsumerGroup billing = broker.group("orders", "billing", new ExponentialBackoff(3, 5));
+        billing.join("billing-A", m -&gt; billingSeen.add(new String[]{"billing-A", m.key(), m.value()}));
+        billing.join("billing-B", m -&gt; billingSeen.add(new String[]{"billing-B", m.key(), m.value()}));
+
+        // Group 2: email, one member; fails once on o5 (transient) and always on "poison".
+        List&lt;String[]&gt; emailSeen = Collections.synchronizedList(new ArrayList&lt;&gt;());
+        Set&lt;String&gt; failedOnce = Collections.synchronizedSet(new HashSet&lt;&gt;());
+        ConsumerGroup email = broker.group("orders", "email", new ExponentialBackoff(3, 5));
+        email.join("email-1", m -&gt; {
+            if (m.value().equals("poison")) throw new IllegalStateException("cannot render template");
+            if (m.value().equals("o5") &amp;&amp; failedOnce.add("o5")) throw new RuntimeException("SMTP timeout");
+            emailSeen.add(new String[]{"email-1", m.key(), m.value()});
+        });
+
+        billing.start();
+        email.start();
+
+        String[][] events = {{"u1", "o1"}, {"u2", "o2"}, {"u3", "o3"}, {"u1", "o4"}, {"u2", "o5"},
+                             {"u3", "o6"}, {"u4", "poison"}, {"u1", "o7"}, {"u2", "o8"}, {"u3", "o9"}};
+        Map&lt;String, List&lt;String&gt;&gt; published = new TreeMap&lt;&gt;();
+        for (String[] e : events) {
+            broker.publish("orders", e[0], e[1]);
+            if (!e[1].equals("poison")) published.computeIfAbsent(e[0], k -&gt; new ArrayList&lt;&gt;()).add(e[1]);
+        }
+
+        System.out.println("topic orders: " + orders.partitions().size() + " partitions");
+        for (Partition p : orders.partitions()) {
+            StringBuilder sb = new StringBuilder("  p" + p.id() + ":");
+            for (Message m : p.read(0, 100, 0)) sb.append(' ').append(m.key()).append('=').append(m.value());
+            System.out.println(sb);
+        }
+
+        awaitDrained(billing, 3000);
+        awaitDrained(email, 3000);
+        System.out.println("billing assignment " + billing.assignment());
+        System.out.println("email   assignment " + email.assignment());
+        System.out.println("billing: delivered=" + billing.delivered + " retries=" + billing.retries
+                           + " dlq=" + billing.deadLettered);
+        System.out.println("email:   delivered=" + email.delivered + " retries=" + email.retries
+                           + " dlq=" + email.deadLettered);
+
+        Map&lt;String, List&lt;String&gt;&gt; billingOrder = byKey(billingSeen);
+        Map&lt;String, List&lt;String&gt;&gt; emailOrder = byKey(emailSeen);
+        System.out.println("email per-key order: " + emailOrder);
+
+        published.forEach((k, v) -&gt; check(v.equals(emailOrder.get(k)), "email order for " + k));
+        published.forEach((k, v) -&gt; check(v.equals(billingOrder.get(k).subList(0, v.size())),
+                                          "billing order for " + k));
+        check(billing.delivered.get() == 10, "billing got all 10 (fan-out: own offsets)");
+        check(email.delivered.get() == 9 &amp;&amp; email.retries.get() == 3, "email: 9 ok, 1 + 2 retries");
+        check(email.deadLettered.get() == 1, "one poison message dead-lettered");
+
+        Topic dlq = broker.topic("orders.dlq");
+        List&lt;Message&gt; parked = dlq.partitions().get(0).read(0, 10, 0);
+        System.out.println("dead letters: " + parked);
+        check(parked.size() == 1 &amp;&amp; parked.get(0).value().startsWith("poison"), "DLQ content");
+
+        // Replay: billing rewinds partition 1 to offset 0 (e.g. after fixing a bug in billing).
+        int before = billing.delivered.get();
+        billing.seek(1, 0);
+        awaitDrained(billing, 3000);
+        System.out.println("billing replayed p1 from 0: +" + (billing.delivered.get() - before)
+                           + " messages, lag=" + billing.lag());
+        check(billing.delivered.get() - before == 4, "replay of p1 delivers its 4 messages again");
+
+        broker.shutdown();
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out *.java &amp;&amp; java -cp out Main
+topic orders: 3 partitions
+  p0: u3=o3 u3=o6 u3=o9
+  p1: u1=o1 u1=o4 u4=poison u1=o7
+  p2: u2=o2 u2=o5 u2=o8
+billing assignment {0=billing-A, 1=billing-B, 2=billing-A}
+email   assignment {0=email-1, 1=email-1, 2=email-1}
+billing: delivered=10 retries=0 dlq=0
+email:   delivered=9 retries=3 dlq=1
+email per-key order: {u1=[o1, o4, o7], u2=[o2, o5, o8], u3=[o3, o6, o9]}
+dead letters: [orders.dlq-0@0 email=poison (from orders-1@2, cannot render template)]
+billing replayed p1 from 0: +4 messages, lag=0
+ALL 11 CHECKS PASSED</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+      <p><b>pubsub.py</b></p>
+<pre><code class="language-python">"""Kafka-lite: topics, partitions, consumer groups with offsets, retries and a dead-letter topic."""
+from __future__ import annotations
+
+import itertools
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
+
+@dataclass(frozen=True)
+class Message:
+    topic: str
+    partition: int
+    offset: int
+    key: Optional[str]
+    value: str
+
+    def __str__(self) -&gt; str:
+        return f"{self.topic}-{self.partition}@{self.offset} {self.key}={self.value}"
+
+class Partition:
+    """Append-only log. Readers keep their own offset; nobody removes messages."""
+
+    def __init__(self, topic: str, pid: int) -&gt; None:
+        self.topic, self.id = topic, pid
+        self._log: List[Message] = []
+        self._grew = threading.Condition()          # lock + "log grew" signal
+
+    def append(self, key: Optional[str], value: str) -&gt; Message:
+        with self._grew:
+            m = Message(self.topic, self.id, len(self._log), key, value)
+            self._log.append(m)
+            self._grew.notify_all()
+            return m
+
+    def read(self, offset: int, max_n: int, timeout_s: float) -&gt; List[Message]:
+        with self._grew:
+            self._grew.wait_for(lambda: len(self._log) &gt; offset, timeout=timeout_s)
+            return self._log[offset:offset + max_n]  # slicing copies
+
+    def end_offset(self) -&gt; int:
+        with self._grew:
+            return len(self._log)
+
+def stable_hash(s: str) -&gt; int:
+    """Same tiny hash as the Java and C++ versions (Python's hash() is randomised per process)."""
+    h = 0
+    for ch in s:
+        h = (h * 31 + ord(ch)) &amp; 0x7FFFFFFF
+    return h
+
+class KeyHashPartitioner:
+    """Strategy: same key -&gt; same partition; no key -&gt; round robin."""
+
+    def __init__(self) -&gt; None:
+        self._rr = itertools.count()
+
+    def partition_for(self, key: Optional[str], n: int) -&gt; int:
+        return next(self._rr) % n if key is None else stable_hash(key) % n
+
+class ExponentialBackoff:
+    """Strategy: max attempts and the wait after each failed attempt."""
+
+    def __init__(self, max_attempts: int, base_s: float) -&gt; None:
+        if max_attempts &lt; 1:
+            raise ValueError("max_attempts &gt;= 1")
+        self.max_attempts, self.base_s = max_attempts, base_s
+
+    def backoff(self, failed_attempt: int) -&gt; float:
+        return self.base_s * (2 ** (failed_attempt - 1))
+
+class Topic:
+    def __init__(self, name: str, partitions: int, partitioner: KeyHashPartitioner) -&gt; None:
+        if partitions &lt; 1:
+            raise ValueError("partitions &gt;= 1")
+        self.name = name
+        self.partitions = [Partition(name, i) for i in range(partitions)]
+        self._partitioner = partitioner
+
+    def publish(self, key: Optional[str], value: str) -&gt; Message:
+        p = self._partitioner.partition_for(key, len(self.partitions))
+        return self.partitions[p].append(key, value)
+
+Subscriber = Callable[[Message], None]   # Observer: raise to signal failure
+
+class ConsumerGroup:
+    """One worker thread per partition; each partition owned by one member -&gt; ordered per partition."""
+
+    def __init__(self, group_id: str, topic: Topic, retry: ExponentialBackoff, broker: "Broker") -&gt; None:
+        self.id, self.topic, self.retry, self._broker = group_id, topic, retry, broker
+        self._members: Dict[str, Subscriber] = {}
+        self._next = {p.id: 0 for p in topic.partitions}
+        self._pos_lock = threading.Lock()
+        self.owner: Dict[int, str] = {}
+        self._workers: List[threading.Thread] = []
+        self._running = False
+        self._stats_lock = threading.Lock()
+        self.delivered = self.retries = self.dead_lettered = 0
+
+    def join(self, name: str, sub: Subscriber) -&gt; None:
+        if self._running:
+            raise RuntimeError("join before start (rebalance is a follow-up)")
+        self._members[name] = sub
+
+    def start(self) -&gt; None:
+        if self._running:
+            return
+        if not self._members:
+            raise RuntimeError(f"group {self.id} has no members")
+        self._running = True
+        names = list(self._members)
+        for p in self.topic.partitions:
+            name = names[p.id % len(names)]
+            self.owner[p.id] = name
+            t = threading.Thread(target=self._run, args=(p, self._members[name]),
+                                 name=f"{self.id}-p{p.id}", daemon=True)
+            self._workers.append(t)
+            t.start()
+
+    def _position(self, pid: int) -&gt; int:
+        with self._pos_lock:
+            return self._next[pid]
+
+    def _commit(self, pid: int, expected: int) -&gt; bool:
+        with self._pos_lock:                      # compare-and-set, so a concurrent seek wins
+            if self._next[pid] != expected:
+                return False
+            self._next[pid] = expected + 1
+            return True
+
+    def _run(self, p: Partition, sub: Subscriber) -&gt; None:
+        while self._running:
+            for m in p.read(self._position(p.id), 16, 0.05):
+                if not self._running or self._position(p.id) != m.offset:
+                    break                             # stopped, or someone seeked
+                self._deliver(m, sub)
+                self._commit(p.id, m.offset)          # commit AFTER processing: at-least-once
+
+    def _bump(self, field: str) -&gt; None:
+        with self._stats_lock:
+            setattr(self, field, getattr(self, field) + 1)
+
+    def _deliver(self, m: Message, sub: Subscriber) -&gt; None:
+        attempt = 1
+        while True:
+            try:
+                sub(m)
+                self._bump("delivered")
+                return
+            except Exception as e:                   # noqa: BLE001 - any failure means retry
+                if attempt &gt;= self.retry.max_attempts:
+                    self._bump("dead_lettered")
+                    self._broker.dead_letter(self.id, m, str(e))
+                    return
+                self._bump("retries")
+                time.sleep(self.retry.backoff(attempt))
+                attempt += 1
+
+    def seek(self, pid: int, offset: int) -&gt; None:
+        with self._pos_lock:
+            self._next[pid] = offset
+
+    def lag(self) -&gt; int:
+        return sum(p.end_offset() - self._position(p.id) for p in self.topic.partitions)
+
+    def stop(self) -&gt; None:
+        self._running = False
+        for t in self._workers:
+            t.join(timeout=1)
+
+class Broker:
+    """Facade: create topics, publish, build consumer groups, park dead letters."""
+
+    def __init__(self) -&gt; None:
+        self._topics: Dict[str, Topic] = {}
+        self._groups: Dict[str, ConsumerGroup] = {}
+        self._lock = threading.Lock()
+
+    def create_topic(self, name: str, partitions: int) -&gt; Topic:
+        with self._lock:
+            if name not in self._topics:
+                self._topics[name] = Topic(name, partitions, KeyHashPartitioner())
+            return self._topics[name]
+
+    def topic(self, name: str) -&gt; Topic:
+        with self._lock:
+            if name not in self._topics:
+                raise KeyError(f"no topic {name}")
+            return self._topics[name]
+
+    def publish(self, topic: str, key: Optional[str], value: str) -&gt; Message:
+        return self.topic(topic).publish(key, value)     # never waits for consumers
+
+    def group(self, topic: str, group_id: str, retry: ExponentialBackoff) -&gt; ConsumerGroup:
+        t = self.topic(topic)
+        with self._lock:
+            k = f"{topic}/{group_id}"
+            if k not in self._groups:
+                self._groups[k] = ConsumerGroup(group_id, t, retry, self)
+            return self._groups[k]
+
+    def dead_letter(self, group_id: str, m: Message, reason: str) -&gt; None:
+        self.create_topic(m.topic + ".dlq", 1).publish(
+            group_id, f"{m.value} (from {m.topic}-{m.partition}@{m.offset}, {reason})")
+
+    def shutdown(self) -&gt; None:
+        for g in list(self._groups.values()):
+            g.stop()
+
+def await_drained(g: ConsumerGroup, timeout_s: float = 3.0) -&gt; None:
+    end = time.time() + timeout_s
+    while g.lag() &gt; 0 and time.time() &lt; end:
+        time.sleep(0.005)
+    time.sleep(0.02)</code></pre>
+      <p><b>main.py</b></p>
+<pre><code class="language-python">"""Demo driver: python main.py"""
+import threading
+from collections import defaultdict
+
+from pubsub import Broker, ExponentialBackoff, await_drained
+
+EVENTS = [("u1", "o1"), ("u2", "o2"), ("u3", "o3"), ("u1", "o4"), ("u2", "o5"),
+          ("u3", "o6"), ("u4", "poison"), ("u1", "o7"), ("u2", "o8"), ("u3", "o9")]
+
+def run() -&gt; int:
+    checks = 0
+    broker = Broker()
+    orders = broker.create_topic("orders", 3)
+
+    seen_lock = threading.Lock()
+    billing_seen, email_seen = [], []
+
+    billing = broker.group("orders", "billing", ExponentialBackoff(3, 0.005))
+    for name in ("billing-A", "billing-B"):
+        def on_bill(m, name=name):
+            with seen_lock:
+                billing_seen.append((name, m.key, m.value))
+        billing.join(name, on_bill)
+
+    failed_once = set()
+    email = broker.group("orders", "email", ExponentialBackoff(3, 0.005))
+
+    def on_email(m):
+        if m.value == "poison":
+            raise ValueError("cannot render template")
+        if m.value == "o5" and "o5" not in failed_once:
+            failed_once.add("o5")
+            raise TimeoutError("SMTP timeout")
+        with seen_lock:
+            email_seen.append(("email-1", m.key, m.value))
+    email.join("email-1", on_email)
+
+    billing.start()
+    email.start()
+
+    published = defaultdict(list)
+    for key, value in EVENTS:
+        broker.publish("orders", key, value)
+        if value != "poison":
+            published[key].append(value)
+
+    print(f"topic orders: {len(orders.partitions)} partitions")
+    for p in orders.partitions:
+        print(f"  p{p.id}: " + " ".join(f"{m.key}={m.value}" for m in p.read(0, 100, 0)))
+
+    await_drained(billing)
+    await_drained(email)
+    print("billing assignment", dict(sorted(billing.owner.items())))
+    print("email   assignment", dict(sorted(email.owner.items())))
+    print(f"billing: delivered={billing.delivered} retries={billing.retries} dlq={billing.dead_lettered}")
+    print(f"email:   delivered={email.delivered} retries={email.retries} dlq={email.dead_lettered}")
+
+    def by_key(rows):
+        out = defaultdict(list)
+        for _, k, v in rows:
+            out[k].append(v)
+        return dict(sorted(out.items()))
+
+    email_order = by_key(email_seen)
+    print("email per-key order:", email_order)
+    for k, v in published.items():
+        assert email_order[k] == v, f"email order for {k}"
+        checks += 1
+        assert by_key(billing_seen)[k][:len(v)] == v, f"billing order for {k}"
+        checks += 1
+    assert billing.delivered == 10
+    assert email.delivered == 9 and email.retries == 3 and email.dead_lettered == 1
+    checks += 2
+
+    parked = broker.topic("orders.dlq").partitions[0].read(0, 10, 0)
+    print("dead letters:", [str(m) for m in parked])
+    assert len(parked) == 1 and parked[0].value.startswith("poison")
+    checks += 1
+
+    before = billing.delivered
+    billing.seek(1, 0)
+    await_drained(billing)
+    print(f"billing replayed p1 from 0: +{billing.delivered - before} messages, lag={billing.lag()}")
+    assert billing.delivered - before == 4
+    checks += 1
+
+    broker.shutdown()
+    print(f"ALL {checks} CHECKS PASSED")
+    return checks
+
+if __name__ == "__main__":
+    run()</code></pre>
+      <p><b>test_pubsub.py</b></p>
+<pre><code class="language-python">"""python -m unittest -v test_pubsub"""
+import threading
+import time
+import unittest
+
+from pubsub import Broker, ExponentialBackoff, KeyHashPartitioner, await_drained
+
+class PubSubTest(unittest.TestCase):
+    def setUp(self):
+        self.broker = Broker()
+        self.broker.create_topic("t", 4)
+
+    def tearDown(self):
+        self.broker.shutdown()
+
+    def test_same_key_same_partition(self):
+        p = KeyHashPartitioner()
+        self.assertEqual({p.partition_for("user-7", 4) for _ in range(20)}, {p.partition_for("user-7", 4)})
+
+    def test_offsets_are_dense_per_partition(self):
+        ms = [self.broker.publish("t", "k", str(i)) for i in range(5)]
+        self.assertEqual([m.offset for m in ms], [0, 1, 2, 3, 4])
+
+    def test_each_group_gets_every_message(self):
+        got = {"a": [], "b": []}
+        lock = threading.Lock()
+        for gid in got:
+            g = self.broker.group("t", gid, ExponentialBackoff(1, 0))
+            g.join(gid, lambda m, gid=gid: (lock.acquire(), got[gid].append(m.value), lock.release()))
+            g.start()
+        for i in range(20):
+            self.broker.publish("t", f"k{i % 3}", str(i))
+        for gid in got:
+            await_drained(self.broker.group("t", gid, None))
+        self.assertEqual(sorted(got["a"], key=int), [str(i) for i in range(20)])
+        self.assertEqual(sorted(got["b"], key=int), [str(i) for i in range(20)])
+
+    def test_poison_goes_to_dlq_and_does_not_block(self):
+        got = []
+        g = self.broker.group("t", "g", ExponentialBackoff(2, 0.001))
+
+        def sub(m):
+            if m.value == "bad":
+                raise RuntimeError("boom")
+            got.append(m.value)
+        g.join("only", sub)
+        g.start()
+        for v in ["1", "bad", "2"]:
+            self.broker.publish("t", "same-key", v)
+        await_drained(g)
+        self.assertEqual(got, ["1", "2"])
+        dlq = self.broker.topic("t.dlq").partitions[0].read(0, 10, 0)
+        self.assertEqual(len(dlq), 1)
+        self.assertEqual(g.retries, 1)
+
+    def test_publisher_never_waits_for_slow_consumer(self):
+        g = self.broker.group("t", "slow", ExponentialBackoff(1, 0))
+        g.join("s", lambda m: time.sleep(0.2))
+        g.start()
+        t0 = time.time()
+        for i in range(10):
+            self.broker.publish("t", "k", str(i))
+        self.assertLess(time.time() - t0, 0.1)
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>$ python main.py
+topic orders: 3 partitions
+  p0: u3=o3 u3=o6 u3=o9
+  p1: u1=o1 u1=o4 u4=poison u1=o7
+  p2: u2=o2 u2=o5 u2=o8
+billing assignment {0: 'billing-A', 1: 'billing-B', 2: 'billing-A'}
+email   assignment {0: 'email-1', 1: 'email-1', 2: 'email-1'}
+billing: delivered=10 retries=0 dlq=0
+email:   delivered=9 retries=3 dlq=1
+email per-key order: {'u1': ['o1', 'o4', 'o7'], 'u2': ['o2', 'o5', 'o8'], 'u3': ['o3', 'o6', 'o9']}
+dead letters: ['orders.dlq-0@0 email=poison (from orders-1@2, cannot render template)']
+billing replayed p1 from 0: +4 messages, lag=0
+ALL 10 CHECKS PASSED
+$ python -m unittest test_pubsub
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 0.268s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Kafka-lite in C++14: partitions as append-only logs, consumer groups with offsets,
+// one worker thread per partition, retries with backoff, dead-letter topic.
+// Build: g++ -std=c++14 -O2 -Wall -pthread main.cpp -o pubsub &amp;&amp; ./pubsub
+// (MinGW.org g++ 6.3 uses the win32 thread model and has no std::thread: build in WSL/Linux.)
+#include &lt;atomic&gt;
+#include &lt;chrono&gt;
+#include &lt;condition_variable&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+struct Message {
+    std::string topic;
+    int partition;
+    long offset;
+    std::string key, value;
+    std::string str() const {
+        return topic + "-" + std::to_string(partition) + "@" + std::to_string(offset) + " " + key + "=" + value;
+    }
+};
+
+class Partition {                                   // like a ring buffer that never overwrites
+public:
+    Partition(std::string topic, int id) : topic_(std::move(topic)), id_(id) {}
+    int id() const { return id_; }
+    Message append(const std::string&amp; key, const std::string&amp; value) {
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        Message msg{topic_, id_, static_cast&lt;long&gt;(log_.size()), key, value};
+        log_.push_back(msg);
+        grew_.notify_all();
+        return msg;
+    }
+    std::vector&lt;Message&gt; read(long offset, size_t max, int timeoutMs) {
+        std::unique_lock&lt;std::mutex&gt; lk(m_);
+        grew_.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                       [&amp;] { return static_cast&lt;long&gt;(log_.size()) &gt; offset; });
+        std::vector&lt;Message&gt; out;
+        for (size_t i = offset; i &lt; log_.size() &amp;&amp; out.size() &lt; max; ++i) out.push_back(log_[i]);
+        return out;                                  // copies: safe after unlock
+    }
+    long endOffset() {
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        return static_cast&lt;long&gt;(log_.size());
+    }
+private:
+    std::string topic_;
+    int id_;
+    std::vector&lt;Message&gt; log_;
+    std::mutex m_;
+    std::condition_variable grew_;
+};
+
+static int stableHash(const std::string&amp; s) {      // same as the Java and Python versions
+    int h = 0;
+    for (char c : s) h = (h * 31 + static_cast&lt;unsigned char&gt;(c)) &amp; 0x7fffffff;
+    return h;
+}
+
+struct Partitioner {                                // Strategy
+    virtual ~Partitioner() = default;
+    virtual int partitionFor(const std::string&amp; key, int n) = 0;
+};
+struct KeyHashPartitioner : Partitioner {
+    int partitionFor(const std::string&amp; key, int n) override { return stableHash(key) % n; }
+};
+
+struct RetryPolicy {                                // Strategy
+    int maxAttempts;
+    int baseMs;
+    int backoffMs(int failedAttempt) const { return baseMs &lt;&lt; (failedAttempt - 1); }
+};
+
+class Topic {
+public:
+    Topic(std::string name, int n) : name_(std::move(name)), partitioner_(new KeyHashPartitioner) {
+        for (int i = 0; i &lt; n; ++i) parts_.emplace_back(new Partition(name_, i));
+    }
+    const std::string&amp; name() const { return name_; }
+    std::vector&lt;std::unique_ptr&lt;Partition&gt;&gt;&amp; partitions() { return parts_; }
+    Message publish(const std::string&amp; key, const std::string&amp; value) {
+        int p = partitioner_-&gt;partitionFor(key, static_cast&lt;int&gt;(parts_.size()));
+        return parts_[p]-&gt;append(key, value);
+    }
+private:
+    std::string name_;
+    std::unique_ptr&lt;Partitioner&gt; partitioner_;
+    std::vector&lt;std::unique_ptr&lt;Partition&gt;&gt; parts_;
+};
+
+using Subscriber = std::function&lt;void(const Message&amp;)&gt;;   // Observer: throw = failure
+class Broker;
+
+class ConsumerGroup {
+public:
+    ConsumerGroup(std::string id, Topic&amp; t, RetryPolicy r, Broker&amp; b)
+        : id_(std::move(id)), topic_(t), retry_(r), broker_(b), next_(t.partitions().size()) {
+        for (auto&amp; n : next_) n = 0;
+    }
+    ~ConsumerGroup() { stop(); }
+    void join(const std::string&amp; name, Subscriber s) {
+        if (running_) throw std::logic_error("join before start");
+        names_.push_back(name);
+        members_[name] = std::move(s);
+    }
+    void start() {
+        running_ = true;
+        for (auto&amp; p : topic_.partitions()) {
+            const std::string&amp; name = names_[p-&gt;id() % names_.size()];
+            owner_[p-&gt;id()] = name;
+            Partition* part = p.get();
+            Subscriber* sub = &amp;members_[name];
+            workers_.emplace_back([this, part, sub] { run(*part, *sub); });
+        }
+    }
+    void stop() {
+        running_ = false;
+        for (auto&amp; t : workers_) if (t.joinable()) t.join();
+        workers_.clear();
+    }
+    void seek(int partition, long offset) { next_[partition] = offset; }
+    long lag() {
+        long lag = 0;
+        for (auto&amp; p : topic_.partitions()) lag += p-&gt;endOffset() - next_[p-&gt;id()];
+        return lag;
+    }
+    const std::map&lt;int, std::string&gt;&amp; assignment() const { return owner_; }
+    std::atomic&lt;int&gt; delivered{0}, retries{0}, deadLettered{0};
+private:
+    void run(Partition&amp; p, Subscriber&amp; s) {
+        while (running_) {
+            for (const Message&amp; m : p.read(next_[p.id()], 16, 50)) {
+                if (!running_ || next_[p.id()] != m.offset) break;    // stopped or seeked
+                deliver(m, s);
+                long expected = m.offset;
+                next_[p.id()].compare_exchange_strong(expected, m.offset + 1);  // commit after work
+            }
+        }
+    }
+    void deliver(const Message&amp; m, Subscriber&amp; s);
+
+    std::string id_;
+    Topic&amp; topic_;
+    RetryPolicy retry_;
+    Broker&amp; broker_;
+    std::vector&lt;std::atomic&lt;long&gt;&gt; next_;           // one position per partition
+    std::vector&lt;std::string&gt; names_;
+    std::map&lt;std::string, Subscriber&gt; members_;
+    std::map&lt;int, std::string&gt; owner_;
+    std::vector&lt;std::thread&gt; workers_;
+    std::atomic&lt;bool&gt; running_{false};
+};
+
+class Broker {
+public:
+    ~Broker() { shutdown(); }
+    Topic&amp; createTopic(const std::string&amp; name, int n) {
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        auto it = topics_.find(name);
+        if (it == topics_.end()) it = topics_.emplace(name, std::unique_ptr&lt;Topic&gt;(new Topic(name, n))).first;
+        return *it-&gt;second;
+    }
+    Topic&amp; topic(const std::string&amp; name) {
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        auto it = topics_.find(name);
+        if (it == topics_.end()) throw std::invalid_argument("no topic " + name);
+        return *it-&gt;second;
+    }
+    Message publish(const std::string&amp; t, const std::string&amp; k, const std::string&amp; v) {
+        return topic(t).publish(k, v);              // never waits on consumers
+    }
+    ConsumerGroup&amp; group(const std::string&amp; t, const std::string&amp; gid, RetryPolicy r) {
+        Topic&amp; top = topic(t);
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        auto&amp; g = groups_[t + "/" + gid];
+        if (!g) g.reset(new ConsumerGroup(gid, top, r, *this));
+        return *g;
+    }
+    void deadLetter(const std::string&amp; gid, const Message&amp; m, const std::string&amp; why) {
+        createTopic(m.topic + ".dlq", 1).publish(gid, m.value + " (from " + m.topic + "-" +
+            std::to_string(m.partition) + "@" + std::to_string(m.offset) + ", " + why + ")");
+    }
+    void shutdown() { for (auto&amp; g : groups_) g.second-&gt;stop(); }
+private:
+    std::mutex m_;
+    std::map&lt;std::string, std::unique_ptr&lt;Topic&gt;&gt; topics_;
+    std::map&lt;std::string, std::unique_ptr&lt;ConsumerGroup&gt;&gt; groups_;
+};
+
+void ConsumerGroup::deliver(const Message&amp; m, Subscriber&amp; s) {
+    for (int attempt = 1;; ++attempt) {
+        try {
+            s(m);
+            ++delivered;
+            return;
+        } catch (const std::exception&amp; e) {
+            if (attempt &gt;= retry_.maxAttempts) {
+                ++deadLettered;
+                broker_.deadLetter(id_, m, e.what());
+                return;
+            }
+            ++retries;
+            std::this_thread::sleep_for(std::chrono::milliseconds(retry_.backoffMs(attempt)));
+        }
+    }
+}
+
+static int checks = 0;
+static void check(bool ok, const char* what) {
+    if (!ok) { std::printf("FAILED: %s\n", what); std::exit(1); }
+    ++checks;
+}
+static void awaitDrained(ConsumerGroup&amp; g) {
+    for (int i = 0; i &lt; 600 &amp;&amp; g.lag() &gt; 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+}
+
+int main() {
+    Broker broker;
+    Topic&amp; orders = broker.createTopic("orders", 3);
+    std::mutex seenM;
+    std::map&lt;std::string, std::vector&lt;std::string&gt;&gt; billingSeen, emailSeen;   // key -&gt; values in order
+
+    ConsumerGroup&amp; billing = broker.group("orders", "billing", RetryPolicy{3, 5});
+    for (const char* name : {"billing-A", "billing-B"})
+        billing.join(name, [&amp;](const Message&amp; m) {
+            std::lock_guard&lt;std::mutex&gt; lk(seenM);
+            billingSeen[m.key].push_back(m.value);
+        });
+
+    std::atomic&lt;bool&gt; o5FailedOnce{false};
+    ConsumerGroup&amp; email = broker.group("orders", "email", RetryPolicy{3, 5});
+    email.join("email-1", [&amp;](const Message&amp; m) {
+        if (m.value == "poison") throw std::runtime_error("cannot render template");
+        if (m.value == "o5" &amp;&amp; !o5FailedOnce.exchange(true)) throw std::runtime_error("SMTP timeout");
+        std::lock_guard&lt;std::mutex&gt; lk(seenM);
+        emailSeen[m.key].push_back(m.value);
+    });
+    billing.start();
+    email.start();
+
+    const char* events[][2] = {{"u1", "o1"}, {"u2", "o2"}, {"u3", "o3"}, {"u1", "o4"}, {"u2", "o5"},
+                               {"u3", "o6"}, {"u4", "poison"}, {"u1", "o7"}, {"u2", "o8"}, {"u3", "o9"}};
+    std::map&lt;std::string, std::vector&lt;std::string&gt;&gt; published;
+    for (auto&amp; e : events) {
+        broker.publish("orders", e[0], e[1]);
+        if (std::string(e[1]) != "poison") published[e[0]].push_back(e[1]);
+    }
+
+    std::printf("topic orders: %zu partitions\n", orders.partitions().size());
+    for (auto&amp; p : orders.partitions()) {
+        std::printf("  p%d:", p-&gt;id());
+        for (auto&amp; m : p-&gt;read(0, 100, 0)) std::printf(" %s=%s", m.key.c_str(), m.value.c_str());
+        std::printf("\n");
+    }
+    awaitDrained(billing);
+    awaitDrained(email);
+    for (auto* g : {&amp;billing, &amp;email}) {
+        std::printf("%s assignment:", g == &amp;billing ? "billing" : "email  ");
+        for (auto&amp; a : g-&gt;assignment()) std::printf(" p%d-&gt;%s", a.first, a.second.c_str());
+        std::printf("\n");
+    }
+    std::printf("billing: delivered=%d retries=%d dlq=%d\n", billing.delivered.load(), billing.retries.load(),
+                billing.deadLettered.load());
+    std::printf("email:   delivered=%d retries=%d dlq=%d\n", email.delivered.load(), email.retries.load(),
+                email.deadLettered.load());
+    {
+        std::lock_guard&lt;std::mutex&gt; lk(seenM);
+        for (auto&amp; kv : published) {
+            check(emailSeen[kv.first] == kv.second, "email per-key order");
+            std::vector&lt;std::string&gt; b(billingSeen[kv.first].begin(),
+                                       billingSeen[kv.first].begin() + kv.second.size());
+            check(b == kv.second, "billing per-key order");
+        }
+    }
+    check(billing.delivered == 10, "billing got all 10");
+    check(email.delivered == 9 &amp;&amp; email.retries == 3 &amp;&amp; email.deadLettered == 1, "email retries + DLQ");
+
+    auto parked = broker.topic("orders.dlq").partitions()[0]-&gt;read(0, 10, 0);
+    for (auto&amp; m : parked) std::printf("dead letter: %s\n", m.str().c_str());
+    check(parked.size() == 1, "one dead letter");
+
+    int before = billing.delivered;
+    billing.seek(1, 0);
+    awaitDrained(billing);
+    std::printf("billing replayed p1 from 0: +%d messages, lag=%ld\n", billing.delivered - before, billing.lag());
+    check(billing.delivered - before == 4, "replay p1");
+
+    broker.shutdown();
+    std::printf("ALL %d CHECKS PASSED\n", checks);
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -Wextra -pthread main.cpp -o pubsub &amp;&amp; ./pubsub
+topic orders: 3 partitions
+  p0: u3=o3 u3=o6 u3=o9
+  p1: u1=o1 u1=o4 u4=poison u1=o7
+  p2: u2=o2 u2=o5 u2=o8
+billing assignment: p0-&gt;billing-A p1-&gt;billing-B p2-&gt;billing-A
+email   assignment: p0-&gt;email-1 p1-&gt;email-1 p2-&gt;email-1
+billing: delivered=10 retries=0 dlq=0
+email:   delivered=9 retries=3 dlq=1
+dead letter: orders.dlq-0@0 email=poison (from orders-1@2, cannot render template)
+billing replayed p1 from 0: +4 messages, lag=0
+ALL 10 CHECKS PASSED</code></pre>
+    </div>
+  </div>
+  <p>Read the output against the requirements. Every group got its own full copy (billing 10, email 9 + 1 dead letter). Per-key order holds in both groups even though billing used two members and email retried in the middle of p1. The poison message cost exactly two retries and then moved to <code>orders.dlq</code> with its origin (<code>orders-1@2</code>) and reason. Replay of p1 delivered its four messages again: that is <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> in action, and why consumers must be idempotent.</p>

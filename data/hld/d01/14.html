@@ -1,0 +1,94 @@
+
+        <h2>Variant: Pastebin / Gists</h2>
+        <p>"Design Pastebin" is the URL shortener's sibling and is often asked as a follow-up. The <b>key</b> half is identical: a short, unguessable base62 key from the same <a href="#deep-dives">KGS or counter</a>, and a read path of <code>GET /{key}</code>. The <b>value</b> half is what changes. A long URL is about 100 bytes; a paste can be 10 KB of code or 5 MB of log output. That one difference decides the storage design.</p>
+        <div class="eli5"><h4>Explain like I'm 5</h4><p>A library card catalogue has a small card for every book: title, author, shelf number. The books themselves sit on big shelves in the back. You search the little cards fast, then walk to the shelf. Pastebin keeps the little card (metadata) in a database and the big book (the paste text) in object storage.</p></div>
+        <h3>Hybrid storage: metadata row in the DB, body in S3</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Pastebin architecture: client, API, key generation service, metadata database, S3 bucket for bodies, CDN in front of raw content">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="130" width="120" height="60"/><text class="label" x="80" y="165">Client</text>
+            <rect class="box svc" x="200" y="130" width="140" height="60"/><text class="label" x="270" y="158">Paste API</text><text class="label small" x="270" y="178">stateless</text>
+            <rect class="box queue" x="200" y="20" width="140" height="60"/><text class="label" x="270" y="48">KGS</text><text class="label small" x="270" y="68">pre-made keys</text>
+            <rect class="box db" x="420" y="40" width="200" height="80"/><text class="label" x="520" y="70">Metadata DB</text><text class="label small" x="520" y="92">key, owner, size, expiry,</text><text class="label small" x="520" y="110">s3_key: ~300 B per row</text>
+            <rect class="box cache" x="420" y="200" width="200" height="80"/><text class="label" x="520" y="232">S3 bucket</text><text class="label small" x="520" y="254">pastes/{key}  (KBs to MBs)</text>
+            <rect class="box svc" x="700" y="200" width="180" height="80"/><text class="label" x="790" y="232">CDN</text><text class="label small" x="790" y="254">raw.example-cdn.com</text>
+            <path class="arrow" d="M140 160 L196 160"/><path class="arrow both" d="M270 84 L270 126"/>
+            <path class="arrow" d="M340 150 L416 90"/><path class="arrow" d="M340 172 L416 230"/>
+            <path class="arrow" d="M624 240 L696 240"/>
+            <path class="arrow dashed" d="M790 196 C 790 100, 400 300, 140 180"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M140 160 L270 160 L520 240"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M270 160 L520 80"/></circle>
+            <text class="label small left" x="640" y="40">reads: metadata from cache/DB,</text>
+            <text class="label small left" x="640" y="62">body from CDN or a pre-signed</text>
+            <text class="label small left" x="640" y="84">S3 URL, never through the DB</text>
+          </svg>
+          <figcaption>Small, hot, queryable facts go to the database; large, cold, write-once bytes go to object storage. The row points at the object.</figcaption>
+        </figure>
+        <div class="proscons">
+          <div class="pros"><h5>Why split it</h5><ul><li>Metadata rows stay tiny, so the indexes (by key, by owner, by <code>expires_at</code>) fit in memory.</li><li>S3 costs a fraction of database storage per GB and is designed for 11 nines of durability.</li><li>Bodies are immutable: perfect for a CDN and long cache lifetimes.</li><li>Big uploads can go straight from the client to S3 with a pre-signed URL, skipping your API servers.</li></ul></div>
+          <div class="cons"><h5>What it costs</h5><ul><li>Two systems to keep consistent (write order matters, below).</li><li>An extra hop on reads, so tiny pastes are often stored inline in the row instead.</li><li>Garbage: orphaned objects need a cleanup job or a lifecycle rule.</li></ul></div>
+        </div>
+        <p><b>Back of the envelope:</b> 1 million new pastes a day at an average 10 KB is about 10 GB of bodies per day, roughly 3.65 TB per year, while 1 million metadata rows at about 300 bytes is only 300 MB per day. Bodies are 97% of the bytes and almost none of the queries. That ratio is the whole argument for the split.</p>
+        <h3>The write path, in the right order</h3>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 220" role="img" aria-label="Write path: validate size, take a key from KGS, upload body to S3, insert the metadata row, return the URL">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="80" width="130" height="60"/><text class="label" x="85" y="106">POST /pastes</text><text class="label small" x="85" y="126">8 KB of code</text>
+            <g data-step="1"><rect class="box warn" x="185" y="80" width="130" height="60"/><text class="label" x="250" y="106">Validate</text><text class="label small" x="250" y="126">&lt;= 10 MB, else 413</text><path class="arrow" d="M150 110 L181 110"/></g>
+            <g data-step="2"><rect class="box queue" x="350" y="80" width="130" height="60"/><text class="label" x="415" y="106">KGS</text><text class="label small" x="415" y="126">key = aZ3kP9qL</text><path class="arrow" d="M315 110 L346 110"/></g>
+            <g data-step="3"><rect class="box cache" x="515" y="80" width="130" height="60"/><text class="label" x="580" y="106">S3 PUT</text><text class="label small" x="580" y="126">pastes/aZ3kP9qL</text><path class="arrow" d="M480 110 L511 110"/></g>
+            <g data-step="4"><rect class="box db" x="680" y="80" width="160" height="60"/><text class="label" x="760" y="106">INSERT row</text><text class="label small" x="760" y="126">points at the object</text><path class="arrow" d="M645 110 L676 110"/></g>
+            <g data-step="5"><text class="label small ok" x="430" y="190">201 Created: https://paste.example/aZ3kP9qL</text>
+              <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M760 150 L760 170 L85 170 L85 144"/></circle></g>
+          </svg>
+          <ol class="stepper-captions">
+            <li>Reject oversized bodies early (HTTP 413). The limit is a product choice; a plan tier can raise it.</li>
+            <li>Take a key from the KGS pool, exactly as in the shortener. No collision check needed.</li>
+            <li>Upload the body to S3 first (for large pastes, give the client a pre-signed PUT URL instead).</li>
+            <li>Only then insert the metadata row. A crash between steps 3 and 4 leaves an orphan object, which cleanup removes; the reverse order could leave a row pointing at nothing.</li>
+            <li>Return the short URL. The paste is readable as soon as the row exists.</li>
+          </ol>
+        </div>
+<pre><code class="language-sql">CREATE TABLE pastes (
+  paste_key   CHAR(8)      PRIMARY KEY,          -- from the KGS
+  owner_id    BIGINT,                            -- NULL for anonymous
+  title       VARCHAR(200),
+  language    VARCHAR(32),                       -- syntax highlighting hint
+  size_bytes  INT          NOT NULL,
+  visibility  SMALLINT     NOT NULL DEFAULT 0,   -- 0 public, 1 unlisted, 2 private
+  body_inline TEXT,                              -- set only when size_bytes &lt;= 4096
+  s3_key      VARCHAR(64),                       -- set otherwise
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ                        -- NULL = never
+);
+CREATE INDEX pastes_owner   ON pastes (owner_id, created_at DESC);
+CREATE INDEX pastes_expires ON pastes (expires_at) WHERE expires_at IS NOT NULL;</code></pre>
+        <h3>Size limits and expiry</h3>
+        <ul>
+          <li><b>Size limits</b> protect cost and abuse: a hard maximum per paste (say 10 MB), a smaller limit for anonymous users, and a per-account quota. GitHub's Gist API is a good real-world reference: it returns at most 1 MB of each file inline, marks bigger files <code>truncated</code> with a <code>raw_url</code> to fetch the rest, and asks you to clone the gist with git for files over 10 MB.</li>
+          <li><b>Expiry options</b> (10 minutes, 1 day, 1 month, never) are stored as <code>expires_at</code> and checked on <b>every read</b> (return 410 Gone), because background deletion is always late.</li>
+          <li><b>Delete the bodies cheaply</b> with an S3 lifecycle rule. Lifecycle rules expire objects by age under a prefix (or tag), so write each body under a prefix that matches its expiry class: <code>ttl-1d/</code>, <code>ttl-30d/</code>, <code>keep/</code>. A nightly job deletes expired metadata rows in batches.</li>
+          <li><b>Burn after reading:</b> a conditional delete (<code>DELETE ... WHERE paste_key = $1 RETURNING s3_key</code>) so exactly one reader wins.</li>
+        </ul>
+<pre><code class="language-json">{
+  "Rules": [
+    { "ID": "expire-1d",  "Filter": { "Prefix": "ttl-1d/" },  "Status": "Enabled", "Expiration": { "Days": 1 } },
+    { "ID": "expire-30d", "Filter": { "Prefix": "ttl-30d/" }, "Status": "Enabled", "Expiration": { "Days": 30 } }
+  ]
+}</code></pre>
+<pre><code class="language-bash">aws s3api put-bucket-lifecycle-configuration --bucket paste-bodies --lifecycle-configuration file://lifecycle.json
+aws s3api get-bucket-lifecycle-configuration --bucket paste-bodies --query "Rules[].ID"</code></pre>
+<pre class="terminal"><code>[
+    "expire-1d",
+    "expire-30d"
+]</code></pre>
+        <h3>What makes Gists different</h3>
+        <ul>
+          <li><b>Versions and forks:</b> each gist is a small git repository, so every edit is a revision and forks are cheap. If the interviewer wants history, store bodies content-addressed (<code>sha256</code> of the text as the S3 key) so unchanged files are never stored twice, and keep a revisions table pointing at them.</li>
+          <li><b>Many files per paste:</b> metadata becomes one paste row plus one row per file.</li>
+          <li><b>Serve raw text from a separate domain</b> (GitHub uses a different host for raw gist content) with <code>Content-Type: text/plain</code> and <code>X-Content-Type-Options: nosniff</code>, so a paste full of HTML and JavaScript can never run as a page on your main site (stored XSS).</li>
+          <li><b>"Unlisted" is not "secret":</b> it only means "not in search". Keys must be long and random enough that guessing is useless, and private pastes need real access checks.</li>
+        </ul>
+        <div class="bridge"><h4>From your world</h4><p>This is a NIC descriptor ring. The ring holds small, fixed-size descriptors (length, flags, a pointer), and the payload sits in separate DMA buffers. You scan and index the descriptors fast and touch the big buffers only when you must. Pastebin's metadata rows are the descriptors and S3 objects are the buffers. The write-order rule is the same too: fill the buffer before you hand the descriptor to the consumer, never the other way round.</p></div>
+        <div class="callout interview"><p>Interviewers love this line: "<b>Same key service as the shortener; the new problem is the value. I keep metadata in the database and bodies in object storage, write the body first, check expiry on every read, and let lifecycle rules do the bulk deletes.</b>"</p></div>
+      

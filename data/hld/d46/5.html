@@ -1,0 +1,108 @@
+
+        <h2>Architecture: one game, start to finish</h2>
+        <p>Click <b>Next</b> or <b>Play</b>. The flow below is close to how Lichess is built: its README says WebSocket traffic is handled by a separate server (<code>lila-ws</code>) that talks to the main application through Redis, and chess rules live in a separate pure library (<code>scalachess</code>).</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 380" role="img" aria-label="Chess request flow from matchmaking to leaderboard">
+            <rect class="box client" x="20" y="40" width="120" height="56"/>
+            <text class="label" x="80" y="62">Alice</text>
+            <text class="label small" x="80" y="82">rating 1720</text>
+            <rect class="box client" x="20" y="270" width="120" height="56"/>
+            <text class="label" x="80" y="292">Bob</text>
+            <text class="label small" x="80" y="312">rating 1705</text>
+
+            <g data-step="1">
+              <rect class="box svc" x="200" y="150" width="130" height="60"/>
+              <text class="label" x="265" y="172">LB + WS</text>
+              <text class="label small" x="265" y="192">gateways</text>
+              <path class="arrow" d="M140 68 L196 160"/>
+              <path class="arrow" d="M140 298 L196 200"/>
+            </g>
+            <g data-step="2">
+              <rect class="box svc" x="390" y="30" width="160" height="60"/>
+              <text class="label" x="470" y="52">Matchmaker</text>
+              <text class="label small" x="470" y="72">Redis ZSET by rating</text>
+              <path class="arrow" d="M300 150 L400 92"/>
+            </g>
+            <g data-step="3">
+              <rect class="box k8s" x="390" y="150" width="160" height="70"/>
+              <text class="label" x="470" y="174">Game server</text>
+              <text class="label small" x="470" y="196">owns game g_9c2</text>
+              <path class="arrow dashed" d="M470 90 L470 144"/>
+              <text class="label small" x="530" y="122">create game</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow both" d="M330 180 L384 180"/>
+              <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M80 96 L265 150 L470 185 L265 210 L80 270"/></circle>
+            </g>
+            <g data-step="5">
+              <rect class="box cache" x="390" y="270" width="160" height="56"/>
+              <text class="label" x="470" y="292">Redis journal</text>
+              <text class="label small" x="470" y="312">append each move</text>
+              <path class="arrow" d="M470 220 L470 264"/>
+            </g>
+            <g data-step="6">
+              <rect class="box kafka" x="610" y="150" width="170" height="60"/>
+              <text class="label" x="695" y="172">Kafka</text>
+              <text class="label small" x="695" y="192">game-finished</text>
+              <path class="arrow" d="M550 180 L604 180"/>
+            </g>
+            <g data-step="7">
+              <rect class="box db" x="610" y="30" width="170" height="60"/>
+              <text class="label" x="695" y="52">Rating svc + PG</text>
+              <text class="label small" x="695" y="72">Glicko-2 update</text>
+              <rect class="box db" x="610" y="270" width="170" height="56"/>
+              <text class="label" x="695" y="292">Game archive</text>
+              <text class="label small" x="695" y="312">PGN, write once</text>
+              <path class="arrow" d="M695 150 L695 96"/>
+              <path class="arrow" d="M695 210 L695 264"/>
+            </g>
+            <g data-step="8">
+              <rect class="box cache" x="610" y="336" width="170" height="36"/>
+              <text class="label small" x="695" y="354">Leaderboard ZSET</text>
+              <path class="arrow dashed" d="M780 60 C800 200 800 300 782 352"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Connect.</b> Alice and Bob open the app. A layer-4/7 load balancer spreads WebSocket connections over stateless-ish gateway nodes. Gateways only hold sockets; they own no game logic.</li>
+            <li><b>Queue.</b> Both press "Play 3+0". The matchmaker adds them to the sorted set <code>mm:blitz:eu</code> with score = rating, then looks for a neighbour within a rating window (for example +/- 50, widening every few seconds of waiting).</li>
+            <li><b>Pair and place.</b> The matchmaker atomically claims both players (deep dive 1), picks a game id, and asks the cluster which game server owns that id (<a href="{{BASE}}hld/hld-02">consistent hash</a> of <code>gameId</code>: every node hashes the id onto the same ring, so all agree on the owner, and adding a server moves only a slice of games). That server creates the game in memory and starts White's clock.</li>
+            <li><b>Play.</b> Each move goes client -&gt; gateway -&gt; owner game server. The server checks it is the mover's turn and the ply number, validates legality with the rules library, applies it, stops one clock, starts the other, then pushes <code>moved</code> to both gateways (through <b>pub/sub</b> on the game's channel: publish to a named channel and every subscriber gets a copy, like sending to a multicast group), which push to both sockets.</li>
+            <li><b>Journal.</b> Before acknowledging, the server appends the move to the game's Redis stream (an append-only log). The append is a small Lua script that first checks the writer's lease epoch, so a stale owner is rejected (deep dive 2). If the server dies, a new owner replays the journal and the game continues.</li>
+            <li><b>Finish.</b> Checkmate, resign or flag fall (a timer fires on the server). The server writes one <code>game-finished</code> event to Kafka, keyed by gameId.</li>
+            <li><b>Fan out.</b> Independent consumers read the event: the rating service updates both Glicko-2 ratings in one Postgres transaction (idempotent by gameId); the archiver writes the PGN to the game store.</li>
+            <li><b>Rank.</b> The rating service updates the leaderboard sorted set with <code>ZADD lb:blitz rating userId</code>. A few seconds after the game, both players see their new rank.</li>
+          </ol>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Move path through gateways and pub/sub to the owning game server">
+            <rect class="box client" x="20" y="30" width="110" height="50"/>
+            <text class="label" x="75" y="55">White</text>
+            <rect class="box client" x="20" y="160" width="110" height="50"/>
+            <text class="label" x="75" y="185">Black</text>
+            <rect class="box svc" x="190" y="30" width="140" height="50"/>
+            <text class="label" x="260" y="55">Gateway A</text>
+            <rect class="box svc" x="190" y="160" width="140" height="50"/>
+            <text class="label" x="260" y="185">Gateway B</text>
+            <rect class="box cache" x="390" y="95" width="150" height="50"/>
+            <text class="label" x="465" y="114">Pub/sub</text>
+            <text class="label small" x="465" y="132">channel game:g_9c2</text>
+            <rect class="box k8s" x="610" y="95" width="170" height="50"/>
+            <text class="label" x="695" y="114">Game server 7</text>
+            <text class="label small" x="695" y="132">owner of g_9c2</text>
+            <path class="arrow both" d="M130 55 L184 55"/>
+            <path class="arrow both" d="M130 185 L184 185"/>
+            <path class="arrow both" d="M330 60 L386 108"/>
+            <path class="arrow both" d="M330 180 L386 132"/>
+            <path class="arrow both" d="M540 120 L604 120"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M130 55 L260 55 L465 120 L695 120 L465 120 L260 185 L130 185"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M695 120 L465 120 L260 55 L130 55"/></circle>
+          </svg>
+          <figcaption>A move (blue dot) travels White -&gt; Gateway A -&gt; pub/sub -&gt; owner game server; the result fans back to both gateways (orange dot is the ack to White). The two players can sit on different gateways.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Think of a chassis router. The <b>gateways are line cards</b>: they terminate sessions and move frames, but they hold no control state. The <b>game server is the route processor</b> for one game: single owner, single writer, all decisions made in one place. The pub/sub layer is the backplane. Choosing the owner by hashing <code>gameId</code> is like ECMP hashing a 5-tuple so every packet of a flow lands on the same path.</p>
+        </div>
+      

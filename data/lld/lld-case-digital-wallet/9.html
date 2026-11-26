@@ -1,0 +1,1050 @@
+
+  <h2>Full code</h2>
+  <p>Java is the main version, in one file with a self-checking demo; its last step runs 20 000 concurrent transfers over 8 threads with 25% duplicate keys and checks every invariant. Python mirrors it with a <code>unittest</code> suite. C++14 is the single-threaded core (ledger, keys, reversal, adapter), since this machine's MinGW 6.3 has no <code>std::thread</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: deposits, failures, transfers, reversal, the 20 000-transfer stress test, the timeout.</li><li><code>WalletService.begin</code>: the idempotency key claimed with <code>putIfAbsent</code>.</li><li><code>WalletService.post</code>: both wallets locked in id order, debit, credit, two ledger lines. This is the heart.</li><li><code>UpiAdapter</code>, <code>CardAdapter</code>, <code>GatewayRouter</code>: Adapter plus Strategy over the payment SDKs.</li><li>Skip on first read: the enums and <code>Money</code>.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.function.Predicate;
+
+// ================= model =================
+enum TxnType { DEPOSIT, WITHDRAW, TRANSFER, REVERSAL }
+enum TxnStatus { PENDING, SUCCESS, FAILED, REVERSED }
+enum Direction { DEBIT, CREDIT }
+enum PaymentMethod { UPI, CARD }
+
+final class Money {
+    static String fmt(long paise) { return (paise &lt; 0 ? "-" : "") + Math.abs(paise) / 100 + "." + String.format("%02d", Math.abs(paise) % 100); }
+}
+
+final class Wallet {
+    final String id, owner;
+    final boolean system;              // system wallets (bank settlement) may go negative
+    private long balance;              // paise; guarded by this wallet's monitor
+    Wallet(String id, String owner, boolean system) { this.id = id; this.owner = owner; this.system = system; }
+    long balance() { synchronized (this) { return balance; } }
+    void apply(Direction d, long amount) {          // caller holds the lock
+        if (d == Direction.DEBIT) {
+            if (!system &amp;&amp; balance &lt; amount) throw new InsufficientFunds(id);
+            balance -= amount;
+        } else balance += amount;
+    }
+}
+
+final class LedgerEntry {                            // immutable, append-only
+    final long seq; final String txnId, walletId; final Direction dir; final long amount, balanceAfter;
+    LedgerEntry(long seq, String txnId, String walletId, Direction dir, long amount, long balanceAfter) {
+        this.seq = seq; this.txnId = txnId; this.walletId = walletId; this.dir = dir; this.amount = amount; this.balanceAfter = balanceAfter;
+    }
+    public String toString() { return String.format("#%d %-8s %-6s %10s  bal %10s", seq, txnId, dir, Money.fmt(amount), Money.fmt(balanceAfter)); }
+}
+
+final class Transaction {
+    final String id, idempotencyKey, from, to; final TxnType type; final long amount; final String reversalOf;
+    volatile TxnStatus status = TxnStatus.PENDING;
+    volatile String failureReason, gatewayRef;
+    Transaction(String id, String key, TxnType type, String from, String to, long amount, String reversalOf) {
+        this.id = id; this.idempotencyKey = key; this.type = type; this.from = from; this.to = to; this.amount = amount; this.reversalOf = reversalOf;
+    }
+    boolean samePayload(TxnType t, String f, String to2, long amt) {
+        return type == t &amp;&amp; Objects.equals(from, f) &amp;&amp; Objects.equals(to, to2) &amp;&amp; amount == amt;
+    }
+    public String toString() {
+        return id + " " + type + " " + Money.fmt(amount) + " " + status + (failureReason != null ? " (" + failureReason + ")" : "");
+    }
+}
+
+class WalletException extends RuntimeException { WalletException(String m) { super(m); } }
+class InsufficientFunds extends WalletException { InsufficientFunds(String w) { super("insufficient funds in " + w); } }
+class IdempotencyConflict extends WalletException { IdempotencyConflict(String k) { super("key " + k + " reused with a different request"); } }
+
+// ================= payment gateway: Adapter + Strategy =================
+final class ChargeResult {
+    final boolean ok, unknown; final String ref, reason;
+    ChargeResult(boolean ok, String ref, String reason) { this(ok, false, ref, reason); }
+    private ChargeResult(boolean ok, boolean unknown, String ref, String reason) {
+        this.ok = ok; this.unknown = unknown; this.ref = ref; this.reason = reason;
+    }
+    /** Timeout or lost reply: the money may or may not have moved. Neither success nor failure. */
+    static ChargeResult unknown(String reason) { return new ChargeResult(false, true, null, reason); }
+}
+/** Our interface. Every provider is adapted to it. */
+interface PaymentGateway { ChargeResult charge(String source, long paise, String idempotencyKey); }
+
+/** Pretend third-party UPI SDK: rupee strings, string status codes, its own method names.
+ *  Like real providers it is idempotent on requestId, and it can be told to "time out": the money
+ *  moves but the reply is lost, so the caller cannot tell success from failure. */
+final class FakeUpiSdk {
+    static final class Timeout extends Exception { Timeout() { super("UPI gateway timeout"); } }
+    private final Map&lt;String, String&gt; done = new ConcurrentHashMap&lt;&gt;();   // requestId -&gt; ref
+    private volatile boolean dropNextReply;
+    void timeoutNextReply() { dropNextReply = true; }
+    int charges() { return done.size(); }
+    String collect(String vpa, String rupees, String requestId) throws Timeout {
+        if (!vpa.contains("@")) return "ERR_INVALID_VPA";
+        String ref = done.computeIfAbsent(requestId, id -&gt; "upi_" + Math.abs(id.hashCode()));  // charge once per id
+        if (dropNextReply) { dropNextReply = false; throw new Timeout(); }                   // charged, reply lost
+        return "SUCCESS:" + ref;
+    }
+}
+/** Pretend card SDK: two-step authorise + capture, throws on decline. */
+final class FakeCardSdk {
+    static final class Declined extends Exception { Declined(String m) { super(m); } }
+    String authorize(String cardToken, long cents) throws Declined {
+        if (cardToken.endsWith("declined")) throw new Declined("card declined by issuer");
+        return "auth_" + cardToken.hashCode();
+    }
+    String capture(String authId) { return "cap_" + authId; }
+}
+
+final class UpiAdapter implements PaymentGateway {
+    private final FakeUpiSdk sdk;
+    UpiAdapter(FakeUpiSdk sdk) { this.sdk = sdk; }
+    public ChargeResult charge(String vpa, long paise, String key) {
+        String r;
+        try { r = sdk.collect(vpa, Money.fmt(paise), key); }      // translate units and naming
+        catch (FakeUpiSdk.Timeout e) { return ChargeResult.unknown(e.getMessage()); }
+        return r.startsWith("SUCCESS:") ? new ChargeResult(true, r.substring(8), null)
+                                        : new ChargeResult(false, null, r);
+    }
+}
+final class CardAdapter implements PaymentGateway {
+    private final FakeCardSdk sdk;
+    CardAdapter(FakeCardSdk sdk) { this.sdk = sdk; }
+    public ChargeResult charge(String token, long paise, String key) {
+        try { return new ChargeResult(true, sdk.capture(sdk.authorize(token, paise)), null); }  // exceptions -&gt; result
+        catch (FakeCardSdk.Declined e) { return new ChargeResult(false, null, e.getMessage()); }
+    }
+}
+
+/** Strategy selection: which gateway for which method, plus amount rules (CRED-style). */
+final class GatewayRouter {
+    private final Map&lt;PaymentMethod, PaymentGateway&gt; gateways = new EnumMap&lt;&gt;(PaymentMethod.class);
+    private final Map&lt;PaymentMethod, Long&gt; maxPerTxn = new EnumMap&lt;&gt;(PaymentMethod.class);
+    GatewayRouter register(PaymentMethod m, PaymentGateway g, long maxPaise) { gateways.put(m, g); maxPerTxn.put(m, maxPaise); return this; }
+    PaymentGateway pick(PaymentMethod m, long paise) {
+        PaymentGateway g = gateways.get(m);
+        if (g == null) throw new WalletException(m + " not supported");
+        if (paise &gt; maxPerTxn.get(m)) throw new WalletException(m + " limit is " + Money.fmt(maxPerTxn.get(m)));
+        return g;
+    }
+}
+
+// ================= the service =================
+final class WalletService {
+    static final String BANK = "SYS_BANK";            // money entering/leaving the system
+    private final Map&lt;String, Wallet&gt; wallets = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Transaction&gt; byKey = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Transaction&gt; byId = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;LedgerEntry&gt; ledger = Collections.synchronizedList(new ArrayList&lt;&gt;());
+    private final AtomicLong seq = new AtomicLong(), txnIds = new AtomicLong();
+    private final GatewayRouter router;
+
+    WalletService(GatewayRouter router) {
+        this.router = router;
+        wallets.put(BANK, new Wallet(BANK, "system", true));
+    }
+    Wallet createWallet(String userId) {
+        Wallet w = new Wallet("W_" + userId, userId, false);
+        if (wallets.putIfAbsent(w.id, w) != null) throw new WalletException("wallet exists for " + userId);
+        return w;
+    }
+    Wallet wallet(String id) {
+        Wallet w = wallets.get(id);
+        if (w == null) throw new WalletException("no wallet " + id);
+        return w;
+    }
+
+    /** Idempotency: the first request with a key creates the txn; repeats get the same object back. */
+    private Transaction begin(String key, TxnType type, String from, String to, long amount, String reversalOf) {
+        if (amount &lt;= 0) throw new WalletException("amount must be positive");
+        Transaction prev = byKey.get(key);              // fast path for a plain retry
+        Transaction fresh = null;
+        if (prev == null) {
+            fresh = new Transaction("T" + txnIds.incrementAndGet(), key, type, from, to, amount, reversalOf);
+            prev = byKey.putIfAbsent(key, fresh);       // atomic: only one racer wins the key
+        }
+        if (prev != null) {
+            if (!prev.samePayload(type, from, to, amount)) throw new IdempotencyConflict(key);
+            return prev;                                // replay: no second charge, no second posting
+        }
+        byId.put(fresh.id, fresh);
+        return fresh;
+    }
+
+    Transaction deposit(String key, String walletId, long amount, PaymentMethod method, String source) {
+        Transaction t = begin(key, TxnType.DEPOSIT, BANK, walletId, amount, null);
+        synchronized (t) {                              // a concurrent duplicate waits here, then sees the result
+            if (t.status != TxnStatus.PENDING) return t;
+            ChargeResult r;
+            try { r = router.pick(method, amount).charge(source, amount, key); }
+            catch (WalletException e) { r = new ChargeResult(false, null, e.getMessage()); }
+            if (r.unknown) { t.failureReason = "outcome unknown: " + r.reason + "; retry with the same key"; return t; }  // stays PENDING
+            if (!r.ok) { t.failureReason = r.reason; t.status = TxnStatus.FAILED; return t; }
+            t.failureReason = null;
+            t.gatewayRef = r.ref;
+            post(t, BANK, walletId, amount);            // external money in: BANK -&gt; user
+            return t;
+        }
+    }
+    Transaction withdraw(String key, String walletId, long amount) {
+        Transaction t = begin(key, TxnType.WITHDRAW, walletId, BANK, amount, null);
+        synchronized (t) {
+            if (t.status != TxnStatus.PENDING) return t;
+            post(t, walletId, BANK, amount);
+            return t;
+        }
+    }
+    Transaction transfer(String key, String fromId, String toId, long amount) {
+        if (fromId.equals(toId)) throw new WalletException("cannot transfer to self");
+        Transaction t = begin(key, TxnType.TRANSFER, fromId, toId, amount, null);
+        synchronized (t) {
+            if (t.status != TxnStatus.PENDING) return t;
+            post(t, fromId, toId, amount);
+            return t;
+        }
+    }
+    /** Reverse a successful transfer by posting the opposite entries. Idempotent per original txn. */
+    Transaction reverse(String txnId) {
+        Transaction orig = byId.get(txnId);
+        if (orig == null || orig.type != TxnType.TRANSFER) throw new WalletException("only transfers can be reversed");
+        Transaction t = begin("reverse:" + txnId, TxnType.REVERSAL, orig.to, orig.from, orig.amount, txnId);
+        synchronized (t) {
+            if (t.status != TxnStatus.PENDING) return t;
+            synchronized (orig) {
+                if (orig.status != TxnStatus.SUCCESS) { t.failureReason = "original is " + orig.status; t.status = TxnStatus.FAILED; return t; }
+                post(t, orig.to, orig.from, orig.amount);
+                if (t.status == TxnStatus.SUCCESS) orig.status = TxnStatus.REVERSED;
+            }
+            return t;
+        }
+    }
+
+    /** Debit one wallet and credit another atomically. Locks in id order so two opposite transfers cannot deadlock. */
+    private void post(Transaction t, String fromId, String toId, long amount) {
+        Wallet from = wallet(fromId), to = wallet(toId);
+        Wallet first = from.id.compareTo(to.id) &lt; 0 ? from : to, second = first == from ? to : from;
+        synchronized (first) {
+            synchronized (second) {
+                try { from.apply(Direction.DEBIT, amount); }
+                catch (InsufficientFunds e) { t.failureReason = "insufficient funds"; t.status = TxnStatus.FAILED; return; }
+                to.apply(Direction.CREDIT, amount);
+                ledger.add(new LedgerEntry(seq.incrementAndGet(), t.id, from.id, Direction.DEBIT, amount, from.balance()));
+                ledger.add(new LedgerEntry(seq.incrementAndGet(), t.id, to.id, Direction.CREDIT, amount, to.balance()));
+                t.status = TxnStatus.SUCCESS;
+            }
+        }
+    }
+
+    List&lt;LedgerEntry&gt; statement(String walletId, Predicate&lt;LedgerEntry&gt; filter, Comparator&lt;LedgerEntry&gt; order) {
+        List&lt;LedgerEntry&gt; out = new ArrayList&lt;&gt;();
+        synchronized (ledger) { for (LedgerEntry e : ledger) if (e.walletId.equals(walletId) &amp;&amp; filter.test(e)) out.add(e); }
+        out.sort(order);
+        return out;
+    }
+    long ledgerBalance(String walletId) {
+        long s = 0;
+        synchronized (ledger) { for (LedgerEntry e : ledger) if (e.walletId.equals(walletId)) s += e.dir == Direction.CREDIT ? e.amount : -e.amount; }
+        return s;
+    }
+    long sumOfAllBalances() { long s = 0; for (Wallet w : wallets.values()) s += w.balance(); return s; }
+    int ledgerSize() { return ledger.size(); }
+    Collection&lt;Wallet&gt; wallets() { return wallets.values(); }
+}
+
+// ================= demo + checks =================
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static long rs(long rupees) { return rupees * 100; }
+
+    public static void main(String[] args) throws Exception {
+        FakeUpiSdk upi = new FakeUpiSdk();
+        GatewayRouter router = new GatewayRouter()
+                .register(PaymentMethod.UPI, new UpiAdapter(upi), rs(100_000))
+                .register(PaymentMethod.CARD, new CardAdapter(new FakeCardSdk()), rs(200_000));
+        WalletService svc = new WalletService(router);
+        Wallet asha = svc.createWallet("asha"), bala = svc.createWallet("bala");
+
+        System.out.println("== 1. deposit via UPI; the retry with the same key is a no-op ==");
+        Transaction d1 = svc.deposit("k-dep-1", asha.id, rs(1000), PaymentMethod.UPI, "asha@okbank");
+        Transaction d1again = svc.deposit("k-dep-1", asha.id, rs(1000), PaymentMethod.UPI, "asha@okbank");
+        System.out.println(d1 + " | retry returns " + d1again.id);
+        check(d1 == d1again &amp;&amp; asha.balance() == rs(1000), "charged and credited once");
+
+        System.out.println("== 2. card declined, UPI over limit, bad VPA ==");
+        Transaction d2 = svc.deposit("k-dep-2", asha.id, rs(500), PaymentMethod.CARD, "tok_declined");
+        Transaction d3 = svc.deposit("k-dep-3", asha.id, rs(150_000), PaymentMethod.UPI, "asha@okbank");
+        Transaction d4 = svc.deposit("k-dep-4", asha.id, rs(10), PaymentMethod.UPI, "no-at-sign");
+        System.out.println(d2); System.out.println(d3); System.out.println(d4);
+        check(d2.status == TxnStatus.FAILED &amp;&amp; d3.status == TxnStatus.FAILED &amp;&amp; d4.status == TxnStatus.FAILED, "all failed");
+        check(asha.balance() == rs(1000), "failed deposits post nothing");
+        Transaction d5 = svc.deposit("k-dep-5", asha.id, rs(250), PaymentMethod.CARD, "tok_visa");
+        check(d5.status == TxnStatus.SUCCESS &amp;&amp; asha.balance() == rs(1250), "card deposit ok");
+
+        System.out.println("== 3. transfers ==");
+        Transaction t1 = svc.transfer("k-tr-1", asha.id, bala.id, rs(300));
+        Transaction t2 = svc.transfer("k-tr-2", bala.id, asha.id, rs(5000));
+        System.out.println(t1); System.out.println(t2);
+        check(t1.status == TxnStatus.SUCCESS &amp;&amp; t2.status == TxnStatus.FAILED, "second transfer lacks funds");
+        check(asha.balance() == rs(950) &amp;&amp; bala.balance() == rs(300), "balances after transfer");
+
+        System.out.println("== 4. reverse a transfer, twice ==");
+        Transaction r1 = svc.reverse(t1.id), r2 = svc.reverse(t1.id);
+        System.out.println(r1 + " | original now " + t1.status);
+        check(r1 == r2 &amp;&amp; t1.status == TxnStatus.REVERSED, "reversal is idempotent");
+        check(asha.balance() == rs(1250) &amp;&amp; bala.balance() == 0, "money back");
+
+        System.out.println("== 5. same key, different request ==");
+        try { svc.transfer("k-tr-1", asha.id, bala.id, rs(1)); check(false, "conflict expected"); }
+        catch (IdempotencyConflict e) { System.out.println("rejected: " + e.getMessage()); checks++; }
+
+        System.out.println("== 6. withdraw and statement (newest first, credits only) ==");
+        svc.withdraw("k-wd-1", asha.id, rs(200));
+        for (LedgerEntry e : svc.statement(asha.id, e -&gt; e.dir == Direction.CREDIT, Comparator.comparingLong((LedgerEntry e) -&gt; e.seq).reversed()))
+            System.out.println("  " + e);
+        check(svc.ledgerBalance(asha.id) == asha.balance(), "ledger replays to the balance");
+
+        System.out.println("== 7. 8 threads, 20 000 transfers, 25% duplicate keys ==");
+        List&lt;Wallet&gt; ws = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 5; i++) { Wallet w = svc.createWallet("u" + i); ws.add(w); svc.deposit("seed" + i, w.id, rs(10_000), PaymentMethod.CARD, "tok_ok"); }
+        int ledgerBefore = svc.ledgerSize();
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        AtomicInteger succeeded = new AtomicInteger();
+        Set&lt;String&gt; successKeys = ConcurrentHashMap.newKeySet();
+        for (int th = 0; th &lt; 8; th++) {
+            final int seed = th;
+            pool.submit(() -&gt; {
+                Random r = new Random(seed);
+                for (int i = 0; i &lt; 2500; i++) {
+                    int a = r.nextInt(5), b = (a + 1 + r.nextInt(4)) % 5;
+                    String key = r.nextInt(4) == 0 ? "dup-" + a + "-" + b + "-" + (i % 50) : "t" + seed + "-" + i;
+                    long amt = rs(1 + r.nextInt(500));
+                    try {
+                        Transaction t = svc.transfer(key, ws.get(a).id, ws.get(b).id, amt);
+                        if (t.status == TxnStatus.SUCCESS &amp;&amp; successKeys.add(key)) succeeded.incrementAndGet();
+                    } catch (IdempotencyConflict e) { /* same key, other amount: correctly refused */ }
+                }
+            });
+        }
+        pool.shutdown();
+        check(pool.awaitTermination(60, TimeUnit.SECONDS), "threads done");
+        check(svc.sumOfAllBalances() == 0, "double entry: all balances incl. system sum to zero");
+        for (Wallet w : svc.wallets()) {
+            check(w.system || w.balance() &gt;= 0, "no user wallet negative");
+            check(svc.ledgerBalance(w.id) == w.balance(), "ledger matches balance for " + w.id);
+        }
+        check(svc.ledgerSize() - ledgerBefore == 2 * succeeded.get(), "each successful key posted exactly once");
+        System.out.println("each successful key posted once: true; sum of all balances = " + Money.fmt(svc.sumOfAllBalances()));
+
+        System.out.println("== 8. the gateway times out: outcome unknown, then the same-key retry resolves it ==");
+        long before = asha.balance();
+        int ledgerAtStart = svc.ledgerSize(), chargesAtStart = upi.charges();
+        upi.timeoutNextReply();
+        Transaction d6 = svc.deposit("k-dep-6", asha.id, rs(100), PaymentMethod.UPI, "asha@okbank");
+        System.out.println("first call:  " + d6.status + " (" + d6.failureReason + ")");
+        check(d6.status == TxnStatus.PENDING &amp;&amp; asha.balance() == before &amp;&amp; svc.ledgerSize() == ledgerAtStart,
+              "unknown outcome: PENDING, nothing posted");
+        Transaction d6again = svc.deposit("k-dep-6", asha.id, rs(100), PaymentMethod.UPI, "asha@okbank");
+        System.out.println("same-key retry: " + d6again.status + " | gateway charges for this key: " + (upi.charges() - chargesAtStart)
+                           + ", ledger lines added: " + (svc.ledgerSize() - ledgerAtStart));
+        check(d6again == d6 &amp;&amp; d6.status == TxnStatus.SUCCESS &amp;&amp; upi.charges() - chargesAtStart == 1
+              &amp;&amp; svc.ledgerSize() - ledgerAtStart == 2 &amp;&amp; asha.balance() == before + rs(100), "one charge, one posting");
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<p><code>wallet.py</code></p>
+<pre><code class="language-python">"""Digital wallet: double-entry ledger, idempotent transfers, payment gateway Adapter + Strategy.
+Money is integer paise."""
+from __future__ import annotations
+
+import enum
+import itertools
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional
+
+
+class TxnType(enum.Enum):
+    DEPOSIT = "DEPOSIT"
+    WITHDRAW = "WITHDRAW"
+    TRANSFER = "TRANSFER"
+    REVERSAL = "REVERSAL"
+
+
+class TxnStatus(enum.Enum):
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    REVERSED = "REVERSED"
+
+
+class Method(enum.Enum):
+    UPI = "UPI"
+    CARD = "CARD"
+
+
+class WalletError(Exception):
+    pass
+
+
+class InsufficientFunds(WalletError):
+    pass
+
+
+class IdempotencyConflict(WalletError):
+    pass
+
+
+def fmt(p: int) -&gt; str:
+    sign = "-" if p &lt; 0 else ""
+    return f"{sign}{abs(p) // 100}.{abs(p) % 100:02d}"
+
+
+class Wallet:
+    def __init__(self, wid: str, owner: str, system: bool = False) -&gt; None:
+        self.id, self.owner, self.system = wid, owner, system
+        self.balance = 0
+        self.lock = threading.RLock()
+
+    def debit(self, amount: int) -&gt; None:
+        if not self.system and self.balance &lt; amount:
+            raise InsufficientFunds(self.id)
+        self.balance -= amount
+
+    def credit(self, amount: int) -&gt; None:
+        self.balance += amount
+
+
+@dataclass(frozen=True)
+class Entry:
+    seq: int
+    txn: str
+    wallet: str
+    dr_cr: str          # "DR" or "CR"
+    amount: int
+    balance_after: int
+
+
+class Txn:
+    def __init__(self, tid: str, key: str, ttype: TxnType, src: str, dst: str, amount: int,
+                 reversal_of: Optional[str] = None) -&gt; None:
+        self.id, self.key, self.type, self.src, self.dst = tid, key, ttype, src, dst
+        self.amount, self.reversal_of = amount, reversal_of
+        self.status = TxnStatus.PENDING
+        self.reason: Optional[str] = None
+        self.lock = threading.Lock()
+
+    def same(self, ttype: TxnType, src: str, dst: str, amount: int) -&gt; bool:
+        return (self.type, self.src, self.dst, self.amount) == (ttype, src, dst, amount)
+
+    def __repr__(self) -&gt; str:
+        extra = f" ({self.reason})" if self.reason else ""
+        return f"{self.id} {self.type.value} {fmt(self.amount)} {self.status.value}{extra}"
+
+
+# ---- payment gateway: our interface + adapters over differently shaped "SDKs" ----
+@dataclass(frozen=True)
+class ChargeResult:
+    ok: bool
+    ref: Optional[str] = None
+    reason: Optional[str] = None
+    unknown: bool = False          # timeout / lost reply: the money may or may not have moved
+
+
+class PaymentGateway(ABC):
+    @abstractmethod
+    def charge(self, source: str, paise: int, key: str) -&gt; ChargeResult: ...
+
+
+class FakeUpiSdk:
+    """Idempotent on request_id, like real providers; can lose one reply to simulate a timeout."""
+    class Timeout(Exception):
+        pass
+
+    def __init__(self) -&gt; None:
+        self.done: dict[str, str] = {}
+        self.drop_next_reply = False
+        self._lock = threading.Lock()
+
+    def collect(self, vpa: str, rupees: str, request_id: str) -&gt; str:
+        if "@" not in vpa:
+            return "ERR_INVALID_VPA"
+        with self._lock:
+            ref = self.done.setdefault(request_id, "upi_" + request_id)   # charge once per id
+            if self.drop_next_reply:
+                self.drop_next_reply = False
+                raise FakeUpiSdk.Timeout("UPI gateway timeout")          # charged, reply lost
+        return "SUCCESS:" + ref
+
+
+class FakeCardSdk:
+    class Declined(Exception):
+        pass
+
+    def authorize(self, token: str, amount: int) -&gt; str:
+        if token.endswith("declined"):
+            raise FakeCardSdk.Declined("card declined by issuer")
+        return "auth_" + token
+
+    def capture(self, auth_id: str) -&gt; str:
+        return "cap_" + auth_id
+
+
+class UpiAdapter(PaymentGateway):
+    def __init__(self, sdk: FakeUpiSdk) -&gt; None:
+        self.sdk = sdk
+
+    def charge(self, source: str, paise: int, key: str) -&gt; ChargeResult:
+        try:
+            r = self.sdk.collect(source, fmt(paise), key)
+        except FakeUpiSdk.Timeout as e:
+            return ChargeResult(False, reason=str(e), unknown=True)
+        return ChargeResult(True, r[8:]) if r.startswith("SUCCESS:") else ChargeResult(False, reason=r)
+
+
+class CardAdapter(PaymentGateway):
+    def __init__(self, sdk: FakeCardSdk) -&gt; None:
+        self.sdk = sdk
+
+    def charge(self, source: str, paise: int, key: str) -&gt; ChargeResult:
+        try:
+            return ChargeResult(True, self.sdk.capture(self.sdk.authorize(source, paise)))
+        except FakeCardSdk.Declined as e:
+            return ChargeResult(False, reason=str(e))
+
+
+class GatewayRouter:
+    """Strategy selection by payment method, with a per-transaction limit per method."""
+
+    def __init__(self) -&gt; None:
+        self._g: Dict[Method, PaymentGateway] = {}
+        self._max: Dict[Method, int] = {}
+
+    def register(self, m: Method, g: PaymentGateway, max_paise: int) -&gt; "GatewayRouter":
+        self._g[m], self._max[m] = g, max_paise
+        return self
+
+    def pick(self, m: Method, paise: int) -&gt; PaymentGateway:
+        if m not in self._g:
+            raise WalletError(f"{m.value} not supported")
+        if paise &gt; self._max[m]:
+            raise WalletError(f"{m.value} limit is {fmt(self._max[m])}")
+        return self._g[m]
+
+
+class WalletService:
+    BANK = "SYS_BANK"
+
+    def __init__(self, router: GatewayRouter) -&gt; None:
+        self.router = router
+        self.wallets: Dict[str, Wallet] = {self.BANK: Wallet(self.BANK, "system", system=True)}
+        self.by_key: Dict[str, Txn] = {}
+        self.by_id: Dict[str, Txn] = {}
+        self.ledger: List[Entry] = []
+        self._ledger_lock = threading.Lock()
+        self._key_lock = threading.Lock()
+        self._seq = itertools.count(1)
+        self._ids = itertools.count(1)
+
+    def create_wallet(self, user: str) -&gt; Wallet:
+        wid = "W_" + user
+        with self._key_lock:
+            if wid in self.wallets:
+                raise WalletError(f"wallet exists for {user}")
+            w = self.wallets[wid] = Wallet(wid, user)
+        return w
+
+    def _begin(self, key: str, ttype: TxnType, src: str, dst: str, amount: int,
+               reversal_of: Optional[str] = None) -&gt; Txn:
+        if amount &lt;= 0:
+            raise WalletError("amount must be positive")
+        with self._key_lock:                       # check-and-insert must be one atomic step
+            prev = self.by_key.get(key)
+            if prev is not None:
+                if not prev.same(ttype, src, dst, amount):
+                    raise IdempotencyConflict(f"key {key} reused with a different request")
+                return prev
+            t = Txn(f"T{next(self._ids)}", key, ttype, src, dst, amount, reversal_of)
+            self.by_key[key] = self.by_id[t.id] = t
+            return t
+
+    def deposit(self, key: str, wallet_id: str, amount: int, method: Method, source: str) -&gt; Txn:
+        t = self._begin(key, TxnType.DEPOSIT, self.BANK, wallet_id, amount)
+        with t.lock:
+            if t.status is not TxnStatus.PENDING:
+                return t
+            try:
+                r = self.router.pick(method, amount).charge(source, amount, key)
+            except WalletError as e:
+                r = ChargeResult(False, reason=str(e))
+            if r.unknown:                    # stays PENDING, nothing posted; retry with the same key
+                t.reason = f"outcome unknown: {r.reason}; retry with the same key"
+                return t
+            if not r.ok:
+                t.status, t.reason = TxnStatus.FAILED, r.reason
+                return t
+            t.reason = None
+            self._post(t, self.BANK, wallet_id, amount)
+            return t
+
+    def withdraw(self, key: str, wallet_id: str, amount: int) -&gt; Txn:
+        t = self._begin(key, TxnType.WITHDRAW, wallet_id, self.BANK, amount)
+        with t.lock:
+            if t.status is TxnStatus.PENDING:
+                self._post(t, wallet_id, self.BANK, amount)
+            return t
+
+    def transfer(self, key: str, src: str, dst: str, amount: int) -&gt; Txn:
+        if src == dst:
+            raise WalletError("cannot transfer to self")
+        t = self._begin(key, TxnType.TRANSFER, src, dst, amount)
+        with t.lock:
+            if t.status is TxnStatus.PENDING:
+                self._post(t, src, dst, amount)
+            return t
+
+    def reverse(self, txn_id: str) -&gt; Txn:
+        orig = self.by_id.get(txn_id)
+        if orig is None or orig.type is not TxnType.TRANSFER:
+            raise WalletError("only transfers can be reversed")
+        t = self._begin("reverse:" + txn_id, TxnType.REVERSAL, orig.dst, orig.src, orig.amount, txn_id)
+        with t.lock:
+            if t.status is not TxnStatus.PENDING:
+                return t
+            with orig.lock:
+                if orig.status is not TxnStatus.SUCCESS:
+                    t.status, t.reason = TxnStatus.FAILED, f"original is {orig.status.value}"
+                    return t
+                self._post(t, orig.dst, orig.src, orig.amount)
+                if t.status is TxnStatus.SUCCESS:
+                    orig.status = TxnStatus.REVERSED
+            return t
+
+    def _post(self, t: Txn, src: str, dst: str, amount: int) -&gt; None:
+        a, b = self.wallets[src], self.wallets[dst]
+        first, second = sorted((a, b), key=lambda w: w.id)    # global lock order: no deadlock
+        with first.lock, second.lock:
+            try:
+                a.debit(amount)
+            except InsufficientFunds:
+                t.status, t.reason = TxnStatus.FAILED, "insufficient funds"
+                return
+            b.credit(amount)
+            with self._ledger_lock:
+                self.ledger.append(Entry(next(self._seq), t.id, a.id, "DR", amount, a.balance))
+                self.ledger.append(Entry(next(self._seq), t.id, b.id, "CR", amount, b.balance))
+            t.status = TxnStatus.SUCCESS
+
+    def statement(self, wallet_id: str, keep: Callable[[Entry], bool] = lambda e: True,
+                  sort_key: Callable[[Entry], object] = lambda e: e.seq, newest_first: bool = False) -&gt; List[Entry]:
+        with self._ledger_lock:
+            rows = [e for e in self.ledger if e.wallet == wallet_id and keep(e)]
+        return sorted(rows, key=sort_key, reverse=newest_first)
+
+    def ledger_balance(self, wallet_id: str) -&gt; int:
+        with self._ledger_lock:
+            return sum(e.amount if e.dr_cr == "CR" else -e.amount for e in self.ledger if e.wallet == wallet_id)
+
+    def total(self) -&gt; int:
+        return sum(w.balance for w in self.wallets.values())</code></pre>
+<p><code>main.py</code></p>
+<pre><code class="language-python">from wallet import (CardAdapter, FakeCardSdk, FakeUpiSdk, GatewayRouter, IdempotencyConflict, Method,
+                    TxnStatus, UpiAdapter, WalletService, fmt)
+
+
+def rs(r: int) -&gt; int:
+    return r * 100
+
+
+def main() -&gt; None:
+    router = (GatewayRouter()
+              .register(Method.UPI, UpiAdapter(FakeUpiSdk()), rs(100_000))
+              .register(Method.CARD, CardAdapter(FakeCardSdk()), rs(200_000)))
+    svc = WalletService(router)
+    asha, bala = svc.create_wallet("asha"), svc.create_wallet("bala")
+
+    print("== 1. idempotent deposit ==")
+    d1 = svc.deposit("k-dep-1", asha.id, rs(1000), Method.UPI, "asha@okbank")
+    again = svc.deposit("k-dep-1", asha.id, rs(1000), Method.UPI, "asha@okbank")
+    print(d1, "| retry returns", again.id)
+    assert d1 is again and asha.balance == rs(1000)
+
+    print("== 2. declined card ==")
+    print(svc.deposit("k-dep-2", asha.id, rs(500), Method.CARD, "tok_declined"))
+
+    print("== 3. transfer, failed transfer, reversal ==")
+    t1 = svc.transfer("k-tr-1", asha.id, bala.id, rs(300))
+    t2 = svc.transfer("k-tr-2", bala.id, asha.id, rs(5000))
+    print(t1, "|", t2)
+    r = svc.reverse(t1.id)
+    print(r, "| original now", t1.status.value)
+    assert svc.reverse(t1.id) is r and t1.status is TxnStatus.REVERSED
+    assert asha.balance == rs(1000) and bala.balance == 0
+
+    print("== 4. key reuse with a different amount ==")
+    try:
+        svc.transfer("k-tr-1", asha.id, bala.id, rs(1))
+    except IdempotencyConflict as e:
+        print("rejected:", e)
+
+    print("== 5. statement for asha ==")
+    for e in svc.statement(asha.id, newest_first=True):
+        print(f"  #{e.seq} {e.txn:&lt;4} {e.dr_cr} {fmt(e.amount):&gt;9}  bal {fmt(e.balance_after):&gt;9}")
+    assert svc.ledger_balance(asha.id) == asha.balance and svc.total() == 0
+    print("sum of all balances:", fmt(svc.total()))
+    print("All checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p><code>test_wallet.py</code></p>
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from wallet import (CardAdapter, FakeCardSdk, FakeUpiSdk, GatewayRouter, IdempotencyConflict, Method,
+                    TxnStatus, UpiAdapter, WalletError, WalletService)
+
+
+def service():
+    router = (GatewayRouter()
+              .register(Method.UPI, UpiAdapter(FakeUpiSdk()), 100_000_00)
+              .register(Method.CARD, CardAdapter(FakeCardSdk()), 200_000_00))
+    return WalletService(router)
+
+
+class WalletTest(unittest.TestCase):
+    def test_deposit_is_idempotent(self):
+        s = service()
+        w = s.create_wallet("a")
+        t1 = s.deposit("k", w.id, 500_00, Method.UPI, "a@bank")
+        t2 = s.deposit("k", w.id, 500_00, Method.UPI, "a@bank")
+        self.assertIs(t1, t2)
+        self.assertEqual(w.balance, 500_00)
+        self.assertEqual(len(s.ledger), 2)
+
+    def test_timeout_stays_pending_then_same_key_retry_charges_once(self):
+        upi = FakeUpiSdk()
+        s = WalletService(GatewayRouter().register(Method.UPI, UpiAdapter(upi), 100_000_00))
+        w = s.create_wallet("a")
+        upi.drop_next_reply = True
+        t = s.deposit("k", w.id, 100_00, Method.UPI, "a@bank")
+        self.assertEqual(t.status, TxnStatus.PENDING)          # unknown outcome: not failed, not posted
+        self.assertEqual((w.balance, len(s.ledger)), (0, 0))
+        again = s.deposit("k", w.id, 100_00, Method.UPI, "a@bank")
+        self.assertIs(again, t)
+        self.assertEqual(t.status, TxnStatus.SUCCESS)
+        self.assertEqual((len(upi.done), len(s.ledger), w.balance), (1, 2, 100_00))   # one charge, one posting
+
+    def test_gateway_failures_post_nothing(self):
+        s = service()
+        w = s.create_wallet("a")
+        self.assertEqual(s.deposit("k1", w.id, 1_00, Method.CARD, "tok_declined").status, TxnStatus.FAILED)
+        self.assertEqual(s.deposit("k2", w.id, 1_00, Method.UPI, "bad-vpa").status, TxnStatus.FAILED)
+        self.assertEqual(s.deposit("k3", w.id, 100_001_00, Method.UPI, "a@bank").reason, "UPI limit is 100000.00")
+        self.assertEqual((w.balance, len(s.ledger)), (0, 0))
+
+    def test_insufficient_funds_and_self_transfer(self):
+        s = service()
+        a, b = s.create_wallet("a"), s.create_wallet("b")
+        t = s.transfer("k", a.id, b.id, 1_00)
+        self.assertEqual((t.status, t.reason), (TxnStatus.FAILED, "insufficient funds"))
+        with self.assertRaises(WalletError):
+            s.transfer("k2", a.id, a.id, 1_00)
+        with self.assertRaises(WalletError):
+            s.transfer("k3", a.id, b.id, 0)
+
+    def test_key_conflict(self):
+        s = service()
+        a, b = s.create_wallet("a"), s.create_wallet("b")
+        s.deposit("d", a.id, 10_00, Method.UPI, "a@x")
+        s.transfer("k", a.id, b.id, 1_00)
+        with self.assertRaises(IdempotencyConflict):
+            s.transfer("k", a.id, b.id, 2_00)
+
+    def test_reversal_once_and_only_success(self):
+        s = service()
+        a, b = s.create_wallet("a"), s.create_wallet("b")
+        s.deposit("d", a.id, 10_00, Method.UPI, "a@x")
+        t = s.transfer("k", a.id, b.id, 4_00)
+        r1, r2 = s.reverse(t.id), s.reverse(t.id)
+        self.assertIs(r1, r2)
+        self.assertEqual((a.balance, b.balance), (10_00, 0))
+        failed = s.transfer("k2", b.id, a.id, 99_00)
+        self.assertEqual(s.reverse(failed.id).status, TxnStatus.FAILED)
+
+    def test_reversal_fails_if_receiver_spent_it(self):
+        s = service()
+        a, b, c = s.create_wallet("a"), s.create_wallet("b"), s.create_wallet("c")
+        s.deposit("d", a.id, 10_00, Method.UPI, "a@x")
+        t = s.transfer("k", a.id, b.id, 10_00)
+        s.transfer("k2", b.id, c.id, 10_00)
+        r = s.reverse(t.id)
+        self.assertEqual(r.status, TxnStatus.FAILED)
+        self.assertEqual(t.status, TxnStatus.SUCCESS)
+
+    def test_concurrent_transfers_conserve_money(self):
+        s = service()
+        ws = [s.create_wallet(f"u{i}") for i in range(5)]
+        for i, w in enumerate(ws):
+            s.deposit(f"seed{i}", w.id, 1_000_00, Method.CARD, "tok")
+        base = len(s.ledger)
+        ok_keys = set()
+        guard = threading.Lock()
+
+        def worker(seed):
+            r = random.Random(seed)
+            for i in range(1500):
+                a = r.randrange(5)
+                b = (a + 1 + r.randrange(4)) % 5
+                key = f"dup-{a}-{b}-{i % 30}" if r.random() &lt; 0.25 else f"t{seed}-{i}"
+                try:
+                    t = s.transfer(key, ws[a].id, ws[b].id, r.randint(1, 300) * 100)
+                    if t.status is TxnStatus.SUCCESS:
+                        with guard:
+                            ok_keys.add(key)
+                except IdempotencyConflict:
+                    pass
+
+        ts = [threading.Thread(target=worker, args=(n,)) for n in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(s.total(), 0)
+        self.assertEqual(len(s.ledger) - base, 2 * len(ok_keys))
+        for w in s.wallets.values():
+            self.assertEqual(s.ledger_balance(w.id), w.balance)
+            if not w.system:
+                self.assertGreaterEqual(w.balance, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Digital wallet core in C++14: double-entry ledger, idempotency keys, reversal,
+// and a payment gateway interface with an adapter over a differently shaped SDK.
+// Single-threaded (this MinGW toolchain has no std::thread); the Java and Python tabs
+// add the locking. Build: g++ -std=c++14 -O2 -Wall main.cpp -o main.exe
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class Status { PENDING, SUCCESS, FAILED, REVERSED };
+static const char* str(Status s) {
+    switch (s) { case Status::PENDING: return "PENDING"; case Status::SUCCESS: return "SUCCESS";
+                 case Status::FAILED: return "FAILED"; default: return "REVERSED"; }
+}
+static std::string fmt(long long p) {                 // paise -&gt; "123.45" (no %lld: old MinGW printf)
+    long long a = p &lt; 0 ? -p : p;
+    std::string cents = std::to_string(a % 100);
+    return (p &lt; 0 ? "-" : "") + std::to_string(a / 100) + "." + (cents.size() &lt; 2 ? "0" + cents : cents);
+}
+
+struct Txn { std::string id, key, kind, from, to; long long amount; Status status = Status::PENDING; std::string reason; };
+struct Entry { long seq; std::string txn, wallet; char drcr; long long amount, after; };
+
+// --- gateway: our interface, one adapter over a "vendor SDK" with its own shape ---
+struct PaymentGateway { virtual ~PaymentGateway() = default; virtual bool charge(const std::string&amp; src, long long paise, std::string&amp; err) = 0; };
+struct VendorUpiSdk {                                  // returns an int code, takes rupees as double
+    int collect(const char* vpa, double rupees) { (void)rupees; return std::string(vpa).find('@') == std::string::npos ? 17 : 0; }
+};
+class UpiAdapter : public PaymentGateway {             // like a driver's ops table wrapping vendor firmware calls
+    VendorUpiSdk sdk_;
+public:
+    bool charge(const std::string&amp; vpa, long long paise, std::string&amp; err) override {
+        int rc = sdk_.collect(vpa.c_str(), paise / 100.0);
+        if (rc != 0) { err = "vendor code " + std::to_string(rc); return false; }
+        return true;
+    }
+};
+
+class WalletService {
+    std::map&lt;std::string, long long&gt; balance_;          // wallet id -&gt; paise
+    std::map&lt;std::string, std::shared_ptr&lt;Txn&gt;&gt; byKey_, byId_;
+    std::vector&lt;Entry&gt; ledger_;
+    std::unique_ptr&lt;PaymentGateway&gt; upi_;
+    long seq_ = 0, ids_ = 0;
+public:
+    static constexpr const char* BANK = "SYS_BANK";
+    explicit WalletService(std::unique_ptr&lt;PaymentGateway&gt; upi) : upi_(std::move(upi)) { balance_[BANK] = 0; }
+    void create(const std::string&amp; w) { if (!balance_.emplace(w, 0).second) throw std::runtime_error("exists"); }
+    long long balance(const std::string&amp; w) const { return balance_.at(w); }
+    const std::vector&lt;Entry&gt;&amp; ledger() const { return ledger_; }
+
+    std::shared_ptr&lt;Txn&gt; begin(const std::string&amp; key, const std::string&amp; kind, const std::string&amp; from,
+                               const std::string&amp; to, long long amt) {
+        if (amt &lt;= 0) throw std::invalid_argument("amount must be positive");
+        auto it = byKey_.find(key);
+        if (it != byKey_.end()) {
+            const Txn&amp; p = *it-&gt;second;
+            if (p.kind != kind || p.from != from || p.to != to || p.amount != amt) throw std::runtime_error("idempotency conflict: " + key);
+            return it-&gt;second;                                   // replay
+        }
+        auto t = std::make_shared&lt;Txn&gt;(Txn{"T" + std::to_string(++ids_), key, kind, from, to, amt});
+        byKey_[key] = t; byId_[t-&gt;id] = t;
+        return t;
+    }
+    void post(Txn&amp; t) {                                          // both legs or neither
+        bool sys = t.from == BANK;
+        if (!sys &amp;&amp; balance_.at(t.from) &lt; t.amount) { t.status = Status::FAILED; t.reason = "insufficient funds"; return; }
+        balance_.at(t.from) -= t.amount; balance_.at(t.to) += t.amount;
+        ledger_.push_back(Entry{++seq_, t.id, t.from, 'D', t.amount, balance_[t.from]});
+        ledger_.push_back(Entry{++seq_, t.id, t.to, 'C', t.amount, balance_[t.to]});
+        t.status = Status::SUCCESS;
+    }
+    std::shared_ptr&lt;Txn&gt; deposit(const std::string&amp; key, const std::string&amp; w, long long amt, const std::string&amp; vpa) {
+        auto t = begin(key, "DEPOSIT", BANK, w, amt);
+        if (t-&gt;status != Status::PENDING) return t;
+        std::string err;
+        if (!upi_-&gt;charge(vpa, amt, err)) { t-&gt;status = Status::FAILED; t-&gt;reason = err; return t; }
+        post(*t); return t;
+    }
+    std::shared_ptr&lt;Txn&gt; transfer(const std::string&amp; key, const std::string&amp; a, const std::string&amp; b, long long amt) {
+        auto t = begin(key, "TRANSFER", a, b, amt);
+        if (t-&gt;status == Status::PENDING) post(*t);
+        return t;
+    }
+    std::shared_ptr&lt;Txn&gt; reverse(const std::string&amp; txnId) {
+        auto orig = byId_.at(txnId);
+        auto t = begin("reverse:" + txnId, "REVERSAL", orig-&gt;to, orig-&gt;from, orig-&gt;amount);
+        if (t-&gt;status != Status::PENDING) return t;
+        if (orig-&gt;status != Status::SUCCESS) { t-&gt;status = Status::FAILED; t-&gt;reason = "original not successful"; return t; }
+        post(*t);
+        if (t-&gt;status == Status::SUCCESS) orig-&gt;status = Status::REVERSED;
+        return t;
+    }
+    long long total() const { long long s = 0; for (auto&amp; kv : balance_) s += kv.second; return s; }
+};
+
+int main() {
+    WalletService svc(std::unique_ptr&lt;PaymentGateway&gt;(new UpiAdapter()));
+    svc.create("W_asha"); svc.create("W_bala");
+
+    auto d1 = svc.deposit("k1", "W_asha", 100000, "asha@okbank");
+    auto d1b = svc.deposit("k1", "W_asha", 100000, "asha@okbank");
+    std::printf("deposit %s %s, retry same object: %s\n", d1-&gt;id.c_str(), str(d1-&gt;status), d1 == d1b ? "yes" : "no");
+    auto bad = svc.deposit("k2", "W_asha", 5000, "no-vpa");
+    std::printf("deposit %s %s (%s)\n", bad-&gt;id.c_str(), str(bad-&gt;status), bad-&gt;reason.c_str());
+    assert(svc.balance("W_asha") == 100000);
+
+    auto t1 = svc.transfer("k3", "W_asha", "W_bala", 30000);
+    auto t2 = svc.transfer("k4", "W_bala", "W_asha", 999999);
+    std::printf("transfer %s %s; transfer %s %s (%s)\n", t1-&gt;id.c_str(), str(t1-&gt;status), t2-&gt;id.c_str(), str(t2-&gt;status), t2-&gt;reason.c_str());
+    auto r = svc.reverse(t1-&gt;id);
+    assert(svc.reverse(t1-&gt;id) == r &amp;&amp; t1-&gt;status == Status::REVERSED);
+    std::printf("reversal %s %s, original %s\n", r-&gt;id.c_str(), str(r-&gt;status), str(t1-&gt;status));
+
+    bool conflict = false;
+    try { svc.transfer("k3", "W_asha", "W_bala", 1); } catch (const std::runtime_error&amp; e) { conflict = true; std::printf("rejected: %s\n", e.what()); }
+    assert(conflict);
+
+    std::printf("ledger:\n");
+    for (auto&amp; e : svc.ledger())
+        std::printf("  #%ld %-3s %-9s %c %9s  bal %9s\n", e.seq, e.txn.c_str(), e.wallet.c_str(), e.drcr, fmt(e.amount).c_str(), fmt(e.after).c_str());
+    assert(svc.total() == 0 &amp;&amp; svc.balance("W_asha") == 100000 &amp;&amp; svc.balance("W_bala") == 0);
+    std::printf("sum of all balances = %s\nAll checks passed\n", fmt(svc.total()).c_str());
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Demo output</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre class="terminal"><code>== 1. deposit via UPI; the retry with the same key is a no-op ==
+T1 DEPOSIT 1000.00 SUCCESS | retry returns T1
+== 2. card declined, UPI over limit, bad VPA ==
+T2 DEPOSIT 500.00 FAILED (card declined by issuer)
+T3 DEPOSIT 150000.00 FAILED (UPI limit is 100000.00)
+T4 DEPOSIT 10.00 FAILED (ERR_INVALID_VPA)
+== 3. transfers ==
+T6 TRANSFER 300.00 SUCCESS
+T7 TRANSFER 5000.00 FAILED (insufficient funds)
+== 4. reverse a transfer, twice ==
+T8 REVERSAL 300.00 SUCCESS | original now REVERSED
+== 5. same key, different request ==
+rejected: key k-tr-1 reused with a different request
+== 6. withdraw and statement (newest first, credits only) ==
+  #8 T8       CREDIT     300.00  bal    1250.00
+  #4 T5       CREDIT     250.00  bal    1250.00
+  #2 T1       CREDIT    1000.00  bal    1000.00
+== 7. 8 threads, 20 000 transfers, 25% duplicate keys ==
+each successful key posted once: true; sum of all balances = 0.00
+== 8. the gateway times out: outcome unknown, then the same-key retry resolves it ==
+first call:  PENDING (outcome unknown: UPI gateway timeout; retry with the same key)
+same-key retry: SUCCESS | gateway charges for this key: 1, ledger lines added: 2
+All 31 checks passed</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre class="terminal"><code>== 1. idempotent deposit ==
+T1 DEPOSIT 1000.00 SUCCESS | retry returns T1
+== 2. declined card ==
+T2 DEPOSIT 500.00 FAILED (card declined by issuer)
+== 3. transfer, failed transfer, reversal ==
+T3 TRANSFER 300.00 SUCCESS | T4 TRANSFER 5000.00 FAILED (insufficient funds)
+T5 REVERSAL 300.00 SUCCESS | original now REVERSED
+== 4. key reuse with a different amount ==
+rejected: key k-tr-1 reused with a different request
+== 5. statement for asha ==
+  #6 T5   CR    300.00  bal   1000.00
+  #3 T3   DR    300.00  bal    700.00
+  #2 T1   CR   1000.00  bal   1000.00
+sum of all balances: 0.00
+All checks passed</code></pre>
+<pre class="terminal"><code>test_concurrent_transfers_conserve_money (test_wallet.WalletTest.test_concurrent_transfers_conserve_money) ... ok
+test_deposit_is_idempotent (test_wallet.WalletTest.test_deposit_is_idempotent) ... ok
+test_gateway_failures_post_nothing (test_wallet.WalletTest.test_gateway_failures_post_nothing) ... ok
+test_insufficient_funds_and_self_transfer (test_wallet.WalletTest.test_insufficient_funds_and_self_transfer) ... ok
+test_key_conflict (test_wallet.WalletTest.test_key_conflict) ... ok
+test_reversal_fails_if_receiver_spent_it (test_wallet.WalletTest.test_reversal_fails_if_receiver_spent_it) ... ok
+test_reversal_once_and_only_success (test_wallet.WalletTest.test_reversal_once_and_only_success) ... ok
+test_timeout_stays_pending_then_same_key_retry_charges_once (test_wallet.WalletTest.test_timeout_stays_pending_then_same_key_retry_charges_once) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.086s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre class="terminal"><code>deposit T1 SUCCESS, retry same object: yes
+deposit T2 FAILED (vendor code 17)
+transfer T3 SUCCESS; transfer T4 FAILED (insufficient funds)
+reversal T5 SUCCESS, original REVERSED
+rejected: idempotency conflict: k3
+ledger:
+  #1 T1  SYS_BANK  D   1000.00  bal  -1000.00
+  #2 T1  W_asha    C   1000.00  bal   1000.00
+  #3 T3  W_asha    D    300.00  bal    700.00
+  #4 T3  W_bala    C    300.00  bal    300.00
+  #5 T5  W_bala    D    300.00  bal      0.00
+  #6 T5  W_asha    C    300.00  bal   1000.00
+sum of all balances = 0.00
+All checks passed</code></pre>
+    </div>
+  </div>

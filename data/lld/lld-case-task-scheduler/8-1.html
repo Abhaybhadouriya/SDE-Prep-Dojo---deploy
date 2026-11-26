@@ -1,0 +1,1129 @@
+<h3>Python</h3>
+  <ul class="file-roles"><li><code>main.py</code>: demo driver</li></ul>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="task_scheduler.py">
+<pre><code class="language-python">"""In-memory task scheduler: delayed, periodic and dependent (DAG) jobs, priorities, retries,
+cancellation and a bounded worker pool. Mirrors the Java version.
+"""
+from __future__ import annotations
+
+import enum
+import heapq
+import queue
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, List, Optional, Set
+
+
+def monotonic_ms() -&gt; int:
+    return time.monotonic_ns() // 1_000_000
+
+
+class JobState(enum.Enum):
+    WAITING = "WAITING"
+    SCHEDULED = "SCHEDULED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    SKIPPED = "SKIPPED"
+
+    @property
+    def terminal(self) -&gt; bool:
+        return self in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED, JobState.SKIPPED)
+
+
+class Schedule:
+    """Strategy: when should the job run next? None means never again."""
+    recurring = True
+
+    def next(self, planned_start: int, finished_at: int) -&gt; Optional[int]:
+        raise NotImplementedError
+
+
+class Once(Schedule):
+    recurring = False
+
+    def next(self, planned_start, finished_at):
+        return None
+
+
+class FixedRate(Schedule):
+    def __init__(self, period_ms: int):
+        if period_ms &lt;= 0:
+            raise ValueError("period must be &gt; 0")
+        self.period = period_ms
+
+    def next(self, planned_start, finished_at):
+        return max(planned_start + self.period, finished_at)
+
+
+class FixedDelay(Schedule):
+    def __init__(self, delay_ms: int):
+        if delay_ms &lt;= 0:
+            raise ValueError("delay must be &gt; 0")
+        self.delay = delay_ms
+
+    def next(self, planned_start, finished_at):
+        return finished_at + self.delay
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_attempts: int = 1
+    base_backoff_ms: int = 0
+
+    def __post_init__(self):
+        if self.max_attempts &lt; 1 or self.base_backoff_ms &lt; 0:
+            raise ValueError("bad retry policy")
+
+    def backoff_ms(self, failed_attempt: int) -&gt; int:
+        return self.base_backoff_ms &lt;&lt; min(failed_attempt - 1, 20)
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    id: str
+    task: Callable[[], None]
+    priority: int = 5                      # higher runs first among due jobs
+    delay_ms: int = 0
+    schedule: Schedule = field(default_factory=Once)
+    depends_on: frozenset = frozenset()
+    retry: RetryPolicy = RetryPolicy()
+
+    def __post_init__(self):
+        if not self.id:
+            raise ValueError("job id is required")
+        if self.delay_ms &lt; 0:
+            raise ValueError("delay &lt; 0")
+        object.__setattr__(self, "depends_on", frozenset(self.depends_on))
+
+
+class _Job:
+    """Run-time record. Every field is guarded by the scheduler lock."""
+
+    def __init__(self, spec: JobSpec, seq: int, not_before: int):
+        self.spec = spec
+        self.seq = seq
+        self.not_before = not_before
+        self.state: Optional[JobState] = None
+        self.run_at = 0
+        self.attempt = 0
+        self.runs = 0
+        self.pending_deps = 0
+        self.last_error: Optional[str] = None
+        self.dependents: List[_Job] = []
+
+
+@dataclass(frozen=True)
+class JobInfo:
+    id: str
+    state: JobState
+    runs: int
+    attempt: int
+    last_error: Optional[str]
+
+
+Listener = Callable[[str, Optional[JobState], JobState], None]
+
+
+class _WorkerPool:
+    _STOP = object()
+
+    def __init__(self, n: int):
+        self._q: "queue.Queue" = queue.Queue()
+        self._threads = [threading.Thread(target=self._loop, name=f"worker-{i + 1}", daemon=True)
+                         for i in range(n)]
+        for t in self._threads:
+            t.start()
+
+    def execute(self, fn: Callable[[], None]) -&gt; None:
+        self._q.put(fn)
+
+    def _loop(self) -&gt; None:
+        while True:
+            fn = self._q.get()
+            if fn is self._STOP:
+                return
+            fn()
+
+    def shutdown_and_join(self) -&gt; None:
+        for _ in self._threads:
+            self._q.put(self._STOP)
+        for t in self._threads:
+            t.join()
+
+
+class TaskScheduler:
+    def __init__(self, workers: int, clock: Callable[[], int] = monotonic_ms):
+        if workers &lt; 1:
+            raise ValueError("need at least one worker")
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._changed = threading.Condition(self._lock)    # dispatcher waits here
+        self._settled = threading.Condition(self._lock)    # await_terminal waits here
+        self._time_q: list = []      # (run_at, seq, job)
+        self._ready_q: list = []     # (-priority, run_at, seq, job)
+        self._jobs: Dict[str, _Job] = {}
+        self._listeners: List[Listener] = []
+        self._free_workers = threading.Semaphore(workers)
+        self._pool = _WorkerPool(workers)
+        self._running = True
+        self._seq = 0
+        self._dispatcher = threading.Thread(target=self._dispatch_loop, name="dispatcher", daemon=True)
+        self._dispatcher.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.shutdown()
+
+    def add_listener(self, listener: Listener) -&gt; None:
+        self._listeners.append(listener)
+
+    # ------------------------------------------------------------ public API
+    def submit(self, spec: JobSpec) -&gt; None:
+        events: list = []
+        with self._lock:
+            self._check_open()
+            self._validate(spec, set())
+            self._admit(spec, events)
+        self._fire(events)
+
+    def submit_graph(self, specs: Iterable[JobSpec]) -&gt; None:
+        events: list = []
+        with self._lock:
+            self._check_open()
+            batch: Dict[str, JobSpec] = {}
+            for s in specs:
+                if s.id in batch:
+                    raise ValueError(f"duplicate job id {s.id}")
+                batch[s.id] = s
+            for s in batch.values():
+                self._validate(s, set(batch))
+            for s in self._topological_order(batch):
+                self._admit(s, events)
+        self._fire(events)
+
+    def cancel(self, job_id: str) -&gt; bool:
+        events: list = []
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.state.terminal:
+                done = False
+            elif job.state is JobState.RUNNING and not job.spec.schedule.recurring:
+                done = False
+            else:
+                self._move(job, JobState.CANCELLED, events)
+                self._skip_dependents(job, events)
+                self._changed.notify()
+                done = True
+        self._fire(events)
+        return done
+
+    def info(self, job_id: str) -&gt; JobInfo:
+        with self._lock:
+            j = self._jobs.get(job_id)
+            if j is None:
+                raise KeyError(f"unknown job {job_id}")
+            return JobInfo(j.spec.id, j.state, j.runs, j.attempt, j.last_error)
+
+    def await_terminal(self, ids: Iterable[str], timeout_s: float) -&gt; bool:
+        ids = list(ids)
+        deadline = time.monotonic() + timeout_s
+        with self._lock:
+            while True:
+                if all(i in self._jobs and self._jobs[i].state.terminal for i in ids):
+                    return True
+                left = deadline - time.monotonic()
+                if left &lt;= 0:
+                    return False
+                self._settled.wait(left)
+
+    def shutdown(self) -&gt; None:
+        with self._lock:
+            self._running = False
+            self._changed.notify_all()
+        self._free_workers.release()      # unblock a dispatcher waiting for a worker
+        self._dispatcher.join()
+        self._pool.shutdown_and_join()
+
+    # ------------------------------------------------------------ admission (lock held)
+    def _check_open(self) -&gt; None:
+        if not self._running:
+            raise RuntimeError("scheduler is shut down")
+
+    def _validate(self, s: JobSpec, batch_ids: Set[str]) -&gt; None:
+        if s.id in self._jobs:
+            raise ValueError(f"duplicate job id {s.id}")
+        if s.schedule.recurring and s.depends_on:
+            raise ValueError(f"recurring job {s.id} cannot have dependencies")
+        for d in s.depends_on:
+            parent = self._jobs.get(d)
+            if parent is None and d not in batch_ids:
+                raise ValueError(f"unknown dependency {d} of {s.id}")
+            if parent is not None and parent.spec.schedule.recurring:
+                raise ValueError(f"{s.id} cannot depend on recurring job {d}")
+
+    @staticmethod
+    def _topological_order(batch: Dict[str, JobSpec]) -&gt; List[JobSpec]:
+        indegree = {i: 0 for i in batch}
+        children: Dict[str, List[str]] = {}
+        for s in batch.values():
+            for d in sorted(s.depends_on):
+                if d in batch:
+                    indegree[s.id] += 1
+                    children.setdefault(d, []).append(s.id)
+        ready = deque(i for i in batch if indegree[i] == 0)
+        order: List[JobSpec] = []
+        while ready:
+            i = ready.popleft()
+            order.append(batch[i])
+            for c in children.get(i, []):
+                indegree[c] -= 1
+                if indegree[c] == 0:
+                    ready.append(c)
+        if len(order) != len(batch):
+            stuck = [i for i in batch if indegree[i] &gt; 0]
+            raise ValueError(f"cycle among {stuck}")
+        return order
+
+    def _admit(self, spec: JobSpec, events: list) -&gt; None:
+        self._seq += 1
+        job = _Job(spec, self._seq, self._clock() + spec.delay_ms)
+        self._jobs[spec.id] = job
+        bad = (JobState.FAILED, JobState.CANCELLED, JobState.SKIPPED)
+        if any(self._jobs[d].state in bad for d in spec.depends_on):
+            self._move(job, JobState.SKIPPED, events)
+            return
+        for d in spec.depends_on:
+            parent = self._jobs[d]
+            if parent.state is not JobState.SUCCEEDED:
+                parent.dependents.append(job)
+                job.pending_deps += 1
+        if job.pending_deps:
+            self._move(job, JobState.WAITING, events)
+        else:
+            self._schedule(job, job.not_before, events)
+
+    # ------------------------------------------------------------ state changes (lock held)
+    def _schedule(self, job: _Job, at: int, events: list) -&gt; None:
+        job.run_at = at
+        self._move(job, JobState.SCHEDULED, events)
+        heapq.heappush(self._time_q, (at, job.seq, job))
+        self._changed.notify()
+
+    def _move(self, job: _Job, to: JobState, events: list) -&gt; None:
+        frm, job.state = job.state, to
+        if to.terminal:
+            self._settled.notify_all()
+        events.append((job.spec.id, frm, to))
+
+    def _release_dependents(self, done: _Job, now: int, events: list) -&gt; None:
+        for d in done.dependents:
+            if d.state is JobState.WAITING:
+                d.pending_deps -= 1
+                if d.pending_deps == 0:
+                    self._schedule(d, max(now, d.not_before), events)
+
+    def _skip_dependents(self, root: _Job, events: list) -&gt; None:
+        for d in root.dependents:
+            if d.state is JobState.WAITING:
+                self._move(d, JobState.SKIPPED, events)
+                self._skip_dependents(d, events)
+
+    # ------------------------------------------------------------ dispatch and execution
+    def _dispatch_loop(self) -&gt; None:
+        while True:
+            self._free_workers.acquire()          # backpressure: pick only when a worker is free
+            events: list = []
+            with self._lock:
+                job = self._next_ready_job()
+                if job is None:
+                    return
+                job.attempt += 1
+                self._move(job, JobState.RUNNING, events)
+            self._fire(events)
+            self._pool.execute(lambda j=job: self._execute(j))
+
+    def _next_ready_job(self) -&gt; Optional[_Job]:
+        while self._running:
+            now = self._clock()
+            while self._time_q and self._time_q[0][0] &lt;= now:
+                _, seq, j = heapq.heappop(self._time_q)
+                if j.state is JobState.SCHEDULED:
+                    heapq.heappush(self._ready_q, (-j.spec.priority, j.run_at, seq, j))
+            if self._ready_q:
+                j = heapq.heappop(self._ready_q)[3]
+                if j.state is JobState.SCHEDULED:
+                    return j
+                continue
+            if self._time_q:
+                self._changed.wait((self._time_q[0][0] - now) / 1000.0)
+            else:
+                self._changed.wait()
+        return None
+
+    def _execute(self, job: _Job) -&gt; None:
+        error: Optional[BaseException] = None
+        try:
+            job.spec.task()
+        except Exception as e:  # noqa: BLE001 - a job may fail in any way
+            error = e
+        events: list = []
+        try:
+            with self._lock:
+                now = self._clock()
+                job.runs += 1
+                if job.state is JobState.CANCELLED:
+                    pass                                   # cancelled while running
+                elif error is None:
+                    nxt = job.spec.schedule.next(job.run_at, now)
+                    job.attempt = 0
+                    if nxt is not None:
+                        self._schedule(job, nxt, events)
+                    else:
+                        self._move(job, JobState.SUCCEEDED, events)
+                        self._release_dependents(job, now, events)
+                else:
+                    job.last_error = str(error)
+                    if job.attempt &lt; job.spec.retry.max_attempts:
+                        self._schedule(job, now + job.spec.retry.backoff_ms(job.attempt), events)
+                    else:
+                        self._move(job, JobState.FAILED, events)
+                        self._skip_dependents(job, events)
+        finally:
+            self._free_workers.release()
+        self._fire(events)
+
+    def _fire(self, events: list) -&gt; None:
+        for job_id, frm, to in events:
+            for listener in list(self._listeners):
+                listener(job_id, frm, to)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver. Run: python main.py"""
+import random
+import threading
+import time
+
+from task_scheduler import FixedDelay, JobSpec, JobState, RetryPolicy, TaskScheduler
+
+checks = 0
+
+
+def check(ok: bool, what: str) -&gt; None:
+    global checks
+    if not ok:
+        raise AssertionError("FAILED: " + what)
+    checks += 1
+
+
+def delayed_jobs():
+    print("== 1. delayed jobs run in time order ==")
+    ran = []
+    with TaskScheduler(2) as s:
+        for name, delay in (("late", 300), ("early", 100), ("mid", 200)):
+            s.submit(JobSpec(name, lambda n=name: ran.append(n), delay_ms=delay))
+        check(s.info("late").state is JobState.SCHEDULED, "late is SCHEDULED before its time")
+        check(s.await_terminal(["late", "early", "mid"], 3), "delayed jobs finish")
+    print("  ran:", ", ".join(ran))
+    check(ran == ["early", "mid", "late"], "time order")
+
+
+def priorities():
+    print("== 2. priority decides among due jobs (1 worker) ==")
+    ran = []
+    gate = threading.Event()
+    with TaskScheduler(1) as s:
+        s.submit(JobSpec("gate", gate.wait))
+        for name, p in (("bulk", 1), ("normal", 5), ("urgent", 9)):
+            s.submit(JobSpec(name, lambda n=f"{name}(p{p})": ran.append(n), priority=p))
+        gate.set()
+        check(s.await_terminal(["bulk", "normal", "urgent"], 3), "priority jobs finish")
+    print("  ran:", ", ".join(ran))
+    check(ran == ["urgent(p9)", "normal(p5)", "bulk(p1)"], "priority order")
+
+
+def periodic():
+    print("== 3. fixed-delay periodic job, cancelled after 3 runs ==")
+    beats = []
+    three = threading.Event()
+
+    def beat():
+        beats.append(1)
+        if len(beats) == 3:
+            three.set()
+
+    with TaskScheduler(2) as s:
+        s.submit(JobSpec("heartbeat", beat, schedule=FixedDelay(150)))
+        check(three.wait(3), "three heartbeats")
+        check(s.cancel("heartbeat"), "cancel a periodic job")
+        time.sleep(0.4)
+        check(len(beats) == 3, "no run after cancel")
+        check(s.info("heartbeat").state is JobState.CANCELLED, "state CANCELLED")
+        print(f"  heartbeat ran {len(beats)} times, state {s.info('heartbeat').state.value}")
+
+
+def retries():
+    print("== 4. retry with exponential backoff, failure skips dependents ==")
+    states = []
+    tries = [0]
+
+    def flaky():
+        tries[0] += 1
+        if tries[0] &lt; 3:
+            raise RuntimeError(f"timeout #{tries[0]}")
+
+    def broken():
+        raise RuntimeError("disk full")
+
+    with TaskScheduler(2) as s:
+        s.add_listener(lambda i, frm, to: states.append(to.value) if i == "flaky" else None)
+        s.submit(JobSpec("flaky", flaky, retry=RetryPolicy(3, 20)))
+        s.submit(JobSpec("broken", broken, retry=RetryPolicy(2, 10)))
+        s.submit(JobSpec("report", lambda: None, depends_on={"broken"}))
+        s.submit(JobSpec("email", lambda: None, depends_on={"report"}))
+        check(s.await_terminal(["flaky", "broken", "report", "email"], 3), "retry jobs settle")
+        b = s.info("broken")
+        print("  flaky:", " -&gt; ".join(states))
+        print(f"  broken: {b.state.value} after {b.runs} attempts, last error '{b.last_error}'")
+        print(f"  report: {s.info('report').state.value}, email: {s.info('email').state.value}")
+        check(tries[0] == 3 and s.info("flaky").state is JobState.SUCCEEDED, "flaky succeeds on try 3")
+        check(b.state is JobState.FAILED and b.runs == 2, "broken fails after 2 attempts")
+        check(s.info("email").state is JobState.SKIPPED, "skip is transitive")
+
+
+def dag():
+    print("== 5. DAG pipeline (Rubrik-style) on 1 worker ==")
+    edges = [("A",), ("B", "A"), ("C", "B"), ("E", "A"), ("F", "E"), ("G", "C", "F"),
+             ("K",), ("L", "K"), ("M", "L")]
+    order = []
+
+    def work(name):
+        time.sleep(0.005)
+        order.append(name)
+
+    specs = [JobSpec(e[0], lambda n=e[0]: work(n), depends_on=set(e[1:])) for e in edges]
+    with TaskScheduler(1) as s:
+        s.submit_graph(specs)
+        check(s.await_terminal([e[0] for e in edges], 5), "pipeline finishes")
+    valid = all(order.index(p) &lt; order.index(e[0]) for e in edges for p in e[1:])
+    print("  order:", " ".join(order))
+    print("  every job ran after all its parents:", valid)
+    check(valid and len(order) == 9, "topological order")
+
+
+def validation():
+    print("== 6. validation ==")
+    with TaskScheduler(1) as s:
+        s.submit(JobSpec("x", lambda: None, delay_ms=10_000))
+        cases = {
+            "cycle": lambda: s.submit_graph([JobSpec("P", lambda: None, depends_on={"R"}),
+                                             JobSpec("Q", lambda: None, depends_on={"P"}),
+                                             JobSpec("R", lambda: None, depends_on={"Q"})]),
+            "duplicate": lambda: s.submit(JobSpec("x", lambda: None)),
+            "unknown": lambda: s.submit(JobSpec("y", lambda: None, depends_on={"nope"})),
+            "recurring-with-deps": lambda: s.submit(
+                JobSpec("z", lambda: None, schedule=FixedDelay(100), depends_on={"x"})),
+        }
+        for name, call in cases.items():
+            try:
+                call()
+                check(False, name + " should be rejected")
+            except ValueError as e:
+                print(f"  rejected {name}: {e}")
+                check(True, name)
+        try:
+            s.info("P")
+            check(False, "no half-admitted graph")
+        except KeyError:
+            check(True, "no half-admitted graph")
+
+
+def stress():
+    print("== 7. stress: 8 threads x 250 jobs, 4 workers ==")
+    producers, per, workers = 8, 250, 4
+    runs = {}
+    runs_lock = threading.Lock()
+    in_flight = [0, 0]           # current, max
+    ids = [f"p{p}-{i}" for p in range(producers) for i in range(per)]
+
+    def body(job_id):
+        with runs_lock:
+            in_flight[0] += 1
+            in_flight[1] = max(in_flight[1], in_flight[0])
+            runs[job_id] = runs.get(job_id, 0) + 1
+        time.sleep(0.001)            # a little work, outside the lock
+        with runs_lock:
+            in_flight[0] -= 1
+
+    with TaskScheduler(workers) as s:
+        def produce(pid):
+            rnd = random.Random(pid)
+            for i in range(per):
+                jid = f"p{pid}-{i}"
+                s.submit(JobSpec(jid, lambda j=jid: body(j), priority=rnd.randrange(10),
+                                 delay_ms=rnd.randrange(5)))
+        threads = [threading.Thread(target=produce, args=(p,)) for p in range(producers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check(s.await_terminal(ids, 30), "all stress jobs finish")
+    once = len(runs) == producers * per and all(v == 1 for v in runs.values())
+    print(f"  {len(runs)} jobs ran exactly once: {once}; max in flight {in_flight[1]} (limit {workers})")
+    check(once, "every job ran exactly once")
+    check(in_flight[1] &lt;= workers, "bounded concurrency")
+
+
+if __name__ == "__main__":
+    delayed_jobs()
+    priorities()
+    periodic()
+    retries()
+    dag()
+    validation()
+    stress()
+    print(f"== all {checks} checks passed ==")</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_task_scheduler.py">
+<pre><code class="language-python">"""Unit tests. Run: python -m unittest -v test_task_scheduler"""
+import threading
+import time
+import unittest
+
+from task_scheduler import FixedDelay, FixedRate, JobSpec, JobState, RetryPolicy, TaskScheduler
+
+
+class ScheduleTest(unittest.TestCase):
+    def test_fixed_rate_keeps_the_beat_and_catches_up(self):
+        self.assertEqual(FixedRate(100).next(1000, 1030), 1100)
+        self.assertEqual(FixedRate(100).next(1000, 1250), 1250)   # overran: start at once
+
+    def test_fixed_delay_counts_from_finish(self):
+        self.assertEqual(FixedDelay(100).next(1000, 1030), 1130)
+
+    def test_backoff_doubles(self):
+        p = RetryPolicy(5, 10)
+        self.assertEqual([p.backoff_ms(i) for i in (1, 2, 3, 4)], [10, 20, 40, 80])
+
+
+class SchedulerTest(unittest.TestCase):
+    def setUp(self):
+        self.s = TaskScheduler(2)
+
+    def tearDown(self):
+        self.s.shutdown()
+
+    def test_delay_is_respected(self):
+        started = time.monotonic()
+        ran_at = []
+        self.s.submit(JobSpec("d", lambda: ran_at.append(time.monotonic()), delay_ms=120))
+        self.assertTrue(self.s.await_terminal(["d"], 2))
+        self.assertGreaterEqual(ran_at[0] - started, 0.11)
+
+    def test_cancel_before_run(self):
+        ran = []
+        self.s.submit(JobSpec("c", lambda: ran.append(1), delay_ms=200))
+        self.assertTrue(self.s.cancel("c"))
+        time.sleep(0.3)
+        self.assertEqual(ran, [])
+        self.assertIs(self.s.info("c").state, JobState.CANCELLED)
+        self.assertFalse(self.s.cancel("c"))
+
+    def test_cancel_running_one_shot_is_refused(self):
+        started, release = threading.Event(), threading.Event()
+
+        def long_job():
+            started.set()
+            release.wait(2)
+
+        self.s.submit(JobSpec("long", long_job))
+        self.assertTrue(started.wait(2))
+        self.assertFalse(self.s.cancel("long"))
+        release.set()
+        self.assertTrue(self.s.await_terminal(["long"], 2))
+        self.assertIs(self.s.info("long").state, JobState.SUCCEEDED)
+
+    def test_cancel_upstream_skips_downstream(self):
+        self.s.submit(JobSpec("up", lambda: None, delay_ms=500))
+        self.s.submit(JobSpec("down", lambda: None, depends_on={"up"}))
+        self.assertIs(self.s.info("down").state, JobState.WAITING)
+        self.s.cancel("up")
+        self.assertIs(self.s.info("down").state, JobState.SKIPPED)
+
+    def test_dependency_already_done_is_satisfied(self):
+        self.s.submit(JobSpec("first", lambda: None))
+        self.assertTrue(self.s.await_terminal(["first"], 2))
+        self.s.submit(JobSpec("second", lambda: None, depends_on={"first"}))
+        self.assertTrue(self.s.await_terminal(["second"], 2))
+        self.assertIs(self.s.info("second").state, JobState.SUCCEEDED)
+
+    def test_diamond_runs_join_once_after_both(self):
+        order = []
+        lock = threading.Lock()
+
+        def rec(n):
+            with lock:
+                order.append(n)
+
+        self.s.submit_graph([JobSpec("a", lambda: rec("a")),
+                             JobSpec("b", lambda: rec("b"), depends_on={"a"}),
+                             JobSpec("c", lambda: rec("c"), depends_on={"a"}),
+                             JobSpec("d", lambda: rec("d"), depends_on={"b", "c"})])
+        self.assertTrue(self.s.await_terminal("abcd", 2))
+        self.assertEqual(order.count("d"), 1)
+        self.assertEqual(order[0], "a")
+        self.assertEqual(order[-1], "d")
+
+    def test_cycle_rejected_and_nothing_admitted(self):
+        with self.assertRaises(ValueError):
+            self.s.submit_graph([JobSpec("p", lambda: None, depends_on={"q"}),
+                                 JobSpec("q", lambda: None, depends_on={"p"})])
+        with self.assertRaises(KeyError):
+            self.s.info("p")
+
+    def test_failure_after_retries(self):
+        def boom():
+            raise RuntimeError("boom")
+
+        self.s.submit(JobSpec("f", boom, retry=RetryPolicy(3, 1)))
+        self.assertTrue(self.s.await_terminal(["f"], 2))
+        info = self.s.info("f")
+        self.assertIs(info.state, JobState.FAILED)
+        self.assertEqual(info.runs, 3)
+        self.assertEqual(info.last_error, "boom")
+
+    def test_submit_after_shutdown_fails(self):
+        s = TaskScheduler(1)
+        s.shutdown()
+        with self.assertRaises(RuntimeError):
+            s.submit(JobSpec("late", lambda: None))
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p><b>task_scheduler.py</b></p>
+      <p><b>test_task_scheduler.py</b></p>
+      <p>Output of <code>python main.py</code> (Python 3.11):</p>
+<pre class="terminal"><code>== 1. delayed jobs run in time order ==
+  ran: early, mid, late
+== 2. priority decides among due jobs (1 worker) ==
+  ran: urgent(p9), normal(p5), bulk(p1)
+== 3. fixed-delay periodic job, cancelled after 3 runs ==
+  heartbeat ran 3 times, state CANCELLED
+== 4. retry with exponential backoff, failure skips dependents ==
+  flaky: SCHEDULED -&gt; RUNNING -&gt; SCHEDULED -&gt; RUNNING -&gt; SCHEDULED -&gt; RUNNING -&gt; SUCCEEDED
+  broken: FAILED after 2 attempts, last error 'disk full'
+  report: SKIPPED, email: SKIPPED
+== 5. DAG pipeline (Rubrik-style) on 1 worker ==
+  order: A K B E L C F M G
+  every job ran after all its parents: True
+== 6. validation ==
+  rejected cycle: cycle among ['P', 'Q', 'R']
+  rejected duplicate: duplicate job id x
+  rejected unknown: unknown dependency nope of y
+  rejected recurring-with-deps: recurring job z cannot have dependencies
+== 7. stress: 8 threads x 250 jobs, 4 workers ==
+  2000 jobs ran exactly once: True; max in flight 4 (limit 4)
+== all 23 checks passed ==</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output: tests">
+      <p>Output of <code>python -m unittest -v test_task_scheduler</code>:</p>
+<pre class="terminal"><code>test_backoff_doubles (test_task_scheduler.ScheduleTest.test_backoff_doubles) ... ok
+test_fixed_delay_counts_from_finish (test_task_scheduler.ScheduleTest.test_fixed_delay_counts_from_finish) ... ok
+test_fixed_rate_keeps_the_beat_and_catches_up (test_task_scheduler.ScheduleTest.test_fixed_rate_keeps_the_beat_and_catches_up) ... ok
+test_cancel_before_run (test_task_scheduler.SchedulerTest.test_cancel_before_run) ... ok
+test_cancel_running_one_shot_is_refused (test_task_scheduler.SchedulerTest.test_cancel_running_one_shot_is_refused) ... ok
+test_cancel_upstream_skips_downstream (test_task_scheduler.SchedulerTest.test_cancel_upstream_skips_downstream) ... ok
+test_cycle_rejected_and_nothing_admitted (test_task_scheduler.SchedulerTest.test_cycle_rejected_and_nothing_admitted) ... ok
+test_delay_is_respected (test_task_scheduler.SchedulerTest.test_delay_is_respected) ... ok
+test_dependency_already_done_is_satisfied (test_task_scheduler.SchedulerTest.test_dependency_already_done_is_satisfied) ... ok
+test_diamond_runs_join_once_after_both (test_task_scheduler.SchedulerTest.test_diamond_runs_join_once_after_both) ... ok
+test_failure_after_retries (test_task_scheduler.SchedulerTest.test_failure_after_retries) ... ok
+test_submit_after_shutdown_fails (test_task_scheduler.SchedulerTest.test_submit_after_shutdown_fails) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.493s
+
+OK</code></pre>
+    </div>
+  </div>
+  <h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: virtual clock, 2 simulated workers</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>C++ demo OK</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Task scheduler in C++14 as a deterministic simulation with a virtual clock.
+// The MinGW g++ 6.3 used here has no std::thread, so instead of real worker threads we
+// simulate N workers: each job has a duration, and time jumps from event to event.
+// The data structures (time queue, ready queue, in-degree counts) are the same as in
+// the threaded Java/Python versions. One scheduler mutex guards every public call, so another thread
+// may submit() or cancel() while runUntil() advances time (the simulation itself has no worker threads).
+// Windows (MinGW g++ 6.3): g++ -std=c++14 -O2 -Wall -o scheduler main.cpp
+// Linux (real lock):      g++ -std=c++14 -O2 -Wall -pthread -DHAVE_STD_MUTEX -o scheduler main.cpp
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;queue&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: a real std::mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). MinGW.org g++ 6.3 (win32 thread model) has no
+// std::mutex and -pthread fails to link there, so the default build uses a no-op Mutex with the same
+// lock()/unlock(): the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+enum class State { WAITING, SCHEDULED, RUNNING, SUCCEEDED, FAILED, CANCELLED, SKIPPED };
+
+static const char* name(State s) {
+    static const char* n[] = {"WAITING", "SCHEDULED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED", "SKIPPED"};
+    return n[static_cast&lt;int&gt;(s)];
+}
+static bool terminal(State s) { return s &gt;= State::SUCCEEDED; }
+
+// Strategy: when does the job run next? -1 = never.
+struct Schedule {
+    virtual ~Schedule() {}
+    virtual long long next(long long planned, long long finished) const = 0;
+    virtual bool recurring() const { return true; }
+};
+struct Once : Schedule {
+    long long next(long long, long long) const override { return -1; }
+    bool recurring() const override { return false; }
+};
+struct FixedRate : Schedule {
+    long long period;
+    explicit FixedRate(long long p) : period(p) {}
+    long long next(long long planned, long long finished) const override {
+        return planned + period &gt; finished ? planned + period : finished;
+    }
+};
+struct FixedDelay : Schedule {
+    long long delay;
+    explicit FixedDelay(long long d) : delay(d) {}
+    long long next(long long, long long finished) const override { return finished + delay; }
+};
+
+struct JobSpec {
+    std::string id;
+    std::function&lt;bool(int)&gt; task;      // the Command; gets the attempt number, returns success
+    long long durationMs = 10;          // simulated run time
+    int priority = 5;
+    long long delayMs = 0;
+    std::shared_ptr&lt;Schedule&gt; schedule = std::make_shared&lt;Once&gt;();
+    std::vector&lt;std::string&gt; dependsOn;
+    int maxAttempts = 1;
+    long long backoffMs = 0;
+};
+
+struct Job {
+    JobSpec spec;
+    long long seq, notBefore, runAt = 0;
+    State state = State::WAITING;
+    int attempt = 0, runs = 0, pendingDeps = 0;
+    std::vector&lt;Job*&gt; dependents;
+};
+
+class SimScheduler {
+    struct ByTime {
+        bool operator()(const Job* a, const Job* b) const {
+            return a-&gt;runAt != b-&gt;runAt ? a-&gt;runAt &gt; b-&gt;runAt : a-&gt;seq &gt; b-&gt;seq;
+        }
+    };
+    struct ByPriority {
+        bool operator()(const Job* a, const Job* b) const {
+            if (a-&gt;spec.priority != b-&gt;spec.priority) return a-&gt;spec.priority &lt; b-&gt;spec.priority;
+            return a-&gt;runAt != b-&gt;runAt ? a-&gt;runAt &gt; b-&gt;runAt : a-&gt;seq &gt; b-&gt;seq;
+        }
+    };
+    struct Done {
+        long long at, seq;
+        Job* job;
+        bool success;
+        bool operator&gt;(const Done&amp; o) const { return at != o.at ? at &gt; o.at : seq &gt; o.seq; }
+    };
+
+    mutable Mutex mu_;                                          // guards everything below
+    long long now_ = 0, seq_ = 0;
+    int freeWorkers_;
+    std::map&lt;std::string, std::unique_ptr&lt;Job&gt;&gt; jobs_;
+    std::priority_queue&lt;Job*, std::vector&lt;Job*&gt;, ByTime&gt; timeQ_;
+    std::priority_queue&lt;Job*, std::vector&lt;Job*&gt;, ByPriority&gt; readyQ_;
+    std::priority_queue&lt;Done, std::vector&lt;Done&gt;, std::greater&lt;Done&gt;&gt; running_;
+
+    void log(const std::string&amp; what, const Job* j) {
+        std::printf("t=%4ld  %-10s %s\n", static_cast&lt;long&gt;(now_), what.c_str(), j-&gt;spec.id.c_str());
+    }
+    void schedule(Job* j, long long at) {
+        j-&gt;runAt = at;
+        j-&gt;state = State::SCHEDULED;
+        timeQ_.push(j);
+    }
+    void skipDependents(Job* root) {
+        for (Job* d : root-&gt;dependents)
+            if (d-&gt;state == State::WAITING) { d-&gt;state = State::SKIPPED; log("skipped", d); skipDependents(d); }
+    }
+    void validate(const JobSpec&amp; s, const std::set&lt;std::string&gt;&amp; batch) {
+        if (jobs_.count(s.id)) throw std::invalid_argument("duplicate job id " + s.id);
+        if (s.schedule-&gt;recurring() &amp;&amp; !s.dependsOn.empty())
+            throw std::invalid_argument("recurring job " + s.id + " cannot have dependencies");
+        for (const auto&amp; d : s.dependsOn)
+            if (!jobs_.count(d) &amp;&amp; !batch.count(d)) throw std::invalid_argument("unknown dependency " + d);
+    }
+    void admit(const JobSpec&amp; s) {
+        std::unique_ptr&lt;Job&gt; j(new Job{s, ++seq_, now_ + s.delayMs});
+        Job* job = j.get();
+        jobs_[s.id] = std::move(j);
+        for (const auto&amp; d : s.dependsOn) {
+            Job* p = jobs_[d].get();
+            if (p-&gt;state == State::FAILED || p-&gt;state == State::CANCELLED || p-&gt;state == State::SKIPPED) {
+                job-&gt;state = State::SKIPPED;
+                return;
+            }
+        }
+        for (const auto&amp; d : s.dependsOn) {
+            Job* p = jobs_[d].get();
+            if (p-&gt;state != State::SUCCEEDED) { p-&gt;dependents.push_back(job); job-&gt;pendingDeps++; }
+        }
+        if (job-&gt;pendingDeps == 0) schedule(job, job-&gt;notBefore);
+    }
+    void dispatch() {
+        while (!timeQ_.empty() &amp;&amp; timeQ_.top()-&gt;runAt &lt;= now_) {
+            Job* j = timeQ_.top();
+            timeQ_.pop();
+            if (j-&gt;state == State::SCHEDULED) readyQ_.push(j);   // lazily drop cancelled jobs
+        }
+        while (freeWorkers_ &gt; 0 &amp;&amp; !readyQ_.empty()) {
+            Job* j = readyQ_.top();
+            readyQ_.pop();
+            if (j-&gt;state != State::SCHEDULED) continue;
+            j-&gt;state = State::RUNNING;
+            j-&gt;attempt++;
+            freeWorkers_--;
+            log("start", j);
+            bool ok = j-&gt;spec.task(j-&gt;attempt);                 // real version: runs on a worker with mu_ released
+            running_.push(Done{now_ + j-&gt;spec.durationMs, j-&gt;seq, j, ok});
+        }
+    }
+    void complete(const Done&amp; d) {                              // caller holds mu_ (real version: re-takes it here)
+        Job* j = d.job;
+        freeWorkers_++;
+        j-&gt;runs++;
+        if (j-&gt;state == State::CANCELLED) { log("stopped", j); return; }
+        if (d.success) {
+            log("done", j);
+            j-&gt;attempt = 0;
+            long long nxt = j-&gt;spec.schedule-&gt;next(j-&gt;runAt, now_);
+            if (nxt &gt;= 0) { schedule(j, nxt); return; }
+            j-&gt;state = State::SUCCEEDED;
+            for (Job* c : j-&gt;dependents)
+                if (c-&gt;state == State::WAITING &amp;&amp; --c-&gt;pendingDeps == 0)
+                    schedule(c, now_ &gt; c-&gt;notBefore ? now_ : c-&gt;notBefore);
+        } else if (j-&gt;attempt &lt; j-&gt;spec.maxAttempts) {
+            long long wait = j-&gt;spec.backoffMs &lt;&lt; (j-&gt;attempt - 1);
+            log("fail-retry", j);
+            schedule(j, now_ + wait);
+        } else {
+            log("FAILED", j);
+            j-&gt;state = State::FAILED;
+            skipDependents(j);
+        }
+    }
+
+public:
+    explicit SimScheduler(int workers) : freeWorkers_(workers) {}
+    long long now() const { LockGuard g(mu_); return now_; }
+
+    void submit(const JobSpec&amp; s) { LockGuard g(mu_); validate(s, {}); admit(s); }
+
+    // All or nothing; Kahn's algorithm inside the batch.
+    void submitGraph(const std::vector&lt;JobSpec&gt;&amp; specs) {
+        LockGuard g(mu_);                                       // all or nothing, also against other threads
+        std::map&lt;std::string, const JobSpec*&gt; batch;
+        std::set&lt;std::string&gt; ids;
+        for (const auto&amp; s : specs) {
+            if (!ids.insert(s.id).second) throw std::invalid_argument("duplicate job id " + s.id);
+            batch[s.id] = &amp;s;
+        }
+        for (const auto&amp; s : specs) validate(s, ids);
+        std::map&lt;std::string, int&gt; indeg;
+        std::map&lt;std::string, std::vector&lt;std::string&gt;&gt; kids;
+        for (const auto&amp; s : specs) {
+            indeg[s.id] += 0;
+            for (const auto&amp; d : s.dependsOn)
+                if (ids.count(d)) { indeg[s.id]++; kids[d].push_back(s.id); }
+        }
+        std::queue&lt;std::string&gt; ready;
+        for (const auto&amp; s : specs) if (indeg[s.id] == 0) ready.push(s.id);
+        std::vector&lt;const JobSpec*&gt; order;
+        while (!ready.empty()) {
+            std::string id = ready.front();
+            ready.pop();
+            order.push_back(batch[id]);
+            for (const auto&amp; c : kids[id]) if (--indeg[c] == 0) ready.push(c);
+        }
+        if (order.size() != specs.size()) throw std::invalid_argument("cycle in job graph");
+        for (const JobSpec* s : order) admit(*s);
+    }
+
+    bool cancel(const std::string&amp; id) {
+        LockGuard g(mu_);
+        auto it = jobs_.find(id);
+        if (it == jobs_.end()) return false;
+        Job* j = it-&gt;second.get();
+        if (terminal(j-&gt;state)) return false;
+        if (j-&gt;state == State::RUNNING &amp;&amp; !j-&gt;spec.schedule-&gt;recurring()) return false;
+        j-&gt;state = State::CANCELLED;
+        log("cancel", j);
+        skipDependents(j);
+        return true;
+    }
+
+    State state(const std::string&amp; id) const { LockGuard g(mu_); return jobs_.at(id)-&gt;state; }
+    int runs(const std::string&amp; id) const { LockGuard g(mu_); return jobs_.at(id)-&gt;runs; }
+
+    // Advance virtual time, processing events in order, up to and including `until`.
+    void runUntil(long long until) {
+        LockGuard g(mu_);
+        while (true) {
+            dispatch();
+            long long next = -1;
+            if (!running_.empty()) next = running_.top().at;
+            if (!timeQ_.empty() &amp;&amp; (next &lt; 0 || timeQ_.top()-&gt;runAt &lt; next)) next = timeQ_.top()-&gt;runAt;
+            if (next &lt; 0 || next &gt; until) { now_ = until; return; }
+            now_ = next;
+            while (!running_.empty() &amp;&amp; running_.top().at == now_) {
+                Done d = running_.top();
+                running_.pop();
+                complete(d);
+            }
+        }
+    }
+};
+
+static JobSpec job(const std::string&amp; id, long long dur, int prio = 5) {
+    JobSpec s;
+    s.id = id;
+    s.durationMs = dur;
+    s.priority = prio;
+    s.task = [](int) { return true; };
+    return s;
+}
+
+int main() {
+    SimScheduler s(2);   // two simulated workers
+    std::printf("== timeline (2 workers, virtual ms) ==\n");
+
+    JobSpec backup = job("backup", 30);
+    backup.schedule = std::make_shared&lt;FixedRate&gt;(100);           // every 100 ms
+    s.submit(backup);
+
+    // ETL pipeline: extract -&gt; transform -&gt; load -&gt; report, extract -&gt; index -&gt; report
+    JobSpec ex = job("extract", 40), tr = job("transform", 50), ld = job("load", 20),
+            ix = job("index", 30), rp = job("report", 10);
+    tr.dependsOn = {"extract"};
+    ld.dependsOn = {"transform"};
+    ix.dependsOn = {"extract"};
+    rp.dependsOn = {"load", "index"};
+    s.submitGraph({rp, ld, ix, tr, ex});                         // any order: Kahn sorts it
+
+    JobSpec urgent = job("urgent", 10, 9);
+    urgent.delayMs = 60;
+    s.submit(urgent);
+
+    JobSpec flaky = job("flaky", 15, 1);
+    flaky.maxAttempts = 3;
+    flaky.backoffMs = 25;
+    flaky.task = [](int attempt) { return attempt &gt;= 2; };       // fails once, then works
+    s.submit(flaky);
+
+    s.runUntil(350);
+    assert(s.cancel("backup"));
+    s.runUntil(1000);
+
+    std::printf("== final states ==\n");
+    const char* ids[] = {"backup", "extract", "transform", "index", "load", "report", "urgent", "flaky"};
+    for (const char* id : ids) std::printf("  %-9s %-9s runs=%d\n", id, name(s.state(id)), s.runs(id));
+    assert(s.runs("backup") == 4 &amp;&amp; s.state("backup") == State::CANCELLED);
+    assert(s.state("report") == State::SUCCEEDED);
+    assert(s.state("flaky") == State::SUCCEEDED &amp;&amp; s.runs("flaky") == 2);
+
+    bool rejected = false;
+    try {
+        JobSpec a = job("a", 1), b = job("b", 1);
+        a.dependsOn = {"b"};
+        b.dependsOn = {"a"};
+        s.submitGraph({a, b});
+    } catch (const std::invalid_argument&amp; e) {
+        rejected = true;
+        std::printf("rejected: %s\n", e.what());
+    }
+    assert(rejected);
+    std::printf("C++ demo OK\n");
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Output of <code>g++ -std=c++14 -O2 -Wall -o scheduler main.cpp &amp;&amp; ./scheduler</code>:</p>
+<pre class="terminal"><code>== timeline (2 workers, virtual ms) ==
+t=   0  start      backup
+t=   0  start      extract
+t=  30  done       backup
+t=  30  start      flaky
+t=  40  done       extract
+t=  40  start      index
+t=  45  fail-retry flaky
+t=  45  start      transform
+t=  70  done       index
+t=  70  start      urgent
+t=  80  done       urgent
+t=  80  start      flaky
+t=  95  done       transform
+t=  95  done       flaky
+t=  95  start      load
+t= 100  start      backup
+t= 115  done       load
+t= 115  start      report
+t= 125  done       report
+t= 130  done       backup
+t= 200  start      backup
+t= 230  done       backup
+t= 300  start      backup
+t= 330  done       backup
+t= 350  cancel     backup
+== final states ==
+  backup    CANCELLED runs=4
+  extract   SUCCEEDED runs=1
+  transform SUCCEEDED runs=1
+  index     SUCCEEDED runs=1
+  load      SUCCEEDED runs=1
+  report    SUCCEEDED runs=1
+  urgent    SUCCEEDED runs=1
+  flaky     SUCCEEDED runs=2
+rejected: cycle in job graph
+C++ demo OK</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it is a single-threaded simulation on a virtual clock with 2 simulated workers, not the real thread pool: one facade lock (real with <code>-DHAVE_STD_MUTEX</code>) but no worker threads, no condition variables, no stress test, and no named check count (it ends with "C++ demo OK" after a 37-line timeline). It does replay priority, no preemption, retry backoff, the DAG and cancellation.</p></div>
+
+  <p>Read the C++ timeline slowly, it teaches three rules. At t=60 <code>urgent</code> (priority 9) is due, but both workers are busy, so it waits until t=70: <b>no preemption</b>. At t=70 the retry of <code>flaky</code> is also due, yet <code>urgent</code> wins: <b>priority beats arrival</b> among due jobs. And <code>backup</code> starts at 0, 100, 200, 300 regardless of its 30 ms run time: <b>fixed rate</b> is anchored to the planned start, not the finish.</p>

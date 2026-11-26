@@ -1,0 +1,49 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Tool</th><th>Where</th><th>Detail</th></tr></thead>
+            <tbody>
+              <tr><td><b>Kafka</b></td><td>Backbone of the async paths</td><td>Topics: <code>payments</code> (key = card fingerprint, so a card's events stay ordered for Flink), <code>fraud.decisions</code>, <code>fraud.labels</code>, <code>fraud.rules</code> (compacted). Producers use <code>acks=all</code> + idempotence (the defaults since Kafka 3.0). Flink reads with <a href="{{BASE}}interview/glossary#eos">exactly-once</a> checkpoints. See <a href="{{BASE}}devops/kafka-04">consumer groups</a> and <a href="{{BASE}}devops/kafka-09">Connect, Streams and Flink</a>.</td></tr>
+              <tr><td><b>Kafka</b></td><td><a href="{{BASE}}interview/glossary#cdc">CDC</a> for labels and profiles</td><td>Chargebacks and account changes live in OLTP databases; <a href="{{BASE}}interview/glossary#debezium">Debezium</a> streams them into Kafka instead of nightly dumps. Razorpay has described a Debezium -&gt; Kafka (MSK) -&gt; stream processing pipeline for real-time anomaly detection. See <a href="{{BASE}}hld/d28">CDC pipeline</a>.</td></tr>
+              <tr><td><b>Kubernetes</b></td><td>Scoring and model serving</td><td>Deployments with a high <code>minReplicas</code> (cold start is too slow for a sale spike), HPA on CPU or request rate, a PodDisruptionBudget, readiness probes that check the model is loaded. Model servers often get a separate node pool (GPU or large-memory nodes).</td></tr>
+              <tr><td><b>Kubernetes</b></td><td>Flink jobs</td><td>The Flink Kubernetes Operator manages a <code>FlinkDeployment</code> custom resource: JobManager, TaskManagers, savepoint-based upgrades. See <a href="{{BASE}}devops/k8s-10">operators</a>.</td></tr>
+              <tr><td><b>Docker</b></td><td>Reproducible models and local tests</td><td>Each model version ships as an image (model + exact feature code + library versions), which also removes one source of training-serving skew. Locally, <code>docker compose</code> with Kafka, Redis and Flink runs the whole pipeline. See <a href="{{BASE}}devops/pipeline-02">build it locally</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<p>The official <code>flink</code> image contains Flink but not <i>your</i> job, so bake the job JAR into your own image first:</p>
+<pre><code class="language-dockerfile"># Dockerfile - job JAR baked into a Flink image
+FROM flink:1.20
+COPY target/fraud-features.jar /opt/flink/usrlib/fraud-features.jar</code></pre>
+<pre><code class="language-yaml">apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: fraud-features
+spec:
+  image: registry.example.internal/risk/fraud-features:0.3.0   # job JAR baked into a Flink image
+  flinkVersion: v1_20
+  serviceAccount: flink
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: "4"
+    execution.checkpointing.interval: "30s"
+    state.backend.type: rocksdb
+  jobManager:
+    resource: { memory: "2048m", cpu: 1 }
+  taskManager:
+    resource: { memory: "8192m", cpu: 4 }
+  job:
+    jarURI: local:///opt/flink/usrlib/fraud-features.jar
+    parallelism: 32          # = partitions of the payments topic
+    upgradeMode: savepoint   # keep window state across upgrades</code></pre>
+<pre class="terminal"><code>$ kubectl apply -f fraud-features.yaml
+flinkdeployment.flink.apache.org/fraud-features created
+$ kubectl get flinkdeployment
+NAME             JOB STATUS   LIFECYCLE STATE
+fraud-features   RUNNING      STABLE
+$ kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group fraud-features
+GROUP           TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG
+fraud-features  payments  0          5512990         5513004         14
+fraud-features  payments  1          5498112         5498112         0</code></pre>
+        <div class="callout tip"><p><b>The metric that matters for features:</b> <a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a> of the Flink job, converted to <em>seconds</em> (lag / rate). If it grows to minutes, your "real-time" velocity features are stale, and the model is quietly making worse decisions without any error showing. Alert on it like an outage. (Flink with Kafka reports offsets on checkpoint, so the group lag view moves in steps.)</p></div>
+      

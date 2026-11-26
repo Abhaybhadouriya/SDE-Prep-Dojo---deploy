@@ -1,0 +1,80 @@
+
+  <h2>Key relationships and patterns (and why each)</h2>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Pattern</th><th>Where</th><th>Why here (the change it absorbs)</th></tr></thead>
+      <tbody>
+        <tr><td><a href="{{BASE}}lld/lld-pat-command">Command</a></td><td><code>Task</code></td><td>A request turned into an object that can be queued, delayed, retried and logged. The scheduler never knows what a job does.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-strategy">Strategy</a></td><td><code>Schedule</code> (Once, FixedRate, FixedDelay)</td><td>"When next?" is the rule that grows: cron, business days, jitter. Each is a new class; the dispatcher calls <code>next(planned, finished)</code> and nothing else.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-builder">Builder</a></td><td><code>JobSpec.of(id, task).priority(9).delay(100).retry(3, 20).build()</code></td><td>Seven optional settings; a constructor with seven parameters is unreadable and easy to call wrongly. Validation happens once, in <code>build()</code> and <code>submit()</code>.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-state">State</a> (enum flavour)</td><td><code>JobState</code></td><td>A job's life is a small state machine (next figure). The enum plus one <code>move()</code> method gives one place to check and announce every transition.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-observer">Observer</a></td><td><code>JobListener</code></td><td>Metrics, logs and UIs want to know about changes without the scheduler knowing them. Called <i>outside</i> the lock.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-facade">Facade</a></td><td><code>TaskScheduler</code></td><td>Six public methods hide two heaps, a map, a semaphore, a lock with two conditions and a pool.</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-conc-producer-consumer">Producer-consumer</a> and <a href="{{BASE}}lld/lld-conc-thread-pool">thread pool</a></td><td>Dispatcher to <code>WorkerPool</code></td><td>Submitters and workers run at different speeds; a queue between them decouples them. The semaphore bounds work in flight.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>The job state machine</h3>
+  <figure class="diagram">
+    <svg viewBox="0 0 900 330" role="img" aria-label="State machine of a job">
+      <circle cx="40" cy="160" r="10" style="fill:var(--svg-arrow)"/>
+      <rect class="box cache" x="90" y="60" width="130" height="44" rx="20"/><text class="label small" x="155" y="87">WAITING</text>
+      <rect class="box svc" x="300" y="140" width="140" height="44" rx="20"/><text class="label small" x="370" y="167">SCHEDULED</text>
+      <rect class="box kafka" x="530" y="140" width="130" height="44" rx="20"/><text class="label small" x="595" y="167">RUNNING</text>
+      <rect class="box ok" x="740" y="60" width="140" height="44" rx="20"/><text class="label small" x="810" y="87">SUCCEEDED</text>
+      <rect class="box db" x="740" y="200" width="140" height="44" rx="20"/><text class="label small" x="810" y="227">FAILED</text>
+      <rect class="box plain" x="300" y="260" width="140" height="44" rx="20"/><text class="label small" x="370" y="287">CANCELLED</text>
+      <rect class="box plain" x="90" y="260" width="130" height="44" rx="20"/><text class="label small" x="155" y="287">SKIPPED</text>
+      <path class="arrow" d="M50 155 L84 92"/><text class="label small left" x="20" y="120">has deps</text>
+      <path class="arrow" d="M50 162 L294 162"/><text class="label small" x="200" y="155">no deps</text>
+      <path class="arrow" d="M220 92 L300 146"/><text class="label small left" x="236" y="106">last dep done</text>
+      <path class="arrow" d="M440 156 L524 156"/><text class="label small" x="484" y="148">due + free worker</text>
+      <path class="arrow" d="M660 150 L734 92"/><text class="label small left" x="680" y="108">ok, once</text>
+      <path class="arrow" d="M660 176 L734 216"/><text class="label small left" x="676" y="214">error, no tries left</text>
+      <path class="arrow" d="M595 184 Q595 236 446 178"/><text class="label small" x="560" y="250">ok + periodic, or error + retry</text>
+      <path class="arrow dashed" d="M370 184 L370 254"/><text class="label small left" x="378" y="226">cancel()</text>
+      <path class="arrow dashed" d="M155 104 L155 254"/><text class="label small left" x="163" y="190">upstream failed / cancelled</text>
+      <path class="arrow dashed" d="M560 184 L440 268"/><text class="label small left" x="470" y="244"></text>
+      <text class="label small" x="450" y="24">terminal states: SUCCEEDED, FAILED, CANCELLED, SKIPPED (a cancelled periodic job may still be RUNNING its last run)</text>
+    </svg>
+    <figcaption>Every arrow is one call to <code>move(job, to)</code> under the lock. A periodic job loops between SCHEDULED and RUNNING forever; it ends only by cancel or by running out of retries.</figcaption>
+  </figure>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is a TCP-style state machine: a fixed set of states, a few legal transitions, and one function that performs them. In the kernel, <code>tcp_set_state()</code> is that one function, and it also updates counters, exactly like our <code>move()</code> also signals waiters and queues listener events. The <code>dependents</code> list with a <code>pendingDeps</code> counter is a <b>reference count in reverse</b>: each parent holds one count on the child, and the child is released when the count hits zero.</p>
+  </div>
+  <h3>Why the pattern earns its place: the if-ladder it replaces</h3>
+  <p>Without the <code>Schedule</code> interface, every kind of timing is a branch in the completion path:</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Before: if / switch">
+<pre><code class="language-java">long nextRun(Job j, long now) {
+    if (j.kind == Kind.ONCE) {
+        return -1;
+    } else if (j.kind == Kind.FIXED_DELAY) {
+        return now + j.periodMs;
+    } else if (j.kind == Kind.FIXED_RATE) {
+        return j.lastPlannedAt + j.periodMs;
+    } else if (j.kind == Kind.CRON) {        // follow-up: cron edits the scheduler's core
+        return Cron.parse(j.expr).next(now);
+    }
+    throw new IllegalStateException();
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="After: an interface">
+<pre><code class="language-java">interface Schedule {
+    long nextRunAfter(long plannedAt, long finishedAt);   // -1 = no more runs
+}
+// once(), fixedDelay(ms), fixedRate(ms) are small implementations in Model.java
+
+long next = job.spec.schedule.nextRunAfter(job.runAt, now);   // in execute(); no kind flag
+if (next &gt;= 0) schedule(job, next, events);</code></pre>
+    </div>
+  </div>
+  <p>With the ladder, the follow-up "cron expressions" edits <code>TaskScheduler</code>, the class with all the locking. With the interface it is one new <code>Schedule</code> class in <code>Model.java</code>, and the concurrent core is not touched.</p>
+  <div class="bridge">
+    <h4>From your world: the same move in C</h4>
+<pre><code class="language-c">struct schedule_ops { long (*next_run)(const struct schedule *s, long planned, long finished); };
+struct schedule { const struct schedule_ops *ops; long period_ms; };
+/* next = job-&gt;sched-&gt;ops-&gt;next_run(job-&gt;sched, job-&gt;run_at, now); if (next &gt;= 0) requeue(job, next); */</code></pre>
+    <p>The "after" version is an ops table: the caller holds a pointer to a struct of function pointers and never asks which implementation it has, exactly as the VFS calls <code>file-&gt;f_op-&gt;read()</code> without a switch on the file system type.</p>
+  </div>

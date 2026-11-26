@@ -1,0 +1,66 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>One ATM serves one person at a time, so many candidates say "no concurrency here". That is wrong in three places.</p>
+  <h3>1. Inside one ATM: user actions versus the operator</h3>
+  <p>The keypad thread and a maintenance thread (cash refill, remote shutdown) can both touch the ATM. Every public method of <code>Atm</code> is <code>synchronized</code>, so a state transition is never seen half done. The dispenser has its own lock so that <code>reserve</code> (plan and take the notes in one step) cannot interleave with <code>load</code>.</p>
+  <h3>2. Many ATMs, one account</h3>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two ATMs withdraw from one joint account: check-then-act race and its fix">
+      <rect class="box client" x="20" y="30" width="150" height="44"/><text class="label small" x="95" y="56">ATM A: 1000</text>
+      <rect class="box client" x="20" y="200" width="150" height="44"/><text class="label small" x="95" y="226">ATM B: 1000</text>
+      <rect class="box db" x="560" y="110" width="200" height="60"/><text class="label small" x="660" y="136">joint account</text><text class="label small" x="660" y="156">balance 1000</text>
+      <g data-step="1"><path class="arrow" d="M170 52 L554 120"/><text class="label small" x="330" y="64">balance()? 1000</text>
+        <path class="arrow" d="M170 222 L554 160"/><text class="label small" x="330" y="216">balance()? 1000</text></g>
+      <g data-step-only="2"><text class="label bad" x="400" y="140">both: "enough, debit"</text>
+        <rect class="box fail" x="560" y="110" width="200" height="60"/><text class="label small bad" x="660" y="136">balance -1000</text></g>
+      <g data-step="3"><rect class="box ok" x="560" y="200" width="200" height="80"/>
+        <text class="label small" x="660" y="222">Fix: the bank checks</text><text class="label small" x="660" y="242">and debits in ONE</text><text class="label small" x="660" y="262">locked step</text></g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Two ATMs (a joint account, or two cards on one account) ask at the same time. If the ATM reads the balance and then decides, both see 1,000.</li>
+      <li>Both debit and the account goes negative. This is the classic check-then-act race, just spread across two machines.</li>
+      <li>The fix: the ATM never decides from a balance it read earlier. It sends <code>debit</code>, and the bank checks funds and subtracts inside one critical section (a synchronized method here, a row lock or a conditional <code>UPDATE ... WHERE balance &gt;= amount</code> in a database). The demo's 20-ATM test proves exactly 10 of 20 succeed.</li>
+    </ol>
+  </div>
+  <h3>3. Retries and the network</h3>
+  <p>The debit request can reach the bank and the answer can be lost. The ATM must retry, and the retry must not debit twice. That is why <code>debit</code> carries a transaction id and the bank keeps a <b>durable outcome for every id it has seen</b>: who, how much, the response code, and whether it was later reversed. A retry of a known id gets the stored code back, declines (51, 61, 62) included, so "the second call returns the first answer" holds for every answer, not just approvals. A reversal does <b>not</b> delete that record: it marks it REVERSED (a tombstone), so a delayed retransmit of the original debit is declined instead of posting a second debit. A reversal that arrives before its debit also leaves a tombstone, so the late debit is declined. And if <code>debit</code> throws (timeout, network error), <code>DispensingState</code> releases the reserved notes, sends <code>reverse(txnId)</code> (safe because of the tombstone) and reports "bank unavailable", so the claim in the flow diagram holds on that path too. Response 14 maps to <code>UNKNOWN_CARD</code> and anything unexpected to <code>BANK_ERROR</code>, never to CARD_BLOCKED. Test 6 in the demo covers retry, reverse-then-retry and reversal-before-debit; <code>LostAnswerBank</code> covers the exception path.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>A transaction id is a TCP sequence number. The receiver drops a retransmitted segment whose sequence number it has already acknowledged, so the sender may retransmit freely. Reserve-then-commit in the dispenser is <code>ring_buffer_lock_reserve()</code> followed by <code>ring_buffer_unlock_commit()</code> in the kernel tracing ring buffer: claim the space first, fill it, then publish, and discard the reservation if you change your mind.</p>
+    <p><b>Where this breaks:</b> TCP sequence numbers wrap and are per-connection; transaction ids must be unique across every ATM forever (or for the bank's retention window). That is the bug in the warning box above.</p>
+  </div>
+  <h3>Every shared thing and how it is protected</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Race</th><th>Protection in our code</th></tr></thead>
+      <tbody>
+        <tr><td>ATM state and card slot</td><td>Keypad and operator at once</td><td><code>synchronized</code> public methods on <code>Atm</code> (Python: one <code>RLock</code>)</td></tr>
+        <tr><td>Cassette counts</td><td>Plan with stale counts; refill during a plan</td><td><code>CashDispenser.reserve</code> plans and takes in one locked step</td></tr>
+        <tr><td>Account balance and daily total</td><td>Overdraft from two ATMs</td><td>Bank checks and debits inside one synchronized method</td></tr>
+        <tr><td>Posted references</td><td>Double debit on retry</td><td>Map of posted ids, checked inside the same lock</td></tr>
+        <tr><td>Transaction id counter</td><td>Duplicate ids</td><td><code>AtomicLong</code> plus the ATM id as prefix</td></tr>
+        <tr><td>State history log</td><td>Reads while writing</td><td><code>Collections.synchronizedList</code>, copied on read</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Trade-offs to say out loud</h3>
+  <ul>
+    <li><b>Do not hold the ATM lock across slow I/O in production.</b> Our ATM holds its lock during the bank call. With one customer per ATM that is fine, but an operator "shutdown" would wait for a slow network. A real design would hold the lock only for state transitions and let DISPENSING itself block other actions.</li>
+    <li><b>Reserve, or just check?</b> Reserving notes before the debit costs a little complexity but means a refill or a second session cannot spend the same notes. With one customer per ATM, "check" would usually work; reserving makes it always correct.</li>
+    <li><b>Reverse immediately, or let the bank reconcile?</b> We reverse at once. Real networks also send a reversal advice later and reconcile against the ATM's electronic journal, because the ATM may lose power before it can send anything.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>Condition.await()</code> / <code>signal()</code></td><td><code>wait_event()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: test the condition under the lock and re-test in a <code>while</code> loop after every wake.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>Collections.synchronizedList</code></td><td>A list with one mutex taken around every call (but not around a loop over it).</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+        <tr><td><code>CountDownLatch</code></td><td><code>struct completion</code> with a count: <code>countDown()</code> is <code>complete()</code>, <code>await()</code> is <code>wait_for_completion()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

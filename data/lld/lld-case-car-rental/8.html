@@ -1,0 +1,736 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java in five files, Python in one module plus a driver and tests. There is no C++ version of this case: the design is the same as Java. For the same two ideas in C++14, read <a href="{{BASE}}lld/lld-case-bookmyshow#code">BookMyShow's C++ tab</a> (hold a set of seats with an overlap and expiry check per show) or <a href="{{BASE}}lld/lld-case-hotel-booking#code">Hotel Booking's</a> (half-open date ranges per room); a C++ port of this case would keep a <code>std::map</code> of reservations per car and use the lock-striped table described in the concurrency section.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: search, book, double-book attempt, return with late fee.</li><li><code>RentalService.search</code>, <code>book</code>, <code>returnVehicle</code>: the use cases.</li><li><code>TimeSlot.overlaps</code> (half-open interval) and the per-car lock inside <code>book</code>. This is the heart (about 15 lines).</li><li>Pricing: <code>HourlyPricing</code>, <code>DailyCapPricing</code>, and <code>WeekendSurcharge</code> as a decorator; then the <code>Spec</code> filters in Search.java.</li><li>Skip on first read: the enums and records in Model.java.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java: Model.java">
+<pre><code class="language-java">import java.time.*;
+import java.util.*;
+
+enum VehicleType { HATCHBACK, SEDAN, SUV, BIKE }
+
+enum ReservationStatus { CONFIRMED, PICKED_UP, RETURNED, CANCELLED }
+
+/** Half-open time range [start, end): a booking ending at 10:00 does not clash with one starting at 10:00. */
+record TimeSlot(LocalDateTime start, LocalDateTime end) {
+    TimeSlot {
+        Objects.requireNonNull(start); Objects.requireNonNull(end);
+        if (!end.isAfter(start)) throw new IllegalArgumentException("end must be after start: " + start + " .. " + end);
+    }
+    boolean overlaps(TimeSlot o) { return start.isBefore(o.end) &amp;&amp; o.start.isBefore(end); }
+    long hours() { return (Duration.between(start, end).toMinutes() + 59) / 60; }   // started hours are billed
+}
+
+record Branch(String id, String city, String name) {}
+
+/** Static facts about a car. Availability is NOT stored here: it is derived from reservations. */
+record Vehicle(String id, VehicleType type, String model, int seats, String branchId,
+               long hourlyRate, long dailyRate) {}
+
+final class Reservation {
+    private final String id, userId, vehicleId;
+    private final TimeSlot slot;
+    private final long price;
+    private ReservationStatus status = ReservationStatus.CONFIRMED;
+    private long lateFee;
+
+    Reservation(String id, String userId, String vehicleId, TimeSlot slot, long price) {
+        this.id = id; this.userId = userId; this.vehicleId = vehicleId; this.slot = slot; this.price = price;
+    }
+    String id() { return id; }
+    String userId() { return userId; }
+    String vehicleId() { return vehicleId; }
+    TimeSlot slot() { return slot; }
+    long price() { return price; }
+    long lateFee() { return lateFee; }
+    ReservationStatus status() { return status; }
+    /** Only these reservations block the car. */
+    boolean isActive() { return status == ReservationStatus.CONFIRMED || status == ReservationStatus.PICKED_UP; }
+
+    // Tiny state machine: CONFIRMED -&gt; PICKED_UP -&gt; RETURNED, or CONFIRMED -&gt; CANCELLED.
+    void pickUp()  { require(ReservationStatus.CONFIRMED, "pick up"); status = ReservationStatus.PICKED_UP; }
+    void cancel()  { require(ReservationStatus.CONFIRMED, "cancel");  status = ReservationStatus.CANCELLED; }
+    void complete(long lateFee) {
+        require(ReservationStatus.PICKED_UP, "return");
+        this.lateFee = lateFee; status = ReservationStatus.RETURNED;
+    }
+    private void require(ReservationStatus s, String action) {
+        if (status != s) throw new IllegalStateException("cannot " + action + " a " + status + " reservation " + id);
+    }
+    @Override public String toString() {
+        return id + " " + vehicleId + " " + slot.start() + ".." + slot.end() + " Rs " + price + " " + status;
+    }
+}
+
+class VehicleUnavailableException extends RuntimeException {
+    VehicleUnavailableException(String msg) { super(msg); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Search.java">
+<pre><code class="language-java">import java.util.function.Predicate;
+
+/** Specification pattern: one small, combinable rule per search filter. */
+interface Spec&lt;T&gt; {
+    boolean isSatisfiedBy(T t);
+    default Spec&lt;T&gt; and(Spec&lt;T&gt; o) { return t -&gt; isSatisfiedBy(t) &amp;&amp; o.isSatisfiedBy(t); }
+    default Spec&lt;T&gt; or(Spec&lt;T&gt; o)  { return t -&gt; isSatisfiedBy(t) || o.isSatisfiedBy(t); }
+    default Spec&lt;T&gt; not()          { return t -&gt; !isSatisfiedBy(t); }
+    static &lt;T&gt; Spec&lt;T&gt; any()       { return t -&gt; true; }
+    static &lt;T&gt; Spec&lt;T&gt; of(Predicate&lt;T&gt; p) { return p::test; }
+}
+
+final class VehicleSpecs {
+    private VehicleSpecs() {}
+    static Spec&lt;Vehicle&gt; ofType(VehicleType type)  { return v -&gt; v.type() == type; }
+    static Spec&lt;Vehicle&gt; atBranch(String branchId) { return v -&gt; v.branchId().equals(branchId); }
+    static Spec&lt;Vehicle&gt; minSeats(int seats)       { return v -&gt; v.seats() &gt;= seats; }
+    static Spec&lt;Vehicle&gt; maxDailyRate(long rate)   { return v -&gt; v.dailyRate() &lt;= rate; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Pricing.java">
+<pre><code class="language-java">import java.time.*;
+
+/** Strategy: how much a rental costs. Prices are whole rupees to avoid floating-point money. */
+interface PricingStrategy {
+    long price(Vehicle v, TimeSlot slot);
+}
+
+/** Every started hour at the hourly rate. */
+final class HourlyPricing implements PricingStrategy {
+    public long price(Vehicle v, TimeSlot slot) { return slot.hours() * v.hourlyRate(); }
+}
+
+/** Full days at the daily rate, leftover hours at the hourly rate, but a leftover never costs more than a day. */
+final class DailyCapPricing implements PricingStrategy {
+    public long price(Vehicle v, TimeSlot slot) {
+        long hours = slot.hours();
+        long days = hours / 24, rest = hours % 24;
+        return days * v.dailyRate() + Math.min(rest * v.hourlyRate(), v.dailyRate());
+    }
+}
+
+/** Decorator over any strategy: +percent if the trip touches a Saturday or Sunday. */
+final class WeekendSurcharge implements PricingStrategy {
+    private final PricingStrategy inner;
+    private final int percent;
+    WeekendSurcharge(PricingStrategy inner, int percent) { this.inner = inner; this.percent = percent; }
+    public long price(Vehicle v, TimeSlot slot) {
+        long base = inner.price(v, slot);
+        return touchesWeekend(slot) ? base + base * percent / 100 : base;
+    }
+    private static boolean touchesWeekend(TimeSlot s) {
+        for (LocalDate d = s.start().toLocalDate(); !d.isAfter(s.end().minusNanos(1).toLocalDate()); d = d.plusDays(1)) {
+            DayOfWeek w = d.getDayOfWeek();
+            if (w == DayOfWeek.SATURDAY || w == DayOfWeek.SUNDAY) return true;
+        }
+        return false;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: RentalService.java">
+<pre><code class="language-java">import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+record Quote(Vehicle vehicle, long price) {}
+
+/** The facade the driver and tests call. Holds the in-memory "tables" and the booking rules. */
+final class RentalService {
+    private final Map&lt;String, Branch&gt; branches = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Vehicle&gt; vehicles = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Reservation&gt; reservations = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, List&lt;Reservation&gt;&gt; byVehicle = new ConcurrentHashMap&lt;&gt;();  // guarded by lockFor(vehicleId)
+    private final Map&lt;String, Object&gt; locks = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicLong nextId = new AtomicLong(1);
+    private final PricingStrategy pricing;
+
+    RentalService(PricingStrategy pricing) { this.pricing = pricing; }
+
+    void addBranch(Branch b) { branches.put(b.id(), b); }
+
+    void addVehicle(Vehicle v) {
+        if (!branches.containsKey(v.branchId())) throw new IllegalArgumentException("unknown branch " + v.branchId());
+        if (vehicles.putIfAbsent(v.id(), v) != null) throw new IllegalArgumentException("duplicate vehicle " + v.id());
+        byVehicle.put(v.id(), new ArrayList&lt;&gt;());
+    }
+
+    /** Vehicles that match the filter AND are free for the whole slot, cheapest first. */
+    List&lt;Quote&gt; search(Spec&lt;Vehicle&gt; filter, TimeSlot slot) {
+        return vehicles.values().stream()
+            .filter(filter::isSatisfiedBy)
+            .filter(v -&gt; isFree(v.id(), slot))
+            .map(v -&gt; new Quote(v, pricing.price(v, slot)))
+            .sorted(Comparator.comparingLong(Quote::price).thenComparing(q -&gt; q.vehicle().id()))
+            .collect(Collectors.toList());
+    }
+
+    /** Check-then-insert happens under the vehicle's lock, so two users can never both win the same slot. */
+    Reservation book(String userId, String vehicleId, TimeSlot slot) {
+        Vehicle v = vehicle(vehicleId);
+        synchronized (lockFor(vehicleId)) {
+            for (Reservation r : byVehicle.get(vehicleId)) {
+                if (r.isActive() &amp;&amp; r.slot().overlaps(slot))
+                    throw new VehicleUnavailableException(vehicleId + " is taken by " + r.id() + " (" + r.slot().start() + ".." + r.slot().end() + ")");
+            }
+            Reservation r = new Reservation("R" + nextId.getAndIncrement(), userId, vehicleId, slot, pricing.price(v, slot));
+            byVehicle.get(vehicleId).add(r);
+            reservations.put(r.id(), r);
+            return r;
+        }
+    }
+
+    void cancel(String reservationId) {
+        Reservation r = reservation(reservationId);
+        synchronized (lockFor(r.vehicleId())) { r.cancel(); }
+    }
+
+    void pickUp(String reservationId) {
+        Reservation r = reservation(reservationId);
+        synchronized (lockFor(r.vehicleId())) { r.pickUp(); }
+    }
+
+    /** Returns the total charged. Late hours are priced with the same strategy. */
+    long returnVehicle(String reservationId, LocalDateTime returnedAt) {
+        Reservation r = reservation(reservationId);
+        synchronized (lockFor(r.vehicleId())) {
+            long late = returnedAt.isAfter(r.slot().end())
+                ? pricing.price(vehicle(r.vehicleId()), new TimeSlot(r.slot().end(), returnedAt)) : 0;
+            r.complete(late);
+            return r.price() + late;
+        }
+    }
+
+    List&lt;Reservation&gt; reservationsOf(String userId) {
+        return reservations.values().stream().filter(r -&gt; r.userId().equals(userId))
+            .sorted(Comparator.comparing(r -&gt; r.slot().start())).collect(Collectors.toList());
+    }
+
+    private boolean isFree(String vehicleId, TimeSlot slot) {
+        synchronized (lockFor(vehicleId)) {
+            return byVehicle.get(vehicleId).stream().noneMatch(r -&gt; r.isActive() &amp;&amp; r.slot().overlaps(slot));
+        }
+    }
+    private Object lockFor(String vehicleId) { return locks.computeIfAbsent(vehicleId, k -&gt; new Object()); }
+    private Vehicle vehicle(String id) {
+        Vehicle v = vehicles.get(id);
+        if (v == null) throw new NoSuchElementException("no vehicle " + id);
+        return v;
+    }
+    private Reservation reservation(String id) {
+        Reservation r = reservations.get(id);
+        if (r == null) throw new NoSuchElementException("no reservation " + id);
+        return r;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    static LocalDateTime at(int month, int day, int hour, int min) { return LocalDateTime.of(2026, month, day, hour, min); }
+    static TimeSlot slot(LocalDateTime a, LocalDateTime b) { return new TimeSlot(a, b); }
+
+    static RentalService seed() {
+        RentalService s = new RentalService(new WeekendSurcharge(new DailyCapPricing(), 20));
+        s.addBranch(new Branch("KOR", "Bengaluru", "Koramangala"));
+        s.addBranch(new Branch("IND", "Bengaluru", "Indiranagar"));
+        s.addVehicle(new Vehicle("KA01", VehicleType.SUV, "Mahindra XUV700", 7, "KOR", 350, 3500));
+        s.addVehicle(new Vehicle("KA02", VehicleType.SEDAN, "Honda City", 5, "KOR", 200, 2000));
+        s.addVehicle(new Vehicle("KA03", VehicleType.HATCHBACK, "Maruti Swift", 5, "KOR", 120, 1200));
+        s.addVehicle(new Vehicle("KA04", VehicleType.SUV, "Hyundai Creta", 5, "IND", 300, 3000));
+        return s;
+    }
+
+    static void print(String title, List&lt;Quote&gt; qs) {
+        System.out.println(title);
+        for (Quote q : qs) System.out.println("  " + q.vehicle().id() + " " + q.vehicle().model() + "  Rs " + q.price());
+    }
+
+    public static void main(String[] args) throws Exception {
+        RentalService s = seed();
+        TimeSlot wed = slot(at(12, 2, 10, 0), at(12, 3, 10, 0));           // Wed 10:00 -&gt; Thu 10:00
+        Spec&lt;Vehicle&gt; korFive = VehicleSpecs.atBranch("KOR").and(VehicleSpecs.minSeats(5));
+
+        print("search KOR, 5+ seats, Wed 10:00 -&gt; Thu 10:00:", s.search(korFive, wed));
+        Reservation r1 = s.book("asha", "KA03", wed);
+        System.out.println("asha booked " + r1);
+        print("same search after asha's booking:", s.search(korFive, wed));
+
+        try {
+            s.book("ravi", "KA03", slot(at(12, 2, 18, 0), at(12, 2, 22, 0)));
+        } catch (VehicleUnavailableException e) {
+            System.out.println("ravi rejected: " + e.getMessage());
+        }
+        Reservation r2 = s.book("ravi", "KA03", slot(at(12, 3, 10, 0), at(12, 3, 14, 0)));
+        System.out.println("ravi booked back-to-back " + r2);
+
+        Reservation r3 = s.book("meera", "KA04", slot(at(12, 5, 9, 0), at(12, 5, 15, 0)));   // Saturday
+        System.out.println("meera booked (weekend +20%) " + r3);
+        s.pickUp(r3.id());
+        long total = s.returnVehicle(r3.id(), at(12, 5, 16, 20));
+        System.out.println("meera returned 80 min late, total Rs " + total + " (late fee Rs " + r3.lateFee() + ")");
+
+        s.cancel(r2.id());
+        print("after ravi cancels, KA03 free Thu 10:00 -&gt; 14:00?",
+              s.search(VehicleSpecs.ofType(VehicleType.HATCHBACK), slot(at(12, 3, 10, 0), at(12, 3, 14, 0))));
+
+        int winners = race(s, "KA02", slot(at(12, 9, 9, 0), at(12, 9, 18, 0)), 8);
+        System.out.println("8 users race for KA02 on the same slot -&gt; successful bookings: " + winners);
+
+        runTests();
+    }
+
+    /** n threads try to book the same car for the same slot at the same instant. */
+    static int race(RentalService s, String vehicleId, TimeSlot slot, int n) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger ok = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) {
+            String user = "user" + i;
+            fs.add(pool.submit(() -&gt; {
+                go.await();
+                try { s.book(user, vehicleId, slot); ok.incrementAndGet(); }
+                catch (VehicleUnavailableException ignored) { }
+                return null;
+            }));
+        }
+        go.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        return ok.get();
+    }
+
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static void expect(Class&lt;? extends Exception&gt; type, Runnable r, String what) {
+        try { r.run(); } catch (Exception e) { if (type.isInstance(e)) { checks++; return; } throw e; }
+        throw new AssertionError("FAILED (no " + type.getSimpleName() + "): " + what);
+    }
+
+    static void runTests() throws Exception {
+        TimeSlot a = slot(at(12, 2, 10, 0), at(12, 2, 12, 0));
+        check(!a.overlaps(slot(at(12, 2, 12, 0), at(12, 2, 13, 0))), "touching slots do not overlap");
+        check(a.overlaps(slot(at(12, 2, 11, 59), at(12, 2, 13, 0))), "one minute of overlap counts");
+        check(a.overlaps(slot(at(12, 2, 9, 0), at(12, 2, 15, 0))), "a slot that contains another overlaps");
+        check(slot(at(12, 2, 10, 0), at(12, 2, 10, 1)).hours() == 1, "a started hour is billed");
+        expect(IllegalArgumentException.class, () -&gt; slot(at(12, 2, 10, 0), at(12, 2, 10, 0)), "empty slot");
+
+        Vehicle swift = new Vehicle("X", VehicleType.HATCHBACK, "Swift", 5, "KOR", 120, 1200);
+        check(new DailyCapPricing().price(swift, slot(at(12, 2, 0, 0), at(12, 3, 6, 0))) == 1200 + 720, "30 h = 1 day + 6 h");
+        check(new DailyCapPricing().price(swift, slot(at(12, 2, 0, 0), at(12, 2, 20, 0))) == 1200, "20 h capped at one day");
+        check(new WeekendSurcharge(new HourlyPricing(), 20).price(swift, slot(at(12, 5, 9, 0), at(12, 5, 10, 0))) == 144, "Saturday +20%");
+        check(new WeekendSurcharge(new HourlyPricing(), 20).price(swift, slot(at(12, 4, 22, 0), at(12, 5, 0, 0))) == 240, "ends exactly at Sat 00:00: no surcharge");
+
+        RentalService s = seed();
+        Reservation r = s.book("u", "KA01", a);
+        expect(VehicleUnavailableException.class, () -&gt; s.book("v", "KA01", a), "double booking");
+        s.pickUp(r.id());
+        expect(IllegalStateException.class, () -&gt; s.cancel(r.id()), "cancel after pick-up");
+        check(s.returnVehicle(r.id(), at(12, 2, 11, 0)) == r.price(), "early return: no refund, no late fee");
+        check(s.book("v", "KA01", a) != null, "returned reservation no longer blocks the car");
+        expect(NoSuchElementException.class, () -&gt; s.book("u", "NOPE", a), "unknown vehicle");
+        expect(IllegalArgumentException.class, () -&gt; s.addVehicle(new Vehicle("Z", VehicleType.SUV, "?", 5, "NOPE", 1, 1)), "unknown branch");
+
+        for (int round = 0; round &lt; 20; round++) {
+            RentalService fresh = seed();
+            check(race(fresh, "KA02", a, 16) == 1, "exactly one winner under contention");
+        }
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: car_rental.py">
+<pre><code class="language-python">"""Car rental (Zoomcar-style) - same design as the Java version."""
+from __future__ import annotations
+
+import itertools
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Callable, Protocol
+
+
+class VehicleType(Enum):
+    HATCHBACK = 1
+    SEDAN = 2
+    SUV = 3
+    BIKE = 4
+
+
+class Status(Enum):
+    CONFIRMED = 1
+    PICKED_UP = 2
+    RETURNED = 3
+    CANCELLED = 4
+
+
+@dataclass(frozen=True)
+class TimeSlot:
+    """Half-open [start, end)."""
+    start: datetime
+    end: datetime
+
+    def __post_init__(self):
+        if self.end &lt;= self.start:
+            raise ValueError(f"end must be after start: {self.start} .. {self.end}")
+
+    def overlaps(self, o: "TimeSlot") -&gt; bool:
+        return self.start &lt; o.end and o.start &lt; self.end
+
+    def hours(self) -&gt; int:
+        minutes = int((self.end - self.start).total_seconds() // 60)
+        return (minutes + 59) // 60
+
+
+@dataclass(frozen=True)
+class Branch:
+    id: str
+    city: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Vehicle:
+    id: str
+    type: VehicleType
+    model: str
+    seats: int
+    branch_id: str
+    hourly_rate: int
+    daily_rate: int
+
+
+@dataclass
+class Reservation:
+    id: str
+    user_id: str
+    vehicle_id: str
+    slot: TimeSlot
+    price: int
+    status: Status = Status.CONFIRMED
+    late_fee: int = 0
+
+    def is_active(self) -&gt; bool:
+        return self.status in (Status.CONFIRMED, Status.PICKED_UP)
+
+    def _require(self, s: Status, action: str) -&gt; None:
+        if self.status is not s:
+            raise RuntimeError(f"cannot {action} a {self.status.name} reservation {self.id}")
+
+    def pick_up(self) -&gt; None:
+        self._require(Status.CONFIRMED, "pick up")
+        self.status = Status.PICKED_UP
+
+    def cancel(self) -&gt; None:
+        self._require(Status.CONFIRMED, "cancel")
+        self.status = Status.CANCELLED
+
+    def complete(self, late_fee: int) -&gt; None:
+        self._require(Status.PICKED_UP, "return")
+        self.late_fee, self.status = late_fee, Status.RETURNED
+
+
+class VehicleUnavailable(Exception):
+    pass
+
+
+# ---- Specification ----
+class Spec:
+    def __init__(self, pred: Callable[[Vehicle], bool]):
+        self._pred = pred
+
+    def __call__(self, v: Vehicle) -&gt; bool:
+        return self._pred(v)
+
+    def __and__(self, o: "Spec") -&gt; "Spec":
+        return Spec(lambda v: self(v) and o(v))
+
+    def __or__(self, o: "Spec") -&gt; "Spec":
+        return Spec(lambda v: self(v) or o(v))
+
+    def __invert__(self) -&gt; "Spec":
+        return Spec(lambda v: not self(v))
+
+
+def of_type(t: VehicleType) -&gt; Spec: return Spec(lambda v: v.type is t)
+def at_branch(b: str) -&gt; Spec: return Spec(lambda v: v.branch_id == b)
+def min_seats(n: int) -&gt; Spec: return Spec(lambda v: v.seats &gt;= n)
+def max_daily_rate(r: int) -&gt; Spec: return Spec(lambda v: v.daily_rate &lt;= r)
+ANY = Spec(lambda v: True)
+
+
+# ---- Pricing strategies ----
+class PricingStrategy(Protocol):
+    def price(self, v: Vehicle, slot: TimeSlot) -&gt; int: ...
+
+
+class HourlyPricing:
+    def price(self, v, slot):
+        return slot.hours() * v.hourly_rate
+
+
+class DailyCapPricing:
+    def price(self, v, slot):
+        days, rest = divmod(slot.hours(), 24)
+        return days * v.daily_rate + min(rest * v.hourly_rate, v.daily_rate)
+
+
+class WeekendSurcharge:
+    def __init__(self, inner: PricingStrategy, percent: int):
+        self.inner, self.percent = inner, percent
+
+    def price(self, v, slot):
+        base = self.inner.price(v, slot)
+        return base + base * self.percent // 100 if self._touches_weekend(slot) else base
+
+    @staticmethod
+    def _touches_weekend(s: TimeSlot) -&gt; bool:
+        d, last = s.start.date(), (s.end - timedelta(microseconds=1)).date()
+        while d &lt;= last:
+            if d.weekday() &gt;= 5:
+                return True
+            d += timedelta(days=1)
+        return False
+
+
+@dataclass(frozen=True)
+class Quote:
+    vehicle: Vehicle
+    price: int
+
+
+@dataclass
+class RentalService:
+    pricing: PricingStrategy
+    branches: dict = field(default_factory=dict)
+    vehicles: dict = field(default_factory=dict)
+    reservations: dict = field(default_factory=dict)
+    by_vehicle: dict = field(default_factory=dict)       # vehicle id -&gt; list, guarded by that vehicle's lock
+    _locks: dict = field(default_factory=dict)
+    _locks_guard: threading.Lock = field(default_factory=threading.Lock)
+    _ids: itertools.count = field(default_factory=lambda: itertools.count(1))
+
+    def add_branch(self, b: Branch) -&gt; None:
+        self.branches[b.id] = b
+
+    def add_vehicle(self, v: Vehicle) -&gt; None:
+        if v.branch_id not in self.branches:
+            raise ValueError(f"unknown branch {v.branch_id}")
+        if v.id in self.vehicles:
+            raise ValueError(f"duplicate vehicle {v.id}")
+        self.vehicles[v.id] = v
+        self.by_vehicle[v.id] = []
+
+    def search(self, spec: Spec, slot: TimeSlot) -&gt; list[Quote]:
+        quotes = [Quote(v, self.pricing.price(v, slot)) for v in list(self.vehicles.values())
+                  if spec(v) and self._is_free(v.id, slot)]
+        return sorted(quotes, key=lambda q: (q.price, q.vehicle.id))
+
+    def book(self, user_id: str, vehicle_id: str, slot: TimeSlot) -&gt; Reservation:
+        v = self._vehicle(vehicle_id)
+        with self._lock_for(vehicle_id):                  # check-then-insert is atomic per vehicle
+            for r in self.by_vehicle[vehicle_id]:
+                if r.is_active() and r.slot.overlaps(slot):
+                    raise VehicleUnavailable(f"{vehicle_id} is taken by {r.id} ({r.slot.start}..{r.slot.end})")
+            r = Reservation(f"R{next(self._ids)}", user_id, vehicle_id, slot, self.pricing.price(v, slot))
+            self.by_vehicle[vehicle_id].append(r)
+            self.reservations[r.id] = r
+            return r
+
+    def cancel(self, rid: str) -&gt; None:
+        r = self._reservation(rid)
+        with self._lock_for(r.vehicle_id):
+            r.cancel()
+
+    def pick_up(self, rid: str) -&gt; None:
+        r = self._reservation(rid)
+        with self._lock_for(r.vehicle_id):
+            r.pick_up()
+
+    def return_vehicle(self, rid: str, returned_at: datetime) -&gt; int:
+        r = self._reservation(rid)
+        with self._lock_for(r.vehicle_id):
+            late = 0
+            if returned_at &gt; r.slot.end:
+                late = self.pricing.price(self._vehicle(r.vehicle_id), TimeSlot(r.slot.end, returned_at))
+            r.complete(late)
+            return r.price + late
+
+    def _is_free(self, vid: str, slot: TimeSlot) -&gt; bool:
+        with self._lock_for(vid):
+            return not any(r.is_active() and r.slot.overlaps(slot) for r in self.by_vehicle[vid])
+
+    def _lock_for(self, vid: str) -&gt; threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(vid, threading.Lock())
+
+    def _vehicle(self, vid: str) -&gt; Vehicle:
+        if vid not in self.vehicles:
+            raise KeyError(f"no vehicle {vid}")
+        return self.vehicles[vid]
+
+    def _reservation(self, rid: str) -&gt; Reservation:
+        if rid not in self.reservations:
+            raise KeyError(f"no reservation {rid}")
+        return self.reservations[rid]
+
+
+def at(month: int, day: int, hour: int, minute: int = 0) -&gt; datetime:
+    return datetime(2026, month, day, hour, minute)
+
+
+def seed() -&gt; RentalService:
+    s = RentalService(WeekendSurcharge(DailyCapPricing(), 20))
+    s.add_branch(Branch("KOR", "Bengaluru", "Koramangala"))
+    s.add_branch(Branch("IND", "Bengaluru", "Indiranagar"))
+    s.add_vehicle(Vehicle("KA01", VehicleType.SUV, "Mahindra XUV700", 7, "KOR", 350, 3500))
+    s.add_vehicle(Vehicle("KA02", VehicleType.SEDAN, "Honda City", 5, "KOR", 200, 2000))
+    s.add_vehicle(Vehicle("KA03", VehicleType.HATCHBACK, "Maruti Swift", 5, "KOR", 120, 1200))
+    s.add_vehicle(Vehicle("KA04", VehicleType.SUV, "Hyundai Creta", 5, "IND", 300, 3000))
+    return s</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">import threading
+
+from car_rental import TimeSlot, VehicleType, VehicleUnavailable, at, at_branch, min_seats, of_type, seed
+
+
+def show(title, quotes):
+    print(title)
+    for q in quotes:
+        print(f"  {q.vehicle.id} {q.vehicle.model}  Rs {q.price}")
+
+
+def race(s, vehicle_id, slot, n):
+    barrier, wins, lock = threading.Barrier(n), [], threading.Lock()
+
+    def worker(i):
+        barrier.wait()                       # everyone calls book() at the same moment
+        try:
+            s.book(f"user{i}", vehicle_id, slot)
+            with lock:
+                wins.append(i)
+        except VehicleUnavailable:
+            pass
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return len(wins)
+
+
+if __name__ == "__main__":
+    s = seed()
+    wed = TimeSlot(at(12, 2, 10), at(12, 3, 10))
+    kor_five = at_branch("KOR") &amp; min_seats(5)
+    show("search KOR, 5+ seats, Wed 10:00 -&gt; Thu 10:00:", s.search(kor_five, wed))
+    r1 = s.book("asha", "KA03", wed)
+    print(f"asha booked {r1.id} {r1.vehicle_id} Rs {r1.price}")
+    show("same search after asha's booking:", s.search(kor_five, wed))
+    try:
+        s.book("ravi", "KA03", TimeSlot(at(12, 2, 18), at(12, 2, 22)))
+    except VehicleUnavailable as e:
+        print(f"ravi rejected: {e}")
+    r2 = s.book("ravi", "KA03", TimeSlot(at(12, 3, 10), at(12, 3, 14)))
+    print(f"ravi booked back-to-back {r2.id} Rs {r2.price}")
+    r3 = s.book("meera", "KA04", TimeSlot(at(12, 5, 9), at(12, 5, 15)))
+    print(f"meera booked (weekend +20%) {r3.id} Rs {r3.price}")
+    s.pick_up(r3.id)
+    total = s.return_vehicle(r3.id, at(12, 5, 16, 20))
+    print(f"meera returned 80 min late, total Rs {total} (late fee Rs {r3.late_fee})")
+    s.cancel(r2.id)
+    show("after ravi cancels, KA03 free Thu 10:00 -&gt; 14:00?",
+         s.search(of_type(VehicleType.HATCHBACK), TimeSlot(at(12, 3, 10), at(12, 3, 14))))
+    print("8 users race for KA02 on the same slot -&gt; successful bookings:",
+          race(s, "KA02", TimeSlot(at(12, 9, 9), at(12, 9, 18)), 8))</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import unittest
+
+from car_rental import (DailyCapPricing, HourlyPricing, TimeSlot, Vehicle, VehicleType, VehicleUnavailable,
+                        WeekendSurcharge, at, seed)
+from main import race
+
+
+class CarRentalTest(unittest.TestCase):
+    a = TimeSlot(at(12, 2, 10), at(12, 2, 12))
+    swift = Vehicle("X", VehicleType.HATCHBACK, "Swift", 5, "KOR", 120, 1200)
+
+    def test_overlap_is_half_open(self):
+        self.assertFalse(self.a.overlaps(TimeSlot(at(12, 2, 12), at(12, 2, 13))))
+        self.assertTrue(self.a.overlaps(TimeSlot(at(12, 2, 11, 59), at(12, 2, 13))))
+        self.assertTrue(self.a.overlaps(TimeSlot(at(12, 2, 9), at(12, 2, 15))))
+        with self.assertRaises(ValueError):
+            TimeSlot(at(12, 2, 10), at(12, 2, 10))
+
+    def test_pricing(self):
+        self.assertEqual(DailyCapPricing().price(self.swift, TimeSlot(at(12, 2, 0), at(12, 3, 6))), 1920)
+        self.assertEqual(DailyCapPricing().price(self.swift, TimeSlot(at(12, 2, 0), at(12, 2, 20))), 1200)
+        weekend = WeekendSurcharge(HourlyPricing(), 20)
+        self.assertEqual(weekend.price(self.swift, TimeSlot(at(12, 5, 9), at(12, 5, 10))), 144)
+        self.assertEqual(weekend.price(self.swift, TimeSlot(at(12, 4, 22), at(12, 5, 0))), 240)
+
+    def test_lifecycle(self):
+        s = seed()
+        r = s.book("u", "KA01", self.a)
+        with self.assertRaises(VehicleUnavailable):
+            s.book("v", "KA01", self.a)
+        s.pick_up(r.id)
+        with self.assertRaises(RuntimeError):
+            s.cancel(r.id)
+        self.assertEqual(s.return_vehicle(r.id, at(12, 2, 11)), r.price)
+        self.assertIsNotNone(s.book("v", "KA01", self.a))
+        with self.assertRaises(KeyError):
+            s.book("u", "NOPE", self.a)
+
+    def test_exactly_one_winner(self):
+        for _ in range(20):
+            self.assertEqual(race(seed(), "KA02", self.a, 16), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+  </div>
+  <p>Run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>, or <code>python main.py</code> and <code>python -m unittest test_car_rental</code>. Java output (Python prints the same lines, with Python's date format):</p>
+<pre class="terminal"><code>search KOR, 5+ seats, Wed 10:00 -&gt; Thu 10:00:
+  KA03 Maruti Swift  Rs 1200
+  KA02 Honda City  Rs 2000
+  KA01 Mahindra XUV700  Rs 3500
+asha booked R1 KA03 2026-12-02T10:00..2026-12-03T10:00 Rs 1200 CONFIRMED
+same search after asha's booking:
+  KA02 Honda City  Rs 2000
+  KA01 Mahindra XUV700  Rs 3500
+ravi rejected: KA03 is taken by R1 (2026-12-02T10:00..2026-12-03T10:00)
+ravi booked back-to-back R2 KA03 2026-12-03T10:00..2026-12-03T14:00 Rs 480 CONFIRMED
+meera booked (weekend +20%) R3 KA04 2026-12-05T09:00..2026-12-05T15:00 Rs 2160 CONFIRMED
+meera returned 80 min late, total Rs 2880 (late fee Rs 720)
+after ravi cancels, KA03 free Thu 10:00 -&gt; 14:00?
+  KA03 Maruti Swift  Rs 480
+8 users race for KA02 on the same slot -&gt; successful bookings: 1
+All 35 checks passed</code></pre>
+  <p>Check the numbers: the Swift for 24 hours is one day, Rs 1200. Ravi's 4 hours are 4 x 120 = 480. Meera's Saturday Creta is 6 x 300 = 1800 plus 20% = 2160; she returns 80 minutes late, which bills 2 started hours = 600 plus 20% = 720.</p>

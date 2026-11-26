@@ -1,0 +1,110 @@
+
+        <h2>Step 3: a safe host and daemon</h2>
+        <div class="callout note"><p><b>Deep dive:</b> for SDE-1 you can skim Steps 3 and 4 (know "the socket is root" and "build once, deploy by digest"). Read them fully for SDE-2, platform or infra roles.</p></div>
+
+        <h3>The Docker socket is root</h3>
+        <p>The Docker daemon runs as root (unless you use rootless mode) and does whatever its API is asked. Anyone who can write to <code>/var/run/docker.sock</code>, which includes every member of the <code>docker</code> group, can ask it to start a privileged container that mounts the host's <code>/</code>. That is root on the host in one command. Mounting the socket into a container (popular for CI agents, dashboards and "Docker-in-Docker" shortcuts) hands that power to whatever runs in that container.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Escape through a mounted docker.sock">
+            <rect class="zone docker" x="20" y="30" width="230" height="200"/>
+            <text class="zone-label" x="34" y="52">CI agent container</text>
+            <rect class="box svc" x="45" y="80" width="180" height="56"/>
+            <text class="label" x="135" y="100">compromised job</text>
+            <text class="label small" x="135" y="122">has docker CLI</text>
+            <rect class="box fail" x="45" y="160" width="180" height="50"/>
+            <text class="label bad mono" x="135" y="185">/var/run/docker.sock</text>
+
+            <rect class="box docker solid" x="320" y="100" width="160" height="70"/>
+            <text class="label white" x="400" y="125">dockerd</text>
+            <text class="label white small" x="400" y="148">runs as root</text>
+
+            <rect class="zone" x="540" y="30" width="240" height="200"/>
+            <text class="zone-label" x="554" y="52">new container</text>
+            <rect class="box fail" x="565" y="80" width="190" height="56"/>
+            <text class="label bad" x="660" y="100">--privileged</text>
+            <text class="label small" x="660" y="122">-v /:/host</text>
+            <rect class="box fail" x="565" y="160" width="190" height="50"/>
+            <text class="label bad" x="660" y="185">chroot /host = host root</text>
+
+            <path class="arrow bad" d="M225 185 L316 140"/>
+            <path class="arrow bad" d="M480 135 L561 108"/>
+            <circle class="packet bad" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M225 185 L320 140 L480 135 L565 108"/></circle>
+          </svg>
+          <figcaption>A mounted socket lets any process in the container drive the root daemon, which happily starts a privileged container with the host filesystem mounted. Treat <code>docker</code> group membership and socket access exactly like <code>sudo</code>.</figcaption>
+        </figure>
+<pre class="terminal"><code>$ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock docker:29-cli \
+    docker run --rm --privileged -v /:/host alpine chroot /host id
+uid=0(root) gid=0(root) groups=0(root)</code></pre>
+        <p>This is why modern CI avoids both mounting the socket and Docker-in-Docker (which needs <code>--privileged</code>). Better options: a remote BuildKit builder, rootless BuildKit, or Buildah. (Kaniko, a former favourite, is now archived.) Never expose the daemon on TCP without mutual TLS.</p>
+
+        <h3>Rootless Docker vs a non-root container</h3>
+        <p>These two sound alike but protect different things:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th><code>USER 10001</code> in the image</th><th><code>userns-remap</code></th><th>Rootless mode</th></tr></thead>
+            <tbody>
+              <tr><td>Daemon runs as</td><td>root</td><td>root</td><td><b>your normal user</b></td></tr>
+              <tr><td>Container "root" on the host</td><td>n/a (process is UID 10001)</td><td>a high, unprivileged UID</td><td>your user's subordinate UIDs</td></tr>
+              <tr><td>Protects against</td><td>app compromise using root privileges</td><td>container escape landing as root</td><td>container escape <em>and</em> daemon compromise</td></tr>
+              <tr><td>Costs</td><td>file permissions to fix</td><td>volume ownership mapping, some features off</td><td>no ports below 1024 by default, no AppArmor, networking through slirp4netns or pasta (slower), cgroup limits need systemd delegation</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre class="terminal"><code>$ dockerd-rootless-setuptool.sh install
+[INFO] Creating /home/dev/.config/systemd/user/docker.service
+[INFO] Installed docker.service successfully.
+$ docker context use rootless
+$ docker info --format '{{.SecurityOptions}}'
+[name=seccomp,profile=builtin name=rootless name=cgroupns]</code></pre>
+        <p>Netflix's tech blog described moving its Titus container platform to user namespaces for the same reason: root inside a container should not be root on the host (see <a href="https://www.infoq.com/news/2017/07/netflix-titus" target="_blank" rel="noopener">InfoQ on Titus</a> for the platform's background).</p>
+
+        <h3>Published ports and the firewall surprise</h3>
+        <p>A networking engineer usually expects a host firewall like <code>ufw</code> or <code>firewalld</code> to block a port. With Docker it does not. <code>-p 8080:80</code> adds a DNAT rule in the <code>nat</code> table's PREROUTING path. The packet's destination is rewritten to the container's IP <em>before</em> the filter INPUT chain (where ufw lives) is consulted, so it is <em>forwarded</em>, not delivered locally, and INPUT never sees it.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Packet to a published port skips the INPUT chain where ufw lives">
+            <rect class="box client" x="20" y="110" width="120" height="56"/>
+            <text class="label" x="80" y="130">internet</text>
+            <text class="label small" x="80" y="150">dst :8080</text>
+            <rect class="box queue" x="180" y="110" width="150" height="56"/>
+            <text class="label" x="255" y="130">PREROUTING</text>
+            <text class="label small" x="255" y="150">DNAT to 172.17.0.2:80</text>
+            <rect class="box ghost" x="380" y="20" width="160" height="56"/>
+            <text class="label muted" x="460" y="40">INPUT (ufw)</text>
+            <text class="label small" x="460" y="60">never reached</text>
+            <rect class="box k8s" x="380" y="110" width="160" height="56"/>
+            <text class="label" x="460" y="130">FORWARD</text>
+            <text class="label small" x="460" y="150">DOCKER-USER first</text>
+            <rect class="box svc solid" x="600" y="110" width="180" height="56"/>
+            <text class="label white" x="690" y="130">container :80</text>
+            <text class="label white small" x="690" y="150">via docker0 + veth</text>
+            <path class="arrow" d="M140 138 L176 138"/>
+            <path class="arrow" d="M330 138 L376 138"/>
+            <path class="arrow" d="M540 138 L596 138"/>
+            <path class="arrow dashed bad" d="M300 110 L380 60"/>
+            <text class="label small" x="460" y="200">Put your own drop rules in the DOCKER-USER chain,</text>
+            <text class="label small" x="460" y="222">or publish on 127.0.0.1 only: -p 127.0.0.1:8080:80</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M140 138 L600 138"/></circle>
+          </svg>
+          <figcaption>The packet path for a published port. Filter it where it actually goes: the <code>DOCKER-USER</code> chain is evaluated before Docker's own forwarding rules.</figcaption>
+        </figure>
+<pre><code class="language-bash"># Allow 8080 only from the office range; drop everything else arriving on eth0 for containers.
+sudo iptables -I DOCKER-USER -i eth0 ! -s 203.0.113.0/24 -j DROP
+sudo iptables -L DOCKER-USER -n --line-numbers</code></pre>
+<pre class="terminal"><code>Chain DOCKER-USER (1 references)
+num  target     prot opt source               destination
+1    DROP       all  --  !203.0.113.0/24      0.0.0.0/0
+2    RETURN     all  --  0.0.0.0/0            0.0.0.0/0</code></pre>
+        <p><b>One trap with DOCKER-USER:</b> packets reach this chain <i>after</i> DNAT, so the destination is already <code>container-IP:80</code>. A rule with <code>--dport 8080</code> (the published host port) never matches. To match the original host port use conntrack: <code>-m conntrack --ctorigdstport 8080 --ctdir ORIGINAL</code> (and <code>--ctorigdst</code> for the original host IP). Filtering on the <i>source</i>, as above, is safe because DNAT does not change it.</p>
+        <p>The full packet walk is on <a href="{{BASE}}devops/docker-05">Docker Networking</a>. (Docker 29 also offers an experimental nftables backend, set with <code>"firewall-backend": "nftables"</code> in daemon.json; iptables remains the default.)</p>
+
+        <h3>Patch the runtime, not only the image</h3>
+        <p>Image scanning finds bugs in your packages. It does not find bugs in <b>runc</b>, <b>containerd</b>, <b>BuildKit</b> or the <b>kernel</b> on the host, and those are what container escapes use. In January 2024 the "Leaky Vessels" set (CVE-2024-21626 in runc plus three BuildKit CVEs) let a malicious image or Dockerfile reach the host; fixes shipped in runc 1.1.12, containerd 1.6.28, BuildKit 0.12.5 and Docker 25.0.2. In 2019, CVE-2019-5736 let a container overwrite the host's runc binary. A production platform needs host patching on a schedule, the same way you patch router software for PSIRT advisories. Run <a href="https://github.com/docker/docker-bench-security" target="_blank" rel="noopener">docker-bench-security</a> to check a host against the CIS Docker Benchmark.</p>
+<pre class="terminal"><code>$ runc --version
+runc version 1.5.3
+commit: ...
+spec: 1.3.0
+$ docker version --format '{{.Server.Version}}'
+29.10.0</code></pre>
+      

@@ -1,0 +1,139 @@
+
+        <h2>CDC with Debezium, and the outbox pattern</h2>
+        <p>Where should data enter Kafka? There are three common doors:</p>
+        <ul>
+          <li><strong>The app produces directly.</strong> The service calls <code>producer.send()</code>. Simple, but see the "dual write" trap below.</li>
+          <li><strong>A log shipper</strong> (Fluent Bit, Vector, Filebeat) tails log files and sends lines to Kafka. Good for logs and metrics.</li>
+          <li><strong>CDC from the database.</strong> A connector reads the database's own transaction log and publishes every committed change. Good whenever the database is the source of truth.</li>
+        </ul>
+
+        <h3>The dual-write problem, in simple words</h3>
+        <p>An order service must do two things: save the order in Postgres, and tell the world with an <code>OrderPlaced</code> event on Kafka. Those are two different systems. There is no single "commit" that covers both. Whatever order you do them in, a crash in the middle leaves them disagreeing. Step through it:</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 320" role="img" aria-label="Dual write failure, then the outbox fix">
+            <rect class="box svc" x="20" y="120" width="150" height="60"/><text class="label" x="95" y="155">Order service</text>
+            <rect class="box db" x="300" y="40" width="160" height="60"/><text class="label" x="380" y="75">Postgres</text>
+            <rect class="box kafka" x="300" y="210" width="160" height="60"/><text class="label" x="380" y="245">Kafka</text>
+
+            <!-- step 1: write order first, DB commits -->
+            <g data-step-only="1">
+              <path class="arrow ok" d="M170 135 L298 75"/>
+              <text class="label small ok" x="200" y="88">1. INSERT + COMMIT</text>
+              <rect class="box plain" x="500" y="45" width="260" height="50"/>
+              <text class="label small ok" x="630" y="68">DB: order 42 saved</text>
+              <text class="label small" x="630" y="86">so far so good</text>
+            </g>
+            <!-- step 2: same write, then crash before publish -->
+            <g data-step-only="2">
+              <path class="arrow ok" d="M170 135 L298 75"/>
+              <text class="label small ok" x="200" y="88">1. INSERT + COMMIT</text>
+              <rect class="box plain" x="500" y="45" width="260" height="50"/>
+              <text class="label small ok" x="630" y="76">DB: order 42 saved</text>
+              <path class="arrow bad dashed" d="M170 165 L298 235"/>
+              <text class="label big bad" x="225" y="205">X CRASH</text>
+              <rect class="box fail" x="500" y="215" width="260" height="50"/>
+              <text class="label small bad" x="630" y="237">Kafka: event never sent</text>
+              <text class="label small" x="630" y="255">payment never starts</text>
+            </g>
+            <!-- step 3: publish first, then the DB commit fails -->
+            <g data-step-only="3">
+              <path class="arrow ok" d="M170 165 L298 235"/>
+              <text class="label small ok" x="190" y="232">1. publish event</text>
+              <path class="arrow bad dashed" d="M170 135 L298 75"/>
+              <text class="label small bad" x="185" y="88">X 2. COMMIT fails</text>
+              <rect class="box fail" x="500" y="45" width="260" height="50"/>
+              <text class="label small bad" x="630" y="68">DB: rolled back</text>
+              <text class="label small" x="630" y="86">order 42 does not exist</text>
+              <rect class="box fail" x="500" y="215" width="260" height="50"/>
+              <text class="label small bad" x="630" y="237">Kafka: OrderPlaced is out</text>
+              <text class="label small" x="630" y="255">ghost order downstream</text>
+            </g>
+            <g data-step="4">
+              <rect class="box db hot" x="520" y="40" width="250" height="60"/>
+              <text class="label" x="645" y="65">orders + outbox rows</text>
+              <text class="label small" x="645" y="88">in ONE transaction</text>
+              <path class="arrow ok" d="M460 70 L518 70"/>
+            </g>
+            <g data-step="5">
+              <rect class="box docker" x="560" y="140" width="200" height="50"/>
+              <text class="label" x="660" y="170">Debezium tails WAL</text>
+              <path class="arrow" d="M645 100 L655 138"/>
+              <path class="arrow kafka" d="M560 180 L462 230"/>
+              <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M645 100 L660 165 L460 240"/></circle>
+            </g>
+            <g data-step-only="6">
+              <rect class="box svc highlight" x="20" y="10" width="250" height="56"/>
+              <text class="label" x="145" y="32">Either both happen</text>
+              <text class="label small" x="145" y="54">or neither. Relay is at-least-once.</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Write 1 succeeds.</b> The service inserts the order and the database commits.</li>
+            <li><b>Crash before write 2.</b> The process dies (deploy, OOM, network blip) before it publishes. The order exists, but no one downstream ever hears about it. Payment never starts.</li>
+            <li><b>Swap the order? Still broken.</b> Publish first, then commit: now the event is out, but the database transaction can still fail or roll back. Consumers act on an order that does not exist.</li>
+            <li><b>Outbox fix.</b> In the <em>same</em> database transaction, insert the order row <em>and</em> a row into an <code>outbox</code> table that describes the event. One commit, so both exist or neither does.</li>
+            <li><b>Relay.</b> Debezium reads the committed outbox rows from the write-ahead log and publishes them to Kafka. If it crashes, it resumes from its stored log position.</li>
+            <li><b>Result.</b> The database and the event stream can no longer disagree. The relay may publish an event twice after a crash, so consumers must still be idempotent (dedupe by event id).</li>
+          </ol>
+        </div>
+
+        <div class="eli5">
+          <h4>Explain like I'm 5</h4>
+          <p>The outbox is like writing in your diary "I broke the vase" and, at the very same moment, putting a sticky note on the same page that says "tell Mom". You cannot do one without the other, because it is the same page. Later a helper reads the sticky notes and tells Mom. Even if you fall asleep, the note is still there.</p>
+        </div>
+
+        <h3>How Debezium reads the database</h3>
+        <p>Every serious database already writes a log of every change, so it can recover after a crash and feed replicas: MySQL has the <strong>binlog</strong>, Postgres has the <strong>WAL</strong> (write-ahead log), MongoDB has change streams, SQL Server has CDC tables. Debezium connects as if it were a replica and reads that log. For Postgres it uses a <em>logical replication slot</em> with the built-in <code>pgoutput</code> plug-in. On first start it takes a <strong>snapshot</strong> of the existing rows, then switches to streaming new changes.</p>
+        <p>Because it reads the log, Debezium sees <em>committed</em> changes in commit order, it adds almost no load on the tables, and nobody has to change the application. That is why CDC is the favourite answer to "how do I get the data from my service's DB into search, cache and the lake".</p>
+
+<pre><code class="language-json">{
+  "name": "shop-pg-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/secrets/pg.properties:password}",
+    "database.dbname": "shop",
+    "topic.prefix": "shop",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_shop",
+    "table.include.list": "public.orders,public.customers",
+    "tasks.max": "1"
+  }
+}</code></pre>
+        <p>Records for table <code>public.orders</code> land in topic <code>shop.public.orders</code> (prefix, schema, table), keyed by the primary key. Keying by primary key means all changes to one row go to one partition, so they stay in order. Each change event looks like this (simplified):</p>
+<pre><code class="language-json">{
+  "before": { "id": 42, "status": "PLACED", "amount": 499 },
+  "after":  { "id": 42, "status": "PAID",   "amount": 499 },
+  "op": "u",
+  "ts_ms": 1795400000000,
+  "source": { "db": "shop", "table": "orders", "lsn": 23983712, "txId": 771 }
+}</code></pre>
+        <p><code>op</code> is <code>c</code> (create), <code>u</code> (update), <code>d</code> (delete) or <code>r</code> (read during the snapshot). A delete is followed by a <em>tombstone</em> (same key, null value), so a <a href="{{BASE}}devops/kafka-07">compacted topic</a> eventually forgets the row, exactly like a table.</p>
+
+        <h3>Outbox with Debezium's Event Router</h3>
+        <p>Streaming raw table changes leaks your internal table design to every consumer. If you rename a column, everyone breaks. The outbox pattern fixes this too: the outbox row is a <em>deliberate public event</em>. Debezium ships a transform for it:</p>
+<pre><code class="language-sql">-- Same transaction as the business write
+BEGIN;
+INSERT INTO orders (id, customer_id, amount, status) VALUES (42, 7, 499, 'PLACED');
+INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload)
+VALUES (gen_random_uuid(), 'order', '42', 'OrderPlaced',
+        '{"orderId":42,"customerId":7,"amount":499}');
+COMMIT;</code></pre>
+<pre><code class="language-json">"table.include.list": "public.outbox",
+"transforms": "outbox",
+"transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+"transforms.outbox.route.by.field": "aggregatetype",
+"transforms.outbox.table.field.event.key": "aggregateid"</code></pre>
+        <p>The router reads each outbox row, picks the topic from <code>aggregatetype</code> (by default the topic becomes <code>outbox.event.order</code>), uses <code>aggregateid</code> as the key so all events of order 42 stay ordered, and sends only the <code>payload</code> as the value. You can delete outbox rows after they are captured; the WAL already has them.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Debezium is like a <b>SPAN / mirror port on the database's journal</b>. The database keeps forwarding as usual; a copy of every committed change flows out to an analyzer without the main path noticing. Or, closer to routing: it is a BGP Monitoring Protocol (BMP) feed of the RIB. You do not poll the table, you get every update as it is committed.</p>
+          <p><b>Where the analogy breaks:</b> a mirror port drops copies when it is congested. A replication slot never drops: Postgres <em>keeps</em> WAL until Debezium confirms it. If the connector stops for days, WAL piles up and can fill the database disk. Monitor slot lag.</p>
+        </div>
+
+        <div class="callout interview"><p>When an interviewer draws "service writes to DB, then publishes to Kafka", say: "That is a dual write; a crash between them loses or invents events. I would use the transactional outbox with CDC (Debezium) as the relay, and make consumers idempotent because the relay is at-least-once." This one sentence comes up in almost every order, payment and booking design at Amazon, Flipkart and Swiggy style rounds.</p></div>
+      

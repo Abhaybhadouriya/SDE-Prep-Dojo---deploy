@@ -1,0 +1,51 @@
+
+        <h2>Polyglot persistence: keeping many stores in sync</h2>
+        <p><b>Polyglot persistence</b> means using several data stores in one system, each for what it does best. Netflix is the cleanest public example: MySQL for billing, Cassandra as the default for user data and viewing history, EVCache (on Memcached) for caching the homepage, Atlas for metrics, Druid and Redshift for analytics, and S3 for almost all files.</p>
+        <p>The hard part is not picking stores; it is keeping them consistent. Never "dual write" from the app (write Postgres, then write Elasticsearch): if the second write fails, the copies silently diverge. Instead write once to the source of truth and stream its changes out.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 300" role="img" aria-label="Source of truth database streaming changes through Kafka to derived stores">
+            <rect class="box client" x="20" y="120" width="110" height="50"/><text class="label" x="75" y="150">App</text>
+            <rect class="box db" x="180" y="120" width="140" height="50"/><text class="label" x="250" y="142">Postgres</text><text class="label small" x="250" y="160">source of truth</text>
+            <rect class="box svc" x="360" y="120" width="110" height="50"/><text class="label small" x="415" y="142">CDC reads</text><text class="label small" x="415" y="160">the WAL</text>
+            <rect class="box kafka" x="510" y="120" width="110" height="50"/><text class="label" x="565" y="150">Kafka</text>
+            <rect class="box hot" x="670" y="30" width="130" height="44"/><text class="label small" x="735" y="56">Elasticsearch</text>
+            <rect class="box cache" x="670" y="123" width="130" height="44"/><text class="label small" x="735" y="149">Redis cache</text>
+            <rect class="box queue" x="670" y="216" width="130" height="44"/><text class="label small" x="735" y="242">ClickHouse</text>
+            <rect class="box docker" x="180" y="230" width="140" height="44"/><text class="label small" x="250" y="256">S3 (bytes)</text>
+            <path class="arrow" d="M130 145 L176 145"/>
+            <path class="arrow" d="M320 145 L356 145"/>
+            <path class="arrow" d="M470 145 L506 145"/>
+            <path class="arrow" d="M620 135 L666 56"/>
+            <path class="arrow" d="M620 145 L666 145"/>
+            <path class="arrow" d="M620 155 L666 238"/>
+            <path class="arrow" d="M75 170 L75 252 L176 252"/>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M130 145 L320 145 L470 145 L620 145 L666 56"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="4s" begin="1.3s" repeatCount="indefinite" path="M130 145 L320 145 L470 145 L620 145 L666 145"/></circle>
+            <circle class="packet gold" r="6"><animateMotion dur="4s" begin="2.6s" repeatCount="indefinite" path="M130 145 L320 145 L470 145 L620 145 L666 238"/></circle>
+            <circle class="packet docker" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M75 170 L75 252 L176 252"/></circle>
+            <text class="label small" x="415" y="210">one write, many derived copies</text>
+          </svg>
+          <figcaption>The app writes once. Change data capture (for example Debezium reading the Postgres WAL) publishes every change to Kafka; each derived store has its own consumer and can be rebuilt by replaying.</figcaption>
+        </figure>
+        <p>This is the transactional outbox and CDC story from <a href="{{BASE}}hld/hld-10">hld-10</a>, and the full pipeline is designed in <a href="{{BASE}}hld/d28">d28 CDC Pipeline</a>. Flipkart's AESOP change-propagation system and DynamoDB Streams are real examples of the same idea. The Kafka side (Connect, Debezium) is in <a href="{{BASE}}devops/kafka-09">Kafka Connect &amp; Streams</a>.</p>
+
+        <h3>Running stateful stores on Kubernetes</h3>
+        <p>Databases need stable names and their own disks, which is what a <b>StatefulSet</b> gives: pods <code>cassandra-0</code>, <code>cassandra-1</code> keep their identity and their PersistentVolumeClaim across restarts (<a href="{{BASE}}devops/k8s-10">StatefulSets &amp; Operators</a>, <a href="{{BASE}}devops/k8s-08">K8s Storage</a>). In practice teams run Postgres, Cassandra and Kafka through operators (CloudNativePG, K8ssandra, Strimzi) or pick a managed service. In an interview, "managed RDS / DynamoDB unless we have a reason" is a fine answer; for local development, one <a href="{{BASE}}devops/docker-07">Docker Compose</a> file with Postgres, Redis and Kafka mirrors the stack.</p>
+
+        <h3>Trade-off table: consistency, scale, cost</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Store</th><th>Consistency</th><th>Scale-out writes</th><th>Query power</th><th>Typical failure to mention</th></tr></thead>
+            <tbody>
+              <tr><td>Postgres / MySQL</td><td>Strong (single primary)</td><td>Hard: shard manually</td><td>Highest (SQL, joins)</td><td>Primary saturates; replica lag</td></tr>
+              <tr><td>Redis</td><td>Async replicas; RDB default loses minutes, ~1 s with AOF everysec</td><td>Hash slots</td><td>By key + data structure ops</td><td>Hot key; memory full; failover data loss</td></tr>
+              <tr><td>Cassandra</td><td>Tunable per request</td><td>Linear, leaderless</td><td>Partition + clustering key only</td><td>Hot partition; tombstones; compaction debt</td></tr>
+              <tr><td>DynamoDB</td><td>Eventual or strong per read</td><td>Automatic partitions</td><td>Key + GSIs</td><td>Partition throttling at 1,000 WCU</td></tr>
+              <tr><td>MongoDB</td><td>Strong on primary</td><td>Shard key</td><td>Rich document queries</td><td>Bad shard key; giant documents</td></tr>
+              <tr><td>Elasticsearch</td><td>Near real time (~1 s)</td><td>Shards (fixed at create)</td><td>Full-text, aggregations</td><td>Drift from source; mapping explosion</td></tr>
+              <tr><td>S3</td><td>Strong read-after-write</td><td>Practically unlimited</td><td>Get by key, list by prefix</td><td>Latency per request; cost of many tiny objects</td></tr>
+              <tr><td>ClickHouse</td><td>Eventual across replicas</td><td>Shards</td><td>Analytics SQL</td><td>Too many small parts</td></tr>
+            </tbody>
+          </table>
+        </div>
+      

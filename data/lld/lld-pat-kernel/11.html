@@ -1,0 +1,561 @@
+
+  <h2>Code: the same five patterns in four languages</h2>
+  <p>One small program, written four ways: ops tables with a NULL op, a notifier chain with priorities, a netfilter-style hook chain, and a work item that holds a reference while the driver drops its own, so the last put happens in the worker. The C tab is kernel-shaped user-space code (not real kernel code) so you can compare it line by line with the language features that replace each trick. All four were compiled and run; files in <code>lld-code/lld-pat-kernel/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>KernelPatterns.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Strategy / Bridge (ops table)</td><td><code>NetDeviceOps</code></td><td>10-14</td><td>a struct of function pointers</td></tr>
+    <tr><td>Object using the ops</td><td><code>NetDevice</code></td><td>16-27</td><td>calls dev.ops.xmit()</td></tr>
+    <tr><td>Observer (notifier chain)</td><td><code>Notifier</code></td><td>41-41</td><td>priority-sorted callbacks</td></tr>
+    <tr><td>Chain of handlers (netfilter)</td><td><code>Hook</code></td><td>49-49</td><td>any hook can drop</td></tr>
+    <tr><td>Client</td><td><code>main</code></td><td>56-91</td><td>registers and fires</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.function.*;
+
+// Kernel patterns mapped to Java: interface = ops table, listeners = notifier chain,
+// handler list = netfilter hooks, Runnable on an executor = work_struct on a workqueue,
+// explicit retain/release = kref (Java has GC, but external resources still need it).
+public class KernelPatterns {
+
+    interface NetDeviceOps {                                   // the ops table
+        void open(NetDevice d);
+        void xmit(NetDevice d, String pkt);
+        default boolean setMtu(NetDevice d, int mtu) { return false; }   // "NULL op" as a default method
+    }
+
+    static final class NetDevice {
+        final String name; final NetDeviceOps ops; int mtu = 1500;
+        private int refcount = 1;                              // kref-style
+        private final Consumer&lt;NetDevice&gt; release;
+        NetDevice(String name, NetDeviceOps ops, Consumer&lt;NetDevice&gt; release) { this.name = name; this.ops = ops; this.release = release; }
+        synchronized void get() { refcount++; }
+        void put() {
+            boolean last;
+            synchronized (this) { last = --refcount == 0; }
+            if (last) release.accept(this);                    // last put calls release
+        }
+    }
+
+    static final NetDeviceOps LOOPBACK = new NetDeviceOps() {
+        public void open(NetDevice d) { System.out.println("  lo: loopback up"); }
+        public void xmit(NetDevice d, String p) { System.out.println("  lo: looped '" + p + "'"); }
+    };
+    static final NetDeviceOps E1000 = new NetDeviceOps() {
+        public void open(NetDevice d) { System.out.println("  eth0: link up, rings allocated"); }
+        public void xmit(NetDevice d, String p) { System.out.println("  eth0: DMA '" + p + "'"); }
+        public boolean setMtu(NetDevice d, int mtu) { d.mtu = mtu; return true; }
+    };
+
+    enum Event { UP, DOWN }
+    // Observer with priority and a "stop" result, like notifier_block
+    record Notifier(int priority, BiFunction&lt;Event, NetDevice, Boolean&gt; call) { }
+    static final List&lt;Notifier&gt; chain = new ArrayList&lt;&gt;();
+    static void register(Notifier n) { chain.add(n); chain.sort((a, b) -&gt; b.priority() - a.priority()); }
+    static void callChain(Event e, NetDevice d) {
+        for (Notifier n : chain) if (n.call().apply(e, d)) { System.out.println("  (chain stopped)"); return; }
+    }
+
+    // Chain of Responsibility, like netfilter hooks
+    record Hook(String name, IntPredicate accept) { }
+    static boolean runHooks(List&lt;Hook&gt; hooks, int dport) {
+        // &lt;-- the pattern: a chain of handlers; any one can end the walk
+        for (Hook h : hooks) if (!h.accept().test(dport)) { System.out.println("    dropped by " + h.name()); return false; }
+        return true;
+    }
+
+    public static void main(String[] args) throws Exception {
+        Consumer&lt;NetDevice&gt; free = d -&gt; System.out.println("  release(" + d.name + "): last reference dropped");
+        NetDevice lo = new NetDevice("lo", LOOPBACK, free), eth = new NetDevice("eth0", E1000, free);
+
+        System.out.println("1) ops tables:");
+        for (NetDevice d : List.of(lo, eth)) { d.ops.open(d); d.ops.xmit(d, "ping"); }
+        System.out.println("  setMtu(lo)=" + lo.ops.setMtu(lo, 9000) + " setMtu(eth0)=" + eth.ops.setMtu(eth, 9000) + " -&gt; " + eth.mtu);
+
+        System.out.println("2) notifier chain:");
+        register(new Notifier(0, (e, d) -&gt; { System.out.println("  bonding: saw " + e + " for " + d.name); return false; }));
+        register(new Notifier(10, (e, d) -&gt; { System.out.println("  routing: " + d.name + " " + e); return false; }));
+        register(new Notifier(20, (e, d) -&gt; { boolean stop = d.name.equals("lo");
+            System.out.println("  firewall: " + d.name + (stop ? " is loopback, stop" : " ok")); return stop; }));
+        callChain(Event.UP, eth);
+        callChain(Event.UP, lo);
+
+        System.out.println("3) hooks:");
+        List&lt;Hook&gt; hooks = List.of(new Hook("conntrack", p -&gt; true), new Hook("filter", p -&gt; p != 23),
+                new Hook("nat", p -&gt; { System.out.println("    nat saw port " + p); return true; }));
+        for (int p : new int[]{443, 23}) System.out.println("  port " + p + " -&gt; " + (runHooks(hooks, p) ? "ACCEPT" : "DROP"));
+
+        System.out.println("4) work queue (Command) + refcount:");
+        ExecutorService workqueue = Executors.newSingleThreadExecutor();
+        CountDownLatch driverDone = new CountDownLatch(1);
+        eth.get();                                             // the work item holds a reference
+        workqueue.submit(() -&gt; {
+            try { driverDone.await(); } catch (InterruptedException ignored) { }
+            System.out.println("  worker: linkwatch for " + eth.name);
+            eth.put();                                         // last put runs release
+        });
+        System.out.println("  driver drops its reference");
+        eth.put();                                             // not freed: the work still holds one
+        driverDone.countDown();
+        workqueue.shutdown();
+        workqueue.awaitTermination(1, TimeUnit.SECONDS);
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out KernelPatterns.java &amp;&amp; java -cp out KernelPatterns
+1) ops tables:
+  lo: loopback up
+  lo: looped 'ping'
+  eth0: link up, rings allocated
+  eth0: DMA 'ping'
+  setMtu(lo)=false setMtu(eth0)=true -&gt; 9000
+2) notifier chain:
+  firewall: eth0 ok
+  routing: eth0 UP
+  bonding: saw UP for eth0
+  firewall: lo is loopback, stop
+  (chain stopped)
+3) hooks:
+    nat saw port 443
+  port 443 -&gt; ACCEPT
+    dropped by filter
+  port 23 -&gt; DROP
+4) work queue (Command) + refcount:
+  driver drops its reference
+  worker: linkwatch for eth0
+  release(eth0): last reference dropped</code></pre>
+      <p>The Java chain has a third observer at priority 20 that returns "stop" for the loopback device, so for <code>lo</code> routing and bonding are never told: that is <code>NOTIFY_STOP</code>. The default <code>setMtu</code> method plays the role of a NULL op.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Kernel patterns in Python: protocol class = ops table, callbacks = notifier chain,
+handler list = netfilter hooks, queue of callables = workqueue, explicit refcount = kref."""
+import queue
+import threading
+
+
+class NetDeviceOps:                       # the ops table; methods left as defaults are "NULL ops"
+    def open(self, dev): raise NotImplementedError
+    def xmit(self, dev, pkt): raise NotImplementedError
+    def set_mtu(self, dev, mtu): return False
+
+
+class LoopbackOps(NetDeviceOps):
+    def open(self, dev): print("  lo: loopback up")
+    def xmit(self, dev, pkt): print(f"  lo: looped '{pkt}'")
+
+
+class E1000Ops(NetDeviceOps):
+    def open(self, dev): print("  eth0: link up, rings allocated")
+    def xmit(self, dev, pkt): print(f"  eth0: DMA '{pkt}'")
+
+    def set_mtu(self, dev, mtu):
+        dev.mtu = mtu
+        return True
+
+
+class NetDevice:
+    def __init__(self, name, ops, release):
+        self.name, self.ops, self.mtu = name, ops, 1500
+        self._ref, self._lock, self._release = 1, threading.Lock(), release
+
+    def get(self):
+        with self._lock:
+            self._ref += 1
+
+    def put(self):
+        with self._lock:
+            self._ref -= 1
+            last = self._ref == 0
+        if last:
+            self._release(self)           # last put calls release
+
+
+chain = []                                # (priority, callback); callback returns True to stop
+
+
+def register(priority, cb):
+    chain.append((priority, cb))
+    chain.sort(key=lambda t: -t[0])
+
+
+def call_chain(event, dev):
+    for _, cb in chain:
+        if cb(event, dev):
+            print("  (chain stopped)")
+            return
+
+
+def run_hooks(hooks, dport):              # Chain of Responsibility
+    for name, accept in hooks:
+        if not accept(dport):
+            print(f"    dropped by {name}")
+            return False
+    return True
+
+
+if __name__ == "__main__":
+    free = lambda d: print(f"  release({d.name}): last reference dropped")
+    lo, eth = NetDevice("lo", LoopbackOps(), free), NetDevice("eth0", E1000Ops(), free)
+
+    print("1) ops tables:")
+    for d in (lo, eth):
+        d.ops.open(d)
+        d.ops.xmit(d, "ping")
+    print(f"  set_mtu(lo)={lo.ops.set_mtu(lo, 9000)} set_mtu(eth0)={eth.ops.set_mtu(eth, 9000)} -&gt; {eth.mtu}")
+
+    print("2) notifier chain:")
+    register(0, lambda e, d: print(f"  bonding: saw {e} for {d.name}") or False)
+    register(10, lambda e, d: print(f"  routing: {d.name} {e}") or False)
+    call_chain("UP", eth)
+
+    print("3) hooks:")
+    hooks = [("conntrack", lambda p: True), ("filter", lambda p: p != 23),
+             ("nat", lambda p: print(f"    nat saw port {p}") or True)]
+    for p in (443, 23):
+        print(f"  port {p} -&gt; {'ACCEPT' if run_hooks(hooks, p) else 'DROP'}")
+
+    print("4) work queue (Command) + refcount:")
+    wq = queue.Queue()
+    eth.get()                             # the queued work holds a reference
+
+    def linkwatch():
+        print(f"  worker: linkwatch for {eth.name}")
+        eth.put()
+
+    wq.put(linkwatch)
+    print("  driver drops its reference")
+    eth.put()                             # not freed yet
+    while not wq.empty():
+        wq.get()()                        # the command runs later; last put here</code></pre>
+<pre class="terminal"><code>$ python kpatterns.py
+1) ops tables:
+  lo: loopback up
+  lo: looped 'ping'
+  eth0: link up, rings allocated
+  eth0: DMA 'ping'
+  set_mtu(lo)=False set_mtu(eth0)=True -&gt; 9000
+2) notifier chain:
+  routing: eth0 UP
+  bonding: saw UP for eth0
+3) hooks:
+    nat saw port 443
+  port 443 -&gt; ACCEPT
+    dropped by filter
+  port 23 -&gt; DROP
+4) work queue (Command) + refcount:
+  driver drops its reference
+  worker: linkwatch for eth0
+  release(eth0): last reference dropped</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// The same kernel patterns written with C++14 language features: virtual functions
+// instead of ops tables, inheritance instead of embedding, shared_ptr instead of kref,
+// std::function lists for the notifier chain and hooks, a queue of commands.
+// Build: g++ -std=c++14 -Wall kpatterns.cpp -o kpatterns_cpp
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+class NetDevice {                                     // abstract base = the ops table
+public:
+    explicit NetDevice(std::string n) : name(std::move(n)) {}
+    virtual ~NetDevice() { std::cout &lt;&lt; "  ~" &lt;&lt; name &lt;&lt; ": last owner gone, freed\n"; }
+    virtual void open() = 0;
+    virtual void xmit(const std::string&amp; pkt) = 0;
+    virtual bool setMtu(int) { return false; }        // default instead of a NULL pointer
+    std::string name;
+    int mtu = 1500;
+};
+
+class Loopback : public NetDevice {
+public:
+    Loopback() : NetDevice("lo") {}
+    void open() override { std::cout &lt;&lt; "  lo: loopback up\n"; }
+    void xmit(const std::string&amp; p) override { std::cout &lt;&lt; "  lo: looped '" &lt;&lt; p &lt;&lt; "'\n"; }
+};
+
+class E1000 : public NetDevice {                      // "embedding" becomes inheritance
+    int txRingUsed_ = 0;
+public:
+    E1000() : NetDevice("eth0") {}
+    void open() override { std::cout &lt;&lt; "  eth0: link up, rings allocated\n"; }
+    void xmit(const std::string&amp; p) override {
+        ++txRingUsed_;                                // no container_of needed: 'this' is the adapter
+        std::cout &lt;&lt; "  eth0: DMA '" &lt;&lt; p &lt;&lt; "' (tx ring used=" &lt;&lt; txRingUsed_ &lt;&lt; ")\n";
+    }
+    bool setMtu(int m) override { mtu = m; return true; }
+};
+
+enum Event { UP = 1, DOWN = 2 };
+using Notifier = std::function&lt;bool(Event, NetDevice&amp;)&gt;;   // return true = stop the chain
+
+class NotifierChain {                                 // Observer, ordered by priority
+    std::multimap&lt;int, Notifier, std::greater&lt;int&gt;&gt; chain_;
+public:
+    void add(int prio, Notifier n) { chain_.emplace(prio, std::move(n)); }
+    void call(Event e, NetDevice&amp; d) {
+        for (auto&amp; kv : chain_) if (kv.second(e, d)) { std::cout &lt;&lt; "  (chain stopped)\n"; return; }
+    }
+};
+
+struct Hook { std::string name; std::function&lt;bool(int)&gt; accept; };   // Chain of Responsibility
+bool runHooks(const std::vector&lt;Hook&gt;&amp; hooks, int dport) {
+    for (auto&amp; h : hooks) if (!h.accept(dport)) { std::cout &lt;&lt; "    dropped by " &lt;&lt; h.name &lt;&lt; "\n"; return false; }
+    return true;
+}
+
+int main() {
+    std::cout &lt;&lt; "1) virtual functions = ops tables:\n";
+    std::vector&lt;std::shared_ptr&lt;NetDevice&gt;&gt; devs = {std::make_shared&lt;Loopback&gt;(), std::make_shared&lt;E1000&gt;()};
+    for (auto&amp; d : devs) { d-&gt;open(); d-&gt;xmit("ping"); }
+    std::cout &lt;&lt; "  setMtu(lo)=" &lt;&lt; devs[0]-&gt;setMtu(9000) &lt;&lt; " setMtu(eth0)=" &lt;&lt; devs[1]-&gt;setMtu(9000) &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "2) notifier chain:\n";
+    NotifierChain chain;
+    chain.add(0, [](Event e, NetDevice&amp; d) { std::cout &lt;&lt; "  bonding: saw event " &lt;&lt; e &lt;&lt; " for " &lt;&lt; d.name &lt;&lt; "\n"; return false; });
+    chain.add(10, [](Event e, NetDevice&amp; d) { std::cout &lt;&lt; "  routing: " &lt;&lt; d.name &lt;&lt; (e == UP ? " UP" : " DOWN") &lt;&lt; "\n"; return false; });
+    chain.call(UP, *devs[1]);
+
+    std::cout &lt;&lt; "3) hooks:\n";
+    std::vector&lt;Hook&gt; hooks = {{"conntrack", [](int) { return true; }},
+                               {"filter", [](int p) { return p != 23; }},
+                               {"nat", [](int p) { std::cout &lt;&lt; "    nat saw port " &lt;&lt; p &lt;&lt; "\n"; return true; }}};
+    for (int p : {443, 23}) std::cout &lt;&lt; "  port " &lt;&lt; p &lt;&lt; " -&gt; " &lt;&lt; (runHooks(hooks, p) ? "ACCEPT" : "DROP") &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "4) command queue + shared ownership (shared_ptr as kref):\n";
+    std::deque&lt;std::function&lt;void()&gt;&gt; workqueue;
+    std::shared_ptr&lt;NetDevice&gt; eth = devs[1];                           // the work item will hold this
+    workqueue.push_back([eth] { std::cout &lt;&lt; "  worker: linkwatch for " &lt;&lt; eth-&gt;name &lt;&lt; "\n"; });
+    eth.reset();
+    devs.pop_back();                                                    // driver drops its reference
+    std::cout &lt;&lt; "  driver dropped eth0; queued work still owns it\n";
+    while (!workqueue.empty()) { workqueue.front()(); workqueue.pop_front(); }   // lambda destroyed -&gt; last owner
+    std::cout &lt;&lt; "  queue drained\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall kpatterns.cpp -o kpatterns_cpp &amp;&amp; ./kpatterns_cpp
+1) virtual functions = ops tables:
+  lo: loopback up
+  lo: looped 'ping'
+  eth0: link up, rings allocated
+  eth0: DMA 'ping' (tx ring used=1)
+  setMtu(lo)=0 setMtu(eth0)=1
+2) notifier chain:
+  routing: eth0 UP
+  bonding: saw event 1 for eth0
+3) hooks:
+    nat saw port 443
+  port 443 -&gt; ACCEPT
+    dropped by filter
+  port 23 -&gt; DROP
+4) command queue + shared ownership (shared_ptr as kref):
+  driver dropped eth0; queued work still owns it
+  worker: linkwatch for eth0
+  ~eth0: last owner gone, freed
+  queue drained
+  ~lo: last owner gone, freed</code></pre>
+      <p>Here every hand-written trick has a language feature: virtual functions for ops tables, a base-class default for the NULL op, inheritance instead of embedding (no <code>container_of</code>), and <code>shared_ptr</code> captured in the queued lambda instead of <code>kref_get</code>. The destructor message appears when the work item is destroyed, exactly where the C version calls release.</p>
+    </div>
+    <div class="tab-panel" data-title="C">
+<pre><code class="language-c">/* Kernel design patterns in user-space C (shapes only, not real kernel code):
+ * ops table (Strategy/Bridge), embedding + container_of (inheritance), kref
+ * (shared ownership), notifier chain (Observer), hook list (Chain of
+ * Responsibility) and a work queue (Command).
+ * Build: gcc -std=c99 -Wall kpatterns.c -o kpatterns */
+#include &lt;stddef.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#define container_of(ptr, type, member) ((type *)((char *)(ptr) - offsetof(type, member)))
+
+/* ---- kref: last put calls the release function ---- */
+struct kref { int refcount; };
+static void kref_init(struct kref *k) { k-&gt;refcount = 1; }
+static void kref_get(struct kref *k) { k-&gt;refcount++; }
+static int kref_put(struct kref *k, void (*release)(struct kref *))
+{
+    if (--k-&gt;refcount == 0) { release(k); return 1; }
+    return 0;
+}
+
+/* ---- ops table: one const table per driver, shared by all its devices ---- */
+struct net_device;
+struct net_device_ops {
+    int (*ndo_open)(struct net_device *dev);
+    int (*ndo_start_xmit)(struct net_device *dev, const char *pkt);
+    int (*ndo_set_mtu)(struct net_device *dev, int mtu);   /* optional: may be NULL */
+};
+
+struct net_device {
+    char name[16];
+    int mtu;
+    const struct net_device_ops *ops;   /* the vtable pointer */
+    struct kref ref;                    /* embedded refcount */
+};
+
+static int lo_open(struct net_device *d) { printf("  %s: loopback up\n", d-&gt;name); return 0; }
+static int lo_xmit(struct net_device *d, const char *p) { printf("  %s: looped '%s'\n", d-&gt;name, p); return 0; }
+static const struct net_device_ops loopback_ops = { .ndo_open = lo_open, .ndo_start_xmit = lo_xmit };
+
+/* "inheritance by embedding": the driver's private struct contains the generic one */
+struct e1000_adapter {
+    int tx_ring_used;
+    struct net_device netdev;           /* embedded base object */
+};
+static int e1k_open(struct net_device *d) { printf("  %s: link up, rings allocated\n", d-&gt;name); return 0; }
+static int e1k_xmit(struct net_device *d, const char *p)
+{
+    struct e1000_adapter *a = container_of(d, struct e1000_adapter, netdev);   /* downcast */
+    a-&gt;tx_ring_used++;
+    printf("  %s: DMA '%s' (tx ring used=%d)\n", d-&gt;name, p, a-&gt;tx_ring_used);
+    return 0;
+}
+static int e1k_set_mtu(struct net_device *d, int mtu) { d-&gt;mtu = mtu; return 0; }
+static const struct net_device_ops e1000_ops = { e1k_open, e1k_xmit, e1k_set_mtu };
+
+static int dev_set_mtu(struct net_device *d, int mtu)    /* generic code checks for NULL */
+{
+    if (!d-&gt;ops-&gt;ndo_set_mtu) return -95;                /* -EOPNOTSUPP */
+    return d-&gt;ops-&gt;ndo_set_mtu(d, mtu);
+}
+
+static void e1000_release(struct kref *k)
+{
+    struct net_device *d = container_of(k, struct net_device, ref);
+    struct e1000_adapter *a = container_of(d, struct e1000_adapter, netdev);
+    printf("  release(%s): last reference dropped, freeing adapter\n", d-&gt;name);
+    free(a);
+}
+
+/* ---- notifier chain: Observer, sorted by priority, may stop ---- */
+#define NOTIFY_DONE 0
+#define NOTIFY_STOP 0x8000
+enum { NETDEV_UP = 1, NETDEV_DOWN = 2 };
+struct notifier_block {
+    int (*notifier_call)(struct notifier_block *nb, unsigned long event, void *data);
+    struct notifier_block *next;
+    int priority;
+};
+static struct notifier_block *netdev_chain;
+
+static void register_notifier(struct notifier_block **head, struct notifier_block *nb)
+{
+    while (*head &amp;&amp; (*head)-&gt;priority &gt;= nb-&gt;priority) head = &amp;(*head)-&gt;next;
+    nb-&gt;next = *head;
+    *head = nb;
+}
+static void call_chain(struct notifier_block *nb, unsigned long ev, void *data)
+{
+    for (; nb; nb = nb-&gt;next)
+        if (nb-&gt;notifier_call(nb, ev, data) &amp; NOTIFY_STOP) { printf("  (chain stopped)\n"); return; }
+}
+static int route_cb(struct notifier_block *nb, unsigned long ev, void *data)
+{
+    struct net_device *d = data;
+    printf("  routing: %s is %s, %s routes\n", d-&gt;name, ev == NETDEV_UP ? "UP" : "DOWN", ev == NETDEV_UP ? "adding" : "flushing");
+    return NOTIFY_DONE;
+}
+static int bond_cb(struct notifier_block *nb, unsigned long ev, void *data)
+{
+    printf("  bonding: saw event %lu for %s\n", ev, ((struct net_device *)data)-&gt;name);
+    return NOTIFY_DONE;
+}
+
+/* ---- hook list: Chain of Responsibility, any hook may drop ---- */
+enum { NF_DROP = 0, NF_ACCEPT = 1 };
+struct nf_hook { const char *name; int (*hook)(int dport); };
+static int conntrack(int dport) { (void)dport; return NF_ACCEPT; }
+static int filter(int dport) { return dport == 23 ? NF_DROP : NF_ACCEPT; }
+static int nat(int dport) { printf("    nat saw port %d\n", dport); return NF_ACCEPT; }
+static const struct nf_hook prerouting[] = { {"conntrack", conntrack}, {"filter", filter}, {"nat", nat} };
+
+static int nf_hook_slow(int dport)
+{
+    for (size_t i = 0; i &lt; sizeof prerouting / sizeof prerouting[0]; i++)
+        if (prerouting[i].hook(dport) == NF_DROP) { printf("    dropped by %s\n", prerouting[i].name); return NF_DROP; }
+    return NF_ACCEPT;
+}
+
+/* ---- work queue: Command (a deferred request = function + embedded data) ---- */
+struct work_struct { void (*func)(struct work_struct *); struct work_struct *next; };
+static struct work_struct *wq_head, **wq_tail = &amp;wq_head;
+static void queue_work(struct work_struct *w) { w-&gt;next = NULL; *wq_tail = w; wq_tail = &amp;w-&gt;next; }
+static void run_workqueue(void)
+{
+    while (wq_head) { struct work_struct *w = wq_head; wq_head = w-&gt;next; w-&gt;func(w); }
+    wq_tail = &amp;wq_head;
+}
+struct linkwatch_work { struct net_device *dev; struct work_struct work; };
+static void linkwatch_fn(struct work_struct *w)
+{
+    struct linkwatch_work *lw = container_of(w, struct linkwatch_work, work);
+    printf("  worker: linkwatch for %s, now dropping its reference\n", lw-&gt;dev-&gt;name);
+    kref_put(&amp;lw-&gt;dev-&gt;ref, e1000_release);
+}
+
+int main(void)
+{
+    printf("1) ops tables + embedding:\n");
+    struct net_device lo = { "lo", 65536, &amp;loopback_ops, {1} };
+    struct e1000_adapter *a = calloc(1, sizeof *a);
+    strcpy(a-&gt;netdev.name, "eth0");
+    a-&gt;netdev.mtu = 1500;
+    a-&gt;netdev.ops = &amp;e1000_ops;
+    kref_init(&amp;a-&gt;netdev.ref);
+    struct net_device *devs[] = { &amp;lo, &amp;a-&gt;netdev };
+    for (int i = 0; i &lt; 2; i++) { devs[i]-&gt;ops-&gt;ndo_open(devs[i]); devs[i]-&gt;ops-&gt;ndo_start_xmit(devs[i], "ping"); }
+    int r_lo = dev_set_mtu(&amp;lo, 9000);                    /* NULL op: generic code refuses */
+    int r_eth = dev_set_mtu(&amp;a-&gt;netdev, 9000);
+    printf("  set_mtu(lo)=%d  set_mtu(eth0)=%d -&gt; eth0 mtu %d\n", r_lo, r_eth, a-&gt;netdev.mtu);
+
+    printf("2) notifier chain (Observer):\n");
+    struct notifier_block route_nb = { route_cb, NULL, 10 }, bond_nb = { bond_cb, NULL, 0 };
+    register_notifier(&amp;netdev_chain, &amp;bond_nb);
+    register_notifier(&amp;netdev_chain, &amp;route_nb);          /* higher priority runs first */
+    call_chain(netdev_chain, NETDEV_UP, &amp;a-&gt;netdev);
+
+    printf("3) netfilter-style hooks (Chain of Responsibility):\n");
+    printf("  port 443 -&gt; %s\n", nf_hook_slow(443) ? "ACCEPT" : "DROP");
+    printf("  port 23  -&gt; %s\n", nf_hook_slow(23) ? "ACCEPT" : "DROP");
+
+    printf("4) work queue (Command) + kref (shared ownership):\n");
+    struct linkwatch_work lw = { &amp;a-&gt;netdev };
+    lw.work.func = linkwatch_fn;
+    kref_get(&amp;a-&gt;netdev.ref);                             /* the queued work holds a reference */
+    queue_work(&amp;lw.work);
+    printf("  driver unregisters eth0, drops its reference (refcount %d -&gt; %d)\n", a-&gt;netdev.ref.refcount, a-&gt;netdev.ref.refcount - 1);
+    call_chain(netdev_chain, NETDEV_DOWN, &amp;a-&gt;netdev);
+    kref_put(&amp;a-&gt;netdev.ref, e1000_release);              /* not freed yet: the work still holds one */
+    run_workqueue();                                      /* last put happens here */
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ gcc -std=c99 -Wall kpatterns.c -o kpatterns &amp;&amp; ./kpatterns
+1) ops tables + embedding:
+  lo: loopback up
+  lo: looped 'ping'
+  eth0: link up, rings allocated
+  eth0: DMA 'ping' (tx ring used=1)
+  set_mtu(lo)=-95  set_mtu(eth0)=0 -&gt; eth0 mtu 9000
+2) notifier chain (Observer):
+  routing: eth0 is UP, adding routes
+  bonding: saw event 1 for eth0
+3) netfilter-style hooks (Chain of Responsibility):
+    nat saw port 443
+  port 443 -&gt; ACCEPT
+    dropped by filter
+  port 23  -&gt; DROP
+4) work queue (Command) + kref (shared ownership):
+  driver unregisters eth0, drops its reference (refcount 2 -&gt; 1)
+  routing: eth0 is DOWN, flushing routes
+  bonding: saw event 2 for eth0
+  worker: linkwatch for eth0, now dropping its reference
+  release(eth0): last reference dropped, freeing adapter</code></pre>
+      <p>Note the two <code>container_of</code> calls in <code>e1000_release</code>: from the embedded <code>kref</code> to the <code>net_device</code>, then from the embedded <code>net_device</code> to the adapter. That double "downcast" is how real drivers free their private structures.</p>
+    </div>
+  </div>

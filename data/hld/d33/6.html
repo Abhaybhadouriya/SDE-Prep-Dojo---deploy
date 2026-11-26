@@ -1,0 +1,109 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Why a normal index fails, and the ladder of geo indexes</h3>
+        <p>The naive query is <code>WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d</code>. With separate B-tree indexes on <code>lat</code> and <code>lng</code>, the database can use only one well: it finds a thin strip of the world (every place at that latitude, all around the globe) and then filters the other dimension. A B-tree sorts on one dimension; space has two. Hello Interview's proximity deep dive makes the same point: every spatial index is a way to turn 2-D closeness into something a 1-D index or a tree can find quickly, producing a <b>candidate set</b> that exact distance math then filters.</p>
+        <ol class="steps">
+          <li><strong>Evenly spaced grid.</strong> Cut the world into fixed squares. Simple, but Manhattan squares hold thousands of places and ocean squares hold none.</li>
+          <li><strong>Geohash.</strong> A recursive grid encoded as a string, so a normal B-tree, a Redis sorted set or a DynamoDB sort key can do prefix lookups. Fixed cell sizes per length; easy to update (recompute one string).</li>
+          <li><strong>Quadtree.</strong> Split a cell into 4 only when it has too many points (ByteByteGo uses 100). Adapts to density: deep in cities, shallow in deserts. Usually an in-memory tree.</li>
+          <li><strong>Google S2 / Uber H3.</strong> Hierarchical cells on the sphere (S2: cube faces + Hilbert curve; H3: hexagons, 16 resolutions, each about 1/7 the area of its parent). Better shapes and no edge-of-world surprises, at the cost of a library.</li>
+          <li><strong>R-tree family (PostGIS GiST, Elasticsearch BKD).</strong> Index bounding boxes, so they handle polygons and "point inside delivery zone" too. Best for complex geometry; heavier writes.</li>
+        </ol>
+
+        <h3>2. Geohash done right: precision, the 9-cell query and the boundary problem</h3>
+        <p>Pick the longest (most precise) geohash whose cell is still at least as big as the search radius. With the size table above, length 6 (1.2 km) is too small for 2 km, so a 2 km radius uses length 5 (4.9 km cells); a 500 m radius uses length 6 (1.2 x 0.6 km). Then query the user's cell <b>and its 8 neighbours</b>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 330" role="img" aria-label="Three by three geohash cells around 9q8yy; the cell above is 9q8zn, which shares only three characters even though it touches">
+            <rect class="box" x="60" y="20" width="120" height="90"/><text class="label" x="120" y="70">9q8zj</text>
+            <rect class="box fail" x="180" y="20" width="120" height="90"/><text class="label" x="240" y="62">9q8zn</text><text class="label small" x="240" y="84">prefix differs!</text>
+            <rect class="box" x="300" y="20" width="120" height="90"/><text class="label" x="360" y="70">9q8zp</text>
+            <rect class="box" x="60" y="110" width="120" height="90"/><text class="label" x="120" y="160">9q8yv</text>
+            <rect class="box cache" x="180" y="110" width="120" height="90"/><text class="label" x="240" y="152">9q8yy</text><text class="label small" x="240" y="174">user's cell</text>
+            <rect class="box" x="300" y="110" width="120" height="90"/><text class="label" x="360" y="160">9q8yz</text>
+            <rect class="box" x="60" y="200" width="120" height="90"/><text class="label" x="120" y="250">9q8yt</text>
+            <rect class="box" x="180" y="200" width="120" height="90"/><text class="label" x="240" y="250">9q8yw</text>
+            <rect class="box" x="300" y="200" width="120" height="90"/><text class="label" x="360" y="250">9q8yx</text>
+            <circle class="packet" cx="240" cy="114" r="7"/><text class="label small" x="262" y="128">you</text>
+            <circle class="packet alt" cx="240" cy="104" r="7"/><text class="label small" x="215" y="100">cafe</text>
+            <text class="label" x="610" y="60">The boundary problem</text>
+            <text class="label small" x="610" y="95">You stand at the top edge of 9q8yy.</text>
+            <text class="label small" x="610" y="120">A cafe 20 m north is in 9q8zn.</text>
+            <text class="label small" x="610" y="145">Prefix search "9q8yy%" misses it.</text>
+            <text class="label ok" x="610" y="190">Fix: always query 9 cells,</text>
+            <text class="label ok" x="610" y="215">then filter by exact distance.</text>
+            <text class="label small" x="610" y="260">Not enough results? Drop one</text>
+            <text class="label small" x="610" y="285">character (bigger cells) and retry.</text>
+          </svg>
+          <figcaption>Real geohashes (computed for the San Francisco point at length 5). The cell directly north of 9q8yy is 9q8zn: it touches, yet it shares only "9q8". Close in space does not always mean a long shared prefix, so prefix-only search misses places. Querying the 3x3 block fixes it.</figcaption>
+        </figure>
+        <p>Two more geohash facts worth saying: cells are not equal in area (degrees of longitude shrink toward the poles, so a cell in Norway is narrower than one in Singapore), and if the 9 cells return fewer results than asked, <b>expand</b> by using one character less (each step is about 32x more area) rather than failing.</p>
+        <p>Redis implements exactly this idea: <code>GEOADD</code> stores a 52-bit interleaved geohash as the score of a sorted set, and <code>GEOSEARCH</code> scans the bounding boxes around your circle, then filters by real distance. Its documented cost is O(N + log M), where N is the number of items in the grid-aligned box.</p>
+<pre class="terminal"><code>$ redis-cli GEOADD biz:pizza -122.4016 37.7564 b_123 -122.4090 37.7599 b_456
+(integer) 2
+$ redis-cli GEOSEARCH biz:pizza FROMLONLAT -122.4016 37.7564 BYRADIUS 2 km ASC COUNT 20 WITHDIST
+1) 1) "b_123"
+   2) "0.0000"
+2) 1) "b_456"
+   2) "0.7583"</code></pre>
+        <p class="muted">Illustrative output: the distance is the haversine distance between the two points using Redis's Earth radius (6,372,797.56 m). The last digits can differ slightly on a real server because Redis stores each point as a 52-bit geohash, not exact coordinates.</p>
+        <div class="callout tip"><p>One sorted set per category (<code>biz:pizza</code>, <code>biz:atm</code>) makes category filtering free. One giant set works too, but then you filter categories after the geo lookup.</p></div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> Why a B-tree on (lat, lng) fails, geohash cells with the 9-cell query and the boundary problem, and picking a precision from the radius are the interview-sufficient core. Deep dives 3-6 (quadtree lifecycle, ratings, the nearby-friends pub/sub tier, sharding and multi-region) are what an SDE-2 answer adds.</p></div>
+
+        <h3>3. Quadtree: adaptive, but you must plan its lifecycle</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 320" role="img" aria-label="Quadtree splits the dense city corner many times and leaves sparse areas as big cells, alongside the tree form">
+            <rect class="box" x="20" y="20" width="280" height="280"/>
+            <rect class="box" x="20" y="20" width="140" height="140"/>
+            <rect class="box" x="20" y="20" width="70" height="70"/>
+            <rect class="box cache" x="20" y="20" width="35" height="35"/>
+            <rect class="box cache" x="55" y="20" width="35" height="35"/>
+            <rect class="box cache" x="20" y="55" width="35" height="35"/>
+            <rect class="box cache" x="55" y="55" width="35" height="35"/>
+            <circle class="packet" cx="30" cy="30" r="3"/><circle class="packet" cx="45" cy="40" r="3"/><circle class="packet" cx="65" cy="30" r="3"/><circle class="packet" cx="80" cy="45" r="3"/><circle class="packet" cx="35" cy="70" r="3"/><circle class="packet" cx="70" cy="75" r="3"/><circle class="packet" cx="110" cy="40" r="3"/><circle class="packet" cx="40" cy="120" r="3"/><circle class="packet" cx="230" cy="230" r="3"/>
+            <text class="label small" x="225" y="90">sparse: 1 cell</text>
+            <text class="label small" x="90" y="290">desert / sea</text>
+            <text class="label" x="560" y="40">Tree view</text>
+            <rect class="box svc" x="520" y="55" width="80" height="34"/><text class="label small" x="560" y="77">world</text>
+            <rect class="box svc" x="400" y="130" width="70" height="34"/><text class="label small" x="435" y="152">NW</text>
+            <rect class="box" x="490" y="130" width="70" height="34"/><text class="label small" x="525" y="152">NE</text>
+            <rect class="box" x="580" y="130" width="70" height="34"/><text class="label small" x="615" y="152">SW</text>
+            <rect class="box" x="670" y="130" width="70" height="34"/><text class="label small" x="705" y="152">SE</text>
+            <path class="arrow" d="M560 89 L440 128"/><path class="arrow" d="M560 89 L525 128"/><path class="arrow" d="M560 89 L615 128"/><path class="arrow" d="M560 89 L705 128"/>
+            <rect class="box svc" x="370" y="210" width="60" height="34"/><text class="label small" x="400" y="232">NW</text>
+            <rect class="box" x="440" y="210" width="60" height="34"/><text class="label small" x="470" y="232">...</text>
+            <path class="arrow" d="M435 164 L400 208"/><path class="arrow" d="M435 164 L470 208"/>
+            <text class="label small" x="560" y="280">split when a leaf has &gt; 100 places</text>
+            <text class="label small" x="560" y="302">leaves hold business ids</text>
+          </svg>
+          <figcaption>The dense corner (a city) is split three levels deep; the empty area stays one big leaf. Hello Interview notes dense areas like Manhattan end up 10+ levels deep while sparse areas stay at about 2.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Search:</b> walk from the root to the leaf that holds the user, collect its businesses, and if there are not enough, add neighbouring leaves until you have K. Cost is about O(log n + k).</li>
+          <li><b>Memory:</b> about 2 GB for 200M businesses (our estimate above), so every LBS server can keep a full copy. No network hop to search.</li>
+          <li><b>Build:</b> O(n log n). ByteByteGo says building it for 200 million businesses can take "a few minutes" at start-up, and the server cannot serve while building. So roll out new LBS versions to a small slice of servers at a time, or load a pre-built snapshot from object storage instead of rebuilding.</li>
+          <li><b>Updates:</b> adding or removing a business means walking to its leaf and maybe splitting or merging, under a lock, on every replica. Since "visible tomorrow" is allowed, the simplest correct answer is a nightly rebuild plus a blue/green swap of the new tree (the same trick Uber's geofence service uses: build a new index on the side, then swap it in under a read-write lock).</li>
+          <li><b>Disk:</b> a quadtree is pointer-chasing; on disk, every hop is a random read. That is why on-disk engines use R-trees or BKD trees instead.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A quadtree is a 2-bit-per-level radix trie, the 2-D cousin of the Linux <code>fib_trie</code> (an LC-trie for route lookup). Its path compression trick (skip levels with one child) is exactly what a compressed quadtree does. A nightly rebuild plus atomic swap is RCU: readers keep using the old tree until the pointer flips.</p>
+        </div>
+
+        <h3>4. Ratings and "one review per user"</h3>
+        <p>Search results show an average rating, and Hello Interview lists "keep the average cheap to read" as a core deep dive. Computing <code>AVG(stars)</code> over millions of reviews per search is far too slow. Store <code>rating_sum</code> and <code>rating_count</code> on the business row and update them in the <b>same transaction</b> as the review insert (or with an atomic <code>UPDATE ... SET rating_sum = rating_sum + :s, rating_count = rating_count + 1</code>). The average is <code>sum / count</code>, and the index cache can refresh it lazily. For "one review per user", the primary key <code>(business_id, user_id)</code> makes the database reject a second insert, which is safer than an application-level "check then insert" race. Return HTTP 409 and let the client switch to "edit your review".</p>
+
+        <h3>5. Nearby friends at scale: the stateful tier and the pub/sub tier</h3>
+        <ul>
+          <li><b>Distance filter on the receiver side.</b> Bob's server knows Bob's last location, so it can drop Alice's update if she is more than 5 miles away. This turns ~40 friends into the handful who are actually close.</li>
+          <li><b>Pub/sub is CPU-bound.</b> From the estimate: ~13M deliveries/s. Shard channels across a cluster of Redis pub/sub nodes by hashing the user ID on a <a href="{{BASE}}hld/d32">consistent-hash ring</a>; keep the ring in a coordination store (etcd or ZooKeeper, see <a href="{{BASE}}hld/d55">Lock Service</a>) so every WebSocket server agrees which node owns which channel. Resize rarely and during low traffic, because moving a channel means re-subscribing everyone on it.</li>
+          <li><b>Scaling the WebSocket tier.</b> Adding servers is easy. Removing one is the hard part: mark it "draining" at the load balancer so it gets no new connections, wait for clients to reconnect elsewhere (or tell them to), then stop it. On reconnect, the new server rebuilds the snapshot from the location cache.</li>
+          <li><b>Hot users.</b> Someone with 5,000 friends causes huge fan-out. Cap how many friends the feature tracks per user, and rate-limit pushes from users with very large friend lists (for example, at most one fan-out per interval).</li>
+          <li><b>"Random people nearby" (not just friends).</b> Make channels per geohash cell instead of per user: a phone publishes to its cell's channel and subscribes to its cell plus 8 neighbours, re-subscribing when it crosses a cell edge. This is how you extend the design to Tinder-style or "find a nearby driver" features.</li>
+        </ul>
+
+        <h3>6. Sharding and multi-region</h3>
+        <p>The Part A index is small enough to replicate everywhere, so sharding is mostly for <b>throughput and locality</b>, not size. Yelp's search on Elasticsearch shards first by geography (San Francisco and Chicago live in separate indexes), then splits each geo index into micro-shards by <code>business_id % n</code>. Tinder did similar "geosharding" with S2 cells, grouping neighbouring cells into shards with roughly equal load. The risk of geo-sharding is hot spots: New York and London are not the same size as Iceland. Balancing by load (users and queries per cell), not by area, fixes that. Deploy one LBS cluster per region close to its users; a search in Mumbai never needs data from Ohio.</p>
+        <div class="callout warn"><p><b>Hot partition trap:</b> "shard by the first geohash character" sounds tidy, but almost all of India falls under one or two first characters. Shard by load-balanced ranges of cells, or by business ID with a scatter-gather, and say why.</p></div>
+      

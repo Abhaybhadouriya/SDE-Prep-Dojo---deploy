@@ -1,0 +1,405 @@
+
+  <h2>Run it: Java, C++ and Python</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-producer-consumer/</code>, followed by its real output. Each program checks its own result: 3 producers push known numbers, 2 consumers stop on poison pills, and the program compares the count and the exact sum.</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">// Producer-consumer: one bounded buffer built three ways, poison-pill shutdown, backpressure. Java 21.
+// Build and run:  javac BoundedBufferDemo.java &amp;&amp; java BoundedBufferDemo
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class BoundedBufferDemo {
+
+    interface BoundedBuffer&lt;T&gt; {
+        void put(T item) throws InterruptedException;   // blocks while full
+        T take() throws InterruptedException;           // blocks while empty
+        int size();
+    }
+
+    // Way 1: intrinsic monitor + wait/notifyAll over a circular array.
+    static final class MonitorBuffer&lt;T&gt; implements BoundedBuffer&lt;T&gt; {
+        private final Object[] items;
+        private int head, tail, count;                  // head = next take, tail = next put
+        MonitorBuffer(int capacity) { items = new Object[capacity]; }
+
+        public synchronized void put(T item) throws InterruptedException {
+            while (count == items.length) wait();       // full: sleep, releasing the monitor
+            items[tail] = item;
+            tail = (tail + 1) % items.length;
+            count++;
+            notifyAll();                                 // one wait set for producers AND consumers
+        }
+        @SuppressWarnings("unchecked")
+        public synchronized T take() throws InterruptedException {
+            while (count == 0) wait();
+            T item = (T) items[head];
+            items[head] = null;                          // let GC reclaim it
+            head = (head + 1) % items.length;
+            count--;
+            notifyAll();
+            return item;
+        }
+        public synchronized int size() { return count; }
+    }
+
+    // Way 2: ReentrantLock + two Conditions, so we can wake exactly the right side with signal().
+    static final class ConditionBuffer&lt;T&gt; implements BoundedBuffer&lt;T&gt; {
+        private final Object[] items;
+        private int head, tail, count;
+        private final ReentrantLock lock = new ReentrantLock();
+        private final Condition notFull = lock.newCondition();
+        private final Condition notEmpty = lock.newCondition();
+        ConditionBuffer(int capacity) { items = new Object[capacity]; }
+
+        public void put(T item) throws InterruptedException {
+            lock.lockInterruptibly();
+            try {
+                while (count == items.length) notFull.await();
+                items[tail] = item;
+                tail = (tail + 1) % items.length;
+                count++;
+                notEmpty.signal();                       // an item exists: wake ONE consumer
+            } finally { lock.unlock(); }
+        }
+        @SuppressWarnings("unchecked")
+        public T take() throws InterruptedException {
+            lock.lockInterruptibly();
+            try {
+                while (count == 0) notEmpty.await();
+                T item = (T) items[head];
+                items[head] = null;
+                head = (head + 1) % items.length;
+                count--;
+                notFull.signal();                        // a slot exists: wake ONE producer
+                return item;
+            } finally { lock.unlock(); }
+        }
+        /** Backpressure: give up after a timeout instead of blocking forever. */
+        public boolean offer(T item, long timeout, TimeUnit unit) throws InterruptedException {
+            long nanos = unit.toNanos(timeout);
+            lock.lockInterruptibly();
+            try {
+                while (count == items.length) {
+                    if (nanos &lt;= 0) return false;
+                    nanos = notFull.awaitNanos(nanos);
+                }
+                items[tail] = item;
+                tail = (tail + 1) % items.length;
+                count++;
+                notEmpty.signal();
+                return true;
+            } finally { lock.unlock(); }
+        }
+        public int size() { lock.lock(); try { return count; } finally { lock.unlock(); } }
+    }
+
+    // Way 2b: two semaphores + a mutex (the OS-textbook form; LeetCode 1188 shape).
+    static final class SemaphoreBuffer&lt;T&gt; implements BoundedBuffer&lt;T&gt; {
+        private final java.util.ArrayDeque&lt;T&gt; q = new java.util.ArrayDeque&lt;&gt;();
+        private final java.util.concurrent.Semaphore slots, items = new java.util.concurrent.Semaphore(0);
+        private final Object mutex = new Object();
+        SemaphoreBuffer(int capacity) { slots = new java.util.concurrent.Semaphore(capacity); }
+        public void put(T v) throws InterruptedException {
+            slots.acquire();                             // wait for a free slot
+            synchronized (mutex) { q.addLast(v); }
+            items.release();                             // announce one item
+        }
+        public T take() throws InterruptedException {
+            items.acquire();                             // wait for an item
+            T v;
+            synchronized (mutex) { v = q.removeFirst(); }
+            slots.release();                             // announce one free slot
+            return v;
+        }
+        public int size() { synchronized (mutex) { return q.size(); } }
+    }
+
+    // Way 3: use the JDK. ArrayBlockingQueue is exactly Way 2, tested and tuned.
+    static final class JdkBuffer&lt;T&gt; implements BoundedBuffer&lt;T&gt; {
+        private final BlockingQueue&lt;T&gt; q;
+        JdkBuffer(int capacity) { q = new ArrayBlockingQueue&lt;&gt;(capacity); }
+        public void put(T item) throws InterruptedException { q.put(item); }
+        public T take() throws InterruptedException { return q.take(); }
+        public int size() { return q.size(); }
+    }
+
+    static final long POISON = -1L;                      // the poison pill: "no more work"
+
+    /** 3 producers x 20,000 items, 2 consumers, capacity 64. Returns "items,sum" consumed. */
+    static String run(String name, BoundedBuffer&lt;Long&gt; buf) throws InterruptedException {
+        int producers = 3, consumers = 2, perProducer = 20_000;
+        AtomicLong consumed = new AtomicLong(), sum = new AtomicLong();
+        List&lt;Thread&gt; ps = new ArrayList&lt;&gt;(), cs = new ArrayList&lt;&gt;();
+        for (int c = 0; c &lt; consumers; c++) cs.add(Thread.ofPlatform().start(() -&gt; {
+            try {
+                while (true) {
+                    long v = buf.take();
+                    if (v == POISON) return;            // stop cleanly, nothing lost
+                    consumed.incrementAndGet();
+                    sum.addAndGet(v);
+                }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }));
+        for (int p = 0; p &lt; producers; p++) {
+            final long base = p * 1_000_000L;
+            ps.add(Thread.ofPlatform().start(() -&gt; {
+                try { for (int i = 1; i &lt;= perProducer; i++) buf.put(base + i); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }));
+        }
+        for (Thread t : ps) t.join();                    // all real work is queued ...
+        for (int c = 0; c &lt; consumers; c++) buf.put(POISON);   // ... then one pill per consumer
+        for (Thread t : cs) t.join();
+        long expectSum = 0;
+        for (int p = 0; p &lt; producers; p++)
+            for (int i = 1; i &lt;= perProducer; i++) expectSum += p * 1_000_000L + i;
+        boolean ok = consumed.get() == (long) producers * perProducer &amp;&amp; sum.get() == expectSum &amp;&amp; buf.size() == 0;
+        System.out.printf("%-16s consumed=%d sum=%d %s%n", name, consumed.get(), sum.get(), ok ? "OK" : "MISMATCH");
+        return consumed.get() + "," + sum.get();
+    }
+
+    public static void main(String[] args) throws Exception {
+        run("wait/notifyAll", new MonitorBuffer&lt;&gt;(64));
+        run("Lock+Conditions", new ConditionBuffer&lt;&gt;(64));
+        run("Semaphores", new SemaphoreBuffer&lt;&gt;(64));
+        run("ArrayBlockingQueue", new JdkBuffer&lt;&gt;(64));
+
+        // Backpressure: a slow consumer (1 item / 2 ms) and a fast producer that will wait at most 1 ms.
+        ConditionBuffer&lt;Integer&gt; small = new ConditionBuffer&lt;&gt;(8);
+        Thread slow = Thread.ofPlatform().start(() -&gt; {
+            try { for (int i = 0; i &lt; 50; i++) { small.take(); Thread.sleep(2); } }
+            catch (InterruptedException ignored) { }
+        });
+        int accepted = 0, rejected = 0;
+        for (int i = 0; accepted &lt; 50; i++) {
+            if (small.offer(i, 1, TimeUnit.MILLISECONDS)) accepted++; else rejected++;
+        }
+        slow.join();
+        System.out.println("backpressure: accepted=" + accepted + " rejected(offer timed out)=" + (rejected &gt; 0 ? "yes" : "no")
+                + ", queue never grew past capacity 8");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out BoundedBufferDemo.java &amp;&amp; java -cp out BoundedBufferDemo
+wait/notifyAll   consumed=60000 sum=60600030000 OK
+Lock+Conditions  consumed=60000 sum=60600030000 OK
+Semaphores       consumed=60000 sum=60600030000 OK
+ArrayBlockingQueue consumed=60000 sum=60600030000 OK
+backpressure: accepted=50 rejected(offer timed out)=yes, queue never grew past capacity 8</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Producer-consumer in C++14: a blocking bounded buffer (mutex + 2 condition variables)
+// and a lock-free single-producer/single-consumer ring like a NIC descriptor ring.
+// Build and run:  g++ -std=c++14 -O2 -Wall -pthread bounded_buffer.cpp -o bounded_buffer &amp;&amp; ./bounded_buffer
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+#include &lt;atomic&gt;
+#include &lt;condition_variable&gt;
+#include &lt;cstdio&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+template &lt;typename T&gt;
+class BoundedBuffer {
+public:
+    explicit BoundedBuffer(size_t cap) : buf_(cap) {}
+    void put(T v) {
+        std::unique_lock&lt;std::mutex&gt; lk(m_);
+        not_full_.wait(lk, [this] { return count_ &lt; buf_.size(); });
+        buf_[tail_] = v;
+        tail_ = (tail_ + 1) % buf_.size();
+        ++count_;
+        lk.unlock();                 // notify after unlocking: the woken thread can take the lock at once
+        not_empty_.notify_one();
+    }
+    T take() {
+        std::unique_lock&lt;std::mutex&gt; lk(m_);
+        not_empty_.wait(lk, [this] { return count_ &gt; 0; });
+        T v = buf_[head_];
+        head_ = (head_ + 1) % buf_.size();
+        --count_;
+        lk.unlock();
+        not_full_.notify_one();
+        return v;
+    }
+private:
+    std::vector&lt;T&gt; buf_;
+    size_t head_ = 0, tail_ = 0, count_ = 0;
+    std::mutex m_;
+    std::condition_variable not_full_, not_empty_;
+};
+
+// SPSC ring: exactly one producer writes tail, exactly one consumer writes head.
+// Size is a power of two so "index &amp; mask" replaces modulo, as in most NIC drivers.
+template &lt;typename T, size_t N&gt;
+class SpscRing {
+    static_assert((N &amp; (N - 1)) == 0, "N must be a power of two");
+public:
+    bool push(const T&amp; v) {                       // producer only
+        size_t t = tail_.load(std::memory_order_relaxed);
+        if (t - head_.load(std::memory_order_acquire) == N) return false;   // full: caller decides (drop/retry)
+        slots_[t &amp; (N - 1)] = v;                  // write the slot ...
+        tail_.store(t + 1, std::memory_order_release);   // ... then publish it (like a doorbell write)
+        return true;
+    }
+    bool pop(T&amp; out) {                            // consumer only
+        size_t h = head_.load(std::memory_order_relaxed);
+        if (h == tail_.load(std::memory_order_acquire)) return false;       // empty
+        out = slots_[h &amp; (N - 1)];
+        head_.store(h + 1, std::memory_order_release);   // give the slot back to the producer
+        return true;
+    }
+private:
+    T slots_[N];
+    std::atomic&lt;size_t&gt; head_{0}, tail_{0};
+};
+
+int main() {
+    const long POISON = -1;
+    const int producers = 3, consumers = 2, per = 20000;
+    BoundedBuffer&lt;long&gt; q(64);
+    std::atomic&lt;long&gt; count(0), sum(0);
+    std::vector&lt;std::thread&gt; cs, ps;
+    for (int c = 0; c &lt; consumers; ++c)
+        cs.emplace_back([&amp;] {
+            for (;;) {
+                long v = q.take();
+                if (v == POISON) return;
+                ++count;
+                sum += v;
+            }
+        });
+    for (int p = 0; p &lt; producers; ++p)
+        ps.emplace_back([&amp;q, p] { for (int i = 1; i &lt;= per; ++i) q.put(p * 1000000L + i); });
+    for (auto&amp; t : ps) t.join();
+    for (int c = 0; c &lt; consumers; ++c) q.put(POISON);   // one pill per consumer
+    for (auto&amp; t : cs) t.join();
+    long expect = 0;
+    for (int p = 0; p &lt; producers; ++p) for (int i = 1; i &lt;= per; ++i) expect += p * 1000000L + i;
+    std::printf("blocking buffer: consumed=%ld sum=%ld %s\n", count.load(), sum.load(),
+                (count == producers * per &amp;&amp; sum == expect) ? "OK" : "MISMATCH");
+
+    SpscRing&lt;int, 256&gt; ring;
+    const int total = 1000000;
+    long long ring_sum = 0;
+    long drops = 0;
+    std::thread rx([&amp;] {                 // consumer, like the NAPI poll loop
+        int got = 0, v;
+        while (got &lt; total) if (ring.pop(v)) { ring_sum += v; ++got; }
+    });
+    for (int i = 1; i &lt;= total; ++i)     // producer, like the NIC filling descriptors
+        while (!ring.push(i)) ++drops;   // full: spin here; a real NIC would drop and count it
+    rx.join();
+    long long expect_ring = static_cast&lt;long long&gt;(total) * (total + 1) / 2;
+    std::printf("spsc ring: sum=%lld %s, producer found the ring full %s\n", ring_sum,
+                ring_sum == expect_ring ? "OK" : "MISMATCH", drops &gt; 0 ? "sometimes (backpressure)" : "never");
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread bounded_buffer.cpp -o bounded_buffer &amp;&amp; ./bounded_buffer
+blocking buffer: consumed=60000 sum=60600030000 OK
+spsc ring: sum=500000500000 OK, producer found the ring full sometimes (backpressure)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Producer-consumer in Python 3.11: a Condition-based bounded buffer and queue.Queue.
+Run:  python bounded_buffer.py
+"""
+import queue
+import threading
+from collections import deque
+
+POISON = object()        # a unique sentinel: no real item can be equal to it
+
+
+class BoundedBuffer:
+    def __init__(self, capacity):
+        self._items = deque()
+        self._cap = capacity
+        lock = threading.Lock()
+        self._not_full = threading.Condition(lock)    # two conditions sharing ONE lock
+        self._not_empty = threading.Condition(lock)
+
+    def put(self, item):
+        with self._not_full:
+            while len(self._items) &gt;= self._cap:
+                self._not_full.wait()
+            self._items.append(item)
+            self._not_empty.notify()
+
+    def take(self):
+        with self._not_empty:
+            while not self._items:
+                self._not_empty.wait()
+            item = self._items.popleft()
+            self._not_full.notify()
+            return item
+
+
+def run(name, put, take, producers=3, consumers=2, per=5000):
+    total = [0, 0]
+    guard = threading.Lock()
+
+    def consumer():
+        n = s = 0
+        while True:
+            v = take()
+            if v is POISON:
+                break
+            n += 1
+            s += v
+        with guard:
+            total[0] += n
+            total[1] += s
+
+    cs = [threading.Thread(target=consumer) for _ in range(consumers)]
+    ps = [threading.Thread(target=lambda p=p: [put(p * 1_000_000 + i) for i in range(1, per + 1)])
+          for p in range(producers)]
+    for t in cs + ps:
+        t.start()
+    for t in ps:
+        t.join()
+    for _ in cs:
+        put(POISON)
+    for t in cs:
+        t.join()
+    expect = sum(p * 1_000_000 + i for p in range(producers) for i in range(1, per + 1))
+    ok = total[0] == producers * per and total[1] == expect
+    print(f"{name:&lt;14} consumed={total[0]} sum={total[1]} {'OK' if ok else 'MISMATCH'}")
+
+
+def main():
+    b = BoundedBuffer(64)
+    run("Condition", b.put, b.take)
+    q = queue.Queue(maxsize=64)          # the standard library's bounded blocking queue
+    run("queue.Queue", q.put, q.get)
+
+    # Backpressure: put with a timeout raises queue.Full instead of waiting forever.
+    tiny = queue.Queue(maxsize=2)
+    tiny.put(1)
+    tiny.put(2)
+    try:
+        tiny.put(3, timeout=0.01)
+    except queue.Full:
+        print("queue.Queue(maxsize=2).put(timeout) -&gt; queue.Full (shed or slow down)")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python bounded_buffer.py
+Condition      consumed=15000 sum=15037507500 OK
+queue.Queue    consumed=15000 sum=15037507500 OK
+queue.Queue(maxsize=2).put(timeout) -&gt; queue.Full (shed or slow down)</code></pre>
+    </div>
+  </div>

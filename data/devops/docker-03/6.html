@@ -1,0 +1,121 @@
+
+        <h2>Multi-stage builds: build fat, ship thin</h2>
+        <p>To compile a Go or Java service you need compilers, SDKs and build tools: hundreds of megabytes. To <em>run</em> it you need only the output: one binary or one jar plus a runtime. A <a href="{{BASE}}interview/glossary#multi-stage-build"><b>multi-stage build</b></a> uses several <code>FROM</code> lines in one Dockerfile. Early stages build; the final stage copies just the result with <code>COPY --from=</code>. Everything else is thrown away.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Multi-stage build funnel: a large build stage with compiler and sources produces one binary that is copied into a tiny runtime stage">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone docker" x="20" y="20" width="400" height="230"/>
+            <text class="zone-label" x="34" y="40">stage "build": FROM golang (hundreds of MB)</text>
+            <rect class="box cache" x="40" y="56" width="170" height="40"/><text class="label small" x="125" y="76">Go compiler + tools</text>
+            <rect class="box cache" x="230" y="56" width="170" height="40"/><text class="label small" x="315" y="76">module cache</text>
+            <rect class="box cache" x="40" y="106" width="170" height="40"/><text class="label small" x="125" y="126">your source code</text>
+            <rect class="box cache" x="230" y="106" width="170" height="40"/><text class="label small" x="315" y="126">tests, git metadata</text>
+            <rect class="box docker solid" x="130" y="170" width="180" height="50"/>
+            <text class="label white" x="220" y="195">/out/server</text>
+
+            <path class="arrow thick docker" d="M310 195 L533 145"/>
+            <text class="label small" x="425" y="200">COPY --from=build</text>
+
+            <rect class="zone k8s" x="540" y="80" width="240" height="130"/>
+            <text class="zone-label" x="554" y="100">final image</text>
+            <rect class="box docker solid" x="570" y="120" width="180" height="50"/>
+            <text class="label white" x="660" y="145">/server only</text>
+            <text class="label small" x="660" y="190">distroless/static, tiny</text>
+
+            <circle class="packet docker" r="8"><animateMotion dur="2.8s" repeatCount="indefinite" path="M220 195 L310 195 L540 145 L660 145"/></circle>
+          </svg>
+          <figcaption>Only the green-dot artifact crosses into the final image. Compilers, caches and source code stay behind in the build stage. Typical result (rule of thumb; your sizes will differ): a small Go service goes from about 800 MB on the full <code>golang</code> image to under 20 MB on <code>distroless/static</code>. See Docker's <a href="https://docs.docker.com/build/building/multi-stage/" target="_blank" rel="noopener">multi-stage build guide</a>.</figcaption>
+        </figure>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Go">
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/server ./cmd/server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/server /server
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/server"]</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Python">
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM python:3.12-slim AS build
+RUN python -m venv /venv
+ENV PATH=/venv/bin:$PATH
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt
+
+FROM python:3.12-slim
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+COPY --from=build /venv /venv
+ENV PATH=/venv/bin:$PATH PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY --chown=10001:10001 . .
+USER 10001
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Java">
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /src
+COPY pom.xml .
+RUN --mount=type=cache,target=/root/.m2 mvn -q dependency:go-offline
+COPY src ./src
+RUN --mount=type=cache,target=/root/.m2 mvn -q package -DskipTests
+
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /src/target/*.jar /app/app.jar
+USER 10001
+EXPOSE 8080
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "/app/app.jar"]</code></pre>
+          </div>
+        </div>
+
+        <p>Things to notice in all three:</p>
+        <ul>
+          <li><b>Dependencies before source</b> in the build stage, for the cache reason above.</li>
+          <li><b>Cache mounts</b> (<code>RUN --mount=type=cache,...</code>) keep the package manager's download cache on the builder between builds, but never put it in a layer. Even when the layer misses, packages do not re-download from the internet.</li>
+          <li><b>A non-root numeric user</b> in the final stage.</li>
+          <li>Java: <code>-XX:MaxRAMPercentage=75</code> sizes the heap from the container's memory limit (JVMs are container-aware since JDK 10, and cgroup v2-aware since JDK 15 (backported to 11.0.16 and 8u372); on older builds running on a cgroup v2 host the JVM sees the host's RAM), leaving room for non-heap memory. Without it, a JVM in a container is a classic exit-137 story.</li>
+        </ul>
+
+<pre class="terminal"><code>$ docker images --format 'table {{.Repository}}:{{.Tag}}\t{{.Size}}' | grep orders
+orders:single-stage   912MB
+orders:multi-stage    14.8MB</code></pre>
+        <p class="muted">Example output for a small Go service; your sizes depend on the code and base images.</p>
+
+        <h3>Stages are a graph, not a line</h3>
+        <p>BuildKit turns a multi-stage Dockerfile into a dependency graph and runs independent stages <b>in parallel</b>. With <code>--target</code> you build just one stage, and BuildKit <b>skips</b> stages the target does not need. Teams use this to run tests inside the build:</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="BuildKit graph: deps stage feeds test and build stages in parallel; final stage needs only build; test can be targeted separately">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box cache" x="30" y="85" width="150" height="50"/><text class="label" x="105" y="110">deps</text>
+            <rect class="box svc" x="270" y="30" width="170" height="50"/><text class="label" x="355" y="55">test</text>
+            <rect class="box docker" x="270" y="140" width="170" height="50"/><text class="label" x="355" y="165">build</text>
+            <rect class="box k8s solid" x="560" y="140" width="190" height="50"/><text class="label white" x="655" y="165">final (default)</text>
+            <rect class="box queue" x="560" y="30" width="190" height="50"/><text class="label small" x="655" y="55">--target test in CI</text>
+            <path class="arrow" d="M180 100 L263 60"/>
+            <path class="arrow" d="M180 120 L263 160"/>
+            <path class="arrow" d="M440 165 L553 165"/>
+            <path class="arrow dashed" d="M440 55 L553 55"/>
+            <text class="label small" x="355" y="110">run in parallel</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M180 120 L270 165 L560 165"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M180 100 L270 55 L560 55"/></circle>
+          </svg>
+          <figcaption>Building the default target skips <code>test</code> entirely; <a href="{{BASE}}interview/glossary#ci">CI</a> (continuous integration: a server that builds and tests every commit) can run <code>docker build --target test .</code> first. The two dots move at the same time: independent stages build in parallel.</figcaption>
+        </figure>
+      

@@ -1,0 +1,68 @@
+
+        <h2>Quorums: how many copies must say yes?</h2>
+        <div class="eli5">
+          <h4>Explain like I'm 5</h4>
+          <p>Three teachers each keep a copy of the class marks. When a mark changes, at least two teachers must write it down. When you ask for a mark, you ask at least two teachers. Because two writers and two askers out of three must share at least one teacher, you always reach someone who has the newest mark.</p>
+        </div>
+        <p>In a <strong>leaderless</strong> database such as Cassandra or the original Amazon Dynamo design, each piece of data is stored on <b>N</b> replicas. A write is "successful" when <b>W</b> replicas confirm it (this count is a <a href="{{BASE}}interview/glossary#quorum">quorum</a>). A read asks <b>R</b> replicas and takes the newest version. The rule to remember:</p>
+        <div class="stats">
+          <div class="stat"><b>W + R &gt; N</b><span>read set and write set overlap</span></div>
+          <div class="stat"><b>N=3, W=2, R=2</b><span>the Dynamo paper's example</span></div>
+        </div>
+        <p class="small">Do not mix this up with the <b>majority rule</b> of consensus systems such as Raft and etcd (2f + 1 nodes survive f failures), covered in <a href="#leader">Leader election</a> later on this page. Raft elects one leader that orders every write, and a write commits when a majority stores it. A Dynamo-style W/R quorum has no leader: any node can coordinate a request, W and R can be tuned per request, and two concurrent writes can both "succeed" and must be merged later.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Write quorum and read quorum overlap on one replica">
+            <rect class="box client" x="20" y="40" width="140" height="56"/><text class="label" x="90" y="68">Writer</text>
+            <rect class="box client" x="20" y="184" width="140" height="56"/><text class="label" x="90" y="212">Reader</text>
+            <rect class="box db hot" x="340" y="112" width="140" height="56"/><text class="label" x="410" y="132">Replica B</text><text class="label small" x="410" y="152">in both sets</text>
+            <rect class="box db" x="340" y="20" width="140" height="56"/><text class="label" x="410" y="48">Replica A</text>
+            <rect class="box db" x="340" y="204" width="140" height="56"/><text class="label" x="410" y="232">Replica C</text>
+            <path class="arrow ok" d="M160 60 L332 48"/>
+            <path class="arrow ok" d="M160 76 L332 130"/>
+            <path class="arrow kafka" d="M160 204 L332 150"/>
+            <path class="arrow kafka" d="M160 220 L332 232"/>
+            <text class="label ok left" x="520" y="48">W = 2 (A, B) got v2</text>
+            <text class="label kafka left" x="520" y="232">R = 2 (B, C) asked</text>
+            <text class="label left" x="520" y="140">B returns v2, C returns v1</text>
+            <text class="label small left" x="520" y="164">reader keeps the newest: v2</text>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M160 60 L340 48"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M160 76 L340 132"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M160 204 L340 150"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M160 220 L340 232"/></circle>
+          </svg>
+          <figcaption>N = 3. The write lands on A and B; the read asks B and C. Because 2 + 2 &gt; 3, at least one replica (B) is in both sets, so the reader finds the latest version.</figcaption>
+        </figure>
+        <h3>What actually happens (who does what)</h3>
+        <ol class="steps">
+          <li><strong>Client to any node.</strong> The client (or its driver) sends the write to any node in the cluster. That node becomes the <b>coordinator</b> for this one request. In Cassandra every node can coordinate.</li>
+          <li><strong>Coordinator finds the replicas.</strong> It hashes the partition key onto the <a href="{{BASE}}interview/glossary#consistent-hashing">consistent-hash</a> ring and picks the N nodes that own that range.</li>
+          <li><strong>Send to all N, wait for W.</strong> It sends the write to all N replicas at once and replies "OK" to the client as soon as W of them acknowledge. The others still get the write; nobody waits for them.</li>
+          <li><strong>Hints for replicas that are down.</strong> If a replica does not answer, the coordinator stores a <b>hint</b> ("this write belongs to node C") and replays it when C comes back (hinted handoff).</li>
+          <li><strong>Reads.</strong> For a read, the coordinator asks R replicas, compares the versions (timestamps) and returns the newest. If one replica returned an old version, the coordinator writes the newest value back to it. That fix-up is called <b>read repair</b>.</li>
+          <li><strong>In the background.</strong> A scheduled repair job compares replicas range by range with Merkle trees (below) and copies over anything that both reads and hints missed.</li>
+        </ol>
+        <p>Turning the knobs changes the trade-off:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Setting (N=3)</th><th>Good at</th><th>Cost</th></tr></thead>
+            <tbody>
+              <tr><td>W=2, R=2</td><td>Balanced; survives one slow or dead replica on both reads and writes</td><td>Each request waits for the 2nd fastest replica</td></tr>
+              <tr><td>W=3, R=1</td><td>Very fast reads</td><td>A write fails if any single replica is down</td></tr>
+              <tr><td>W=1, R=3</td><td>Very fast writes</td><td>Reads are slow and fail if any replica is down</td></tr>
+              <tr><td>W=1, R=1</td><td>Fastest, most available</td><td>W + R = 2, not &gt; 3, so reads can be stale (eventual)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Cassandra exposes this as a <strong>consistency level</strong> per query: <code>ONE</code>, <code>QUORUM</code>, <code>ALL</code>, plus <code>LOCAL_QUORUM</code> to count only replicas in the local data centre (so a write does not wait for another continent).</p>
+<pre><code class="language-sql">-- cqlsh: choose the consistency level per session, then run queries
+CONSISTENCY QUORUM;
+INSERT INTO shop.carts (user_id, item_id, qty) VALUES (42, 'sku-9', 2);
+SELECT qty FROM shop.carts WHERE user_id = 42 AND item_id = 'sku-9';</code></pre>
+<pre class="terminal" data-title="cqlsh"><code>cqlsh&gt; CONSISTENCY QUORUM;
+Consistency level set to QUORUM.</code></pre>
+        <h3>Two honest footnotes</h3>
+        <ul>
+          <li><b>Sloppy quorum and hinted handoff.</b> Dynamo keeps accepting writes during a failure by writing to a healthy "stand-in" node with a note (a hint) saying "this belongs to node C". When C comes back, the hint is handed over. This favours availability, but it means W + R &gt; N no longer guarantees overlap during the failure.</li>
+          <li><b>Quorum is not linearizable on its own.</b> Two concurrent writers can both "win" on different replicas, so you need a rule to pick a winner: last-write-wins (LWW: the newest timestamp wins; simple, can lose data) or version vectors (a small counter per replica that shows whether two versions are "one after the other" or "at the same time"; the store keeps both and the app merges them). Background repair slowly fixes replicas that missed writes: read repair (described above) and Merkle-tree anti-entropy. A <b>Merkle tree</b> is a tree of hashes over key ranges; two replicas compare the root hash, then only the branches that differ, so they find the few differing ranges without sending all the data.</li>
+        </ul>
+      

@@ -1,0 +1,72 @@
+
+        <h2>Errors, timeouts and backpressure</h2>
+        <p>Every record ends in exactly one of two ways: the callback gets an offset, or the callback gets an error. Your job is to <b>always look at the error</b>. The producer sorts errors into two kinds:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Kind</th><th>Examples</th><th>What the producer does</th><th>What you do</th></tr></thead>
+            <tbody>
+              <tr><td><b>Retriable</b> (temporary)</td><td><code>NOT_LEADER_OR_FOLLOWER</code> (leader moved), <code>NOT_ENOUGH_REPLICAS</code>, request timeout, network disconnect</td><td>Refreshes metadata if needed, backs off (<code>retry.backoff.ms</code>, 100 ms growing to <code>retry.backoff.max.ms</code>, 1 s), and retries until <code>delivery.timeout.ms</code> runs out</td><td>Nothing, unless the deadline is hit; then you get a timeout error in the callback</td></tr>
+              <tr><td><b>Non-retriable</b> (permanent)</td><td><code>RecordTooLargeException</code>, serialization errors, authorization failure, invalid topic</td><td>Fails the record immediately</td><td>Log, alert, and park the record somewhere safe (a local file or a dead-letter path); retrying will not help</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>The two clocks</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Two timers: max.block.ms limits how long send() itself may block, and delivery.timeout.ms limits the total time from send() returning to the final success or failure, covering linger, in-flight requests and retries.">
+            <text class="zone-label" x="20" y="28">inside send(), on your thread</text>
+            <rect class="box queue" x="20" y="40" width="300" height="44"/>
+            <text class="label" x="170" y="62">max.block.ms (60 s)</text>
+            <text class="label small left" x="335" y="54">waiting for topic metadata, or for free space</text>
+            <text class="label small left" x="335" y="74">in buffer.memory; then send() throws</text>
+
+            <text class="zone-label" x="20" y="120">after send() returns, in the background</text>
+            <rect class="box kafka" x="20" y="132" width="760" height="44"/>
+            <text class="label" x="400" y="154">delivery.timeout.ms (120 s): the whole deadline for one record</text>
+            <rect class="box plain" x="20" y="184" width="90" height="34"/><text class="label small" x="65" y="201">linger</text>
+            <rect class="box plain" x="115" y="184" width="200" height="34"/><text class="label small" x="215" y="201">request (request.timeout.ms 30 s)</text>
+            <rect class="box plain" x="320" y="184" width="80" height="34"/><text class="label small" x="360" y="201">backoff</text>
+            <rect class="box plain" x="405" y="184" width="200" height="34"/><text class="label small" x="505" y="201">retry request</text>
+            <rect class="box fail" x="610" y="184" width="170" height="34"/><text class="label small bad" x="695" y="201">deadline: error</text>
+          </svg>
+          <figcaption>Two separate clocks. <code>max.block.ms</code> limits how long <code>send()</code> itself can block your thread. <code>delivery.timeout.ms</code> is the total budget for a record after that - waiting in a batch, in flight, backing off and retrying. It must be at least <code>linger.ms + request.timeout.ms</code>, or the producer refuses to start.</figcaption>
+        </figure>
+        <p>This is why tuning <code>retries</code> directly is old advice. Modern clients set <code>retries</code> to a huge number (2147483647) and let <b><code>delivery.timeout.ms</code></b> decide when to give up. Think in time ("I accept up to 2 minutes of trying"), not in attempt counts.</p>
+
+        <h3>Backpressure: when brokers are slower than your app</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Application threads pour records into the producer buffer, the sender thread drains it to the brokers. If the drain is slower than the fill, the buffer fills up and send() blocks.">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="60" width="150" height="70"/>
+            <text class="label" x="95" y="85">app threads</text>
+            <text class="label small" x="95" y="108">fill fast</text>
+            <rect class="box plain" x="300" y="30" width="200" height="140"/>
+            <rect class="box kafka solid" x="300" y="90" width="200" height="80">
+              <animate attributeName="y" values="150;40;40;150" keyTimes="0;0.6;0.85;1" dur="8s" repeatCount="indefinite"/>
+              <animate attributeName="height" values="20;130;130;20" keyTimes="0;0.6;0.85;1" dur="8s" repeatCount="indefinite"/>
+            </rect>
+            <text class="label" x="400" y="20">buffer.memory (32 MiB)</text>
+            <rect class="box queue" x="630" y="60" width="150" height="70"/>
+            <text class="label" x="705" y="85">brokers</text>
+            <text class="label small" x="705" y="108">drain slower</text>
+            <path class="arrow" d="M170 95 L294 95"/>
+            <path class="arrow kafka" d="M500 95 L624 95"/>
+            <circle class="packet" r="6"><animateMotion dur="1s" repeatCount="indefinite" path="M170 95 L300 95"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M500 95 L630 95"/></circle>
+            <text class="label small bad" x="95" y="160">buffer full: send() blocks</text>
+            <text class="label small bad" x="95" y="180">up to max.block.ms, then throws</text>
+            <text class="label small muted left" x="300" y="200">the producer's natural brake on your application</text>
+          </svg>
+          <figcaption>The accumulator is a bucket between your threads and the network. If brokers are slow (overloaded, throttled by a quota, or waiting for replicas), the bucket fills and <code>send()</code> starts blocking. That pause is <b>backpressure</b>: the producer pushes the slowdown back onto your code instead of growing memory forever.</figcaption>
+        </figure>
+        <p>What blocking means for you depends on where the producer is called:</p>
+        <ul>
+          <li>In a <b>batch job</b> or log shipper, blocking is perfect: the job simply slows to the speed Kafka can absorb.</li>
+          <li>In a <b>web request handler</b>, blocking for up to 60 s is a disaster: request threads pile up and the whole service stops answering. Set <code>max.block.ms</code> low (for example a few hundred milliseconds), catch the error, and decide: reply "try again", or write to a local fallback. Better still, the outbox pattern (<a href="{{BASE}}hld/hld-10">HLD page 10</a>) avoids calling Kafka inside the request at all.</li>
+          <li>In <b>Python confluent-kafka</b>, a full local queue raises <code>BufferError</code> from <code>produce()</code> instead of blocking. The usual fix is to call <code>p.poll(1)</code> to let deliveries drain, then try again.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A full <code>buffer.memory</code> is a <b>full socket send buffer</b>: a blocking <code>write()</code> sleeps until the peer's window opens, a non-blocking one returns <code>EAGAIN</code>. Python's <code>BufferError</code> is the <code>EAGAIN</code> version. It is flow control, just like the TCP receive window closing. <b>Where this breaks:</b> TCP's window is negotiated by the receiver; Kafka brokers do not send "slow down" signals per producer, except for quota throttling. The producer infers it simply from replies coming back slowly.</p>
+        </div>
+      

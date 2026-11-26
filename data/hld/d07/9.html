@@ -1,0 +1,114 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: Clarify.</strong> Which sides are in scope (customer + restaurant + rider)? One city or a country? Do we own the riders? Is live tracking needed? Write the core loop: discover, order, cook, assign, track.</li>
+          <li><strong>5-10: Estimate.</strong> Show that orders are only hundreds per second but rider pings are tens of thousands per second. Say what that changes: SQL for orders, memory for locations.</li>
+          <li><strong>10-15: API and data model.</strong> The idempotent <code>POST /orders</code>, the order table with status and version, the outbox.</li>
+          <li><strong>15-25: Architecture.</strong> Draw the 6-box whiteboard version and walk one order through it.</li>
+          <li><strong>25-40: Deep dives.</strong> Batched assignment and dispatch timing, ETA, geo serviceability, peaks. Let the interviewer choose, but offer assignment first, because it is the part unique to food delivery.</li>
+          <li><strong>40-45: Wrap up.</strong> Failure modes per box, metrics (order-to-assign time, ETA error, rider idle time, cancellations), and what you would build next.</li>
+        </ol>
+        <div class="callout note"><p><b>SDE-1 vs SDE-2.</b> An SDE-1 answer gets the core loop right with clean APIs, an idempotent order, SQL plus cache, and a geo search for riders. An SDE-2 answer drives the conversation, brings up dispatch timing and batching without being asked, explains the outbox, and talks about peak supply and graceful degradation.</p></div>
+        <div class="callout danger"><p><b>Common mistakes:</b> spending 15 minutes on the order database (it is not the bottleneck); "assign the nearest rider" with no timing; storing every GPS ping in SQL; straight-line distance for ETA; no idempotency on place-order; forgetting the restaurant can reject or go offline; no plan for peaks except "autoscale".</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Swiggy,Zomato">
+          <summary>How do you show only restaurants that can deliver to my address, fast?</summary>
+          <div class="answer">
+            <p>Each restaurant has a delivery polygon. Offline, convert each polygon to the set of H3 cells it covers (say, resolution 8 or 9) and store it in the restaurant's search document. At query time, convert the address to its cell and filter on that cell. Then rank by distance, rating, current kitchen load and predicted ETA. Cache the result per (cell, filter) for a short time, because thousands of people in one apartment cluster see the same list. When a restaurant changes its polygon or goes offline, publish an event and update the index within seconds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "can deliver" (a precomputed cell filter) from "rank" (a scoring step). Mention why not a radius: delivery areas follow roads and rivers, not circles.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A restaurant shrinks its area at peak. How quickly does the app reflect it?</li><li>Why hexagons and not squares? (Every neighbour is the same distance away.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Swiggy,Zomato,Uber">
+          <summary>Walk me through rider assignment. Why not just pick the nearest free rider?</summary>
+          <div class="answer">
+            <p>Nearest-first fails on timing (the rider waits at the kitchen), fairness (it steals riders from the next order) and batching (two orders could share one rider). I would run batched matching per zone every 30-60 seconds: collect unassigned orders and riders, compute a cost per pair (food waiting, rider idling, lateness versus the promise), and solve a minimum-cost assignment. Dispatch an order only when the rider's travel time to the restaurant is close to the remaining prep time. The chosen rider is locked with an atomic set-if-not-exists offer with a TTL. Declines go back into the next window.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with the naive answer and break it yourself. Then give the batch idea, the cost function, and the lock. Cite Swiggy's one-minute assignment SLA as a real-world anchor.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you choose the window length? (It trades decision quality against waiting time. Tune it per zone with experiments.)</li><li>How would you batch two orders onto one rider?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Swiggy,Amazon">
+          <summary>How do you guarantee the same rider is not given two orders at the same time?</summary>
+          <div class="answer">
+            <p>Two layers. First, a fast lock in Redis: <code>SET rider:{id}:offer {orderId} NX EX 30</code>. Only one offer can exist per rider, and it expires if the rider ignores it or the dispatcher dies. Second, the source of truth in SQL: the assignment is a conditional update <code>WHERE status='ACCEPTED' AND rider_id IS NULL</code>, and a rider-side check that the rider has no other active order (or fewer than the batch limit). If Redis and SQL ever disagree, SQL wins and the offer is withdrawn.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the race (two dispatch workers, or a retry), then the cheap lock and the authoritative guard. Mention that a Redis lock alone is only an efficiency lock, not a correctness guarantee.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the rider accepts after the 30 s TTL expired?</li><li>How do fencing tokens help here?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Zomato,Swiggy,Uber">
+          <summary>How does live tracking reach the customer's phone?</summary>
+          <div class="answer">
+            <p>The rider app sends batched pings every few seconds to the location service. It updates the rider's latest position in Redis and appends the ping to the <code>rider-locations</code> Kafka topic. Tracking gateways hold the customers' WebSocket connections. They look up which rider each watched order has, and push throttled updates (one every few seconds, smoothed). If the socket drops, the app falls back to polling <code>GET /orders/{id}</code>. A gateway only needs the riders of the orders it is serving, so route customers to gateways by orderId or subscribe gateways to the riders they need.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the path rider -&gt; location svc -&gt; Kafka/Redis -&gt; gateway -&gt; customer. Give the fan-out number (about 90k pushes/s in our estimate) to show it is manageable.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>WebSocket vs SSE vs long polling?</li><li>How do you deploy a new gateway version without dropping 300k sockets at once?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Swiggy,Zomato,DoorDash">
+          <summary>How would you build the ETA, and how do you know it is good?</summary>
+          <div class="answer">
+            <p>Split it: prep time (model on dish mix, restaurant history by hour, open orders), rider-to-restaurant and restaurant-to-customer travel (routing on the road graph with live traffic), and last mile (learned per area or building). Recompute after each milestone and from live pings. Measure it with the error between promised and actual delivery time (mean and p90), and the percentage of orders late by more than N minutes. Promise a slightly padded number, because being late hurts more than being early.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the timeline picture (prep overlaps with the rider's trip), name the features, and name the metric. Interviewers want to see that you would measure it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The model is slow. What is your fallback? (A historical median per restaurant and hour.)</li><li>How do you train it? (From Kafka event history in a data lake.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart,Swiggy">
+          <summary>The user taps "Place order" twice on a bad network. What happens?</summary>
+          <div class="answer">
+            <p>The app creates one <code>Idempotency-Key</code> when the checkout screen opens and sends it with every retry. The orders table has a UNIQUE constraint on that key. The first request inserts the order. The second hits the constraint, so the service reads the existing order and returns the same response. The payment step uses the order ID as its own idempotency key with the payment provider, so money is collected once.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say who generates the key (the client, once per attempt), where it is enforced (a unique constraint, not a "check then insert"), and that the response is replayed.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The key expires after 24 hours. Is that a problem?</li><li>What if two different carts reuse one key by a bug? (Store a request hash and reject a mismatch.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Zomato,Swiggy,Flipkart">
+          <summary>It is New Year's Eve and orders are 5x normal. What breaks first and what do you do?</summary>
+          <div class="answer">
+            <p>The first thing to run out is riders, not CPU. Zomato publicly said it ran out of delivery partner capacity before the 2020 NYE peak. So the plan is mostly product levers: honest higher ETAs, smaller serviceable areas, caps on open orders per kitchen, surge fees and rider incentives, and admission control before checkout. On the tech side: pre-scale gateways, discovery and tracking ahead of time; warm caches; freeze deploys; keep tracking on its own topic; and watch order-to-assign time and unassigned orders as the main health signals.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with the supply insight, then the levers, then the tech. End with the metrics you would watch in the war room.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metric would trigger shrinking the serviceable area?</li><li>How do you avoid accepting orders you cannot deliver?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Swiggy,Walmart,Amazon">
+          <summary>Why put order events on Kafka instead of calling each service directly?</summary>
+          <div class="answer">
+            <p>An order change has many listeners: the restaurant push, notifications, dispatch, analytics, fraud and ratings. Direct calls would make the order service wait on all of them and fail when any one is down. With Kafka, the order service writes once (through the outbox). Each listener is its own consumer group with its own offset, so a slow consumer only delays itself. Keying by orderId keeps the events of one order in order. And the log is replayable, so a new service (say, a new ETA model) can rebuild state from history.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give decoupling, independent speed, ordering per key and replay. Then admit the cost: eventual consistency and at-least-once delivery, so consumers must be idempotent.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many partitions, and what happens if you add more later? (Key-to-partition mapping changes.)</li><li>What happens when a consumer sees the same event twice?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Swiggy,Zomato">
+          <summary>How would you batch two orders onto one rider?</summary>
+          <div class="answer">
+            <p>Add "bundle" candidates to the matching problem. For orders from the same or nearby restaurants, with ready times within a few minutes of each other and customers in a similar direction, create a bundle with a combined route and its cost: the extra delay for the first customer must stay under a limit (for example a few minutes) and both promises must still hold. The solver then chooses between single and bundled assignments. Respect the bag capacity and food type (hot and cold items).</p>
+            <div class="approach"><h5>How to answer</h5><p>Frame it as "more candidates in the same solver" with a constraint that protects the first customer. That is cleaner than a separate batching system.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The second restaurant is late. What happens to the first order?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Swiggy,Zomato,Amazon">
+          <summary>A restaurant marks an item out of stock. How fast do customers see it, and what about carts that already have it?</summary>
+          <div class="answer">
+            <p>The menu change is written to SQL with a new menu version and an outbox event. Consumers invalidate the menu cache and update the search index, so new viewers see it within seconds. Carts are not updated live. At order time, the order service re-validates every item and price against the latest menu version and returns a clear error ("Masala dosa is now unavailable") if needed. The restaurant can still reject later as a last safety net.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the pattern: eventual consistency for display, strict validation at the moment of commitment.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What TTL would you put on the menu cache, and why also use invalidation?</li></ul></div>
+          </div>
+        </details>
+
+        <h3>60-second answer (say it out loud)</h3>
+        <div class="callout interview"><p>"Food delivery is a three-sided marketplace: customers, restaurants and riders. Orders are only hundreds per second even at peak, so they live in SQL with an idempotency key and a status state machine, and every change goes out through an outbox to Kafka. The heavy load is rider GPS, tens of thousands of pings per second, which I keep in an in-memory geo index sharded by city, plus a Kafka stream for tracking and ETA training. Discovery uses precomputed H3 cells for serviceability plus a search index. The unique part is dispatch: instead of nearest rider, I run batched matching per zone every 30-60 seconds and time the dispatch so the rider arrives as the food is ready, locking the rider atomically. At peak the bottleneck is riders, not servers, so I degrade with honest ETAs, smaller delivery areas and kitchen caps."</p></div>
+
+        <div class="scenario">
+          <h4>Scenario: rain hits Bengaluru at 8 pm</h4>
+          <div class="situation">Orders jump 3x in 20 minutes. Riders slow down, some go offline. The unassigned order count climbs, ETAs shown at checkout are 30 minutes, but actual deliveries are taking 70.</div>
+          <div class="bad">Weak answer: "Autoscale the dispatch service and add more Kafka partitions."</div>
+          <div class="good">Strong answer: "The problem is supply and a stale ETA model, not CPU. First stop the bleeding: feed live rider supply and travel speed into the ETA so promises go up, shrink serviceable areas in the affected zones, cap open orders per kitchen, and turn on the rain surge and rider incentives. Check the dashboards for order-to-assign time and unassigned orders per zone. Afterwards, add 'weather' and 'live supply' features to the ETA model, and an automatic rule that changes the serviceable radius when the supply-to-demand ratio drops below a threshold."</div>
+          <div class="followups">Follow-ups: How do you treat customers whose order was already promised 30 minutes? (Proactive notification, a coupon, priority in matching.)</div>
+        </div>
+      

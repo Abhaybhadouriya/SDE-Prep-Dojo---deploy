@@ -1,0 +1,58 @@
+
+        <h2>Concurrency inside LLD</h2>
+        <p>Almost every LLD classic has one shared, scarce thing: a parking spot, a seat, a locker, an elevator. Two threads must never both get it. The requirement often says it directly, for example "handle multiple entry and exit points and support concurrent access" (AlgoMaster's parking lot). You have four tools, in order of preference:</p>
+        <ol class="steps">
+          <li><strong>Atomic check-and-set on a concurrent map.</strong> <code>ConcurrentHashMap.putIfAbsent(seatId, userId)</code> either wins or loses in one step. It is lock-free and simple.</li>
+          <li><strong>Fine-grained locks.</strong> Lock one spot or one show, never the whole parking lot. Always lock several seats in a fixed order (sorted by ID) to avoid deadlock.</li>
+          <li><strong>Optimistic versioning.</strong> Keep a version number on the object and update only if it is unchanged. This is the in-memory version of <code>UPDATE ... WHERE version = ?</code>.</li>
+          <li><strong>Coarse <code>synchronized</code> methods.</strong> Correct but slow. Fine for a demo, so say you would refine it.</li>
+        </ol>
+        <div class="callout tip"><p><b>Which language should a C engineer use?</b> Pick Java, Python or C++ for LLD and machine-coding rounds. C is usually not accepted for object-oriented design rounds, because there are no classes or interfaces to show; check with the recruiter before the loop. Java is the most common choice in Indian SDE-2 loops and maps most directly to the patterns on this page; Python is fastest to type; C++ is fine if you are fluent in its classes and smart pointers. Here is the same toolbox in all three:</p></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Need</th><th>Java</th><th>Python</th><th>C++</th></tr></thead>
+            <tbody>
+              <tr><td>Atomic "claim if free" on a map</td><td><code>ConcurrentHashMap.putIfAbsent</code> / <code>compute</code></td><td><code>with lock: d.setdefault(k, v)</code> (a plain dict is not safe to check-then-set across threads)</td><td><code>std::mutex</code> + <code>map.try_emplace</code> under a <code>std::lock_guard</code></td></tr>
+              <tr><td>Mutual exclusion</td><td><code>synchronized</code> / <code>ReentrantLock</code></td><td><code>threading.Lock</code> with <code>with lock:</code></td><td><code>std::mutex</code> + <code>std::lock_guard</code> / <code>std::scoped_lock</code> (locks several mutexes without deadlock)</td></tr>
+              <tr><td>Lock-free counter / CAS</td><td><code>AtomicInteger.incrementAndGet</code>, <code>compareAndSet</code></td><td>No user-level CAS; use a <code>Lock</code> (or <code>itertools.count</code> for ids)</td><td><code>std::atomic&lt;int&gt;</code>, <code>fetch_add</code>, <code>compare_exchange_strong</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-java">// In-memory seat hold with expiry: the heart of a BookMyShow LLD
+public class InMemorySeatLockProvider implements SeatLockProvider {
+    private final Map&lt;String, SeatLock&gt; locks = new ConcurrentHashMap&lt;&gt;();
+    private final Duration ttl;
+
+    public InMemorySeatLockProvider(Duration ttl) { this.ttl = ttl; }
+
+    @Override
+    public boolean tryLock(String showId, List&lt;String&gt; seatIds, String userId) {
+        Map&lt;String, SeatLock&gt; acquired = new LinkedHashMap&lt;&gt;();
+        for (String seat : seatIds.stream().sorted().toList()) {     // fixed order
+            String key = showId + ":" + seat;
+            SeatLock mine = new SeatLock(userId, Instant.now().plus(ttl));
+            SeatLock now = locks.compute(key, (k, cur) -&gt;
+                (cur == null || cur.isExpired() || cur.userId().equals(userId))
+                    ? mine : cur);                                      // free, expired, or already mine: (re)take
+            if (now != mine) {                                          // someone else holds it
+                // roll back ONLY the holds we placed: remove(key, value) is a no-op
+                // if another user took the seat after our hold expired
+                acquired.forEach((k, v) -&gt; locks.remove(k, v));
+                return false;
+            }
+            acquired.put(key, mine);
+        }
+        return true;
+    }
+}
+
+record SeatLock(String userId, Instant expiresAt) {
+    boolean isExpired() { return Instant.now().isAfter(expiresAt); }
+}</code></pre>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the same discipline as kernel locking. Hold the smallest lock for the shortest time, take multiple locks in a global order to avoid ABBA deadlocks, and prefer atomic compare-and-swap (<code>cmpxchg</code>) over a big spinlock. <code>ConcurrentHashMap.compute</code> is effectively a per-bucket lock plus CAS.</p>
+          <p><b>Where this breaks:</b> a kernel spinlock holder never sleeps, but a Java thread inside <code>synchronized</code> can be paused by the garbage collector or the scheduler for a long time, so in LLD you prefer short critical sections and expiry (TTL) on holds rather than trusting the holder to release quickly.</p>
+        </div>
+        <p>In the HLD half the same idea becomes distributed: a Redis <code>SET key value NX PX 600000</code> hold with a TTL, or a database row lock or version check. See <a href="{{BASE}}hld/p02">Pattern: Dealing with contention</a> and <a href="{{BASE}}hld/hld-09">Replication, consensus and coordination</a>.</p>
+      

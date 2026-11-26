@@ -1,0 +1,123 @@
+
+        <h2>Interview: how to drive the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: clarify.</strong> Channels, transactional vs promotional, scale, latency per type, preferences, tracking.</li>
+          <li><strong>5-10 min: estimate.</strong> 1B/day, ~60k/s peak, 500 GB/day log, ~60 MB/s into Kafka. Conclude: async + isolated priorities.</li>
+          <li><strong>10-15 min: API and data model.</strong> 202 Accepted, idempotency key, prefs/tokens/templates/log/sent-log.</li>
+          <li><strong>15-25 min: architecture.</strong> API → Kafka → router → per-channel, per-priority topics → workers → providers → callbacks.</li>
+          <li><strong>25-40 min: deep dives.</strong> Priority isolation, dedupe, retries + DLQ + failover, campaigns.</li>
+          <li><strong>40-45 min: wrap-up.</strong> Failure of each box; metrics: end-to-end latency per priority, lag per topic, provider error rate, delivery rate, DLQ size.</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h3>Good SDE-1 answer</h3><ul><li>Clear channels and flow, a queue between intake and sending.</li><li>User preferences and templates.</li><li>Retries and a DLQ.</li></ul></div>
+          <div class="panel"><h3>Good SDE-2 answer adds</h3><ul><li>Priority isolation with numbers ("a campaign is an hour of backlog").</li><li>At-least-once + dedupe, and the claim-send-mark ordering.</li><li>Retry topics instead of blocking partitions; provider circuit breakers; lag-based autoscaling.</li></ul></div>
+        </div>
+
+        <h3>The 60-second answer</h3>
+        <div class="callout interview"><p>"Services call a notification API that validates the request, checks an idempotency key and returns 202. The request goes into Kafka, keyed by user so each user's messages stay in order. A router reads it, applies the user's preferences, quiet hours and frequency caps, renders the template, and fans out to topics per channel and per priority: push-high, SMS-high, push-low and so on. Each topic has its own worker pool, so a 100-million-user campaign on the low topics can never delay an OTP. Workers dedupe on event ID plus channel, call APNs, FCM, the SMS vendor or the email provider, and record status. Temporary failures go to delayed retry topics with backoff and finally a DLQ; permanent errors like dead tokens are cleaned up. SMS and email have two vendors behind circuit breakers. Workers autoscale on consumer lag."</p></div>
+
+        <details class="qa" data-level="2" data-topic="hld,kafka" data-company="Amazon,Flipkart,Swiggy">
+          <summary>Why put a queue between the API and the senders at all?</summary>
+          <div class="answer">
+            <p>Three reasons. Speed: callers get 202 in milliseconds instead of waiting for APNs or an SMS vendor. Bursts: a campaign can enqueue millions of messages faster than providers accept them; the queue holds the backlog instead of the API falling over. Reliability: once a message is in Kafka with acks=all and replication, a crashed worker or a provider outage delays it but does not lose it. Kafka also gives per-user ordering and replay.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the three benefits (latency, buffering, durability) in one line each, then one Kafka-specific bonus.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Kafka or SQS here? Why?</li><li>What is the partition key?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Flipkart,Amazon,Swiggy">
+          <summary>A 100-million-user campaign is running. How do you make sure OTPs still arrive in seconds?</summary>
+          <div class="answer">
+            <p>Isolate them physically, not just logically. OTPs go to their own high-priority topics with their own always-warm worker pools and, ideally, their own provider accounts or sender IDs. Campaigns go to low-priority topics whose workers are throttled and released by a planner at a controlled rate. A priority field inside one shared queue is not enough because the OTP still sits behind millions of messages in the same partitions. I would alert on push.high/sms.high lag and end-to-end OTP latency.</p>
+            <div class="approach"><h5>How to answer</h5><p>Quantify the problem first ("100M messages at 30k/s is nearly an hour"), then isolation at three levels: topics, workers, provider quotas.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you use a priority queue instead of separate topics?</li><li>What if OTPs and campaigns share one SMS vendor account with a rate cap?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Amazon,Atlassian,Uber">
+          <summary>How do you avoid sending the same notification twice?</summary>
+          <div class="answer">
+            <p>Accept that Kafka delivery is at-least-once and make consumers idempotent. Each notification carries an event ID from the producer (for example <code>ord-981:shipped</code>), and the API dedupes caller retries with an Idempotency-Key. Workers keep a sent log keyed by (event ID, channel) in Redis with SET NX and a TTL, or a table with a unique key. Order matters: mark SENDING, call the provider, mark SENT; a stale SENDING is retried. That allows a rare duplicate but no silent loss. Push collapse keys reduce visible duplicates on the device.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "exactly-once end to end with an external provider is not possible; at-least-once plus dedupe is". Then the key, the store and the ordering.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Doesn't Kafka have exactly-once? (Only for read-process-write inside Kafka; an APNs call is outside.)</li><li>How long do you keep dedupe keys?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Swiggy,Flipkart,Amazon">
+          <summary>FCM starts returning errors for 10 minutes. What does your system do?</summary>
+          <div class="answer">
+            <p>Workers classify the errors: 5xx and timeouts are temporary. The failing messages go to a delayed retry topic with backoff and jitter instead of blocking their partitions; a circuit breaker stops hammering FCM and probes it periodically. Lag on push topics grows, which is expected and visible on dashboards. When FCM recovers, retries flow; messages whose TTL has passed (an OTP after 5 minutes) are dropped and their status set to "expired". For critical messages, the router can fall back to SMS if push fails for too long.</p>
+            <div class="approach"><h5>How to answer</h5><p>Classify, retry without blocking, protect the provider, drop what is stale, and offer channel fallback for critical messages.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid a thundering herd when FCM comes back?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Amazon,Microsoft">
+          <summary>Why not just sleep and retry inside the worker when a send fails?</summary>
+          <div class="answer">
+            <p>Within a partition, Kafka consumers process in order. If the worker sleeps 10 minutes on one message, every message behind it in that partition waits 10 minutes, including healthy ones for other users. Publishing the failed message to a retry topic (and committing the original offset) lets the main flow continue. The retry topic's consumer waits until each message's due time. After N tries, the DLQ.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain head-of-line blocking in one sentence, then the retry-topic ladder.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What goes in the DLQ message besides the payload? (error, attempt count, timestamps)</li><li>Who reads the DLQ?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Flipkart,Swiggy">
+          <summary>Where do user preferences and quiet hours get applied, and why there?</summary>
+          <div class="answer">
+            <p>In the router, after the request leaves Kafka and before fan-out to channels. That is the one place that sees every notification, so the rules are applied consistently and the calling services do not need to know anything about preferences. The router caches preferences (they change rarely) and refreshes on change events. If preferences are unavailable, transactional messages still go out but promotional ones are held.</p>
+            <div class="approach"><h5>How to answer</h5><p>One central place, cached, and a safe default when the data is missing.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A user opts out while a campaign is mid-send. Do they still get it?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,k8s,kafka" data-company="Amazon,Atlassian">
+          <summary>How do you scale the workers, and what limits scaling?</summary>
+          <div class="answer">
+            <p>Scale on consumer lag (KEDA's Kafka scaler or a custom metric for the HPA), not CPU, because workers mostly wait on provider calls. Limits: in a classic consumer group, one partition feeds at most one consumer, so the partition count caps parallelism; choose partitions up front for peak (adding partitions later remaps keys and breaks per-user ordering briefly). Provider rate limits cap you too: past a point more workers just get 429s. Within a worker, use async HTTP/2 with many requests in flight to make each pod efficient. Kafka share groups (production-ready since 4.2) remove the one-consumer-per-partition limit for queue-like work.</p>
+            <div class="approach"><h5>How to answer</h5><p>Right metric, then the two ceilings (partitions, provider limits), then per-pod efficiency.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not 1,000 partitions just in case?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>How do you track whether a notification was delivered and opened?</summary>
+          <div class="answer">
+            <p>Each send creates a log row with status "queued". The worker updates it to "sent" with the provider's message ID. SMS and email providers call our webhook with delivery or bounce events; we look up the row by provider message ID and update it. "Opened" comes from the app (it reports when a push is tapped) or an email tracking pixel. Status updates flow through Kafka to the log store and an analytics store, so dashboards show delivery and open rates per template and campaign.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the status state machine: queued → sent → delivered/failed → opened, and name who reports each step.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>APNs does not tell you about delivery. How do you know a push arrived?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="PhonePe,Swiggy,Paytm">
+          <summary>Design the OTP path specifically. What is different?</summary>
+          <div class="answer">
+            <p>OTP is the highest priority and the most abuse-prone. Generate the code in the auth service, store only a hash with a short TTL (say 5 minutes) and an attempt counter; never log it. Rate-limit sends per phone number and per IP (fail closed) to stop SMS-pumping fraud. Send via a dedicated high-priority topic and worker pool to two SMS vendors behind circuit breakers; drop the message if its TTL has expired. Allow "resend" only after a cool-down, with the same idempotency rules. In India, the SMS template must be registered on DLT.</p>
+            <div class="approach"><h5>How to answer</h5><p>Security (hash, TTL, rate limit), speed (isolated path), reliability (two vendors), and cost (abuse limits).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Vendor A accepted the SMS but it never arrived. When do you try vendor B?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Microsoft,Amazon">
+          <summary>Kafka or SQS/RabbitMQ for this system?</summary>
+          <div class="answer">
+            <p>Kafka fits the high-volume, bursty, multi-consumer shape: retention for replay, per-user ordering with keys, many consumer groups reading the same events (push, analytics, audit), and very high throughput. A classic queue such as SQS or RabbitMQ gives simpler per-message acks, visibility timeouts and built-in delayed redelivery and DLQs, which suits the retry part well, and is a fine choice at lower volume. Many real systems use Kafka for the main flow and a delay-capable queue or retry topics for retries. Kafka 4.2+ share groups narrow the gap.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not say "Kafka is better". Map each tool to a need and pick for this scale. See <a href="{{BASE}}devops/kafka-01">why messaging</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you implement a 10-minute delay in Kafka?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: users get the same "order shipped" push three times</h4>
+          <div class="situation">Since this morning, support reports triple pushes for order updates. Kafka consumer group dashboards show frequent rebalances on <code>push.high</code>. No code was deployed to the push workers.</div>
+          <div class="bad">Weak answer: "Kafka is broken; switch to a different queue."</div>
+          <div class="good">Strong answer: "Rebalances plus duplicates means workers are being kicked out of the group before they commit offsets, so another worker re-reads the same messages. Likely cause: processing a batch now takes longer than <code>max.poll.interval.ms</code> (maybe the provider got slower, or the batch size grew), so the coordinator thinks the worker died. Short term: reduce <code>max.poll.records</code> or raise the poll interval. Real fix: make sure dedupe is actually working (is the sent-log TTL too short? is the event ID stable?), because rebalances will always happen sometimes."</div>
+          <div class="followups">Follow-ups: How would you confirm the theory from metrics? Why did dedupe not catch it?</div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: the campaign at 9 AM delayed OTPs by 20 minutes</h4>
+          <div class="situation">During a sale launch, login OTPs took up to 20 minutes. The push.high and sms.high lag graphs stayed flat.</div>
+          <div class="bad">Weak answer: "Add more SMS workers."</div>
+          <div class="good">Strong answer: "If our high-priority lag was flat, the queue was not ours: it was at the provider. Campaign SMS and OTP SMS probably shared one vendor account, and the campaign used up its per-second quota, so OTPs were throttled or queued at the vendor. Fix: separate sender accounts or routes for transactional SMS, pace campaign SMS below the vendor limit, and measure end-to-end delivery time from callbacks, not just our own lag."</div>
+          <div class="followups">Follow-ups: What SLO would you set for OTP delivery, and how would you measure it?</div>
+        </div>
+      

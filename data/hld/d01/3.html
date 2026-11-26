@@ -1,0 +1,100 @@
+
+        <h2>Key APIs</h2>
+        <p>An <strong>API</strong> (application programming interface) is the list of requests a client can send. We use plain <strong>REST</strong> over HTTPS: each request is a verb (<code>POST</code>, <code>GET</code>, <code>DELETE</code>) plus a path. Two calls do 95% of the work.</p>
+<pre><code class="language-bash"># 1) Create a short link
+POST /api/v1/urls
+Authorization: Bearer &lt;api-key&gt;        # who is creating (for quotas and abuse)
+Content-Type: application/json
+{
+  "long_url":   "https://www.example.com/products/2026/winter-sale?ref=email",
+  "custom_alias": "diwali-sale",          # optional
+  "expires_at":   "2027-01-31T00:00:00Z"  # optional
+}
+-&gt; 201 Created
+{ "code": "aZ3kP9q", "short_url": "https://sho.rt/aZ3kP9q", "expires_at": "2027-01-31T00:00:00Z" }
+-&gt; 409 Conflict   if custom_alias is taken
+-&gt; 429 Too Many Requests  if the caller exceeds its quota (see the rate limiter design)
+
+# 2) Follow a short link (what a browser does)
+GET /aZ3kP9q
+-&gt; 302 Found
+   Location: https://www.example.com/products/2026/winter-sale?ref=email
+-&gt; 404 Not Found  if unknown;  410 Gone  if expired or disabled
+
+# 3) Analytics (stretch)
+GET /api/v1/urls/aZ3kP9q/stats?from=2026-11-01&amp;to=2026-11-23
+-&gt; 200 { "total_clicks": 18342, "by_day": [ ... ] }
+
+# 4) Delete / disable
+DELETE /api/v1/urls/aZ3kP9q   -&gt; 204 No Content</code></pre>
+        <p>The create call is protected by the <a href="{{BASE}}hld/d02">rate limiter</a> so one script cannot burn through millions of codes. Note that the redirect path is <b>not</b> under <code>/api</code>: it must be as short and as fast as possible.</p>
+
+        <h3>301 or 302? (the classic trap)</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Status</th><th>Meaning</th><th>Browser caches it?</th><th>Good for</th><th>Cost</th></tr></thead>
+            <tbody>
+              <tr><td><b>301</b> Moved Permanently</td><td>"This address moved forever."</td><td class="yes">Yes, can cache for a long time</td><td>Less load on us</td><td class="no">Repeat clicks never reach us, so click counts are lost; you cannot change the target later</td></tr>
+              <tr><td><b>302</b> Found (or <b>307</b>)</td><td>"Go here for now."</td><td class="no">No (unless headers allow)</td><td>Analytics, editable or expiring links</td><td>Every click hits our servers or CDN</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>Our pick:</b> 302, because analytics and expiry are requirements. If the interviewer drops analytics, say 301 cuts load. Either way, say <i>why</i>. That sentence is what they are listening for.</p>
+
+        <h3>Try it: a 40-line shortener on your laptop</h3>
+        <p>To see the real HTTP exchange, here is a toy version using only the Python standard library (a dict stands in for the database). Save the base62 functions from the deep dive below as <code>b62.py</code>, this file as <code>tiny.py</code>, then run <code>python tiny.py</code> in one terminal and the <code>curl</code> commands in another.</p>
+<pre><code class="language-python"># tiny.py - toy URL shortener (one process, in-memory)
+import json, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from b62 import encode
+
+lock = threading.Lock()
+counter = 62**6          # start at the first 7-character number
+store = {}               # code -&gt; long URL
+
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global counter
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with lock:                       # the "global counter"
+            counter += 1
+            code = encode(counter)
+        store[code] = body["long_url"]
+        out = json.dumps({"code": code, "short_url": f"http://localhost:8080/{code}"}).encode()
+        self.send_response(201)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_GET(self):
+        url = store.get(self.path.lstrip("/"))
+        if url is None:
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+        self.send_response(302)
+        self.send_header("Location", url)
+        self.send_header("Cache-Control", "private, max-age=0")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+if __name__ == "__main__":
+    ThreadingHTTPServer(("127.0.0.1", 8080), H).serve_forever()</code></pre>
+<pre class="terminal"><code>$ curl -s -X POST localhost:8080/api/v1/urls -H "Content-Type: application/json" -d '{"long_url":"https://kafka.apache.org/documentation/"}'
+{"code": "1000001", "short_url": "http://localhost:8080/1000001"}
+
+$ curl -si localhost:8080/1000001
+HTTP/1.0 302 Found
+Server: BaseHTTP/0.6 Python/3.11.9
+Date: Sun, 22 Nov 2026 20:44:16 GMT
+Location: https://kafka.apache.org/documentation/
+Cache-Control: private, max-age=0
+Content-Length: 0
+
+$ curl -si localhost:8080/nope
+HTTP/1.0 404 Not Found
+Server: BaseHTTP/0.6 Python/3.11.9
+Date: Sun, 22 Nov 2026 20:44:16 GMT
+Content-Length: 0</code></pre>
+        <p class="muted">(Your Python version in the <code>Server:</code> header will differ; this run used 3.11, while the Dockerfile below pins 3.12. Both work.)</p>
+        <p>Notice the first code is <code>1000001</code>: we started the counter at 62<sup>6</sup> so every code is exactly 7 characters. The rest of this page is about turning this one process into something that survives 350,000 clicks a second and a dead machine.</p>
+      

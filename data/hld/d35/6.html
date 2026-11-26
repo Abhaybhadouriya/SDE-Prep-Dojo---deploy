@@ -1,0 +1,120 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Is "merge the local top-Ks" actually correct?</h3>
+        <p>It depends on <b>how you partitioned</b>. This is the question that separates good answers from great ones.</p>
+        <ul>
+          <li><b>Partitioned by item (our design):</b> every item's full count is on one shard. The global top-K must be in some shard's local top-K, so merging K items from each of N shards is <b>exact</b>.</li>
+          <li><b>Partitioned any other way</b> (round-robin, by time, by user): an item's count is split across shards. An item can be number 1,001 everywhere and number 1 overall. Merging local top-Ks is then <b>approximate</b>.</li>
+        </ul>
+        <p>Real systems live with the second case. Apache Druid's TopN query returns the top 1,000 local results from each segment and merges them at the broker, and its documentation states the result is approximate only when a dimension has more than 1,000 values. Their fix for exactness is a second pass: find candidates with TopN, then re-count just those candidates exactly. Use the same two-pass trick in an interview when you cannot partition by item.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="Merging local top lists; exact when keyed by item, approximate otherwise">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="15" y="15" width="400" height="200"/>
+            <text class="zone-label" x="28" y="36">keyed by item: exact</text>
+            <rect class="box svc" x="35" y="55" width="160" height="40"/><text class="label small" x="115" y="75">shard A: cat 900, dog 40</text>
+            <rect class="box svc" x="35" y="110" width="160" height="40"/><text class="label small" x="115" y="130">shard B: fox 700, owl 30</text>
+            <rect class="box active" x="250" y="80" width="145" height="50"/><text class="label ok" x="322" y="105">top-2: cat, fox</text>
+            <path class="arrow" d="M195 75 L243 98"/><path class="arrow" d="M195 130 L243 112"/>
+            <text class="label small" x="215" y="185">each item lives on one shard</text>
+            <rect class="zone" x="445" y="15" width="400" height="200"/>
+            <text class="zone-label" x="458" y="36">split counts: can be wrong</text>
+            <rect class="box svc" x="465" y="55" width="170" height="40"/><text class="label small" x="550" y="75">A: cat 50, dog 48</text>
+            <rect class="box svc" x="465" y="110" width="170" height="40"/><text class="label small" x="550" y="130">B: fox 50, dog 48</text>
+            <rect class="box fail" x="675" y="80" width="155" height="50"/><text class="label bad" x="752" y="97">top-1 says cat 50</text><text class="label small" x="752" y="118">but dog = 96</text>
+            <path class="arrow" d="M635 75 L668 98"/><path class="arrow" d="M635 130 L668 112"/>
+            <text class="label small" x="645" y="185">fix: send K + buffer, or recount candidates</text>
+          </svg>
+          <figcaption>Left: partitioned by item, merging local lists is exact. Right: with K = 1, "dog" is second on both shards (48 + 48 = 96) and is the real winner, but a local top-1 never sends it up.</figcaption>
+        </figure>
+
+        <h3>2. Windows: tumbling, sliding, and all-time</h3>
+        <ul>
+          <li><b>Tumbling</b> windows do not overlap; each event belongs to exactly one window (09:00-10:00, 10:00-11:00). Cheap: one counter set per window.</li>
+          <li><b>Sliding</b> windows have a size and a slide; with a 10-minute size and 5-minute slide each event lands in two windows (Flink docs). A month sliding by the minute would put each event in 43,200 windows - too much state.</li>
+          <li><b>The practical answer:</b> keep minute buckets, then maintain each window total by <b>adding the newest bucket and subtracting the expired one</b> (the ring buffer above). Hello Interview offers a neat variant: a second Kafka <a href="{{BASE}}interview/glossary#consumer-group">consumer group</a> that reads the same topic one hour behind and <i>decrements</i> - no minute storage, but Kafka retention must exceed the longest window.</li>
+          <li><b>Product shortcut:</b> sliding for "last hour", tumbling (aligned) for day and month. Users rarely notice the difference for long windows.</li>
+          <li><b>Late events.</b> Allow about 1 minute: use event time with a watermark (Hello Interview uses 30 seconds of out-of-orderness in Flink) and a small allowed lateness; anything later goes only to the batch path.</li>
+        </ul>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> "Partition by item so merging local top-Ks is exact" and "minute buckets that you add and subtract for sliding windows" are the interview-sufficient core. Deep dives 3-5 (count-min sketch, hot-key salting, the Lambda split) are what an SDE-2 answer adds.</p></div>
+
+        <h3>3. Approximate counting: count-min sketch + heap</h3>
+        <p>When keys are too many for exact counters, or memory per node is tight, use a <b>count-min sketch</b>: a d x w grid of counters and d hash functions. To add an item, increment one counter in each row. To query, take the <b>minimum</b> across rows. Collisions can only add, never subtract, so the estimate is <b>never too low</b>, and with probability 1 - delta it is at most epsilon x total count too high.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 300" role="img" aria-label="Count-min sketch update and query">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="25">3 rows (hash functions) x 6 columns</text>
+            <g>
+              <rect class="box" x="200" y="50" width="60" height="50"/><rect class="box" x="260" y="50" width="60" height="50"/><rect class="box" x="320" y="50" width="60" height="50"/><rect class="box" x="380" y="50" width="60" height="50"/><rect class="box" x="440" y="50" width="60" height="50"/><rect class="box" x="500" y="50" width="60" height="50"/>
+              <rect class="box" x="200" y="110" width="60" height="50"/><rect class="box" x="260" y="110" width="60" height="50"/><rect class="box" x="320" y="110" width="60" height="50"/><rect class="box" x="380" y="110" width="60" height="50"/><rect class="box" x="440" y="110" width="60" height="50"/><rect class="box" x="500" y="110" width="60" height="50"/>
+              <rect class="box" x="200" y="170" width="60" height="50"/><rect class="box" x="260" y="170" width="60" height="50"/><rect class="box" x="320" y="170" width="60" height="50"/><rect class="box" x="380" y="170" width="60" height="50"/><rect class="box" x="440" y="170" width="60" height="50"/><rect class="box" x="500" y="170" width="60" height="50"/>
+              <text class="label small" x="170" y="75">h1</text><text class="label small" x="170" y="135">h2</text><text class="label small" x="170" y="195">h3</text>
+            </g>
+            <g data-step="1">
+              <rect class="box client" x="20" y="110" width="110" height="50"/><text class="label" x="75" y="135">"cat"</text>
+              <rect class="box highlight" x="260" y="50" width="60" height="50"/><text class="label" x="290" y="75">5</text>
+              <rect class="box highlight" x="320" y="170" width="60" height="50"/><text class="label" x="350" y="195">5</text>
+            </g>
+            <g data-step-only="1">
+              <rect class="box highlight" x="440" y="110" width="60" height="50"/><text class="label" x="470" y="135">5</text>
+            </g>
+            <g data-step="2">
+              <rect class="box hot" x="440" y="110" width="60" height="50"/><text class="label" x="470" y="135">8</text>
+              <text class="label small" x="470" y="240">"dog" (3) collided here</text>
+            </g>
+            <g data-step="3">
+              <rect class="box active" x="600" y="90" width="240" height="90"/>
+              <text class="label" x="720" y="115">estimate(cat)</text>
+              <text class="label" x="720" y="140">= min(5, 8, 5) = 5</text>
+              <text class="label small" x="720" y="163">never below the truth</text>
+              <path class="arrow" d="M560 135 L593 135"/>
+            </g>
+            <g data-step="4">
+              <rect class="box queue" x="600" y="200" width="240" height="70"/>
+              <text class="label" x="720" y="225">min-heap of top K</text>
+              <text class="label small" x="720" y="248">replace root if estimate is bigger</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Add.</b> "cat" is seen 5 times; each of the 3 hash functions picks one counter per row and adds 5.</li>
+            <li><b>Collision.</b> "dog" (seen 3 times) hashed into the same row-2 counter, so it reads 8. Collisions only ever inflate.</li>
+            <li><b>Query.</b> Take the minimum across rows: 5. The smallest counter is the one with the fewest collisions.</li>
+            <li><b>Keep the winners.</b> A min-heap of K items sits beside the sketch: after each update, if the item's estimate beats the heap's smallest, swap it in.</li>
+          </ol>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Structure</th><th>Memory</th><th>Error</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td>Exact hash map + heap</td><td>O(distinct keys) - 64 GB for 4B videos</td><td>None</td><td>Best when keys fit after partitioning</td></tr>
+              <tr><td>Count-min sketch + heap</td><td>O(w x d) - about 54 KB at 0.1% / 99%</td><td>Overestimates by at most epsilon x N</td><td>Mergeable (add grids cell by cell); Redis <code>CMS.*</code>; low counts are noise</td></tr>
+              <tr><td>HeavyKeeper (Redis <code>TOPK.*</code>)</td><td>Small; width about k log k, depth about log k (min 5)</td><td>Low for big items</td><td>"Count with exponential decay" biased against small flows; <code>TOPK.ADD</code> returns the item it expelled</td></tr>
+              <tr><td>Space-Saving / Misra-Gries</td><td>O(K) counters</td><td>Bounded overestimate</td><td>Classic streaming heavy-hitter algorithms; good to name</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-bash"># Redis Stack: approximate counts + a self-maintaining top-K
+CMS.INITBYPROB views:2026-11-23T10 0.001 0.01      # 0.1% error, 99% confidence
+CMS.INCRBY     views:2026-11-23T10 video:42 1
+CMS.QUERY      views:2026-11-23T10 video:42
+
+TOPK.RESERVE   top:1h 100 2000 7 0.9               # k, width, depth, decay
+TOPK.ADD       top:1h video:42                    # returns an expelled item, or nil
+TOPK.LIST      top:1h</code></pre>
+        <div class="callout warn"><p>Redis's own docs warn that counts below the threshold <code>error x total_count</code> are noise. A count-min sketch is great at finding <i>heavy</i> items, useless for the long tail. That is exactly what top-K needs - but never use it to show a small creator their exact view count.</p></div>
+
+        <h3>4. Hot keys: when one item is the whole stream</h3>
+        <p>Partitioning by item makes merging exact, but a viral video can send a huge share of 700k events/s to one partition. Fixes, cheapest first:</p>
+        <ol class="steps">
+          <li><strong>Pre-aggregate before Kafka.</strong> Each ingest server sums events per item for 1 second and sends <code>(item, +350)</code> instead of 350 messages. This is a "combiner" in MapReduce terms and cuts volume most for exactly the hottest items.</li>
+          <li><strong>Salt the hot key.</strong> Write <code>video:42#0..7</code> to 8 partitions; the merger sums the 8 partial counts before ranking. Only salt keys you detect as hot: salting every key multiplies merge and read work by the salt factor. Also make sure the partials are summed <em>before</em> any local top-K cut - if a shard ranks <code>video:42#3</code> on its own, it can drop it, and the merge becomes approximate.</li>
+          <li><strong>Batch writes downstream.</strong> Flush aggregated counts to the store every few seconds, not per event - the 2-100x reduction from the estimation.</li>
+        </ol>
+        <p>The general toolbox is on <a href="{{BASE}}hld/p05">Scaling Writes</a>; the sibling problem is <a href="{{BASE}}hld/d39">Distributed Counter</a>.</p>
+
+        <h3>5. Fast-and-approximate plus slow-and-exact (Lambda)</h3>
+        <p>Many teams run two paths: the stream gives a fresh, possibly approximate answer within a minute; a batch job over raw events in object storage gives an exact answer hours later and <b>overwrites</b> the stream's numbers for closed windows. system-design-primer's Amazon example is pure batch - a two-step MapReduce (sum per (category, product), then distributed sort) run hourly into a <code>sales_rank</code> table. The alternative, <b>Kappa</b>, keeps one streaming path and fixes bugs by replaying Kafka. See <a href="{{BASE}}hld/hld-12">Big Data: Batch, Streaming &amp; Probabilistic Structures</a> and <a href="{{BASE}}hld/p09">Counting, Ranking &amp; Windowed Aggregation</a>.</p>
+        <div class="callout interview"><p><b>Atlassian twist:</b> "top-K pages, excluding ones this user already viewed." Compute a global candidate list of K + buffer (say 3K), then filter per user against their viewed set (a Bloom filter is fine - a false positive only hides one page). Never compute a per-user top-K from raw events.</p></div>
+      

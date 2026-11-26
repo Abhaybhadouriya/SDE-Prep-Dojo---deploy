@@ -1,0 +1,80 @@
+
+        <h2>Data model</h2>
+        <h3>Cart: a key-value document</h3>
+<pre><code class="language-json">// DynamoDB-style item. Partition key = cart owner. One read gets the whole cart.
+{
+  "pk": "USER#42",               // or "GUEST#c8f1..." for a guest cart token
+  "items": { "B0-PHONE-128": { "qty": 1, "addedAt": 1732350000, "priceSeen": 1899900 } },
+  "version": 17,                 // optimistic concurrency for multi-device edits
+  "ttl": 1740000000              // guest carts expire
+}</code></pre>
+        <p>If a phone and a laptop both edit the cart, use a conditional write on <code>version</code>. If you ever accept conflicting versions (for example from two regions), merge them by keeping the union of items, which is the approach the Dynamo paper describes. The worst case is that a deleted item comes back, and the customer can remove it again. Losing an added item would cost a sale, so the union is the kinder failure.</p>
+        <h3>Checkout: relational tables (the truth)</h3>
+<pre><code class="language-sql">CREATE TABLE inventory (
+  sku TEXT, warehouse_id INT,
+  on_hand  INT NOT NULL,             -- physically in the building
+  reserved INT NOT NULL DEFAULT 0,   -- promised to orders not yet shipped
+  PRIMARY KEY (sku, warehouse_id),
+  CHECK (reserved &gt;= 0 AND reserved &lt;= on_hand)
+);
+
+CREATE TABLE reservations (
+  reservation_id BIGINT PRIMARY KEY, order_id BIGINT, sku TEXT, warehouse_id INT, qty INT,
+  status TEXT NOT NULL,              -- HELD, CONFIRMED, RELEASED
+  expires_at TIMESTAMPTZ NOT NULL,   -- e.g. now() + 15 min
+  UNIQUE (order_id, sku)             -- a retried reserve step cannot double-hold
+);
+
+CREATE TABLE orders (
+  order_id BIGINT PRIMARY KEY, customer_id BIGINT NOT NULL,
+  idempotency_key UUID NOT NULL, request_hash TEXT NOT NULL,
+  status TEXT NOT NULL,              -- PENDING, CONFIRMED, PAYMENT_FAILED, CANCELLED, SHIPPED
+  total_minor BIGINT NOT NULL, currency CHAR(3) NOT NULL,
+  quote_id TEXT NOT NULL, response JSONB,     -- saved response, replayed on retry
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (customer_id, idempotency_key)
+);
+-- order states: PENDING -&gt; CONFIRMED -&gt; SHIPPED (happy path)
+--               PENDING -&gt; PAYMENT_FAILED (declined; stock released)
+--               CONFIRMED -&gt; CANCELLED (customer cancels before shipping; refund)
+
+CREATE TABLE payments (
+  payment_id BIGINT PRIMARY KEY, order_id BIGINT UNIQUE,
+  provider TEXT, provider_ref TEXT, status TEXT,   -- AUTH_PENDING, AUTHORIZED, CAPTURED, FAILED, UNKNOWN
+  amount_minor BIGINT NOT NULL
+);
+
+CREATE TABLE outbox (id BIGSERIAL PRIMARY KEY, aggregate_id BIGINT, type TEXT, payload JSONB);</code></pre>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Shard key</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Cart</td><td>DynamoDB / Cassandra-style KV</td><td>user or guest id</td><td>Huge write rate, single-key access, must stay writable.</td></tr>
+              <tr><td>Orders, payments, outbox</td><td>SQL (Aurora / Postgres), sharded</td><td><code>customer_id</code></td><td>"My orders" stays on one shard. The order id embeds the shard, so lookups by id are direct.</td></tr>
+              <tr><td>Inventory, reservations</td><td>SQL, sharded</td><td><code>sku</code></td><td>Row-level atomic updates with a CHECK constraint. A hot SKU is a hot row (see <a href="{{BASE}}hld/d09">flash sale</a>).</td></tr>
+              <tr><td>Catalogue, reviews, "only 3 left"</td><td>Cache + search index</td><td>sku</td><td>Read-heavy, eventual consistency is fine for display.</td></tr>
+              <tr><td>Events</td><td>Kafka</td><td><code>orderId</code></td><td>Fan-out to fulfilment, email, analytics, with per-order ordering.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Two worlds: the cart is available and eventually consistent, the order path is consistent and transactional">
+            <rect class="zone" x="20" y="20" width="330" height="180"/>
+            <text class="zone-label" x="36" y="44">AP world: never refuse a write</text>
+            <rect class="box client" x="50" y="70" width="120" height="56"/><text class="label" x="110" y="98">Cart svc</text>
+            <rect class="box cache" x="200" y="70" width="120" height="56"/><text class="label" x="260" y="92">KV store</text><text class="label small" x="260" y="112">multi-AZ</text>
+            <path class="arrow both" d="M170 98 L192 98"/>
+            <text class="label small" x="185" y="170">merge conflicts: union of items</text>
+            <rect class="zone kafka" x="430" y="20" width="350" height="180"/>
+            <text class="zone-label" x="446" y="44">CP world: exactly right or retry</text>
+            <rect class="box svc" x="460" y="70" width="130" height="56"/><text class="label" x="525" y="98">Checkout</text>
+            <rect class="box db" x="620" y="70" width="130" height="56"/><text class="label" x="685" y="92">SQL shards</text><text class="label small" x="685" y="112">ACID per step</text>
+            <path class="arrow both" d="M590 98 L612 98"/>
+            <text class="label small" x="605" y="170">idempotency key + saga + outbox</text>
+            <path class="arrow" d="M350 110 L422 110"/>
+            <text class="label small" x="390" y="140">checkout</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M260 126 L260 150 L390 150 L390 110 L525 110"/></circle>
+          </svg>
+          <figcaption>The cart and the order live in two different consistency worlds. Pressing "Proceed to checkout" crosses the border.</figcaption>
+        </figure>
+      

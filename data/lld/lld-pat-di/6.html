@@ -1,0 +1,441 @@
+
+  <h2>Code: manual wiring, tests with fakes, a locator, a mini container</h2>
+  <p>Each tab is a complete program that was compiled and run; outputs are real. Java shows constructor and setter injection, a composition root, tests with fakes and a fixed <code>Clock</code>, a service locator for contrast, a 25-line container that names a binding cycle instead of overflowing the stack, and <code>ServiceLoader</code>. Python injects plain functions as well as objects. C++14 shows interface injection with clear ownership, compile-time policy injection, and the C ops-table style. Files live in <code>lld-code/lld-pat-di/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>DiDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Abstractions</td><td><code>PaymentGateway, Notifier, OrderRepository</code></td><td>8-10</td><td>what the service depends on</td></tr>
+    <tr><td>Implementations</td><td><code>CardGateway, InMemoryOrders, EmailNotifier, SmsNotifier</code></td><td>13-28</td><td>chosen outside the service</td></tr>
+    <tr><td>Client receiving dependencies</td><td><code>OrderService</code></td><td>31-55</td><td>constructor injection, final fields</td></tr>
+    <tr><td>Contrast: service locator</td><td><code>ServiceLocator, LocatorOrderService</code></td><td>58-71</td><td>hidden dependencies</td></tr>
+    <tr><td>Mini container</td><td><code>Container</code></td><td>75-96</td><td>recipes, cache, cycle check</td></tr>
+    <tr><td>Test doubles</td><td><code>FakeGateway, RecordingNotifier</code></td><td>99-109</td><td>possible only because of DI</td></tr>
+    <tr><td>Composition root</td><td><code>main</code></td><td>115-166</td><td>the one place that calls new</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.time.*;
+import java.util.*;
+import java.util.function.Function;
+
+public class DiDemo {
+
+    // ---- Abstractions the business code depends on ----
+    public interface PaymentGateway { boolean charge(String orderId, long paise); }
+    public interface Notifier { String channel(); void send(String to, String msg); }
+    public interface OrderRepository { void save(String orderId, String status); Optional&lt;String&gt; status(String orderId); }
+
+    // ---- Real implementations ----
+    static final class CardGateway implements PaymentGateway {
+        public boolean charge(String id, long paise) { System.out.println("  [card] charged " + paise + " for " + id); return true; }
+    }
+    static final class InMemoryOrders implements OrderRepository {
+        private final Map&lt;String, String&gt; rows = new HashMap&lt;&gt;();
+        public void save(String id, String s) { rows.put(id, s); }
+        public Optional&lt;String&gt; status(String id) { return Optional.ofNullable(rows.get(id)); }
+    }
+    public static final class EmailNotifier implements Notifier {          // public + no-arg ctor: ServiceLoader can create it
+        public String channel() { return "email"; }
+        public void send(String to, String msg) { System.out.println("  [email] to " + to + ": " + msg); }
+    }
+    public static final class SmsNotifier implements Notifier {
+        public String channel() { return "sms"; }
+        public void send(String to, String msg) { System.out.println("  [sms] to " + to + ": " + msg); }
+    }
+
+    // ---- The class under design: CONSTRUCTOR INJECTION ----
+    static final class OrderService {
+        private final PaymentGateway gateway;          // required collaborators: final, set once
+        private final OrderRepository orders;
+        private final Notifier notifier;
+        private final Clock clock;                     // even time is a dependency
+        private Runnable auditHook = () -&gt; { };        // optional: SETTER INJECTION with a safe default
+
+        OrderService(PaymentGateway gateway, OrderRepository orders, Notifier notifier, Clock clock) {
+            this.gateway = Objects.requireNonNull(gateway);
+            this.orders = Objects.requireNonNull(orders);
+            this.notifier = Objects.requireNonNull(notifier);
+            this.clock = Objects.requireNonNull(clock);
+        }
+        void setAuditHook(Runnable hook) { this.auditHook = Objects.requireNonNull(hook); }
+
+        String placeOrder(String orderId, String customer, long paise) {
+            boolean lateNight = LocalTime.now(clock).getHour() &gt;= 23;       // business rule that needs time
+            long total = lateNight ? paise + 2_000 : paise;                 // Rs 20 late-night fee
+            String status = gateway.charge(orderId, total) ? "PAID" : "FAILED";
+            orders.save(orderId, status);
+            notifier.send(customer, "order " + orderId + " " + status + " (" + total + " paise)");
+            auditHook.run();
+            return status;
+        }
+    }
+
+    // ---- Anti-example for contrast: SERVICE LOCATOR (a global registry the class pulls from) ----
+    static final class ServiceLocator {
+        private static final Map&lt;Class&lt;?&gt;, Object&gt; services = new HashMap&lt;&gt;();
+        static &lt;T&gt; void register(Class&lt;T&gt; type, T impl) { services.put(type, impl); }
+        static &lt;T&gt; T get(Class&lt;T&gt; type) {
+            Object o = services.get(type);
+            if (o == null) throw new IllegalStateException("no service registered for " + type.getSimpleName());
+            return type.cast(o);
+        }
+    }
+    static final class LocatorOrderService {               // its dependencies are invisible in its constructor
+        String placeOrder(String id, long paise) {
+            return ServiceLocator.get(PaymentGateway.class).charge(id, paise) ? "PAID" : "FAILED";
+        }
+    }
+
+    // ---- A 25-line "container": what Spring/Guice automate (register recipes, resolve, cache singletons) ----
+    // Single-threaded by design (plain HashMaps): build the graph in main() before starting threads.
+    static final class Container {
+        private final Map&lt;Class&lt;?&gt;, Function&lt;Container, ?&gt;&gt; recipes = new HashMap&lt;&gt;();
+        private final Map&lt;Class&lt;?&gt;, Object&gt; singletons = new HashMap&lt;&gt;();
+        private final LinkedHashSet&lt;Class&lt;?&gt;&gt; resolving = new LinkedHashSet&lt;&gt;();   // the current path
+        &lt;T&gt; Container bind(Class&lt;T&gt; type, Function&lt;Container, ? extends T&gt; recipe) { recipes.put(type, recipe); return this; }
+        &lt;T&gt; T get(Class&lt;T&gt; type) {
+            Object o = singletons.get(type);
+            if (o == null) {
+                Function&lt;Container, ?&gt; r = recipes.get(type);
+                if (r == null) throw new IllegalStateException("no binding for " + type.getSimpleName());
+                if (!resolving.add(type)) {                         // A needs B needs A: say so clearly
+                    StringBuilder path = new StringBuilder();
+                    for (Class&lt;?&gt; c : resolving) path.append(c.getSimpleName()).append(" -&gt; ");
+                    throw new IllegalStateException("cycle: " + path + type.getSimpleName());
+                }
+                try { o = r.apply(this); }                          // &lt;-- the pattern: the container calls new
+                finally { resolving.remove(type); }
+                singletons.put(type, o);
+            }
+            return type.cast(o);
+        }
+    }
+
+    // ---- Test doubles: possible only because OrderService does not create its own collaborators ----
+    static final class FakeGateway implements PaymentGateway {
+        final List&lt;Long&gt; charges = new ArrayList&lt;&gt;();
+        final boolean approve;
+        FakeGateway(boolean approve) { this.approve = approve; }
+        public boolean charge(String id, long paise) { charges.add(paise); return approve; }
+    }
+    static final class RecordingNotifier implements Notifier {
+        final List&lt;String&gt; sent = new ArrayList&lt;&gt;();
+        public String channel() { return "test"; }
+        public void send(String to, String msg) { sent.add(to + "|" + msg); }
+    }
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError(what);
+        System.out.println("  PASS " + what);
+    }
+
+    public static void main(String[] args) {
+        // 1) COMPOSITION ROOT: the one place that knows concrete classes and calls `new`.
+        System.out.println("1) manual wiring in main");
+        OrderService service = new OrderService(new CardGateway(), new InMemoryOrders(), new EmailNotifier(),
+                Clock.fixed(Instant.parse("2026-11-23T10:00:00Z"), ZoneOffset.UTC));
+        service.setAuditHook(() -&gt; System.out.println("  [audit] order recorded"));
+        System.out.println("  -&gt; " + service.placeOrder("ORD-1", "asha@example.com", 49_900));
+
+        // 2) UNIT TESTS with fakes and a fixed late-night clock: no network, no real time.
+        System.out.println("2) tests with injected fakes");
+        FakeGateway declined = new FakeGateway(false);
+        RecordingNotifier inbox = new RecordingNotifier();
+        InMemoryOrders repo = new InMemoryOrders();
+        Clock lateNight = Clock.fixed(Instant.parse("2026-11-23T23:30:00Z"), ZoneOffset.UTC);
+        OrderService underTest = new OrderService(declined, repo, inbox, lateNight);
+        String st = underTest.placeOrder("T-1", "ravi", 10_000);
+        check(st.equals("FAILED"), "declined charge gives FAILED");
+        check(declined.charges.equals(List.of(12_000L)), "late-night fee added (10000 + 2000)");
+        check(repo.status("T-1").orElse("").equals("FAILED"), "status saved");
+        check(inbox.sent.size() == 1 &amp;&amp; inbox.sent.get(0).startsWith("ravi|"), "customer notified once");
+
+        // 3) Service locator: works, but the dependency is hidden and fails only at run time.
+        System.out.println("3) service locator");
+        try {
+            new LocatorOrderService().placeOrder("L-1", 100);
+        } catch (IllegalStateException ex) {
+            System.out.println("  runtime failure: " + ex.getMessage());
+        }
+        ServiceLocator.register(PaymentGateway.class, new CardGateway());
+        System.out.println("  -&gt; " + new LocatorOrderService().placeOrder("L-1", 100));
+
+        // 4) A tiny container resolving the same graph from recipes.
+        System.out.println("4) mini container");
+        Container c = new Container()
+                .bind(PaymentGateway.class, k -&gt; new CardGateway())
+                .bind(OrderRepository.class, k -&gt; new InMemoryOrders())
+                .bind(Notifier.class, k -&gt; new SmsNotifier())
+                .bind(Clock.class, k -&gt; Clock.fixed(Instant.parse("2026-11-23T10:00:00Z"), ZoneOffset.UTC))
+                .bind(OrderService.class, k -&gt; new OrderService(k.get(PaymentGateway.class),
+                        k.get(OrderRepository.class), k.get(Notifier.class), k.get(Clock.class)));
+        System.out.println("  -&gt; " + c.get(OrderService.class).placeOrder("ORD-2", "ravi-phone", 25_000));
+        System.out.println("  same singleton? " + (c.get(OrderService.class) == c.get(OrderService.class)));
+        Container bad = new Container()                           // A needs B, B needs A
+                .bind(String.class, k -&gt; "n=" + k.get(Integer.class))
+                .bind(Integer.class, k -&gt; k.get(String.class).length());
+        try { bad.get(String.class); }
+        catch (IllegalStateException e) { System.out.println("  refused: " + e.getMessage()); }
+
+        // 5) java.util.ServiceLoader: discover implementations listed in META-INF/services.
+        System.out.println("5) ServiceLoader discovered:");
+        for (Notifier n : ServiceLoader.load(Notifier.class)) System.out.println("  - " + n.channel() + " (" + n.getClass().getSimpleName() + ")");
+    }
+}</code></pre>
+      <p>ServiceLoader needs a provider-configuration file on the classpath. Its name is the interface's binary name and each line names an implementation:</p>
+<pre><code class="language-bash"># resources/META-INF/services/DiDemo$Notifier
+DiDemo$EmailNotifier
+DiDemo$SmsNotifier</code></pre>
+<pre class="terminal"><code>$ javac -d out DiDemo.java &amp;&amp; java -cp "out;resources" DiDemo      # Windows; use out:resources on Linux/macOS
+1) manual wiring in main
+  [card] charged 49900 for ORD-1
+  [email] to asha@example.com: order ORD-1 PAID (49900 paise)
+  [audit] order recorded
+  -&gt; PAID
+2) tests with injected fakes
+  PASS declined charge gives FAILED
+  PASS late-night fee added (10000 + 2000)
+  PASS status saved
+  PASS customer notified once
+3) service locator
+  runtime failure: no service registered for PaymentGateway
+  [card] charged 100 for L-1
+  -&gt; PAID
+4) mini container
+  [card] charged 25000 for ORD-2
+  [sms] to ravi-phone: order ORD-2 PAID (25000 paise)
+  -&gt; PAID
+  same singleton? true
+  refused: cycle: String -&gt; Integer -&gt; String
+5) ServiceLoader discovered:
+  - email (EmailNotifier)
+  - sms (SmsNotifier)</code></pre>
+      <p>Look at step 3: <code>LocatorOrderService</code> compiled fine and failed only when called, because nothing in its constructor said it needed a gateway. Step 2 tested the 11 pm fee at 10 am by injecting <code>Clock.fixed(...)</code>. Step 4 is the whole idea of a DI container in miniature: a map from type to recipe, plus a cache for singletons.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Dependency Injection in Python: pass collaborators in; wire them in one place; swap them in tests."""
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Protocol
+
+
+class PaymentGateway(Protocol):
+    def charge(self, order_id: str, paise: int) -&gt; bool: ...
+
+
+class Notifier(Protocol):
+    def send(self, to: str, msg: str) -&gt; None: ...
+
+
+class CardGateway:
+    def charge(self, order_id, paise):
+        print(f"  [card] charged {paise} for {order_id}")
+        return True
+
+
+class EmailNotifier:
+    def send(self, to, msg):
+        print(f"  [email] to {to}: {msg}")
+
+
+class OrderService:
+    """Constructor injection. `now` is a plain function: the simplest possible dependency."""
+
+    def __init__(self, gateway: PaymentGateway, notifier: Notifier,
+                 now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)):
+        self._gateway = gateway
+        self._notifier = notifier
+        self._now = now
+
+    def place_order(self, order_id: str, customer: str, paise: int) -&gt; str:
+        total = paise + 2_000 if self._now().hour &gt;= 23 else paise   # late-night fee
+        status = "PAID" if self._gateway.charge(order_id, total) else "FAILED"
+        self._notifier.send(customer, f"order {order_id} {status} ({total} paise)")
+        return status
+
+
+class BadOrderService:
+    """For contrast: creates its own collaborators. Cannot be tested without a real card network."""
+
+    def __init__(self):
+        self._gateway = CardGateway()          # hard-wired
+        self._notifier = EmailNotifier()       # hard-wired
+
+
+# ---- test doubles ----
+@dataclass
+class FakeGateway:
+    approve: bool
+    charges: list = field(default_factory=list)
+
+    def charge(self, order_id, paise):
+        self.charges.append(paise)
+        return self.approve
+
+
+@dataclass
+class RecordingNotifier:
+    sent: list = field(default_factory=list)
+
+    def send(self, to, msg):
+        self.sent.append((to, msg))
+
+
+def build_app() -&gt; OrderService:
+    """Composition root: the only function that knows concrete classes."""
+    return OrderService(CardGateway(), EmailNotifier())
+
+
+def test_late_night_fee_and_decline():
+    gw, inbox = FakeGateway(approve=False), RecordingNotifier()
+    late = lambda: datetime(2026, 11, 23, 23, 30, tzinfo=timezone.utc)
+    svc = OrderService(gw, inbox, now=late)
+    assert svc.place_order("T-1", "ravi", 10_000) == "FAILED"
+    assert gw.charges == [12_000]
+    assert inbox.sent[0][0] == "ravi"
+    print("  PASS late-night fee and decline")
+
+
+if __name__ == "__main__":
+    print("1) wired in the composition root")
+    app = build_app()
+    morning = OrderService(CardGateway(), EmailNotifier(),
+                           now=lambda: datetime(2026, 11, 23, 10, 0, tzinfo=timezone.utc))
+    print("  -&gt;", morning.place_order("ORD-1", "asha@example.com", 49_900))
+    print("2) test with fakes")
+    test_late_night_fee_and_decline()
+    print("3) build_app() wired:", type(app._gateway).__name__, "+", type(app._notifier).__name__,
+          "+ default clock")</code></pre>
+<pre class="terminal"><code>$ python di.py
+1) wired in the composition root
+  [card] charged 49900 for ORD-1
+  [email] to asha@example.com: order ORD-1 PAID (49900 paise)
+  -&gt; PAID
+2) test with fakes
+  PASS late-night fee and decline
+3) build_app() wired: CardGateway + EmailNotifier + default clock</code></pre>
+      <p>Python rarely needs a container: functions are first-class, so a dependency can simply be a callable (<code>now</code>), and duck typing means a fake only needs the same methods. A default argument keeps production call sites short while tests override it. Tools like pytest fixtures and FastAPI's <code>Depends</code> are DI by another name.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Dependency Injection in C++14: three ways to hand a class its collaborators.
+//  (a) constructor injection of interfaces (runtime polymorphism, ownership explicit)
+//  (b) template / policy injection (compile-time, zero virtual calls)
+//  (c) C-style: a struct of function pointers passed in, like a kernel ops table
+// Build: g++ -std=c++14 -Wall di.cpp -o di
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+// ---------- (a) constructor injection ----------
+class Notifier {
+public:
+    virtual ~Notifier() = default;
+    virtual void send(const std::string&amp; to, const std::string&amp; msg) = 0;
+};
+class Clock {
+public:
+    virtual ~Clock() = default;
+    virtual int hour() const = 0;
+};
+
+class EmailNotifier : public Notifier {
+public:
+    void send(const std::string&amp; to, const std::string&amp; msg) override {
+        std::cout &lt;&lt; "  [email] to " &lt;&lt; to &lt;&lt; ": " &lt;&lt; msg &lt;&lt; "\n";
+    }
+};
+class FixedClock : public Clock {
+public:
+    explicit FixedClock(int h) : h_(h) {}
+    int hour() const override { return h_; }
+private:
+    int h_;
+};
+
+class OrderService {
+public:
+    // Owns the notifier (unique_ptr), borrows the clock (reference: caller keeps it alive).
+    OrderService(std::unique_ptr&lt;Notifier&gt; notifier, const Clock&amp; clock)
+        : notifier_(std::move(notifier)), clock_(clock) {}
+    long place(const std::string&amp; who, long paise) {
+        long total = clock_.hour() &gt;= 23 ? paise + 2000 : paise;
+        notifier_-&gt;send(who, "charged " + std::to_string(total) + " paise");
+        return total;
+    }
+private:
+    std::unique_ptr&lt;Notifier&gt; notifier_;
+    const Clock&amp; clock_;
+};
+
+// Test double
+class RecordingNotifier : public Notifier {
+public:
+    explicit RecordingNotifier(std::vector&lt;std::string&gt;&amp; log) : log_(log) {}
+    void send(const std::string&amp; to, const std::string&amp; msg) override { log_.push_back(to + "|" + msg); }
+private:
+    std::vector&lt;std::string&gt;&amp; log_;
+};
+
+// ---------- (b) template (policy) injection ----------
+struct ConsoleLog { static void write(const std::string&amp; s) { std::cout &lt;&lt; "  [log] " &lt;&lt; s &lt;&lt; "\n"; } };
+struct NullLog    { static void write(const std::string&amp;) {} };
+
+template &lt;typename LogPolicy&gt;
+class Router {
+public:
+    int route(int dst) { LogPolicy::write("route to " + std::to_string(dst)); return dst % 4; }
+};
+
+// ---------- (c) C-style ops table injection ----------
+struct net_ops {                                   // like struct net_device_ops
+    int  (*xmit)(const char* frame, int len);
+    void (*on_drop)(int len);
+};
+static int fake_xmit(const char*, int len) { std::cout &lt;&lt; "  [ops] xmit " &lt;&lt; len &lt;&lt; " bytes\n"; return len &gt; 1500 ? -1 : 0; }
+static void count_drop(int len) { std::cout &lt;&lt; "  [ops] dropped " &lt;&lt; len &lt;&lt; " bytes\n"; }
+
+static void send_frame(const net_ops* ops, const char* frame, int len) {   // depends only on the table
+    if (ops-&gt;xmit(frame, len) != 0 &amp;&amp; ops-&gt;on_drop) ops-&gt;on_drop(len);
+}
+
+int main() {
+    std::cout &lt;&lt; "1) composition root wires real objects\n";
+    FixedClock morning(10);
+    OrderService app(std::unique_ptr&lt;Notifier&gt;(new EmailNotifier()), morning);
+    app.place("asha", 49900);
+
+    std::cout &lt;&lt; "2) test with a recording fake and a late-night clock\n";
+    std::vector&lt;std::string&gt; log;
+    FixedClock late(23);
+    OrderService underTest(std::unique_ptr&lt;Notifier&gt;(new RecordingNotifier(log)), late);
+    long total = underTest.place("ravi", 10000);
+    std::cout &lt;&lt; "  " &lt;&lt; (total == 12000 &amp;&amp; log.size() == 1 ? "PASS" : "FAIL")
+              &lt;&lt; " fee added and one message: " &lt;&lt; log[0] &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "3) policy injection at compile time\n";
+    Router&lt;ConsoleLog&gt; verbose;
+    Router&lt;NullLog&gt; quiet;
+    int p1 = verbose.route(9);                     // logs
+    int p2 = quiet.route(9);                       // NullLog::write does nothing
+    std::cout &lt;&lt; "  verbose -&gt; port " &lt;&lt; p1 &lt;&lt; ", quiet -&gt; port " &lt;&lt; p2 &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "4) ops-table injection, C style\n";
+    const net_ops ops = {fake_xmit, count_drop};
+    send_frame(&amp;ops, "hello", 64);
+    send_frame(&amp;ops, "jumbo", 9000);
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall di.cpp -o di &amp;&amp; ./di
+1) composition root wires real objects
+  [email] to asha: charged 49900 paise
+2) test with a recording fake and a late-night clock
+  PASS fee added and one message: ravi|charged 12000 paise
+3) policy injection at compile time
+  [log] route to 9
+  verbose -&gt; port 1, quiet -&gt; port 1
+4) ops-table injection, C style
+  [ops] xmit 64 bytes
+  [ops] xmit 9000 bytes
+  [ops] dropped 9000 bytes</code></pre>
+      <p>In C++ injection also states <b>ownership</b>: a <code>unique_ptr</code> parameter says "I own this from now on"; a reference says "I borrow it, you keep it alive". Template (policy) injection picks the dependency at compile time, so there is no virtual call; the price is that the choice cannot change at run time. The <code>net_ops</code> struct is what you already write in drivers.</p>
+    </div>
+  </div>

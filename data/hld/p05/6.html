@@ -1,0 +1,111 @@
+
+        <h2>Interview: phrases, traps and questions</h2>
+        <div class="callout interview"><p><b>Phrases that land:</b> "Let me estimate the write rate first." - "I'll shard by user ID: high cardinality, and it is in every query." - "Range sharding on time would put every new write on one shard." - "That counter is a hot key; I'll split it into N sub-counters and roll them up." - "Kafka here turns a burst into lag; consumers write in batches." - "Batching loses data on crash unless the log is durable."</p></div>
+        <div class="callout warn"><p><b>Traps:</b> adding <a href="{{BASE}}interview/glossary#read-replica">read replicas</a> to fix a write problem; sharding by a low-cardinality or monotonic key; ignoring cross-shard queries the product needs; claiming a queue raises sustained capacity; batching money without durability; forgetting resharding; picking Kafka partition count without thinking about the peak.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>How would you shard a users table, and what happens when one shard gets hot?</summary>
+          <div class="answer">
+            <p>Shard by <code>hash(user_id)</code> into many logical shards (say 1,024) mapped onto fewer physical hosts through a directory, so rebalancing moves whole logical shards. Most queries are per user, so they hit one shard. A hot shard usually means one hot tenant or key: move that logical shard to its own host, split the hot key, or cache its reads. Avoid cross-shard joins by co-locating a user's data on the user's shard.</p>
+            <div class="approach"><h5>How to answer</h5><p>Key choice and why, logical vs physical shards, then the hot-shard playbook. Mention Notion (480 logical on 32 hosts) as a real example.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you look up a user by email? (a global secondary index table sharded by email)</li><li>How do you reshard without downtime?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>Design the like counter for a post that gets 1 million likes in a minute.</summary>
+          <div class="answer">
+            <p>One row would take ~17K increments per second - far past a single row's or partition's limit (DynamoDB: 1,000 writes/s per partition). Record the like event itself (user, post) idempotently so a user cannot like twice; send events to Kafka keyed by post. A consumer aggregates in memory per post for a few seconds and writes "+N" to a sharded counter (N sub-keys) or a Redis counter. Display reads a rollup refreshed every few seconds; exact counts are not needed in real time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate the truth (who liked) from the display number (approximately how many). Quantify the hot row, then batch, then shard.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Unlikes?</li><li>How do you recover counts after a crash? (replay Kafka from the last committed offset)</li><li>See <a href="{{BASE}}hld/d39">Distributed Counter</a></li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>Range vs hash sharding: when would you choose each?</summary>
+          <div class="answer">
+            <p>Range keeps adjacent keys together, so range scans ("orders for this user in March", "rows A-C") hit one shard - but monotonically increasing keys (timestamps) send all new writes to the last range. Hash spreads writes evenly but turns range scans into scatter-gather. A common hybrid: hash on the entity (user ID) and range on time inside it - the Cassandra partition key + clustering key model.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie the choice to the dominant query. Name the hybrid.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why does Bigtable use range, and how does it avoid hot spots? (tablets split automatically at ~100-200 MB; design row keys to spread)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Flipkart">
+          <summary>1 million drivers send GPS every 4 seconds. How do you store it?</summary>
+          <div class="answer">
+            <p>That is 250K writes/s. Split the two needs. For matching, only the latest location matters: keep it in an in-memory geo index (Redis GEO or sharded by geo cell, overwritten in place). For history (trip replay, ETA training), produce every ping to Kafka partitioned by driver ID and land it in batched files in object storage or a time-series/wide-column store. No relational table takes every ping.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the arithmetic aloud, then ask "does every write need to be durable and queryable?" The answer splits the design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A city centre cell is hot - how do you shard the geo index? (smaller cells where dense, e.g. H3 resolution)</li><li>What if a driver's pings arrive out of order? (timestamp, keep the newest)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>Flash sale: 1 lakh users try to buy 1,000 units of one product at 12:00. Where do the writes go?</summary>
+          <div class="answer">
+            <p>The stock row is the hot key. Gate entry with a waiting room so admission rate matches capacity. Hold stock in Redis, split into, say, 10 sub-counters of 100 units each; each buyer decrements a random sub-counter atomically (Lua or DECR with a check) and retries another if empty. Successful reservations are queued to Kafka and turned into orders by consumers at the rate the order DB can take. Payment confirms or the reservation expires and returns stock.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know it is a contention plus burst problem: split the hot key, decouple order creation with a queue, protect fairness.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Redis fails mid-sale?</li><li>How do you avoid overselling across sub-counters? (each only sells its own units)</li><li>See <a href="{{BASE}}hld/d09">Flash Sale</a> and <a href="{{BASE}}hld/p02">Contention</a></li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>Why are LSM-tree databases faster for writes than B-tree databases? What do you pay?</summary>
+          <div class="answer">
+            <p>An LSM write is a sequential append to a commit log plus an in-memory insert into a memtable; the memtable is later flushed as an immutable sorted file. A B-tree write must find and modify a page in place, often a random I/O plus page splits. The price: background compaction rewrites data (write amplification and I/O spikes), and reads may check several files (read amplification), mitigated with <a href="{{BASE}}interview/glossary#bloom-filter">Bloom filters</a> and compaction strategy.</p>
+            <div class="approach"><h5>How to answer</h5><p>Describe the write path in four steps (log, memtable, flush, compact) and name both amplifications.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Leveled vs size-tiered compaction?</li><li>How does a delete work? (a <a href="{{BASE}}interview/glossary#tombstone">tombstone</a>, removed at compaction)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Uber">
+          <summary>Does putting a queue in front of the database let it handle more writes?</summary>
+          <div class="answer">
+            <p>It handles bursts, not more sustained throughput. If the average arrival rate exceeds what consumers can write, the backlog grows without bound. A queue gives durability for accepted writes, smooths spikes into lag, and lets consumers batch - which does raise efficiency. For a steady overload you still need sharding or cheaper writes. Monitor consumer lag and shed load if lag passes your freshness budget.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "bursts, not sustained" in the first sentence. Then the batching bonus and the lag alert.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does the user see while the write is queued?</li><li>How do you keep order per entity? (partition by entity key)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Meta,Discord">
+          <summary>One huge chat channel makes its database partition slow, and other users on that node suffer. What do you do?</summary>
+          <div class="answer">
+            <p>That is exactly what Discord saw in Cassandra: a busy channel-bucket overloaded a node, and quorum reads/writes spread the latency. Fixes: bucket messages by channel and time window so a channel's data spreads over many partitions; put a data-service layer in front that coalesces identical reads and routes by channel with consistent hashing; rate-limit or batch writes per channel; and pick a store with better tail latency under load (Discord moved 177 Cassandra nodes to 72 ScyllaDB nodes; insert <a href="{{BASE}}interview/glossary#p99">p99</a> went from 5-70 ms to a steady 5 ms).</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the noisy-neighbour effect, fix the data layout first, then protect the node, then mention the storage engine.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big should a time bucket be?</li><li>How do you read the last 50 messages across bucket boundaries?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>You have 8 shards and need 32. Walk me through resharding with no downtime.</summary>
+          <div class="answer">
+            <p>Ideally you planned logical shards (e.g. 256) from day one, so you only move logical shards to new hosts: copy a snapshot, stream the change log until caught up, briefly pause writes for that shard, flip the directory entry, resume. Without logical shards, follow Notion's recipe: double-write to old and new layouts, backfill history, verify with sampled comparisons and dark reads, switch reads, then writes, keeping a reverse path for rollback. Use consistent hashing or a directory so only the moved keys change owner.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with "this is why I'd start with logical shards". Then the double-write, backfill, verify, cut-over sequence.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a write lands on the old shard after the flip? (fencing via a shard epoch in the directory)</li><li>How long would a 20 TB backfill take?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Walmart">
+          <summary>Your metrics system receives 5 million data points per second. Sketch the write path.</summary>
+          <div class="answer">
+            <p>Agents batch and compress points (every 10 s per host). They send to a Kafka topic partitioned by series ID. Ingesters keep recent points per series in memory and append compressed chunks (time-series compression makes consecutive points a few bytes each), flushing blocks every few hours to object storage. Series are sharded by hash across ingesters with replication factor 3. Older data is downsampled. No per-point row write anywhere.</p>
+            <div class="approach"><h5>How to answer</h5><p>Batch at the edge, buffer in Kafka, append-only chunks, shard by series. Same four moves as the ladder.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>One service emits a million new label values (high cardinality) - what breaks?</li><li>See <a href="{{BASE}}hld/d20">Metrics &amp; Monitoring</a></li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "We sharded, and it got worse"</h4>
+          <div class="situation"><p>A team sharded their orders table by <code>created_date</code> range into 12 monthly shards. Writes are now slower than before and one database is at 100% CPU while 11 are idle.</p></div>
+          <div class="bad"><p>Weak answer: "Add more shards, maybe weekly ones."</p></div>
+          <div class="good"><p>Strong answer: "A monotonic range key sends every new order to the current month's shard, so all writes hit one machine - sharding did nothing for writes. Re-key on <code>hash(customer_id)</code> (most queries are per customer) with logical shards, keep <code>created_date</code> as a sort key inside the shard, and serve cross-customer reporting from a warehouse fed by <a href="{{BASE}}interview/glossary#cdc">CDC</a> instead of scatter-gather on the OLTP shards."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you migrate the existing data?</li><li>What about "all orders in the last hour" for ops dashboards?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the noon sale took down the other stores</h4>
+          <div class="situation"><p>A multi-tenant shop platform puts many merchants on each database shard. One celebrity merchant's sale saturates its shard, and unrelated merchants on the same shard go down.</p></div>
+          <div class="bad"><p>Weak answer: "Buy a bigger database."</p></div>
+          <div class="good"><p>Strong answer: "This is Shopify's 2016 lesson. Short term: throttle that merchant's checkouts at the edge into a fair queue (tokens in arrival order, not random retries). Medium term: move big merchants to dedicated shards and use shuffle sharding so any two tenants rarely share all their resources. Long term: cut writes per checkout (Shopify's checkout rewrote one row on every step) and buffer non-critical writes through a queue."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect a sale is coming? (merchants pre-register, traffic forecast)</li></ul></div>
+        </div>
+      

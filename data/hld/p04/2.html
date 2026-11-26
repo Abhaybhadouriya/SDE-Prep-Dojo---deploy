@@ -1,0 +1,272 @@
+
+        <h2>The ladder: naive to best</h2>
+        <p>Climb in this order. Each rung costs more complexity than the one before it, so in an interview say why the lower rung is no longer enough before you step up. Hello Interview's guide uses the same order: optimise inside the database, then scale it horizontally, then add caches outside it.</p>
+
+        <h3>Rung 0 - Make the database do less work</h3>
+        <p>Before adding machines, make each read cheaper. A missing <strong>index</strong> turns a 1 ms lookup into a full table scan. Fix that first (see <a href="{{BASE}}hld/hld-07">Data Modeling &amp; Indexing</a>). Then look at <strong><a href="{{BASE}}interview/glossary#denormalization">denormalisation</a></strong>: store the author's name on the post row so the feed does not join two tables on every read. The system-design-primer notes the cost clearly: reads get faster, but writes must now update several copies, and heavy write loads can do worse than a normalised schema. A <strong><a href="{{BASE}}interview/glossary#materialized-view">materialised view</a></strong> (a stored query result the database refreshes for you, in Postgres or Oracle) is the in-database version of the same idea.</p>
+        <p><b>Breaks when:</b> one machine's CPU, memory or disk I/O is saturated even with good indexes. That is a physical limit; you need more machines.</p>
+
+        <h3>Rung 1 - Read replicas</h3>
+        <p>A <strong>read replica</strong> is a copy of the database that receives the primary's change log and replays it. Writes go to the primary; reads can go to any replica. Five replicas give roughly five times the read capacity.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Writes go to the primary, reads to replicas, replication arrives late">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="110" width="150" height="60"/>
+            <text class="label" x="95" y="136">App / proxy</text>
+            <text class="label small" x="95" y="156">routes by query type</text>
+            <rect class="box db solid" x="320" y="110" width="160" height="60"/>
+            <text class="label white" x="400" y="138">Primary</text>
+            <text class="label white" x="400" y="158">writes</text>
+            <rect class="box db" x="600" y="20" width="170" height="54"/>
+            <text class="label" x="685" y="52">Replica 1</text>
+            <rect class="box db" x="600" y="113" width="170" height="54"/>
+            <text class="label" x="685" y="145">Replica 2</text>
+            <rect class="box db" x="600" y="206" width="170" height="54"/>
+            <text class="label" x="685" y="238">Replica 3</text>
+            <path class="arrow thick" d="M170 140 L314 140"/>
+            <text class="label small" x="242" y="128">write</text>
+            <path class="arrow dashed" d="M480 130 L594 50"/>
+            <path class="arrow dashed" d="M480 140 L594 140"/>
+            <path class="arrow dashed" d="M480 150 L594 230"/>
+            <text class="label small" x="540" y="190">change log</text>
+            <path class="arrow ok" d="M120 110 C 250 10, 450 10, 594 40"/>
+            <text class="label small" x="300" y="30">reads (most traffic)</text>
+            <path class="arrow ok" d="M120 170 C 250 270, 450 270, 594 245"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M480 140 L600 140"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M120 110 C 250 10, 450 10, 600 40"/></circle>
+          </svg>
+          <figcaption>Leader-follower replication. The change log is asynchronous in most setups, so a replica can be a few milliseconds to several seconds behind the primary.</figcaption>
+        </figure>
+
+        <p>Who decides where a query goes? Either the application (a "read" connection pool and a "write" pool) or a database proxy in the middle. ByteByteGo's read-replica guide describes the proxy option: the middleware speaks the MySQL wire protocol, so clients do not change, but now every query crosses one more highly-available box and one more network hop.</p>
+
+        <p><b>The catch is replication lag.</b> Replication is usually <em>asynchronous</em>: the primary acknowledges the write before replicas have it. A user who edits their profile and immediately reloads may read from a replica that has not caught up, and see the old profile. Fixes, from simplest to strongest:</p>
+        <ol class="steps">
+          <li><strong>Read-your-writes by time.</strong> After a user writes, route that user's reads to the primary for a short window (say 10 seconds).</li>
+          <li><strong>Read-your-writes by position.</strong> The write returns a log position (an LSN in Postgres, a GTID in MySQL). The client sends it back; the router picks a replica that has replayed at least that far, or falls back to the primary.</li>
+          <li><strong>Critical reads go to the primary.</strong> Checkout totals, balances and "is this seat free?" never read from a replica.</li>
+          <li><strong>Synchronous replicas.</strong> The primary waits for at least one replica before acknowledging. Fresher, but every write is slower and a slow replica slows everyone.</li>
+        </ol>
+        <p>The primer lists the other costs: promotion logic when the primary dies, possible loss of writes that never reached a replica, and more lag as you add more replicas. See <a href="{{BASE}}hld/hld-09">Replication &amp; Consensus</a> for the full story.</p>
+        <p><b>Breaks when:</b> the data set no longer fits on one machine (replicas copy everything), or you need sub-millisecond reads, or the same few rows get so much traffic that even many replicas melt. That is when you add a cache, or shard (see <a href="{{BASE}}hld/p05">Scaling Writes</a>).</p>
+
+        <h3>Rung 2 - A cache in front (cache-aside)</h3>
+        <p>A <strong>cache</strong> is a key-value store in RAM (<a href="{{BASE}}interview/glossary#redis">Redis</a> or Memcached) that keeps answers to popular reads. The most common way to use it is <strong><a href="{{BASE}}interview/glossary#cache-aside">cache-aside</a></strong> (also called lazy loading): the application checks the cache, and on a miss reads the database and fills the cache. On a write, the application updates the database and then <em>deletes</em> the cache key. Walk through it:</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Cache-aside: miss, fill, hit, write and delete">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="120" width="130" height="60"/>
+            <text class="label" x="85" y="155">Client</text>
+            <rect class="box svc" x="250" y="120" width="140" height="60"/>
+            <text class="label" x="320" y="155">App</text>
+            <rect class="box cache" x="520" y="30" width="200" height="60"/>
+            <text class="label" x="620" y="65">Cache (Redis)</text>
+            <rect class="box db" x="520" y="210" width="200" height="60"/>
+            <text class="label" x="620" y="245">Database</text>
+            <path class="arrow" d="M150 150 L244 150"/>
+            <g data-step-only="1">
+              <path class="arrow" d="M390 135 L514 65"/>
+              <text class="label small bad" x="470" y="120">GET user:42 - miss</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow" d="M390 165 L514 235"/>
+              <text class="label small" x="460" y="190">SELECT ... id=42</text>
+              <path class="arrow ok" d="M514 225 L400 160"/>
+            </g>
+            <g data-step-only="3">
+              <path class="arrow ok" d="M390 140 L514 70"/>
+              <text class="label small ok" x="470" y="120">SET user:42 TTL 300s</text>
+            </g>
+            <g data-step-only="4">
+              <path class="arrow ok" d="M390 135 L514 65"/>
+              <text class="label small ok" x="470" y="120">GET user:42 - hit</text>
+              <rect class="box highlight" x="520" y="30" width="200" height="60"/>
+            </g>
+            <g data-step-only="5">
+              <path class="arrow thick" d="M390 165 L514 235"/>
+              <text class="label small" x="460" y="190">UPDATE id=42</text>
+              <path class="arrow bad" d="M390 135 L514 65"/>
+              <text class="label small bad" x="470" y="120">DEL user:42</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box fail" x="160" y="10" width="330" height="46"/>
+              <text class="label bad" x="325" y="38">Race: old read SETs a stale value</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Miss.</b> The app asks the cache for <code>user:42</code>. It is not there.</li>
+            <li><b>Read the truth.</b> The app reads the row from the database (or a replica).</li>
+            <li><b>Fill.</b> The app stores the result in the cache with a TTL (time to live), so it expires even if we forget to delete it.</li>
+            <li><b>Hit.</b> The next thousand reads for <code>user:42</code> are served from RAM in under a millisecond. The database never sees them.</li>
+            <li><b>Write, then delete.</b> On an update the app writes the database first, then deletes the key. The next read refills it with the new value. Delete is safer than overwrite because two concurrent overwrites can land in the wrong order.</li>
+            <li><b>The race.</b> Reader A misses and reads the OLD row. Writer B updates the row and deletes the key. Then A, a bit late, SETs the old row into the cache. Now the cache is stale until the TTL expires. Facebook calls this a "stale set"; their fix is leases (below).</li>
+          </ol>
+        </div>
+
+        <p>Other cache update strategies exist, and interviewers expect you to name them and say when they fit:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Strategy</th><th>How it works</th><th>Good for</th><th>Watch out</th></tr></thead>
+            <tbody>
+              <tr><td>Cache-aside</td><td>App reads cache, fills on miss, deletes on write</td><td>Default for most reads</td><td>First read after a miss is slow (three trips); stale-set race</td></tr>
+              <tr><td>Read-through</td><td>The cache library loads from the DB itself on a miss</td><td>Uniform code, e.g. DAX in front of DynamoDB</td><td>The cache is now in the availability path of every read</td></tr>
+              <tr><td><a href="{{BASE}}interview/glossary#write-through">Write-through</a></td><td>Write goes to cache and DB together</td><td>Data read right after it is written</td><td>Slower writes; caches data nobody reads (use a <a href="{{BASE}}interview/glossary#ttl">TTL</a>)</td></tr>
+              <tr><td>Write-behind (write-back)</td><td>Write to cache, flush to DB later</td><td>Very high write rates, counters</td><td>Lose data if the cache dies before flushing</td></tr>
+              <tr><td>Write-around</td><td>Write to DB only, cache fills on read</td><td>Write-once, rarely-read data (logs)</td><td>Recently written items always miss first</td></tr>
+              <tr><td>Refresh-ahead</td><td>Cache refreshes popular keys before they expire</td><td>Predictable hot keys</td><td>Wasted work if predictions are wrong</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout tip"><p><b>Local plus remote.</b> The AWS Builders' Library article on caching contrasts an in-process (local) cache - fastest, but every server holds a different copy and the load on the database grows with fleet size - with an external cache like Redis, which gives one shared view and survives deployments but is another system to run. Big systems use both: a tiny local cache for the hottest keys (seconds of TTL) plus a shared Redis tier.</p></div>
+
+        <p><b>Breaks when:</b> the cache itself becomes the failure point. The AWS article calls this <em>modal behaviour</em>: the system behaves differently when an item is cached and when it is not, and a sudden shift (cache restart, a deploy that changes keys) can send the full read load to a database that was sized for 5% of it. The next rungs - and the pitfalls section - are about that.</p>
+
+        <h3>Rung 3 - CDN and edge caching</h3>
+        <p>A <strong>CDN</strong> is a fleet of cache servers in hundreds of cities. Static files (images, JS, video segments) and even whole API responses can be cached at the edge, close to the user. The primer and Karan Pratap Singh's book describe two styles:</p>
+        <ul>
+          <li><b>Pull CDN</b>: the edge fetches from your origin on the first request and keeps it for the TTL. Low effort, best for heavy traffic; the first request in each city is slow.</li>
+          <li><b>Push CDN</b>: you upload content ahead of time. More control and no first-request penalty, but more storage. Netflix's Open Connect pre-positions popular titles inside ISP networks overnight, which is the extreme form (see <a href="{{BASE}}hld/d12">Video Streaming</a>).</li>
+        </ul>
+        <p>Use <strong>versioned URLs</strong> (<code>app.4f3a9c.js</code>, <code>avatar_v7.jpg</code>) so you never need to purge: a new version is a new key. Use <code>Cache-Control: max-age</code> and <code>stale-while-revalidate</code> headers so the edge can serve a slightly old copy while it refetches.</p>
+        <p><b>Breaks when:</b> content is personalised per user (a feed, a cart). You cannot cache "my feed" at a shared edge. Move up to read models.</p>
+
+        <h3>Rung 4 - Precomputed read models (CQRS)</h3>
+        <p>Sometimes the problem is not the number of reads but the <em>shape</em> of the query. "Show my feed" might mean "join follows with posts, sort by time, take 20". Doing that on every read is expensive whatever cache you add. Instead, build a separate store shaped exactly like the answer and keep it updated from the write side. This is <strong><a href="{{BASE}}interview/glossary#cqrs">CQRS</a></strong> (Command Query Responsibility Segregation): writes go to one model, reads come from another. Microsoft's Azure pattern guide describes the read store as possibly a different database, kept in sync by events, with the price being <a href="{{BASE}}interview/glossary#eventual-consistency">eventual consistency</a> between the two.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Writes go to the write DB, a change stream updates a read model, reads go to the read model">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="130" height="54"/>
+            <text class="label" x="85" y="62">Writer</text>
+            <rect class="box client" x="20" y="166" width="130" height="54"/>
+            <text class="label" x="85" y="198">Reader</text>
+            <rect class="box db" x="220" y="30" width="160" height="54"/>
+            <text class="label" x="300" y="55">Write DB</text>
+            <text class="label small" x="300" y="74">normalised</text>
+            <rect class="box kafka" x="440" y="30" width="140" height="54"/>
+            <text class="label" x="510" y="55">Kafka / CDC</text>
+            <text class="label small" x="510" y="74">change events</text>
+            <rect class="box svc" x="620" y="30" width="160" height="54"/>
+            <text class="label" x="700" y="55">Projector</text>
+            <text class="label small" x="700" y="74">builds views</text>
+            <rect class="box cache" x="500" y="166" width="280" height="54"/>
+            <text class="label" x="640" y="191">Read model</text>
+            <text class="label small" x="640" y="210">feed:42 = [p9, p7, p3 ...]</text>
+            <path class="arrow" d="M150 57 L214 57"/>
+            <path class="arrow" d="M380 57 L434 57"/>
+            <path class="arrow" d="M580 57 L614 57"/>
+            <path class="arrow" d="M700 84 L700 160"/>
+            <path class="arrow ok" d="M150 193 L494 193"/>
+            <text class="label small" x="320" y="183">one key lookup, no joins</text>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M150 57 L440 57 L620 57 L700 57 L700 166"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M150 193 L500 193"/></circle>
+          </svg>
+          <figcaption>CQRS read model. The write side stays normalised and correct; a projector consumes change events and writes a denormalised view; reads become single key lookups. The view lags the write by the pipeline delay.</figcaption>
+        </figure>
+        <p>Examples on this site: the precomputed feed list in <a href="{{BASE}}hld/d05">News Feed</a> (<a href="{{BASE}}interview/glossary#fan-out">fan-out</a> on write is a read model), the top-k suggestions stored at each trie node in <a href="{{BASE}}hld/d15">Search Autocomplete</a>, and the search index in <a href="{{BASE}}hld/d49">Product Catalog Search</a> (<a href="{{BASE}}interview/glossary#elasticsearch">Elasticsearch</a> is a read model fed by <a href="{{BASE}}interview/glossary#cdc">CDC</a>). <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Events</a> covers CDC and the <a href="{{BASE}}interview/glossary#outbox">outbox</a> that keep these in sync.</p>
+        <p><b>Breaks when:</b> the read model is expensive to keep current (a celebrity with 50 million followers turns one post into 50 million writes - see <a href="{{BASE}}hld/p08">Fan-out: Push vs Pull</a>), or users need to see their own change instantly.</p>
+
+        <div class="level-up" data-level="4">Level 4 - Advanced</div>
+        <h3>Rung 5 - Protect the cache: the pitfalls</h3>
+        <p>A cache that sits in front of a small database is not an optimisation any more; it is load-bearing. These are the four classic ways it collapses, and the fixes interviewers expect.</p>
+
+        <h4>Pitfall 1: Cache stampede (thundering herd)</h4>
+        <p>A popular key expires. In the next 50 ms, 5,000 requests miss at once, and all 5,000 run the same expensive database query and try to SET the same value. The database falls over, which makes the queries slower, which keeps more requests in the miss window. Fixes:</p>
+        <ul>
+          <li><b>Request coalescing (<a href="{{BASE}}interview/glossary#single-flight">single-flight</a>).</b> Only one request per key goes to the database; the others wait for its result. Discord's Rust "data services" do this in front of their message database: the first request for a row starts a worker task, and later identical requests subscribe to it. They also route by channel ID with <a href="{{BASE}}interview/glossary#consistent-hashing">consistent hashing</a>, so all requests for one channel land on the same instance - which makes the coalescing work. Instagram described a similar trick: cache a <em>promise</em> of the value, not the value, so everyone waits on one fetch.</li>
+          <li><b><a href="{{BASE}}interview/glossary#lease">Leases</a>.</b> Facebook's memcache paper gives a client a 64-bit lease token on a miss. Only the lease holder may fill the key, and the server hands out at most one token per key every 10 seconds; others are told to wait briefly and retry. On a set of herd-prone keys measured for a week, peak database queries fell from 17K/s without leases to 1.3K/s with them.</li>
+          <li><b>Probabilistic early refresh (XFetch).</b> The intuition in one line: the closer a key is to expiry, the more likely each reader is to refresh it early. With many readers, one of them almost always refreshes a little before the expiry, so the key never actually goes missing and no herd forms. No locks, and expiries spread out naturally.
+            <details class="callout note"><summary><b>Optional depth:</b> the XFetch formula (safe to skip)</summary>
+              <p>Vattani, Chierichetti and Lowenstein (VLDB 2015) give each reader this test: refresh early if <code>now - delta * beta * log(rand()) &gt;= expiry</code>. Here <code>delta</code> is how long the recompute takes and <code>beta</code> (default 1) tunes eagerness. <code>rand()</code> is between 0 and 1, so <code>-log(rand())</code> is a positive random number that is usually small and only sometimes large: most readers do nothing, and a few "look ahead" far enough to cross the expiry and refresh. A slow recompute (big <code>delta</code>) makes readers look further ahead, so expensive keys are refreshed earlier.</p>
+            </details></li>
+          <li><b>Jittered TTLs.</b> If you load 10,000 keys at startup with TTL 300 s, they all expire together at 300 s. Use 300 s &plusmn; random 30 s. (When a whole cache tier expires at once, people call it a <em>cache avalanche</em>.)</li>
+          <li><b>Serve stale.</b> Keep a soft TTL (refresh after it) and a hard TTL (stop serving after it). The AWS caching article recommends this so a failing database does not turn straight into user errors.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Without coalescing many misses hit the database; with coalescing one does">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="10" y="10" width="380" height="250"/>
+            <text class="zone-label" x="24" y="32">Without: stampede</text>
+            <rect class="box client" x="30" y="50" width="80" height="34"/><text class="label small" x="70" y="72">req</text>
+            <rect class="box client" x="30" y="100" width="80" height="34"/><text class="label small" x="70" y="122">req</text>
+            <rect class="box client" x="30" y="150" width="80" height="34"/><text class="label small" x="70" y="172">req</text>
+            <rect class="box client" x="30" y="200" width="80" height="34"/><text class="label small" x="70" y="222">req</text>
+            <rect class="box db hot" x="250" y="110" width="120" height="60"/><text class="label" x="310" y="145">DB</text>
+            <path class="arrow bad" d="M110 67 L244 120"/>
+            <path class="arrow bad" d="M110 117 L244 133"/>
+            <path class="arrow bad" d="M110 167 L244 147"/>
+            <path class="arrow bad" d="M110 217 L244 160"/>
+            <rect class="zone" x="410" y="10" width="380" height="250"/>
+            <text class="zone-label" x="424" y="32">With: coalescing / lease</text>
+            <rect class="box client" x="430" y="50" width="80" height="34"/><text class="label small" x="470" y="72">req</text>
+            <rect class="box client" x="430" y="100" width="80" height="34"/><text class="label small" x="470" y="122">req</text>
+            <rect class="box client" x="430" y="150" width="80" height="34"/><text class="label small" x="470" y="172">req</text>
+            <rect class="box client" x="430" y="200" width="80" height="34"/><text class="label small" x="470" y="222">req</text>
+            <rect class="box svc" x="560" y="110" width="90" height="60"/><text class="label small" x="605" y="137">single</text><text class="label small" x="605" y="155">flight</text>
+            <rect class="box db" x="690" y="110" width="80" height="60"/><text class="label" x="730" y="145">DB</text>
+            <path class="arrow" d="M510 67 L554 125"/>
+            <path class="arrow" d="M510 117 L554 133"/>
+            <path class="arrow" d="M510 167 L554 147"/>
+            <path class="arrow" d="M510 217 L554 158"/>
+            <path class="arrow ok" d="M650 140 L684 140"/>
+            <circle class="packet bad" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M110 67 L250 120"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="1.5s" begin="0.3s" repeatCount="indefinite" path="M110 217 L250 160"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="1.5s" repeatCount="indefinite" path="M650 140 L690 140"/></circle>
+          </svg>
+          <figcaption>Left: every miss becomes a database query. Right: misses for the same key join one in-flight fetch, so the database sees one query per key per refresh.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The <a href="{{BASE}}interview/glossary#thundering-herd">thundering herd</a> name comes from the kernel: many processes sleeping on one event (an <code>accept()</code> on a listening socket) all wake, and all but one go back to sleep having wasted a context switch. Linux fixed it with exclusive wake-ups (<code>EPOLLEXCLUSIVE</code>, <code>SO_REUSEPORT</code>). Request coalescing is the same fix one layer up: wake one worker, let the rest wait for its answer. And Facebook's lease is just load-link/store-conditional for a cache key - the paper says so itself.</p>
+        </div>
+
+        <h4>Pitfall 2: Hot keys</h4>
+        <p>Consistent hashing puts each key on exactly one cache node. If one key - the IPL final score, a viral tweet, the flash-sale product - gets 30% of all traffic, that one node's CPU or NIC saturates while the rest sit idle. More nodes do not help, because the key still lives on one node.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="A hot key is copied to several suffixed keys on different nodes and also held in local caches">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="40" width="150" height="50"/><text class="label" x="95" y="62">App 1</text><text class="label small" x="95" y="80">local L1: 2 s TTL</text>
+            <rect class="box svc" x="20" y="160" width="150" height="50"/><text class="label" x="95" y="182">App 2</text><text class="label small" x="95" y="200">local L1: 2 s TTL</text>
+            <rect class="box cache" x="420" y="20" width="200" height="44"/><text class="label" x="520" y="47">node A: score#0</text>
+            <rect class="box cache" x="420" y="80" width="200" height="44"/><text class="label" x="520" y="107">node B: score#1</text>
+            <rect class="box cache" x="420" y="140" width="200" height="44"/><text class="label" x="520" y="167">node C: score#2</text>
+            <rect class="box cache" x="420" y="200" width="200" height="44"/><text class="label" x="520" y="227">node D: score#3</text>
+            <text class="label small" x="300" y="130">pick #rand(0..3)</text>
+            <path class="arrow" d="M170 60 L414 42"/>
+            <path class="arrow" d="M170 72 L414 162"/>
+            <path class="arrow" d="M170 180 L414 102"/>
+            <path class="arrow" d="M170 192 L414 222"/>
+            <text class="label small" x="710" y="120">writes update</text>
+            <text class="label small" x="710" y="138">all copies</text>
+          </svg>
+          <figcaption>Two hot-key fixes together: each app server keeps a tiny local copy for a second or two, and the shared cache holds N suffixed replicas of the key on different nodes, so reads spread N ways.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Local (L1) cache</b> for detected hot keys, with a very short TTL. One hundred app servers absorb the load before it reaches Redis.</li>
+          <li><b>Key replication with suffixes</b>: store <code>score#0 .. score#N-1</code>, read a random one, write all. Facebook did a version of this with a dedicated "replicated pool" for very frequently read data; it had about 2.7 times the get rate of their next busiest pool.</li>
+          <li><b>Read replicas of the cache</b> (Redis replicas) for that shard.</li>
+          <li><b>Detect hot keys</b>: sample requests, count top-k with a <a href="{{BASE}}interview/glossary#count-min-sketch">Count-Min sketch</a> (see <a href="{{BASE}}hld/d35">Top-K / Heavy Hitters</a>), and promote the winners to the L1 cache automatically.</li>
+        </ul>
+
+        <h4>Pitfall 3: Cache penetration</h4>
+        <p>Requests for keys that do <em>not exist</em> - a bot probing random short URLs, a deleted product ID - always miss the cache and always hit the database, because there is nothing to cache. Fixes: <b>negative caching</b> (cache "not found" with a short TTL; the AWS article reports real incidents caused by not doing this), and a <b><a href="{{BASE}}interview/glossary#bloom-filter">Bloom filter</a></b> of all valid IDs in front of the database, which answers "definitely not present" in memory (see <a href="{{BASE}}hld/hld-12">Big Data &amp; Probabilistic Structures</a>).</p>
+
+        <h4>Pitfall 4: Stale data and invalidation</h4>
+        <p>Phil Karlton's old joke says cache invalidation is one of the two hard things in computer science. Practical rules:</p>
+        <ul>
+          <li><b>Always set a TTL</b> as a safety net, even when you also delete on write.</li>
+          <li><b>Delete, do not update,</b> on write. Two updates can arrive out of order; two deletes cannot do harm.</li>
+          <li><b>Invalidate from the commit log, not the web server.</b> Facebook runs a daemon (mcsqueal) on every database that reads committed SQL and broadcasts deletes. Because the log is durable, lost deletes can be replayed. Batching deletes this way gave an 18x improvement in deletes per packet. The modern version is CDC with Debezium into Kafka (see <a href="{{BASE}}hld/d28">CDC Pipeline</a>).</li>
+          <li><b>Version the value.</b> Store the row version with the cached value and refuse a SET with an older version - this kills the stale-set race.</li>
+          <li><b>Plan cold starts.</b> Facebook's "cold cluster warmup" lets an empty cache cluster read from a warm one instead of the database, bringing it to full capacity in hours instead of days. Their memcached servers took a few hours to reach 90% of peak hit rate, so restarts were done carefully and the cache was moved into shared memory so it survived a software upgrade.</li>
+        </ul>
+
+        <h4>And when a cache node dies?</h4>
+        <p>Rehashing a dead node's keys onto the survivors moves load onto nodes that do not have the data, so they all miss together. Facebook's answer was a small spare pool called <b>Gutter</b> - about 1% of the memcached servers. When a get gets no reply, the client retries in Gutter, whose entries expire quickly. The paper reports this cut client-visible failures by 99% and that Gutter hit rates exceeded 35% within four minutes of a server failure.</p>
+      

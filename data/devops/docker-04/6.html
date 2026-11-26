@@ -1,0 +1,50 @@
+
+        <h2>PID 1 in practice: spot a slow stop and fix it</h2>
+        <p>Inside a container your app is usually <b>PID 1</b>, and Linux gives PID 1 no default signal actions. <b>Why</b> that happens, why shell-form <code>CMD</code> hides your app behind <code>/bin/sh</code>, and the signal diagram are all on <a href="{{BASE}}devops/docker-03#cmd-entrypoint">page 03</a> (see 03 for why). This section is the operational side: how you notice the problem on a running host, how you read the result, and the three knobs you have.</p>
+        <ol class="steps">
+          <li><strong>Spot it.</strong> <code>time docker stop NAME</code> takes almost exactly the timeout (10 s by default). That means PID 1 ignored SIGTERM and was SIGKILLed at the deadline.</li>
+          <li><strong>Read the result.</strong> <code>docker inspect -f '{{.State.ExitCode}} {{.State.OOMKilled}}'</code>: <b>0</b> means the app handled SIGTERM and exited cleanly; <b>143</b> means it died from SIGTERM without a handler (fine, but nothing was drained); <b>137</b> with <code>OOMKilled=false</code> after a <code>docker stop</code> means the stop timed out.</li>
+          <li><strong>Knob 1: more time.</strong> <code>docker stop -t 30 NAME</code> for one stop, or <code>docker run --stop-timeout 30</code> to change the default for that container. Use it for apps that need longer to drain, not to hide a missing handler.</li>
+          <li><strong>Knob 2: a different signal.</strong> <code>docker run --stop-signal SIGQUIT</code> or <code>STOPSIGNAL</code> in the Dockerfile, for apps whose graceful shutdown signal is not SIGTERM. The official nginx image does this: it sets <code>STOPSIGNAL SIGQUIT</code>, nginx's "finish current requests, then quit" signal.</li>
+          <li><strong>Knob 3: an init.</strong> <code>docker run --init</code> starts Docker's bundled <b>tini</b> as PID 1. tini forwards signals to your app (which is now an ordinary process, so default actions apply again) and reaps <a href="{{BASE}}interview/glossary#zombie">zombies</a>.</li>
+        </ol>
+
+        <h3>Lab: measure it</h3>
+        <p>A Python script with no signal handler is the classic stubborn PID 1. Run it twice, with and without <code>--init</code>:</p>
+<pre><code class="language-bash"># 1. stubborn: python is PID 1 and has no SIGTERM handler
+docker run -d --name stubborn python:3.12-slim python -c "import time; time.sleep(1000)"
+time docker stop stubborn
+docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' stubborn
+
+# 2. same program, tini as PID 1
+docker run -d --init --name polite python:3.12-slim python -c "import time; time.sleep(1000)"
+time docker stop polite
+docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' polite
+
+# 3. see the signals Docker sent
+docker events --since 5m --filter container=stubborn --filter event=kill</code></pre>
+<pre class="terminal"><code>$ time docker stop stubborn
+stubborn
+real    0m10.3s
+$ docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' stubborn
+exit=137 oom=false
+$ time docker stop polite
+polite
+real    0m0.4s
+$ docker inspect -f 'exit={{.State.ExitCode}} oom={{.State.OOMKilled}}' polite
+exit=143 oom=false
+$ docker events --since 5m --filter container=stubborn --filter event=kill
+2026-11-23T10:21:04.118 container kill 9b1e... (image=python:3.12-slim, name=stubborn, signal=15)
+2026-11-23T10:21:14.131 container kill 9b1e... (image=python:3.12-slim, name=stubborn, signal=9)</code></pre>
+        <p class="muted">Your times and IDs will differ. Read the events: signal 15 (SIGTERM) at t = 0, signal 9 (SIGKILL) ten seconds later. With <code>--init</code>, python is no longer PID 1, so SIGTERM's default action (die) works, and tini reports 128 + 15 = 143. To get <b>0</b>, add a SIGTERM handler in the app (example on page 03).</p>
+
+        <h3>Check what PID 1 really is</h3>
+<pre class="terminal"><code>$ docker exec polite cat /proc/1/comm
+docker-init
+$ docker top polite -o pid,comm
+PID     COMMAND
+23817   docker-init
+23841   python</code></pre>
+        <p><code>python:3.12-slim</code> does not ship <code>ps</code> (the procps package), so we read <code>/proc/1/comm</code> directly, or ask the host with <code>docker top</code> (which shows host PIDs). If PID 1 is <code>sh</code>, your <code>CMD</code> is in shell form: fix the Dockerfile (page 03).</p>
+        <p>The same rule matters even more on Kubernetes, where the grace period is <code>terminationGracePeriodSeconds</code> (30 s by default) and a <code>preStop</code> hook can run first. That production angle is on <a href="{{BASE}}devops/docker-09">page 09</a> and <a href="{{BASE}}devops/k8s-03">Pods</a>.</p>
+      

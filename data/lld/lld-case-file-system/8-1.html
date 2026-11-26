@@ -1,0 +1,481 @@
+<h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: one file, <code>g++ -std=c++14 main.cpp</code>.</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>C++ demo OK</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// In-memory file system in C++14: same design as the Java version, single-threaded demo.
+// Ownership: a Directory owns its children (shared_ptr); a child points up with weak_ptr, so there is
+// no reference cycle. A Shell holds a shared_ptr to its cwd, which keeps a removed directory alive
+// (like a dentry reference from dget) until the shell moves away.
+// Thread safety: one reader-writer lock for the tree (readers shared, writers exclusive), like Java's
+// ReentrantReadWriteLock. Windows (MinGW g++ 6.3): g++ -std=c++14 -Wall main.cpp -o fs
+// Linux (real lock + 8-thread append): g++ -std=c++14 -Wall -pthread -DHAVE_STD_MUTEX main.cpp -o fs
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+using namespace std;
+
+// MinGW.org g++ 6.3 (win32 thread model) has no std::shared_timed_mutex/std::thread and -pthread fails to
+// link there, so without HAVE_STD_MUTEX RwLock is a no-op with the same interface: the SAME locking code
+// compiles both ways and runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+#include &lt;shared_mutex&gt;
+#include &lt;thread&gt;
+typedef std::shared_timed_mutex RwLock;               // C++14; C++17 has std::shared_mutex
+#else
+struct RwLock { void lock() {} void unlock() {} void lock_shared() {} void unlock_shared() {} };
+#endif
+struct ReadGuard {                                     // like down_read()/up_read()
+    RwLock&amp; m; explicit ReadGuard(RwLock&amp; x) : m(x) { m.lock_shared(); } ~ReadGuard() { m.unlock_shared(); }
+};
+struct WriteGuard {                                    // like down_write()/up_write()
+    RwLock&amp; m; explicit WriteGuard(RwLock&amp; x) : m(x) { m.lock(); } ~WriteGuard() { m.unlock(); }
+};
+
+struct FsError : runtime_error {
+    explicit FsError(const string&amp; m) : runtime_error(m) {}
+};
+
+struct Directory;
+
+// ---------- Composite ----------
+struct Node {
+    string name;
+    weak_ptr&lt;Directory&gt; parent;                  // empty for root and for removed nodes
+    explicit Node(string n) : name(move(n)) {}
+    virtual ~Node() {}
+    virtual bool isDir() const = 0;
+    virtual long size() const = 0;
+    string path() const;
+};
+
+struct FileNode : Node {
+    string content;
+    explicit FileNode(string n) : Node(move(n)) {}
+    bool isDir() const override { return false; }
+    long size() const override { return (long)content.size(); }
+};
+
+struct Directory : Node, enable_shared_from_this&lt;Directory&gt; {
+    map&lt;string, shared_ptr&lt;Node&gt;&gt; children;      // sorted = ls order
+    explicit Directory(string n) : Node(move(n)) {}
+    bool isDir() const override { return true; }
+    long size() const override {
+        long total = 0;
+        for (const auto&amp; kv : children) total += kv.second-&gt;size();
+        return total;
+    }
+    shared_ptr&lt;Directory&gt; up() {                 // '..' of root is root
+        auto p = parent.lock();
+        return p ? p : shared_from_this();
+    }
+    vector&lt;shared_ptr&lt;Directory&gt;&gt; childDirs() const {
+        vector&lt;shared_ptr&lt;Directory&gt;&gt; out;
+        for (const auto&amp; kv : children)
+            if (kv.second-&gt;isDir()) out.push_back(static_pointer_cast&lt;Directory&gt;(kv.second));
+        return out;
+    }
+};
+
+string Node::path() const {
+    auto p = parent.lock();
+    if (!p) return "/";
+    string pp = p-&gt;path();
+    return pp == "/" ? "/" + name : pp + "/" + name;
+}
+
+// ---------- glob ----------
+bool hasWildcard(const string&amp; s) { return s.find_first_of("*?") != string::npos; }
+
+bool globMatch(const string&amp; pat, const string&amp; text) {
+    size_t p = 0, t = 0, mark = 0;
+    long star = -1;
+    while (t &lt; text.size()) {
+        if (p &lt; pat.size() &amp;&amp; (pat[p] == '?' || pat[p] == text[t])) { ++p; ++t; }
+        else if (p &lt; pat.size() &amp;&amp; pat[p] == '*') { star = (long)p++; mark = t; }
+        else if (star &gt;= 0) { p = (size_t)star + 1; t = ++mark; }
+        else return false;
+    }
+    while (p &lt; pat.size() &amp;&amp; pat[p] == '*') ++p;
+    return p == pat.size();
+}
+
+// ---------- Specification ----------
+struct Spec {
+    function&lt;bool(const Node&amp;)&gt; fn;
+    bool test(const Node&amp; n) const { return fn(n); }
+    Spec And(Spec o) const { auto a = fn; return Spec{[a, o](const Node&amp; n) { return a(n) &amp;&amp; o.test(n); }}; }
+    Spec Or(Spec o) const { auto a = fn; return Spec{[a, o](const Node&amp; n) { return a(n) || o.test(n); }}; }
+    Spec Not() const { auto a = fn; return Spec{[a](const Node&amp; n) { return !a(n); }}; }
+};
+Spec nameSpec(string g) { return Spec{[g](const Node&amp; n) { return globMatch(g, n.name); }}; }
+Spec extSpec(string e) {
+    return Spec{[e](const Node&amp; n) {
+        string suf = "." + e;
+        return !n.isDir() &amp;&amp; n.name.size() &gt;= suf.size() &amp;&amp;
+               n.name.compare(n.name.size() - suf.size(), suf.size(), suf) == 0;
+    }};
+}
+Spec minSize(long b) { return Spec{[b](const Node&amp; n) { return !n.isDir() &amp;&amp; n.size() &gt;= b; }}; }
+Spec isFile() { return Spec{[](const Node&amp; n) { return !n.isDir(); }}; }
+Spec isDir() { return Spec{[](const Node&amp; n) { return n.isDir(); }}; }
+
+// ---------- the shared tree ----------
+using DirPtr = shared_ptr&lt;Directory&gt;;
+using NodePtr = shared_ptr&lt;Node&gt;;
+
+vector&lt;string&gt; segments(const string&amp; path) {
+    vector&lt;string&gt; out;
+    string cur;
+    for (char c : path) {
+        if (c == '/') { if (!cur.empty()) out.push_back(cur); cur.clear(); }
+        else cur += c;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+class FileSystem {
+public:
+    DirPtr root = make_shared&lt;Directory&gt;("");
+
+    DirPtr resolveDir(const DirPtr&amp; cwd, const string&amp; path) {
+        ReadGuard g(rw_);
+        NodePtr n = mustExist(cwd, path);
+        if (!n-&gt;isDir()) throw FsError("not a directory: " + path);
+        return static_pointer_cast&lt;Directory&gt;(n);
+    }
+
+    vector&lt;DirPtr&gt; resolveDirs(const DirPtr&amp; cwd, const string&amp; pattern) {
+        ReadGuard g(rw_);
+        vector&lt;DirPtr&gt; frontier{start(cwd, pattern)};
+        for (const string&amp; seg : segments(pattern)) {
+            set&lt;Directory*&gt; seen;
+            vector&lt;DirPtr&gt; next;
+            for (const DirPtr&amp; d : frontier) {
+                vector&lt;DirPtr&gt; cands;
+                if (seg == ".") cands.push_back(d);
+                else if (seg == "..") cands.push_back(d-&gt;up());
+                else if (seg == "*") {
+                    cands.push_back(d);
+                    cands.push_back(d-&gt;up());
+                    for (auto&amp; c : d-&gt;childDirs()) cands.push_back(c);
+                } else if (hasWildcard(seg)) {
+                    for (auto&amp; c : d-&gt;childDirs()) if (globMatch(seg, c-&gt;name)) cands.push_back(c);
+                } else {
+                    auto it = d-&gt;children.find(seg);
+                    if (it != d-&gt;children.end() &amp;&amp; it-&gt;second-&gt;isDir())
+                        cands.push_back(static_pointer_cast&lt;Directory&gt;(it-&gt;second));
+                }
+                for (auto&amp; c : cands) if (seen.insert(c.get()).second) next.push_back(c);
+            }
+            frontier = next;
+            if (frontier.empty()) break;
+        }
+        sort(frontier.begin(), frontier.end(),
+             [](const DirPtr&amp; a, const DirPtr&amp; b) { return a-&gt;path() &lt; b-&gt;path(); });
+        return frontier;
+    }
+
+    void mkdir(const DirPtr&amp; cwd, const string&amp; path, bool parents) {
+        WriteGuard g(rw_);
+        vector&lt;string&gt; segs = segments(path);
+        if (segs.empty()) throw FsError("mkdir: missing name");
+        DirPtr cur = start(cwd, path);
+        for (size_t i = 0; i &lt; segs.size(); ++i) {
+            const string&amp; s = segs[i];
+            bool last = i + 1 == segs.size();
+            if (s == ".") continue;
+            if (s == "..") { cur = cur-&gt;up(); continue; }
+            auto it = cur-&gt;children.find(s);
+            if (it == cur-&gt;children.end()) {
+                if (!last &amp;&amp; !parents) throw FsError("no such directory: " + s);
+                checkName(s);
+                auto d = make_shared&lt;Directory&gt;(s);
+                d-&gt;parent = cur;
+                cur-&gt;children[s] = d;
+                cur = d;
+            } else if (!it-&gt;second-&gt;isDir()) {
+                throw FsError("not a directory: " + it-&gt;second-&gt;path());
+            } else if (last &amp;&amp; !parents) {
+                throw FsError("already exists: " + it-&gt;second-&gt;path());
+            } else {
+                cur = static_pointer_cast&lt;Directory&gt;(it-&gt;second);
+            }
+        }
+    }
+
+    vector&lt;string&gt; ls(const DirPtr&amp; cwd, const string&amp; path) {
+        ReadGuard g(rw_);
+        vector&lt;string&gt; segs = segments(path), out;
+        if (!segs.empty() &amp;&amp; hasWildcard(segs.back())) {
+            for (auto&amp; kv : parentOf(cwd, path, segs)-&gt;children)
+                if (globMatch(segs.back(), kv.first)) out.push_back(kv.first);
+            return out;
+        }
+        NodePtr n = mustExist(cwd, path);
+        if (!n-&gt;isDir()) return {n-&gt;name};
+        for (auto&amp; kv : static_pointer_cast&lt;Directory&gt;(n)-&gt;children) out.push_back(kv.first);
+        return out;
+    }
+
+    void writeFile(const DirPtr&amp; cwd, const string&amp; path, const string&amp; text, bool append) {
+        WriteGuard g(rw_);
+        vector&lt;string&gt; segs = segments(path);
+        if (segs.empty()) throw FsError("not a file: " + path);
+        DirPtr d = parentOf(cwd, path, segs);
+        auto it = d-&gt;children.find(segs.back());
+        shared_ptr&lt;FileNode&gt; f;
+        if (it == d-&gt;children.end()) {
+            checkName(segs.back());
+            f = make_shared&lt;FileNode&gt;(segs.back());
+            f-&gt;parent = d;
+            d-&gt;children[segs.back()] = f;
+        } else if (it-&gt;second-&gt;isDir()) {
+            throw FsError("is a directory: " + it-&gt;second-&gt;path());
+        } else {
+            f = static_pointer_cast&lt;FileNode&gt;(it-&gt;second);
+        }
+        if (!append) f-&gt;content.clear();
+        f-&gt;content += text;
+    }
+
+    string readFile(const DirPtr&amp; cwd, const string&amp; path) {
+        ReadGuard g(rw_);
+        NodePtr n = mustExist(cwd, path);
+        if (n-&gt;isDir()) throw FsError("is a directory: " + path);
+        return static_pointer_cast&lt;FileNode&gt;(n)-&gt;content;
+    }
+
+    void remove(const DirPtr&amp; cwd, const string&amp; path, bool recursive) {
+        WriteGuard g(rw_);
+        NodePtr n = mustExist(cwd, path);
+        if (n == root) throw FsError("cannot remove /");
+        if (n-&gt;isDir() &amp;&amp; !recursive &amp;&amp; !static_pointer_cast&lt;Directory&gt;(n)-&gt;children.empty())
+            throw FsError("directory not empty: " + n-&gt;path());
+        DirPtr p = n-&gt;parent.lock();
+        n-&gt;parent.reset();                       // detach first: stale holders see "not attached"
+        p-&gt;children.erase(n-&gt;name);
+    }
+
+    long du(const DirPtr&amp; cwd, const string&amp; path) { ReadGuard g(rw_); return mustExist(cwd, path)-&gt;size(); }
+
+    vector&lt;string&gt; find(const DirPtr&amp; cwd, const string&amp; path, const Spec&amp; spec) {
+        ReadGuard g(rw_);
+        vector&lt;string&gt; out;
+        vector&lt;NodePtr&gt; stack{mustExist(cwd, path)};
+        while (!stack.empty()) {
+            NodePtr n = stack.back();
+            stack.pop_back();
+            if (spec.test(*n)) out.push_back(n-&gt;path());
+            if (n-&gt;isDir()) {
+                auto&amp; kids = static_pointer_cast&lt;Directory&gt;(n)-&gt;children;
+                for (auto it = kids.rbegin(); it != kids.rend(); ++it) stack.push_back(it-&gt;second);
+            }
+        }
+        return out;
+    }
+
+    bool isAttached(const DirPtr&amp; d) {
+        ReadGuard g(rw_);
+        DirPtr cur = d;
+        while (auto p = cur-&gt;parent.lock()) cur = p;
+        return cur == root;
+    }
+
+private:
+    RwLock rw_;                                        // guards the whole tree; private helpers assume it is held
+    DirPtr start(const DirPtr&amp; cwd, const string&amp; path) {
+        if (path.empty()) throw FsError("empty path");
+        return path[0] == '/' ? root : cwd;
+    }
+    NodePtr walk(const DirPtr&amp; from, const vector&lt;string&gt;&amp; segs, size_t count) {
+        NodePtr cur = from;
+        for (size_t i = 0; i &lt; count; ++i) {
+            const string&amp; s = segs[i];
+            if (!cur-&gt;isDir()) throw FsError("not a directory: " + cur-&gt;path());
+            DirPtr d = static_pointer_cast&lt;Directory&gt;(cur);
+            if (s == ".") continue;
+            if (s == "..") { cur = d-&gt;up(); continue; }
+            auto it = d-&gt;children.find(s);
+            if (it == d-&gt;children.end()) return nullptr;
+            cur = it-&gt;second;
+        }
+        return cur;
+    }
+    NodePtr mustExist(const DirPtr&amp; cwd, const string&amp; path) {
+        vector&lt;string&gt; segs = segments(path);
+        NodePtr n = walk(start(cwd, path), segs, segs.size());
+        if (!n) throw FsError("no such file or directory: " + path);
+        return n;
+    }
+    DirPtr parentOf(const DirPtr&amp; cwd, const string&amp; path, const vector&lt;string&gt;&amp; segs) {
+        NodePtr p = walk(start(cwd, path), segs, segs.size() - 1);
+        if (!p) throw FsError("no such directory: " + path);
+        if (!p-&gt;isDir()) throw FsError("not a directory: " + p-&gt;path());
+        return static_pointer_cast&lt;Directory&gt;(p);
+    }
+    static void checkName(const string&amp; s) {
+        if (s == "." || s == ".." || hasWildcard(s)) throw FsError("invalid name: " + s);
+    }
+};
+
+class Shell {
+    FileSystem&amp; fs;
+    DirPtr cwd;
+    DirPtr here() {
+        if (!fs.isAttached(cwd)) cwd = fs.root;
+        return cwd;
+    }
+public:
+    explicit Shell(FileSystem&amp; f) : fs(f), cwd(f.root) {}
+    string pwd() { return here()-&gt;path(); }
+    void cd(const string&amp; path) {
+        if (!hasWildcard(path)) { cwd = fs.resolveDir(here(), path); return; }
+        auto m = fs.resolveDirs(here(), path);
+        if (m.empty()) throw FsError("no such directory: " + path);
+        cwd = m.front();
+    }
+    void mkdir(const string&amp; p, bool parents = false) { fs.mkdir(here(), p, parents); }
+    vector&lt;string&gt; ls(const string&amp; p) { return fs.ls(here(), p); }
+    void write(const string&amp; p, const string&amp; t) { fs.writeFile(here(), p, t, false); }
+    void append(const string&amp; p, const string&amp; t) { fs.writeFile(here(), p, t, true); }
+    string cat(const string&amp; p) { return fs.readFile(here(), p); }
+    void rm(const string&amp; p, bool recursive = false) { fs.remove(here(), p, recursive); }
+    long du(const string&amp; p) { return fs.du(here(), p); }
+    vector&lt;string&gt; find(const string&amp; p, const Spec&amp; s) { return fs.find(here(), p, s); }
+};
+
+string join(const vector&lt;string&gt;&amp; v) {
+    string s = "[";
+    for (size_t i = 0; i &lt; v.size(); ++i) s += (i ? ", " : "") + v[i];
+    return s + "]";
+}
+
+int main() {
+    FileSystem fs;
+    Shell sh(fs);
+    sh.mkdir("/home/asha/projects", true);
+    sh.mkdir("/home/ravi", true);
+    sh.mkdir("/var/log/nginx", true);
+    sh.cd("/home/asha");
+    sh.cd("../ravi");
+    cout &lt;&lt; "pwd -&gt; " &lt;&lt; sh.pwd() &lt;&lt; "\n";
+    assert(sh.pwd() == "/home/ravi");
+
+    sh.write("/var/log/app.log", "boot ok\n");
+    sh.append("/var/log/app.log", "disk ok\n");
+    sh.write("/var/log/nginx/access.log", "GET / 200\n");
+    sh.write("/var/log/nginx/error.txt", "none");
+    cout &lt;&lt; "du /var -&gt; " &lt;&lt; sh.du("/var") &lt;&lt; "\n";
+    assert(sh.du("/var") == 30);
+
+    cout &lt;&lt; "ls /var/log/*.log -&gt; " &lt;&lt; join(sh.ls("/var/log/*.log")) &lt;&lt; "\n";
+    sh.cd("/home/asha");
+    sh.cd("*/../ravi");
+    cout &lt;&lt; "cd */../ravi from /home/asha -&gt; " &lt;&lt; sh.pwd() &lt;&lt; "\n";
+    assert(sh.pwd() == "/home/ravi");
+
+    auto logs = sh.find("/", extSpec("log"));
+    cout &lt;&lt; "find / -name '*.log' -&gt; " &lt;&lt; join(logs) &lt;&lt; "\n";
+    assert(logs.size() == 2);
+    auto small = sh.find("/var", isFile().And(minSize(10)).And(nameSpec("*.txt").Not()));
+    cout &lt;&lt; "find /var -type f -size +10 ! -name '*.txt' -&gt; " &lt;&lt; join(small) &lt;&lt; "\n";
+    assert(sh.find("/", isDir()).size() == 8);
+
+    try { sh.rm("/var"); assert(false); } catch (const FsError&amp; e) { cout &lt;&lt; "error ok: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    try { sh.cd("/var/log/app.log"); assert(false); } catch (const FsError&amp; e) { cout &lt;&lt; "error ok: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+
+    Shell other(fs);
+    other.cd("/var/log/nginx");
+    sh.rm("/var/log", true);
+    cout &lt;&lt; "other shell pwd after rm -r /var/log -&gt; " &lt;&lt; other.pwd() &lt;&lt; "\n";
+    assert(other.pwd() == "/");
+#ifdef HAVE_STD_MUTEX
+    {   // the Java race: 8 threads append to one file at once; no append may be lost
+        sh.write("/tmp.log", "");
+        vector&lt;thread&gt; ts;
+        for (int i = 0; i &lt; 8; ++i)
+            ts.emplace_back([&amp;fs] { Shell me(fs); for (int k = 0; k &lt; 100; ++k) me.append("/tmp.log", "x"); });
+        for (auto&amp; t : ts) t.join();
+        cout &lt;&lt; "8 threads x 100 appends -&gt; size " &lt;&lt; sh.du("/tmp.log") &lt;&lt; "\n";
+        assert(sh.du("/tmp.log") == 800);
+    }
+#endif
+    cout &lt;&lt; "C++ demo OK\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> on MinGW no thread test (the Linux <code>-DHAVE_STD_MUTEX</code> build adds the 8-thread append, measured), no <code>Shell</code> class per session beyond two cwd pointers, and a shorter demo: 10 lines and one final "C++ demo OK" against Java's 24 named checks. It does show the Composite, wildcards, the Spec tree and the removed-directory case.</p></div>
+
+  <h3 id="run">Run it</h3>
+<pre><code class="language-bash">cd lld-code/lld-case-file-system/java   &amp;&amp; javac -d out *.java &amp;&amp; java -cp out Main
+cd ../python                             &amp;&amp; python main.py &amp;&amp; python -m unittest -v test_fs
+cd ../cpp                                &amp;&amp; g++ -std=c++14 -Wall -o fs main.cpp &amp;&amp; ./fs</code></pre>
+  <p>Java output:</p>
+<pre class="terminal"><code>== 1. mkdir / cd / pwd / ls ==
+  pwd -&gt; /home/asha
+  ls / -&gt; [home, var]
+== 2. files: write / append / cat / du ==
+  cat app.log -&gt; boot ok|disk ok|
+  du /var -&gt; 30 bytes
+== 3. wildcards ==
+  ls /var/log/*.log -&gt; [app.log]
+  cd */projects from /home/asha -&gt; /home/asha/projects
+  cd /*/r* -&gt; /home/ravi
+  every match of /*/* -&gt; [/, /home, /home/asha, /home/ravi, /var, /var/log]
+== 4. find with Specification ==
+  find / -name '*.log' -&gt; [/var/log/app.log, /var/log/nginx/access.log]
+  find /var -type f -size +10 ! -name '*.txt' -&gt; [/var/log/app.log, /var/log/nginx/access.log]
+== 5. errors ==
+  error ok: already exists: /var
+  error ok: no such file or directory: /nope
+  error ok: not a directory: /var/log/app.log
+  error ok: is a directory: /var
+  error ok: directory not empty: /var
+  error ok: no such directory: tmp
+  error ok: cannot remove /
+== 6. rm -r removes a subtree; a shell inside it falls back to / ==
+  other shell pwd -&gt; /
+== 7. 8 threads x 200 appends under the read-write lock ==
+  du /load -&gt; 3200
+ALL 24 CHECKS PASSED</code></pre>
+  <p>Python tests:</p>
+<pre class="terminal"><code>test_cd_no_match (test_fs.FileSystemTest.test_cd_no_match) ... ok
+test_cd_star_matches_dot_dotdot_child (test_fs.FileSystemTest.test_cd_star_matches_dot_dotdot_child) ... ok
+test_du_composite (test_fs.FileSystemTest.test_du_composite) ... ok
+test_files (test_fs.FileSystemTest.test_files) ... ok
+test_find_specs (test_fs.FileSystemTest.test_find_specs) ... ok
+test_glob (test_fs.FileSystemTest.test_glob) ... ok
+test_ls_sorted_and_file (test_fs.FileSystemTest.test_ls_sorted_and_file) ... ok
+test_mkdir_errors (test_fs.FileSystemTest.test_mkdir_errors) ... ok
+test_pwd_and_relative_cd (test_fs.FileSystemTest.test_pwd_and_relative_cd) ... ok
+test_rm (test_fs.FileSystemTest.test_rm) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.003s
+
+OK</code></pre>
+  <p>C++ output:</p>
+<pre class="terminal"><code>pwd -&gt; /home/ravi
+du /var -&gt; 30
+ls /var/log/*.log -&gt; [app.log]
+cd */../ravi from /home/asha -&gt; /home/ravi
+find / -name '*.log' -&gt; [/var/log/app.log, /var/log/nginx/access.log]
+find /var -type f -size +10 ! -name '*.txt' -&gt; [/var/log/app.log, /var/log/nginx/access.log]
+error ok: directory not empty: /var
+error ok: not a directory: /var/log/app.log
+other shell pwd after rm -r /var/log -&gt; /
+C++ demo OK</code></pre>

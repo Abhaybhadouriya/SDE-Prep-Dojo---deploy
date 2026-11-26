@@ -1,0 +1,57 @@
+
+  <h2>Relationships and patterns used (and why)</h2>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Pattern</th><th>Where</th><th>Why here</th><th>What you say in the room</th></tr></thead>
+      <tbody>
+        <tr><td>Table-driven state machine</td><td><code>Workflow</code></td><td>Statuses differ per board and are configured, not coded.</td><td>"A move is legal if the table says so. A new status is a new row, not a new class."</td></tr>
+        <tr><td>Guard list (<a href="{{BASE}}lld/lld-pat-specification">Specification</a> / validation chain)</td><td><code>TransitionGuard</code></td><td>Rules such as "needs assignee" or "subtasks done" vary per board and are added over time. It is not Strategy: nothing picks one interchangeable algorithm; every guard runs and they combine like an AND of predicates (or a <a href="{{BASE}}lld/lld-pat-chain-of-responsibility">chain</a> that stops at the first refusal).</td><td>"Each rule is a small object; the move code just loops over them. The first one that refuses wins."</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-specification">Specification</a></td><td><code>Filters</code></td><td>Search criteria combine freely; a method per combination would explode.</td><td>"Six small predicates give me every combination with and, or and not."</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-observer">Observer</a></td><td><code>TrackerListener</code></td><td>Notifications, webhooks and search indexing react to changes; the core must not know them.</td><td>"Listeners run after the lock is released, so a slow webhook never blocks the board."</td></tr>
+        <tr><td><a href="{{BASE}}lld/lld-pat-facade">Facade</a></td><td><code>TaskTracker</code></td><td>One entry point that enforces locking, membership and logging for every write.</td><td>"There is no way to change an issue without producing an event."</td></tr>
+        <tr><td>Immutable snapshot (value object)</td><td><code>IssueView</code>, <code>Event</code></td><td>Readers and the log must never change or see partial state.</td><td>"Copy under the lock, filter outside it."</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Patterns we deliberately skipped: the classic <a href="{{BASE}}lld/lld-pat-state">State pattern</a> with one class per status (statuses are configurable and have no behaviour of their own; State pays off when each state <i>behaves</i> differently, like a vending machine), <b>Composite</b> for subtasks (one level deep, so a list of keys is enough), and a <b>Singleton</b> tracker (tests create a fresh one each time). Also not a listener: the audit log. If the log were an observer, a failing listener could lose an audit record; instead it is written inside the same lock as the change.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 360" role="img" aria-label="State diagrams: an issue moves TODO, IN_PROGRESS, IN_REVIEW, DONE with back moves and reopen, guarded by needs-assignee and subtasks-done rules; a sprint moves PLANNED, ACTIVE, CLOSED"><text class="label" x="400" y="18">Issue workflow (Scrum board): a transition table plus guards</text><rect class="box client" x="20" y="60" width="150" height="46" rx="20"/><text class="label" x="95" y="88">TODO</text><rect class="box svc" x="220" y="60" width="150" height="46" rx="20"/><text class="label" x="295" y="88">IN_PROGRESS</text><rect class="box queue" x="420" y="60" width="150" height="46" rx="20"/><text class="label" x="495" y="88">IN_REVIEW</text><rect class="box ok" x="620" y="60" width="150" height="46" rx="20"/><text class="label" x="695" y="88">DONE</text><path class="arrow" d="M170 74 L216 74"/><path class="arrow" d="M370 74 L416 74"/><path class="arrow" d="M570 74 L616 74"/><path class="arrow" d="M220 94 L174 94"/><path class="arrow" d="M420 94 L374 94"/><text class="label small" x="195" y="44">guard: assignee set</text><text class="label small" x="395" y="44">submit</text><text class="label small" x="595" y="44">guard: subtasks done</text><path class="arrow" d="M695 106 C 695 168, 95 168, 95 110"/><text class="label small" x="395" y="176">reopen: DONE -> TODO</text><text class="label small" x="400" y="124">back moves: IN_PROGRESS -> TODO, IN_REVIEW -> IN_PROGRESS</text><text class="label" x="400" y="205">Sprint (enum SprintState)</text><rect class="box client" x="60" y="228" width="190" height="46" rx="20"/><text class="label" x="155" y="256">PLANNED</text><rect class="box svc" x="305" y="228" width="190" height="46" rx="20"/><text class="label" x="400" y="256">ACTIVE</text><rect class="box fail" x="550" y="228" width="190" height="46" rx="20"/><text class="label" x="645" y="256">CLOSED</text><path class="arrow" d="M250 251 L301 251"/><path class="arrow" d="M495 251 L546 251"/><text class="label small" x="277" y="296">start: no other</text><text class="label small" x="277" y="312">ACTIVE sprint</text><text class="label small" x="522" y="296">complete: unfinished</text><text class="label small" x="522" y="312">work to backlog</text><text class="label small" x="400" y="344">addToSprint() is refused on a CLOSED sprint; subtasks always follow their parent</text></svg>
+    <figcaption>The Scrum preset as a transition table with two guards, and the sprint lifecycle. The To-do preset is the same machine with two states (TODO and DONE) and reopen.</figcaption>
+  </figure>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>A table-driven state machine is how netfilter conntrack and many protocol stacks are written: a 2-D table indexed by (current state, input) gives the next state, and illegal combinations are rejected without any per-state code. Choosing "table plus guard hooks" over "one ops struct per state" is the same trade-off you make in C: an ops table per state (the State pattern) is worth it when states have different behaviour; when they only differ in which moves are legal, a table is shorter and can be loaded from configuration.</p>
+  </div>
+  <h3>Why the pattern earns its place: the if-ladder it replaces</h3>
+  <p>Without guard objects, every workflow rule is another <code>if</code> inside <code>move</code>:</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Before: if / switch">
+<pre><code class="language-java">void move(String key, String actor, String to) {
+    Issue i = issue(key);
+    if (!workflow.allowed(i.status, to)) throw new TransitionDenied(i.status + " -&gt; " + to);
+    if (to.equals("IN_PROGRESS") &amp;&amp; i.assignee == null)
+        throw new TransitionDenied("needs an assignee");
+    if (to.equals("DONE") &amp;&amp; i.subtasks.stream().anyMatch(s -&gt; !s.done))
+        throw new TransitionDenied("subtasks open");
+    if (to.equals("DONE") &amp;&amp; board.id.equals("PAY") &amp;&amp; i.reviewer == null)   // follow-up:
+        throw new TransitionDenied("needs review");                         // edits move()
+    i.status = to;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="After: an interface">
+<pre><code class="language-java">interface TransitionGuard {
+    Optional&lt;String&gt; refuse(Issue i, String to, Board b);   // empty = allowed
+}
+// per board: b.guards.add(Workflow.needsAssignee("IN_PROGRESS"));
+for (TransitionGuard g : b.guards)                     // inside move(), under the board lock
+    g.refuse(i, to, b).ifPresent(r -&gt; { throw new TransitionDenied(r); });</code></pre>
+    </div>
+  </div>
+  <p>With the ladder, the follow-up "PAY board needs a reviewer before DONE" edits <code>TaskTracker.move</code> for every board. With guards it is one new guard added to one board; <code>move</code> is unchanged.</p>
+  <div class="bridge">
+    <h4>From your world: the same move in C</h4>
+<pre><code class="language-c">struct guard { const char *(*refuse)(const struct guard *g, const struct issue *i, const char *to); };
+/* like netfilter hooks: for (k = 0; k &lt; b-&gt;nguards; k++)
+       if ((why = b-&gt;guards[k]-&gt;refuse(b-&gt;guards[k], i, to))) return deny(why); */</code></pre>
+    <p>The "after" version is an ops table: the caller holds a pointer to a struct of function pointers and never asks which implementation it has, exactly as the VFS calls <code>file-&gt;f_op-&gt;read()</code> without a switch on the file system type.</p>
+  </div>

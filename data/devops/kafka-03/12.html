@@ -1,0 +1,79 @@
+
+        <h2>Interview questions</h2>
+
+        <div class="callout interview">
+          <p><b>The 60-second answer: "How does a Kafka producer work, and how do you make it reliable?"</b><br>
+          "A producer is a client library in the application. When I call <code>send()</code>, it serializes the key and value, picks a partition - by hashing the key, so the same key always goes to the same partition and stays in order - and appends the record to an in-memory batch for that partition. <code>send()</code> returns right away. A background thread sends a batch when it is full (<code>batch.size</code>) or when <code>linger.ms</code> runs out, groups batches per leader broker, and compresses them per batch, which is where most of Kafka's producer throughput comes from. Reliability is about acks: with replication factor 3, <code>min.insync.replicas=2</code> and <code>acks=all</code>, a write is only acknowledged once two copies exist, so one broker can fail without data loss. Retries can create duplicates or reorder data, so I keep the idempotent producer on: each batch carries a producer ID and sequence number and the broker drops repeats. That covers retries inside one session; for atomic multi-partition writes I would use transactions, and consumers still need to be idempotent."</p>
+        </div>
+
+        <details class="qa" data-level="3" data-topic="kafka" data-company="Amazon,Microsoft,Flipkart">
+          <summary>Walk me through what happens when a producer calls send().</summary>
+          <div class="answer">
+            <p>On the calling thread: interceptors run, the producer makes sure it has metadata for the topic (blocking up to <code>max.block.ms</code> if not), the serializers turn key and value into bytes, the partitioner picks a partition (explicit partition, custom partitioner, murmur2 of the key, or the sticky partition for null keys), and the record is appended to that partition's open batch in the RecordAccumulator. <code>send()</code> returns a Future. On the Sender (I/O) thread: batches that are full or past <code>linger.ms</code> are drained, grouped by leader broker into ProduceRequests, and sent. The leader appends, waits according to <code>acks</code>, and replies with the base offset. The Sender completes the Futures and runs callbacks, or re-queues the batch on a retriable error until <code>delivery.timeout.ms</code>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split it into "my thread" and "the I/O thread" - that structure alone signals understanding. Name the accumulator and the two batching triggers. End with what the ack means under each <code>acks</code> value.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where can <code>send()</code> block? (Metadata fetch and a full <code>buffer.memory</code>, both limited by <code>max.block.ms</code>.)</li><li>How does the producer find the leader? (Cached metadata, refreshed on <code>NOT_LEADER_OR_FOLLOWER</code>.)</li><li>Is the producer thread-safe? (Yes; share one per process.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="kafka" data-company="Amazon,Walmart,PhonePe">
+          <summary>Explain acks=0, 1 and all. Is acks=all enough to never lose data?</summary>
+          <div class="answer">
+            <p><code>acks=0</code>: no reply; any failure loses data. <code>acks=1</code>: the leader replies after writing to its own log; if it dies before followers copy the batch, acknowledged data is lost. <code>acks=all</code>: the leader replies after all in-sync replicas have it. It is not enough on its own, because the ISR can shrink to just the leader; then "all" means one copy. You need replication factor 3 and <code>min.insync.replicas=2</code>, so the leader rejects writes (<code>NOT_ENOUGH_REPLICAS</code>) when fewer than two copies are in sync, and unclean leader election left disabled (the default). Even then, the producer must check its callbacks, and consumers must commit offsets only after processing, or data is lost at the edges rather than in Kafka.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the three meanings in one line each, then say "acks=all is necessary but not sufficient" and add min ISR. Close with the trade-off: with two of three replicas down, writes stop by design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does acks=1 really wait for - disk? (The leader's log in page cache, not an fsync.)</li><li>What is the latency cost of acks=all? (The slowest in-sync follower's fetch; small within one region.)</li><li>What is unclean leader election?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Uber,Amazon,Google">
+          <summary>How does the idempotent producer prevent duplicates, and what does it not protect against?</summary>
+          <div class="answer">
+            <p>The producer gets a producer ID and epoch when it starts. Every batch to a partition carries a sequence number that increases per partition. The leader remembers recent sequence numbers for each producer and partition (the last 5 batches), so a retried batch with a sequence it has already written is acknowledged without being appended again, and a gap is rejected as out of order. That is why <code>max.in.flight.requests.per.connection</code> must be at most 5, and why ordering survives retries. It does not cover application-level resends (a new record, new sequence), a producer restart (new PID), atomic writes across partitions (that needs transactions with a <code>transactional.id</code>), or duplicate processing on the consumer side.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mechanism (PID + sequence per partition), the guarantee (no duplicates or reordering from internal retries), then the limits. The limits are what interviewers are really testing. A TCP sequence-number analogy is a nice touch.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do transactions fence a zombie producer? (Epoch bump on <code>initTransactions()</code>.)</li><li>Is idempotence on by default? (Java since 3.0, unless a conflicting setting quietly disables it; not in librdkafka.)</li><li>How would you de-duplicate on the consumer side?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Microsoft,Uber,Swiggy">
+          <summary>How would you tune a producer for maximum throughput? What do you give up?</summary>
+          <div class="answer">
+            <p>Make batches bigger and fewer: raise <code>linger.ms</code> (say 20-100 ms) and <code>batch.size</code> (64 KiB to 1 MiB), turn on <code>compression.type=lz4</code> or <code>zstd</code>, give <code>buffer.memory</code> room for many in-flight batches, keep idempotence on with up to 5 in-flight requests, and either use a well-spread key or no key so the sticky partitioner fills batches. Make sure the topic has enough partitions across enough brokers to parallelise writes. The price is latency when traffic is light (up to <code>linger.ms</code>), more memory, and compression CPU on both ends. If loss is acceptable, <code>acks=1</code> removes the follower wait, but I would only do that for data like metrics. I would measure before and after with <code>kafka-producer-perf-test.sh</code> and watch the producer metrics for average batch size, compression ratio and request latency.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with the principle ("amortise per-request cost over bigger batches"), list the knobs in that light, name the cost of each, and finish with "and I would measure it". Avoid quoting magic throughput numbers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Now tune for low latency instead. (<code>linger.ms</code> 0-5, small batches, maybe no compression; keep acks=all if durability matters.)</li><li>Why does compression get better with bigger batches?</li><li>Which side is usually the real bottleneck - producer or consumer?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Flipkart,Amazon,Walmart">
+          <summary>Producers are timing out in production. How do you debug it?</summary>
+          <div class="answer">
+            <p>First read the <i>underlying</i> errors, not just the final timeout: retry warnings show the real cause. Then check, in order: can the app reach the broker addresses that metadata returns (<code>advertised.listeners</code>, a frequent Docker/Kubernetes issue); does the topic exist with leaders for every partition; is the ISR below <code>min.insync.replicas</code> (<code>NOT_ENOUGH_REPLICAS</code>, under-replicated partitions); is <code>buffer.memory</code> full so <code>send()</code> blocks on <code>max.block.ms</code> (producer metrics for buffer available bytes and record queue time); is a quota throttling the client; are TLS or SASL failing; are brokers saturated (request queue time, network and I/O thread idle ratios). Fix the cause, and make sure request paths have a short <code>max.block.ms</code> and a fallback so a Kafka problem does not take the web tier down.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show a method: client side first (config, connectivity, buffer), then cluster side (leaders, ISR, load), then the protection you would add. Mention that a "timeout" is usually a symptom wrapping a retriable error.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What metrics would you alert on for producers? (Error rate, retry rate, record queue time, request latency, buffer exhaustion.)</li><li>How does delivery.timeout.ms relate to request.timeout.ms?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Flipkart,Swiggy">
+          <summary>Your service writes an order to its database and then publishes to Kafka. What can go wrong?</summary>
+          <div class="answer">
+            <p>That is the <b>dual-write problem</b>. The DB commit and the Kafka send are not atomic. If the service crashes after the commit but before the send succeeds, the order exists but no event is published, so inventory and notifications never hear about it. If you send first and the DB commit fails, consumers act on an order that does not exist. Retrying the send from application code can also publish duplicates. The standard fix is the <b>transactional outbox</b>: write the event into an outbox table in the same DB transaction as the order, and have a relay (a poller or Debezium CDC) publish outbox rows to Kafka with an idempotent producer. The relay is at-least-once, so consumers de-duplicate by event ID.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the problem ("dual write"), give both crash orderings, then the outbox fix, then the remaining duty on consumers. This question appears in many order-flow and payment designs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not use Kafka transactions for this? (They cover Kafka writes only, not your database.)</li><li>Poller vs CDC for the relay?</li><li>See <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Event-Driven Data</a>.</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: duplicate "payment captured" events after a broker restart</h4>
+          <div class="situation"><p>During a routine rolling restart of the Kafka brokers, the payments team sees some <code>payment.captured</code> events twice in the topic, and a few customers get two confirmation emails. The producer is a Python service. Nobody changed producer code. What happened and how do you fix it?</p></div>
+          <div class="bad"><p><b>Weak answer:</b> "Kafka is at-least-once, duplicates happen, tell the email team to ignore them." It is not an explanation, and it leaves the duplicates in the source of truth.</p></div>
+          <div class="good"><p><b>Strong answer:</b> "When a leader moves during a restart, in-flight requests can be written but not acknowledged, so the producer retries. A Python <code>confluent-kafka</code> producer does <b>not</b> enable idempotence by default, so those retries created real duplicates; with several requests in flight they may even be reordered. Fix one: set <code>enable.idempotence=true</code> (which also forces acks=all and safe in-flight limits) and verify the effective config at startup. Fix two: check the service does not resend on its own after an error callback; if it must, it should reuse the same business event ID. Fix three, defence in depth: the email and ledger consumers de-duplicate by <code>paymentId</code> (a unique constraint or a processed-IDs table with a TTL). I would also add a check that rolling restarts happen one broker at a time, only when there are no under-replicated partitions."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would Java have had the same problem? (Not with defaults since 3.0, unless someone set acks=1.)</li><li>Would transactions help here? (Only if you also need atomic multi-partition writes; idempotence is enough for retry duplicates.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the checkout API freezes when Kafka is slow</h4>
+          <div class="situation"><p>On a sale day, one Kafka broker becomes very slow. Within a minute, your checkout API stops answering entirely, even for requests that do not need Kafka. Thread dumps show every request thread stuck inside <code>KafkaProducer.send()</code>.</p></div>
+          <div class="bad"><p><b>Weak answer:</b> "Add more API servers." More servers will freeze the same way, because each one blocks on the same slow broker.</p></div>
+          <div class="good"><p><b>Strong answer:</b> "The producer buffer filled up because batches to the slow broker could not drain, so <code>send()</code> started blocking for up to <code>max.block.ms</code>, 60 seconds by default, on request threads. The thread pool ran out and the whole API stopped. Immediate fix: lower <code>max.block.ms</code> to something like a few hundred milliseconds in request paths, catch the exception and fail fast or fall back, and bulkhead Kafka calls onto their own small executor so they cannot eat every request thread. Structural fix: move publishing out of the request path with a transactional outbox, so checkout only depends on its own database and a relay publishes to Kafka at its own pace. Then find out why the broker was slow (disk, GC, a hot partition, replication) and add alerts on producer buffer exhaustion and request latency."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why did requests that do not use Kafka also hang? (Shared thread pool exhaustion.)</li><li>What is a bulkhead? (Isolating resources per dependency; see <a href="{{BASE}}hld/hld-11">resilience patterns</a>.)</li></ul></div>
+        </div>
+        <p>For many more questions across all Kafka topics, see the <a href="{{BASE}}devops/kafka-13">Kafka interview page</a>.</p>
+      

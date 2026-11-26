@@ -1,0 +1,1310 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file per language; in a real round split into <code>buffer/</code>, <code>command/</code>, <code>render/</code> and <code>Main</code>. The same files live in <code>lld-code/lld-case-text-editor/</code> in this repo. Each was compiled and run; the output below is the real output.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+
+// ---------- storage: a gap buffer (what Emacs uses) ----------
+final class GapBuffer {
+    private char[] buf;
+    private int gapStart, gapEnd;               // the gap is buf[gapStart, gapEnd)
+
+    GapBuffer(int capacity) { buf = new char[Math.max(capacity, 8)]; gapEnd = buf.length; }
+
+    int length() { return buf.length - (gapEnd - gapStart); }
+
+    char charAt(int i) {
+        if (i &lt; 0 || i &gt;= length()) throw new IndexOutOfBoundsException("index " + i);
+        return i &lt; gapStart ? buf[i] : buf[i + (gapEnd - gapStart)];
+    }
+
+    private void moveGap(int pos) {             // O(distance): typing at one place is O(1)
+        if (pos &lt; gapStart) {
+            int n = gapStart - pos;
+            System.arraycopy(buf, pos, buf, gapEnd - n, n);
+            gapStart -= n; gapEnd -= n;
+        } else if (pos &gt; gapStart) {
+            int n = pos - gapStart;
+            System.arraycopy(buf, gapEnd, buf, gapStart, n);
+            gapStart += n; gapEnd += n;
+        }
+    }
+
+    private void ensureGap(int need) {          // grow by doubling, like a vector
+        if (gapEnd - gapStart &gt;= need) return;
+        int cap = Math.max(buf.length * 2, length() + need + 8);
+        char[] nb = new char[cap];
+        int tail = buf.length - gapEnd;
+        System.arraycopy(buf, 0, nb, 0, gapStart);
+        System.arraycopy(buf, gapEnd, nb, cap - tail, tail);
+        gapEnd = cap - tail;
+        buf = nb;
+    }
+
+    void insert(int pos, String s) {
+        checkPos(pos);
+        moveGap(pos);
+        ensureGap(s.length());
+        s.getChars(0, s.length(), buf, gapStart);
+        gapStart += s.length();
+    }
+
+    String delete(int pos, int len) {           // returns the removed text (commands keep it for undo)
+        checkPos(pos);
+        if (len &lt; 0 || pos + len &gt; length()) throw new IndexOutOfBoundsException("delete " + pos + "+" + len);
+        moveGap(pos);
+        String removed = new String(buf, gapEnd, len);
+        gapEnd += len;
+        return removed;
+    }
+
+    private void checkPos(int pos) {
+        if (pos &lt; 0 || pos &gt; length()) throw new IndexOutOfBoundsException("position " + pos);
+    }
+
+    @Override public String toString() {
+        return new String(buf, 0, gapStart) + new String(buf, gapEnd, buf.length - gapEnd);
+    }
+}
+
+// ---------- the document: text plus line arithmetic ----------
+final class Document {
+    private final GapBuffer text = new GapBuffer(16);
+
+    int length() { return text.length(); }
+    char charAt(int i) { return text.charAt(i); }
+    void insert(int pos, String s) { text.insert(pos, s); }
+    String delete(int pos, int len) { return text.delete(pos, len); }
+    @Override public String toString() { return text.toString(); }
+
+    int lineStart(int pos) { while (pos &gt; 0 &amp;&amp; charAt(pos - 1) != '\n') pos--; return pos; }
+    int lineEnd(int pos) { while (pos &lt; length() &amp;&amp; charAt(pos) != '\n') pos++; return pos; }
+    int lineOf(int pos) { int n = 0; for (int i = 0; i &lt; pos; i++) if (charAt(i) == '\n') n++; return n; }
+}
+
+// ---------- Command: every edit knows how to undo itself ----------
+interface EditCommand {
+    int execute(Document d);                    // apply; returns where the cursor goes
+    void undo(Document d);                      // apply the exact inverse
+}
+
+final class InsertCommand implements EditCommand {
+    private final int pos; private String text;
+    InsertCommand(int pos, String text) { this.pos = pos; this.text = text; }
+    public int execute(Document d) { d.insert(pos, text); return pos + text.length(); }
+    public void undo(Document d) { d.delete(pos, text.length()); }
+
+    /** Word-level undo: glue single typed characters onto this insert until a space or newline. */
+    boolean absorb(InsertCommand next) {
+        char last = text.charAt(text.length() - 1);
+        boolean ok = next.pos == pos + text.length() &amp;&amp; next.text.length() == 1
+                &amp;&amp; next.text.charAt(0) != '\n' &amp;&amp; last != ' ' &amp;&amp; last != '\n';
+        if (ok) text += next.text;
+        return ok;
+    }
+}
+
+final class DeleteCommand implements EditCommand {
+    private final int pos, len; private String removed = "";
+    DeleteCommand(int pos, int len) { this.pos = pos; this.len = len; }
+    public int execute(Document d) { removed = d.delete(pos, len); return pos; }
+    public void undo(Document d) { d.insert(pos, removed); }
+}
+
+final class MacroCommand implements EditCommand {   // Composite: many edits, one undo step
+    private final List&lt;EditCommand&gt; parts;
+    MacroCommand(List&lt;EditCommand&gt; parts) { this.parts = parts; }
+    public int execute(Document d) { int c = 0; for (EditCommand p : parts) c = p.execute(d); return c; }
+    public void undo(Document d) { for (int i = parts.size() - 1; i &gt;= 0; i--) parts.get(i).undo(d); }
+}
+
+// ---------- Flyweight: one shared Glyph per (character, font) ----------
+final class Glyph {
+    final char ch; final String font;           // intrinsic state only; position is extrinsic
+    Glyph(char ch, String font) { this.ch = ch; this.font = font; }
+}
+
+final class GlyphFactory {
+    private final Map&lt;String, Glyph&gt; pool = new HashMap&lt;&gt;();
+    Glyph get(char ch, String font) { return pool.computeIfAbsent(font + '\u0000' + ch, k -&gt; new Glyph(ch, font)); }
+    int size() { return pool.size(); }
+}
+
+// ---------- the editor: facade, cursor, history ----------
+final class Editor {
+    /** Memento: an opaque snapshot. Only Editor can read it. */
+    static final class Snapshot {
+        private final String text; private final int cursor;
+        private Snapshot(String text, int cursor) { this.text = text; this.cursor = cursor; }
+    }
+
+    private static final class Entry {          // one undo step: the command + the cursor before it
+        final EditCommand cmd; final int cursorBefore;
+        Entry(EditCommand cmd, int cursorBefore) { this.cmd = cmd; this.cursorBefore = cursorBefore; }
+    }
+
+    private final Document doc = new Document();
+    private final Deque&lt;Entry&gt; undo = new ArrayDeque&lt;&gt;(), redo = new ArrayDeque&lt;&gt;();
+    private final int historyLimit, pageLines;
+    private int cursor, goalCol = -1;           // goalCol: column remembered across up/down moves
+    private boolean canMerge;
+
+    Editor(int historyLimit, int pageLines) { this.historyLimit = historyLimit; this.pageLines = pageLines; }
+
+    // ----- edits -----
+    synchronized void type(String s) {
+        if (s.isEmpty()) return;
+        InsertCommand c = new InsertCommand(cursor, s);
+        if (canMerge &amp;&amp; !undo.isEmpty() &amp;&amp; undo.peek().cmd instanceof InsertCommand
+                &amp;&amp; ((InsertCommand) undo.peek().cmd).absorb(c)) {
+            cursor = c.execute(doc);            // applied, but folded into the previous undo step
+            redo.clear();
+            goalCol = -1;
+        } else {
+            run(c);
+        }
+        canMerge = s.length() == 1;
+    }
+
+    synchronized void backspace() { if (cursor &gt; 0) run(new DeleteCommand(cursor - 1, 1)); }
+    synchronized void deleteForward() { if (cursor &lt; doc.length()) run(new DeleteCommand(cursor, 1)); }
+
+    /** Replace every non-overlapping match, left to right. One undo step. Returns the count. */
+    synchronized int replaceAll(String find, String with) {
+        if (find.isEmpty()) throw new IllegalArgumentException("empty search string");
+        String t = doc.toString();
+        List&lt;Integer&gt; hits = new ArrayList&lt;&gt;();
+        for (int i = t.indexOf(find); i &gt;= 0; i = t.indexOf(find, i + find.length())) hits.add(i);
+        if (hits.isEmpty()) return 0;
+        List&lt;EditCommand&gt; parts = new ArrayList&lt;&gt;();
+        for (int k = hits.size() - 1; k &gt;= 0; k--) {   // right to left: earlier offsets stay valid
+            parts.add(new DeleteCommand(hits.get(k), find.length()));
+            parts.add(new InsertCommand(hits.get(k), with));
+        }
+        run(new MacroCommand(parts));
+        return hits.size();
+    }
+
+    // ----- memento checkpoint: save and revert (the revert is itself undoable) -----
+    synchronized Snapshot save() { return new Snapshot(doc.toString(), cursor); }
+
+    synchronized void restore(Snapshot s) {
+        run(new MacroCommand(List.of(new DeleteCommand(0, doc.length()), new InsertCommand(0, s.text))));
+        cursor = s.cursor;
+    }
+
+    private void run(EditCommand c) {
+        int before = cursor;
+        cursor = c.execute(doc);
+        undo.push(new Entry(c, before));
+        if (undo.size() &gt; historyLimit) undo.removeLast();   // bounded history: drop the oldest
+        redo.clear();                                       // a new edit forks history
+        canMerge = false; goalCol = -1;
+    }
+
+    synchronized boolean undo() {
+        if (undo.isEmpty()) return false;
+        Entry e = undo.pop();
+        e.cmd.undo(doc);
+        cursor = e.cursorBefore;
+        redo.push(e);
+        canMerge = false; goalCol = -1;
+        return true;
+    }
+
+    synchronized boolean redo() {
+        if (redo.isEmpty()) return false;
+        Entry e = redo.pop();
+        cursor = e.cmd.execute(doc);
+        undo.push(e);
+        canMerge = false; goalCol = -1;
+        return true;
+    }
+
+    // ----- cursor moves (not edits: never recorded in history) -----
+    synchronized void left() { moved(Math.max(0, cursor - 1)); }
+    synchronized void right() { moved(Math.min(doc.length(), cursor + 1)); }
+    synchronized void home() { moved(doc.lineStart(cursor)); }
+    synchronized void end() { moved(doc.lineEnd(cursor)); }
+    synchronized void up() { vertical(-1); }
+    synchronized void down() { vertical(+1); }
+    synchronized void pageUp() { for (int i = 0; i &lt; pageLines; i++) vertical(-1); }
+    synchronized void pageDown() { for (int i = 0; i &lt; pageLines; i++) vertical(+1); }
+
+    private void moved(int pos) { cursor = pos; goalCol = -1; canMerge = false; }
+
+    private void vertical(int dir) {
+        int start = doc.lineStart(cursor);
+        if (goalCol &lt; 0) goalCol = cursor - start;
+        int target;
+        if (dir &lt; 0) {
+            if (start == 0) return;             // already on the first line
+            target = doc.lineStart(start - 1);
+        } else {
+            int end = doc.lineEnd(cursor);
+            if (end == doc.length()) return;    // already on the last line
+            target = end + 1;
+        }
+        cursor = Math.min(target + goalCol, doc.lineEnd(target));
+        canMerge = false;
+    }
+
+    // ----- queries -----
+    synchronized String text() { return doc.toString(); }
+    synchronized int cursor() { return cursor; }
+    synchronized String where() { return (doc.lineOf(cursor) + 1) + ":" + (cursor - doc.lineStart(cursor) + 1); }
+    synchronized String view() { String t = doc.toString(); return (t.substring(0, cursor) + "|" + t.substring(cursor)).replace("\n", "\\n"); }
+    synchronized int undoDepth() { return undo.size(); }
+
+    synchronized List&lt;Glyph&gt; layout(GlyphFactory f, String font) {
+        List&lt;Glyph&gt; out = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; doc.length(); i++) out.add(f.get(doc.charAt(i), font));
+        return out;
+    }
+}
+
+public class Main {
+    private static int checks;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+    static void show(Editor e, String label) { System.out.println("  " + label + ": \"" + e.view() + "\" at " + e.where()); }
+
+    public static void main(String[] args) {
+        Editor ed = new Editor(100, 2);
+
+        System.out.println("1) type 'hello world' one key at a time");
+        for (char c : "hello world".toCharArray()) ed.type(String.valueOf(c));
+        show(ed, "text");
+        check(ed.text().equals("hello world") &amp;&amp; ed.undoDepth() == 2, "word-level groups: 'hello ' + 'world'");
+
+        System.out.println("2) undo twice, redo once");
+        ed.undo(); show(ed, "undo");
+        check(ed.text().equals("hello "), "undo removes the last word");
+        ed.undo(); show(ed, "undo");
+        check(ed.text().isEmpty() &amp;&amp; ed.cursor() == 0, "undo to empty");
+        ed.redo(); show(ed, "redo");
+        check(ed.text().equals("hello ") &amp;&amp; ed.cursor() == 6, "redo restores text and cursor");
+
+        System.out.println("3) a new edit after undo clears redo");
+        ed.type("there");
+        check(!ed.redo(), "redo stack forked away");
+        show(ed, "text");
+
+        System.out.println("4) multi-line text, arrows remember the column");
+        ed.type("\nab\nlonger line");
+        show(ed, "text");
+        ed.up(); show(ed, "up");
+        check(ed.where().equals("2:3"), "short line clamps column");
+        ed.up(); show(ed, "up");
+        check(ed.where().equals("1:12"), "goal column 12 restored on a long line");
+        ed.pageDown(); show(ed, "pgdn");
+        check(ed.where().equals("3:12"), "page down by 2 lines");
+        ed.home(); ed.left(); show(ed, "home, left");
+        check(ed.where().equals("2:3"), "left wraps to the end of the previous line");
+
+        System.out.println("5) backspace and forward delete, then undo all three");
+        ed.backspace(); ed.backspace(); show(ed, "2 x backspace");
+        ed.deleteForward(); show(ed, "delete");
+        check(ed.text().equals("hello there\nlonger line"), "deleted 'ab' and a newline");
+        ed.undo(); ed.undo(); ed.undo(); show(ed, "3 x undo");
+        check(ed.text().equals("hello there\nab\nlonger line") &amp;&amp; ed.where().equals("2:3"), "edits reversed exactly");
+
+        System.out.println("6) replace all is one undo step");
+        Editor.Snapshot saved = ed.save();
+        int n = ed.replaceAll("l", "L");
+        show(ed, "replaced " + n);
+        check(n == 4 &amp;&amp; ed.text().equals("heLLo there\nab\nLonger Line"), "4 matches replaced");
+        ed.undo();
+        check(ed.text().equals("hello there\nab\nlonger line"), "one undo reverts all 4");
+        ed.redo(); ed.type("!");
+        show(ed, "redo + type");
+
+        System.out.println("7) revert to the saved checkpoint (Memento), and undo the revert");
+        ed.restore(saved); show(ed, "restored");
+        check(ed.text().equals("hello there\nab\nlonger line"), "checkpoint restored");
+        ed.undo(); show(ed, "undo revert");
+        check(ed.text().contains("!"), "revert is itself undoable");
+
+        System.out.println("8) bounded history keeps the newest 3 steps");
+        Editor small = new Editor(3, 1);
+        for (String w : new String[]{"a ", "b ", "c ", "d ", "e "}) small.type(w);
+        int undone = 0; while (small.undo()) undone++;
+        System.out.println("  after " + undone + " undos: \"" + small.text() + "\"");
+        check(undone == 3 &amp;&amp; small.text().equals("a b "), "oldest steps dropped");
+
+        System.out.println("9) Flyweight glyphs");
+        Editor big = new Editor(10, 1);
+        for (int i = 0; i &lt; 100; i++) big.type("hello world ");
+        GlyphFactory f = new GlyphFactory();
+        List&lt;Glyph&gt; glyphs = big.layout(f, "Mono-12");
+        System.out.println("  " + glyphs.size() + " glyph references, " + f.size() + " glyph objects");
+        check(glyphs.size() == 1200 &amp;&amp; f.size() == 8 &amp;&amp; glyphs.get(0) == glyphs.get(12), "shared glyphs");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Text editor with undo/redo: gap buffer + Command + Memento + Flyweight glyphs."""
+from __future__ import annotations
+
+import threading
+from abc import ABC, abstractmethod
+from collections import deque
+
+
+# ---------- storage: a gap buffer ----------
+class GapBuffer:
+    def __init__(self, capacity: int = 16) -&gt; None:
+        self._buf: list[str] = [""] * max(capacity, 8)
+        self._gs, self._ge = 0, len(self._buf)          # gap is _buf[_gs:_ge]
+
+    def __len__(self) -&gt; int:
+        return len(self._buf) - (self._ge - self._gs)
+
+    def char_at(self, i: int) -&gt; str:
+        if not 0 &lt;= i &lt; len(self):
+            raise IndexError(f"index {i}")
+        return self._buf[i] if i &lt; self._gs else self._buf[i + self._ge - self._gs]
+
+    def _move_gap(self, pos: int) -&gt; None:              # O(distance moved)
+        if pos &lt; self._gs:
+            n = self._gs - pos
+            self._buf[self._ge - n:self._ge] = self._buf[pos:self._gs]
+            self._gs, self._ge = self._gs - n, self._ge - n
+        elif pos &gt; self._gs:
+            n = pos - self._gs
+            self._buf[self._gs:self._gs + n] = self._buf[self._ge:self._ge + n]
+            self._gs, self._ge = self._gs + n, self._ge + n
+
+    def _ensure_gap(self, need: int) -&gt; None:
+        if self._ge - self._gs &gt;= need:
+            return
+        cap = max(len(self._buf) * 2, len(self) + need + 8)
+        tail = self._buf[self._ge:]
+        self._buf = self._buf[:self._gs] + [""] * (cap - self._gs - len(tail)) + tail
+        self._ge = cap - len(tail)
+
+    def _check(self, pos: int) -&gt; None:
+        if not 0 &lt;= pos &lt;= len(self):
+            raise IndexError(f"position {pos}")
+
+    def insert(self, pos: int, s: str) -&gt; None:
+        self._check(pos)
+        self._move_gap(pos)
+        self._ensure_gap(len(s))
+        self._buf[self._gs:self._gs + len(s)] = list(s)
+        self._gs += len(s)
+
+    def delete(self, pos: int, n: int) -&gt; str:
+        self._check(pos)
+        if n &lt; 0 or pos + n &gt; len(self):
+            raise IndexError(f"delete {pos}+{n}")
+        self._move_gap(pos)
+        removed = "".join(self._buf[self._ge:self._ge + n])
+        self._ge += n
+        return removed
+
+    def __str__(self) -&gt; str:
+        return "".join(self._buf[:self._gs]) + "".join(self._buf[self._ge:])
+
+
+class Document:
+    def __init__(self) -&gt; None:
+        self._text = GapBuffer()
+
+    def __len__(self) -&gt; int:
+        return len(self._text)
+
+    def char_at(self, i: int) -&gt; str:
+        return self._text.char_at(i)
+
+    def insert(self, pos: int, s: str) -&gt; None:
+        self._text.insert(pos, s)
+
+    def delete(self, pos: int, n: int) -&gt; str:
+        return self._text.delete(pos, n)
+
+    def __str__(self) -&gt; str:
+        return str(self._text)
+
+    def line_start(self, pos: int) -&gt; int:
+        while pos &gt; 0 and self.char_at(pos - 1) != "\n":
+            pos -= 1
+        return pos
+
+    def line_end(self, pos: int) -&gt; int:
+        while pos &lt; len(self) and self.char_at(pos) != "\n":
+            pos += 1
+        return pos
+
+    def line_of(self, pos: int) -&gt; int:
+        return sum(1 for i in range(pos) if self.char_at(i) == "\n")
+
+
+# ---------- Command ----------
+class EditCommand(ABC):
+    @abstractmethod
+    def execute(self, d: Document) -&gt; int: ...      # returns the new cursor
+
+    @abstractmethod
+    def undo(self, d: Document) -&gt; None: ...
+
+
+class InsertCommand(EditCommand):
+    def __init__(self, pos: int, text: str) -&gt; None:
+        self.pos, self.text = pos, text
+
+    def execute(self, d: Document) -&gt; int:
+        d.insert(self.pos, self.text)
+        return self.pos + len(self.text)
+
+    def undo(self, d: Document) -&gt; None:
+        d.delete(self.pos, len(self.text))
+
+    def absorb(self, nxt: "InsertCommand") -&gt; bool:
+        last = self.text[-1]
+        ok = (nxt.pos == self.pos + len(self.text) and len(nxt.text) == 1
+              and nxt.text != "\n" and last not in " \n")
+        if ok:
+            self.text += nxt.text
+        return ok
+
+
+class DeleteCommand(EditCommand):
+    def __init__(self, pos: int, n: int) -&gt; None:
+        self.pos, self.n, self.removed = pos, n, ""
+
+    def execute(self, d: Document) -&gt; int:
+        self.removed = d.delete(self.pos, self.n)
+        return self.pos
+
+    def undo(self, d: Document) -&gt; None:
+        d.insert(self.pos, self.removed)
+
+
+class MacroCommand(EditCommand):
+    def __init__(self, parts: list[EditCommand]) -&gt; None:
+        self.parts = parts
+
+    def execute(self, d: Document) -&gt; int:
+        c = 0
+        for p in self.parts:
+            c = p.execute(d)
+        return c
+
+    def undo(self, d: Document) -&gt; None:
+        for p in reversed(self.parts):
+            p.undo(d)
+
+
+# ---------- Flyweight ----------
+class Glyph:
+    __slots__ = ("ch", "font")
+
+    def __init__(self, ch: str, font: str) -&gt; None:
+        self.ch, self.font = ch, font
+
+
+class GlyphFactory:
+    def __init__(self) -&gt; None:
+        self._pool: dict[tuple[str, str], Glyph] = {}
+
+    def get(self, ch: str, font: str) -&gt; Glyph:
+        key = (ch, font)
+        if key not in self._pool:
+            self._pool[key] = Glyph(ch, font)
+        return self._pool[key]
+
+    def __len__(self) -&gt; int:
+        return len(self._pool)
+
+
+# ---------- editor ----------
+class Snapshot:
+    """Memento: callers hold it but should not look inside."""
+    __slots__ = ("_text", "_cursor")
+
+    def __init__(self, text: str, cursor: int) -&gt; None:
+        self._text, self._cursor = text, cursor
+
+
+class Editor:
+    def __init__(self, history_limit: int = 100, page_lines: int = 20) -&gt; None:
+        self._doc = Document()
+        self._undo: deque[tuple[EditCommand, int]] = deque()
+        self._redo: list[tuple[EditCommand, int]] = []
+        self._limit, self._page = history_limit, page_lines
+        self._cursor, self._goal, self._can_merge = 0, -1, False
+        self._lock = threading.RLock()
+
+    # ----- edits -----
+    def type(self, s: str) -&gt; None:
+        with self._lock:
+            if not s:
+                return
+            c = InsertCommand(self._cursor, s)
+            top = self._undo[-1][0] if self._undo else None
+            if self._can_merge and isinstance(top, InsertCommand) and top.absorb(c):
+                self._cursor = c.execute(self._doc)
+                self._redo.clear()
+                self._goal = -1
+            else:
+                self._run(c)
+            self._can_merge = len(s) == 1
+
+    def backspace(self) -&gt; None:
+        with self._lock:
+            if self._cursor &gt; 0:
+                self._run(DeleteCommand(self._cursor - 1, 1))
+
+    def delete_forward(self) -&gt; None:
+        with self._lock:
+            if self._cursor &lt; len(self._doc):
+                self._run(DeleteCommand(self._cursor, 1))
+
+    def replace_all(self, find: str, with_: str) -&gt; int:
+        with self._lock:
+            if not find:
+                raise ValueError("empty search string")
+            t, hits, i = str(self._doc), [], 0
+            while (i := t.find(find, i)) &gt;= 0:
+                hits.append(i)
+                i += len(find)
+            if not hits:
+                return 0
+            parts: list[EditCommand] = []
+            for h in reversed(hits):                     # right to left keeps offsets valid
+                parts += [DeleteCommand(h, len(find)), InsertCommand(h, with_)]
+            self._run(MacroCommand(parts))
+            return len(hits)
+
+    def save(self) -&gt; Snapshot:
+        with self._lock:
+            return Snapshot(str(self._doc), self._cursor)
+
+    def restore(self, s: Snapshot) -&gt; None:
+        with self._lock:
+            self._run(MacroCommand([DeleteCommand(0, len(self._doc)), InsertCommand(0, s._text)]))
+            self._cursor = s._cursor
+
+    def _run(self, c: EditCommand) -&gt; None:
+        before = self._cursor
+        self._cursor = c.execute(self._doc)
+        self._undo.append((c, before))
+        if len(self._undo) &gt; self._limit:
+            self._undo.popleft()                         # drop the oldest step
+        self._redo.clear()
+        self._can_merge, self._goal = False, -1
+
+    def undo(self) -&gt; bool:
+        with self._lock:
+            if not self._undo:
+                return False
+            c, before = self._undo.pop()
+            c.undo(self._doc)
+            self._cursor = before
+            self._redo.append((c, before))
+            self._can_merge, self._goal = False, -1
+            return True
+
+    def redo(self) -&gt; bool:
+        with self._lock:
+            if not self._redo:
+                return False
+            c, before = self._redo.pop()
+            self._cursor = c.execute(self._doc)
+            self._undo.append((c, before))
+            self._can_merge, self._goal = False, -1
+            return True
+
+    # ----- moves -----
+    def _moved(self, pos: int) -&gt; None:
+        self._cursor, self._goal, self._can_merge = pos, -1, False
+
+    def left(self) -&gt; None:
+        with self._lock:
+            self._moved(max(0, self._cursor - 1))
+
+    def right(self) -&gt; None:
+        with self._lock:
+            self._moved(min(len(self._doc), self._cursor + 1))
+
+    def home(self) -&gt; None:
+        with self._lock:
+            self._moved(self._doc.line_start(self._cursor))
+
+    def end(self) -&gt; None:
+        with self._lock:
+            self._moved(self._doc.line_end(self._cursor))
+
+    def up(self) -&gt; None:
+        with self._lock:
+            self._vertical(-1)
+
+    def down(self) -&gt; None:
+        with self._lock:
+            self._vertical(+1)
+
+    def page_up(self) -&gt; None:
+        with self._lock:
+            for _ in range(self._page):
+                self._vertical(-1)
+
+    def page_down(self) -&gt; None:
+        with self._lock:
+            for _ in range(self._page):
+                self._vertical(+1)
+
+    def _vertical(self, direction: int) -&gt; None:
+        d = self._doc
+        start = d.line_start(self._cursor)
+        if self._goal &lt; 0:
+            self._goal = self._cursor - start
+        if direction &lt; 0:
+            if start == 0:
+                return
+            target = d.line_start(start - 1)
+        else:
+            end = d.line_end(self._cursor)
+            if end == len(d):
+                return
+            target = end + 1
+        self._cursor = min(target + self._goal, d.line_end(target))
+        self._can_merge = False
+
+    # ----- queries -----
+    @property
+    def text(self) -&gt; str:
+        return str(self._doc)
+
+    @property
+    def cursor(self) -&gt; int:
+        return self._cursor
+
+    def where(self) -&gt; str:
+        d = self._doc
+        return f"{d.line_of(self._cursor) + 1}:{self._cursor - d.line_start(self._cursor) + 1}"
+
+    def view(self) -&gt; str:
+        t = self.text
+        return (t[:self._cursor] + "|" + t[self._cursor:]).replace("\n", "\\n")
+
+    def undo_depth(self) -&gt; int:
+        return len(self._undo)
+
+    def layout(self, f: GlyphFactory, font: str) -&gt; list[Glyph]:
+        with self._lock:
+            return [f.get(self._doc.char_at(i), font) for i in range(len(self._doc))]
+
+
+def demo() -&gt; None:
+    ed = Editor(history_limit=100, page_lines=2)
+    for ch in "hello world":
+        ed.type(ch)
+    print(f'1) typed one key at a time: "{ed.view()}", undo steps {ed.undo_depth()}')
+    ed.undo()
+    print(f'2) undo: "{ed.view()}"')
+    ed.redo()
+    ed.type("\nab\nlonger line")
+    ed.up()
+    print(f'3) up from 3:12 -&gt; {ed.where()}', end="")
+    ed.up()
+    print(f", up again -&gt; {ed.where()} (goal column kept)")
+    n = ed.replace_all("l", "L")
+    print(f'4) replaced {n}: {ed.text!r}')
+    ed.undo()
+    print(f'5) one undo: {ed.text!r}')
+    f = GlyphFactory()
+    glyphs = ed.layout(f, "Mono-12")
+    print(f"6) {len(glyphs)} glyph references, {len(f)} glyph objects")
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python tests">
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from main import Editor, GapBuffer, GlyphFactory
+
+
+class GapBufferTest(unittest.TestCase):
+    def test_matches_python_string_under_random_edits(self):
+        rng = random.Random(7)
+        gb, ref = GapBuffer(8), ""
+        for _ in range(3000):
+            pos = rng.randint(0, len(ref))
+            if rng.random() &lt; 0.6 or not ref:
+                s = "".join(rng.choice("abc\n") for _ in range(rng.randint(1, 5)))
+                gb.insert(pos, s)
+                ref = ref[:pos] + s + ref[pos:]
+            else:
+                n = rng.randint(0, len(ref) - pos)
+                self.assertEqual(gb.delete(pos, n), ref[pos:pos + n])
+                ref = ref[:pos] + ref[pos + n:]
+            self.assertEqual(len(gb), len(ref))
+        self.assertEqual(str(gb), ref)
+
+    def test_bad_positions_raise(self):
+        gb = GapBuffer()
+        gb.insert(0, "abc")
+        with self.assertRaises(IndexError):
+            gb.insert(4, "x")
+        with self.assertRaises(IndexError):
+            gb.delete(2, 5)
+
+
+class UndoRedoTest(unittest.TestCase):
+    def test_word_level_grouping(self):
+        ed = Editor()
+        for ch in "hello world\nbye":
+            ed.type(ch)
+        self.assertEqual(ed.undo_depth(), 4)             # "hello ", "world", "\n", "bye"
+        ed.undo()
+        self.assertEqual(ed.text, "hello world\n")
+        ed.left()                                        # a cursor move breaks the group
+        ed.type("x")
+        ed.type("y")
+        self.assertEqual(ed.undo_depth(), 4)
+        ed.undo()
+        self.assertEqual(ed.text, "hello world\n")
+
+    def test_command_undo_equals_snapshot_undo(self):
+        """Random edits: Command-based undo must give exactly what full snapshots (Memento) give."""
+        rng = random.Random(42)
+        for _ in range(30):
+            ed = Editor(history_limit=1000, page_lines=3)
+            text, cursor = "", 0
+            undo, redo = [], []                           # reference: (before, after) whole-state snapshots
+            for _ in range(300):
+                op = rng.choice(["type", "type", "bs", "del", "move", "repl", "undo", "redo"])
+                before = (text, cursor)
+                if op == "type":
+                    s = "".join(rng.choice("ab \n") for _ in range(rng.randint(2, 4)))
+                    ed.type(s)
+                    text, cursor = text[:cursor] + s + text[cursor:], cursor + len(s)
+                elif op == "bs":
+                    ed.backspace()
+                    if cursor &gt; 0:
+                        text, cursor = text[:cursor - 1] + text[cursor:], cursor - 1
+                elif op == "del":
+                    ed.delete_forward()
+                    if cursor &lt; len(text):
+                        text = text[:cursor] + text[cursor + 1:]
+                elif op == "move":
+                    rng.choice([ed.left, ed.right, ed.up, ed.down, ed.home, ed.end, ed.page_up, ed.page_down])()
+                    cursor = ed.cursor                    # moves are tested elsewhere
+                    continue
+                elif op == "repl":
+                    find, rep = rng.choice([("a", "bb"), ("ab", ""), ("b", "a"), ("\n", " ")])
+                    n = ed.replace_all(find, rep)
+                    self.assertEqual(n, text.count(find))
+                    if n:
+                        first = text.find(find)
+                        text, cursor = text.replace(find, rep), first + len(rep)
+                elif op == "undo":
+                    ok = ed.undo()
+                    self.assertEqual(ok, bool(undo))
+                    if undo:
+                        step = undo.pop()
+                        redo.append(step)
+                        text, cursor = step[0]
+                    self.assertEqual((ed.text, ed.cursor), (text, cursor))
+                    continue
+                else:
+                    ok = ed.redo()
+                    self.assertEqual(ok, bool(redo))
+                    if redo:
+                        step = redo.pop()
+                        undo.append(step)
+                        text, cursor = step[1]
+                    self.assertEqual((ed.text, ed.cursor), (text, cursor))
+                    continue
+                if (text, cursor) != before:                  # only real edits enter history
+                    undo.append((before, (text, cursor)))
+                    redo.clear()
+                self.assertEqual((ed.text, ed.cursor), (text, cursor))
+
+    def test_history_limit_and_redo_fork(self):
+        ed = Editor(history_limit=2)
+        for w in ["a ", "b ", "c "]:
+            ed.type(w)
+        self.assertTrue(ed.undo())
+        self.assertTrue(ed.undo())
+        self.assertFalse(ed.undo())
+        self.assertEqual(ed.text, "a ")
+        ed.type("z")
+        self.assertFalse(ed.redo())
+
+    def test_checkpoint_restore_is_undoable(self):
+        ed = Editor()
+        ed.type("draft one")
+        snap = ed.save()
+        ed.type(" and more")
+        ed.restore(snap)
+        self.assertEqual(ed.text, "draft one")
+        ed.undo()
+        self.assertEqual(ed.text, "draft one and more")
+
+
+class CursorTest(unittest.TestCase):
+    def test_vertical_moves_keep_goal_column(self):
+        ed = Editor(page_lines=2)
+        ed.type("0123456789\nab\n0123456789\nxyz")
+        ed.up()
+        self.assertEqual(ed.where(), "3:4")
+        ed.up()
+        self.assertEqual(ed.where(), "2:3")               # clamped on a short line
+        ed.up()
+        self.assertEqual(ed.where(), "1:4")               # goal column 4 restored
+        ed.page_down()
+        self.assertEqual(ed.where(), "3:4")
+        ed.page_down()
+        self.assertEqual(ed.where(), "4:4")               # stops at the last line
+        ed.page_up()
+        ed.page_up()
+        ed.page_up()
+        self.assertEqual(ed.where(), "1:4")
+
+    def test_edges_do_nothing(self):
+        ed = Editor()
+        ed.backspace()
+        ed.delete_forward()
+        ed.left()
+        ed.up()
+        self.assertEqual((ed.text, ed.cursor, ed.undo_depth()), ("", 0, 0))
+        self.assertEqual(ed.replace_all("x", "y"), 0)
+        with self.assertRaises(ValueError):
+            ed.replace_all("", "y")
+
+
+class FlyweightAndThreadsTest(unittest.TestCase):
+    def test_glyphs_are_shared(self):
+        ed = Editor()
+        ed.type("abab" * 50)
+        f = GlyphFactory()
+        g = ed.layout(f, "Serif")
+        self.assertEqual((len(g), len(f)), (200, 2))
+        self.assertIs(g[0], g[2])
+        ed.layout(f, "Mono")
+        self.assertEqual(len(f), 4)
+
+    def test_concurrent_typing_loses_nothing(self):
+        ed = Editor(history_limit=10_000)
+
+        def worker():
+            for _ in range(200):
+                ed.type("xy")
+
+        ts = [threading.Thread(target=worker) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(ed.text, "xy" * 800)
+        while ed.undo():
+            pass
+        self.assertEqual(ed.text, "")
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Text editor with undo/redo: gap buffer + Command + Memento + Flyweight. C++14.
+// Threaded build: add -DED_THREADS -pthread (a std::mutex around every public call). Our MinGW g++ 6.3 has no
+// std::mutex, so the default build is single-threaded, like one keyboard feeding one editor. The threaded
+// build was compiled and run on WSL Ubuntu (g++ 13): same output, see run-cpp-linux.txt.
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;deque&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;utility&gt;
+#include &lt;vector&gt;
+#ifdef ED_THREADS
+#include &lt;mutex&gt;
+#define ED_LOCK std::lock_guard&lt;std::mutex&gt; guard_(mu_)
+#define ED_MUTEX mutable std::mutex mu_;
+#else
+#define ED_LOCK (void)0
+#define ED_MUTEX
+#endif
+
+// ---------- gap buffer ----------
+class GapBuffer {
+    std::vector&lt;char&gt; buf_;
+    size_t gs_ = 0, ge_;                                   // gap is [gs_, ge_)
+    void moveGap(size_t pos) {
+        if (pos &lt; gs_) {
+            size_t n = gs_ - pos;
+            std::copy_backward(buf_.begin() + pos, buf_.begin() + gs_, buf_.begin() + ge_);
+            gs_ -= n; ge_ -= n;
+        } else if (pos &gt; gs_) {
+            size_t n = pos - gs_;
+            std::copy(buf_.begin() + ge_, buf_.begin() + ge_ + n, buf_.begin() + gs_);
+            gs_ += n; ge_ += n;
+        }
+    }
+    void ensureGap(size_t need) {
+        if (ge_ - gs_ &gt;= need) return;
+        size_t cap = std::max(buf_.size() * 2, length() + need + 8);
+        size_t tail = buf_.size() - ge_;
+        std::vector&lt;char&gt; nb(cap);
+        std::copy(buf_.begin(), buf_.begin() + gs_, nb.begin());
+        std::copy(buf_.begin() + ge_, buf_.end(), nb.end() - tail);
+        ge_ = cap - tail;
+        buf_.swap(nb);
+    }
+    void check(size_t pos) const { if (pos &gt; length()) throw std::out_of_range("position " + std::to_string(pos)); }
+public:
+    explicit GapBuffer(size_t cap = 16) : buf_(std::max&lt;size_t&gt;(cap, 8)), ge_(buf_.size()) {}
+    size_t length() const { return buf_.size() - (ge_ - gs_); }
+    char at(size_t i) const {
+        if (i &gt;= length()) throw std::out_of_range("index " + std::to_string(i));
+        return i &lt; gs_ ? buf_[i] : buf_[i + (ge_ - gs_)];
+    }
+    void insert(size_t pos, const std::string&amp; s) {
+        check(pos); moveGap(pos); ensureGap(s.size());
+        std::copy(s.begin(), s.end(), buf_.begin() + gs_);
+        gs_ += s.size();
+    }
+    std::string erase(size_t pos, size_t n) {
+        check(pos);
+        if (pos + n &gt; length()) throw std::out_of_range("erase past end");
+        moveGap(pos);
+        std::string removed(buf_.begin() + ge_, buf_.begin() + ge_ + n);
+        ge_ += n;
+        return removed;
+    }
+    std::string str() const {
+        return std::string(buf_.begin(), buf_.begin() + gs_) + std::string(buf_.begin() + ge_, buf_.end());
+    }
+};
+
+class Document {
+    GapBuffer text_;
+public:
+    size_t length() const { return text_.length(); }
+    char at(size_t i) const { return text_.at(i); }
+    void insert(size_t pos, const std::string&amp; s) { text_.insert(pos, s); }
+    std::string erase(size_t pos, size_t n) { return text_.erase(pos, n); }
+    std::string str() const { return text_.str(); }
+    size_t lineStart(size_t p) const { while (p &gt; 0 &amp;&amp; at(p - 1) != '\n') --p; return p; }
+    size_t lineEnd(size_t p) const { while (p &lt; length() &amp;&amp; at(p) != '\n') ++p; return p; }
+    size_t lineOf(size_t p) const { size_t n = 0; for (size_t i = 0; i &lt; p; ++i) n += at(i) == '\n'; return n; }
+};
+
+// ---------- commands ----------
+struct EditCommand {                                       // like a vtable of two function pointers
+    virtual ~EditCommand() = default;
+    virtual size_t execute(Document&amp; d) = 0;               // returns the new cursor
+    virtual void undo(Document&amp; d) = 0;
+};
+
+class InsertCommand : public EditCommand {
+    size_t pos_; std::string text_;
+public:
+    InsertCommand(size_t pos, std::string t) : pos_(pos), text_(std::move(t)) {}
+    size_t execute(Document&amp; d) override { d.insert(pos_, text_); return pos_ + text_.size(); }
+    void undo(Document&amp; d) override { d.erase(pos_, text_.size()); }
+    bool absorb(const InsertCommand&amp; n) {
+        char last = text_.back();
+        bool ok = n.pos_ == pos_ + text_.size() &amp;&amp; n.text_.size() == 1 &amp;&amp; n.text_[0] != '\n' &amp;&amp; last != ' ' &amp;&amp; last != '\n';
+        if (ok) text_ += n.text_;
+        return ok;
+    }
+};
+
+class DeleteCommand : public EditCommand {
+    size_t pos_, n_; std::string removed_;
+public:
+    DeleteCommand(size_t pos, size_t n) : pos_(pos), n_(n) {}
+    size_t execute(Document&amp; d) override { removed_ = d.erase(pos_, n_); return pos_; }
+    void undo(Document&amp; d) override { d.insert(pos_, removed_); }
+};
+
+class MacroCommand : public EditCommand {
+    std::vector&lt;std::unique_ptr&lt;EditCommand&gt;&gt; parts_;
+public:
+    explicit MacroCommand(std::vector&lt;std::unique_ptr&lt;EditCommand&gt;&gt; p) : parts_(std::move(p)) {}
+    size_t execute(Document&amp; d) override { size_t c = 0; for (auto&amp; p : parts_) c = p-&gt;execute(d); return c; }
+    void undo(Document&amp; d) override { for (auto it = parts_.rbegin(); it != parts_.rend(); ++it) (*it)-&gt;undo(d); }
+};
+
+// ---------- flyweight ----------
+struct Glyph { char ch; std::string font; };
+class GlyphFactory {
+    std::map&lt;std::pair&lt;char, std::string&gt;, std::unique_ptr&lt;Glyph&gt;&gt; pool_;
+public:
+    const Glyph* get(char c, const std::string&amp; font) {
+        auto&amp; slot = pool_[std::make_pair(c, font)];
+        if (!slot) slot.reset(new Glyph{c, font});
+        return slot.get();
+    }
+    size_t size() const { return pool_.size(); }
+};
+
+// ---------- editor ----------
+class Editor {
+public:
+    class Snapshot {                                       // memento: only Editor reads it
+        friend class Editor;
+        std::string text_; size_t cursor_;
+        Snapshot(std::string t, size_t c) : text_(std::move(t)), cursor_(c) {}
+    };
+private:
+    struct Entry { std::unique_ptr&lt;EditCommand&gt; cmd; size_t before; };
+    Document doc_;
+    std::deque&lt;Entry&gt; undo_; std::vector&lt;Entry&gt; redo_;
+    size_t limit_, page_, cursor_ = 0;
+    long goal_ = -1;
+    bool canMerge_ = false;
+    ED_MUTEX
+
+    void run(std::unique_ptr&lt;EditCommand&gt; c) {
+        size_t before = cursor_;
+        cursor_ = c-&gt;execute(doc_);
+        undo_.push_back(Entry{std::move(c), before});
+        if (undo_.size() &gt; limit_) undo_.pop_front();
+        redo_.clear();
+        canMerge_ = false; goal_ = -1;
+    }
+    void moved(size_t p) { cursor_ = p; goal_ = -1; canMerge_ = false; }
+    void vertical(int dir) {
+        size_t start = doc_.lineStart(cursor_), target;
+        if (goal_ &lt; 0) goal_ = static_cast&lt;long&gt;(cursor_ - start);
+        if (dir &lt; 0) {
+            if (start == 0) return;
+            target = doc_.lineStart(start - 1);
+        } else {
+            size_t end = doc_.lineEnd(cursor_);
+            if (end == doc_.length()) return;
+            target = end + 1;
+        }
+        cursor_ = std::min(target + static_cast&lt;size_t&gt;(goal_), doc_.lineEnd(target));
+        canMerge_ = false;
+    }
+public:
+    Editor(size_t limit, size_t page) : limit_(limit), page_(page) {}
+
+    void type(const std::string&amp; s) {
+        ED_LOCK;
+        if (s.empty()) return;
+        std::unique_ptr&lt;InsertCommand&gt; c(new InsertCommand(cursor_, s));
+        InsertCommand* top = undo_.empty() ? nullptr : dynamic_cast&lt;InsertCommand*&gt;(undo_.back().cmd.get());
+        if (canMerge_ &amp;&amp; top &amp;&amp; top-&gt;absorb(*c)) {
+            cursor_ = c-&gt;execute(doc_);
+            redo_.clear(); goal_ = -1;
+        } else {
+            run(std::move(c));
+        }
+        canMerge_ = s.size() == 1;
+    }
+    void backspace() { ED_LOCK; if (cursor_ &gt; 0) run(std::unique_ptr&lt;EditCommand&gt;(new DeleteCommand(cursor_ - 1, 1))); }
+    void deleteForward() { ED_LOCK; if (cursor_ &lt; doc_.length()) run(std::unique_ptr&lt;EditCommand&gt;(new DeleteCommand(cursor_, 1))); }
+
+    int replaceAll(const std::string&amp; find, const std::string&amp; with) {
+        ED_LOCK;
+        if (find.empty()) throw std::invalid_argument("empty search string");
+        std::string t = doc_.str();
+        std::vector&lt;size_t&gt; hits;
+        for (size_t i = t.find(find); i != std::string::npos; i = t.find(find, i + find.size())) hits.push_back(i);
+        if (hits.empty()) return 0;
+        std::vector&lt;std::unique_ptr&lt;EditCommand&gt;&gt; parts;
+        for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
+            parts.emplace_back(new DeleteCommand(*it, find.size()));
+            parts.emplace_back(new InsertCommand(*it, with));
+        }
+        run(std::unique_ptr&lt;EditCommand&gt;(new MacroCommand(std::move(parts))));
+        return static_cast&lt;int&gt;(hits.size());
+    }
+
+    Snapshot save() const { ED_LOCK; return Snapshot(doc_.str(), cursor_); }
+    void restore(const Snapshot&amp; s) {
+        ED_LOCK;
+        std::vector&lt;std::unique_ptr&lt;EditCommand&gt;&gt; parts;
+        parts.emplace_back(new DeleteCommand(0, doc_.length()));
+        parts.emplace_back(new InsertCommand(0, s.text_));
+        run(std::unique_ptr&lt;EditCommand&gt;(new MacroCommand(std::move(parts))));
+        cursor_ = s.cursor_;
+    }
+
+    bool undo() {
+        ED_LOCK;
+        if (undo_.empty()) return false;
+        Entry e = std::move(undo_.back()); undo_.pop_back();
+        e.cmd-&gt;undo(doc_);
+        cursor_ = e.before;
+        redo_.push_back(std::move(e));
+        canMerge_ = false; goal_ = -1;
+        return true;
+    }
+    bool redo() {
+        ED_LOCK;
+        if (redo_.empty()) return false;
+        Entry e = std::move(redo_.back()); redo_.pop_back();
+        cursor_ = e.cmd-&gt;execute(doc_);
+        undo_.push_back(std::move(e));
+        canMerge_ = false; goal_ = -1;
+        return true;
+    }
+
+    void left() { ED_LOCK; moved(cursor_ &gt; 0 ? cursor_ - 1 : 0); }
+    void right() { ED_LOCK; moved(std::min(doc_.length(), cursor_ + 1)); }
+    void home() { ED_LOCK; moved(doc_.lineStart(cursor_)); }
+    void end() { ED_LOCK; moved(doc_.lineEnd(cursor_)); }
+    void up() { ED_LOCK; vertical(-1); }
+    void down() { ED_LOCK; vertical(+1); }
+    void pageUp() { ED_LOCK; for (size_t i = 0; i &lt; page_; ++i) vertical(-1); }
+    void pageDown() { ED_LOCK; for (size_t i = 0; i &lt; page_; ++i) vertical(+1); }
+
+    std::string text() const { ED_LOCK; return doc_.str(); }
+    size_t cursor() const { ED_LOCK; return cursor_; }
+    size_t undoDepth() const { ED_LOCK; return undo_.size(); }
+    std::string where() const {
+        ED_LOCK;
+        return std::to_string(doc_.lineOf(cursor_) + 1) + ":" + std::to_string(cursor_ - doc_.lineStart(cursor_) + 1);
+    }
+    std::string view() const {
+        ED_LOCK;
+        std::string t = doc_.str(), out;
+        for (size_t i = 0; i &lt;= t.size(); ++i) {
+            if (i == cursor_) out += '|';
+            if (i &lt; t.size()) out += t[i] == '\n' ? std::string("\\n") : std::string(1, t[i]);
+        }
+        return out;
+    }
+    std::vector&lt;const Glyph*&gt; layout(GlyphFactory&amp; f, const std::string&amp; font) const {
+        ED_LOCK;
+        std::vector&lt;const Glyph*&gt; out;
+        for (size_t i = 0; i &lt; doc_.length(); ++i) out.push_back(f.get(doc_.at(i), font));
+        return out;
+    }
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) {
+    if (!ok) { std::printf("FAILED: %s\n", what); std::exit(1); }
+    ++checks;
+}
+static void show(const Editor&amp; e, const char* label) { std::printf("  %s: \"%s\" at %s\n", label, e.view().c_str(), e.where().c_str()); }
+
+int main() {
+    Editor ed(100, 2);
+    std::printf("1) type 'hello world' one key at a time\n");
+    for (char c : std::string("hello world")) ed.type(std::string(1, c));
+    show(ed, "text");
+    check(ed.undoDepth() == 2, "two word groups");
+    ed.undo(); show(ed, "undo");
+    ed.redo(); ed.type("\nab\nlonger line");
+    std::printf("2) arrows remember the column\n");
+    ed.up(); show(ed, "up");
+    ed.up(); show(ed, "up");
+    check(ed.where() == "1:12", "goal column restored");
+    ed.pageDown(); check(ed.where() == "3:12", "page down");
+    std::printf("3) replace all, one undo\n");
+    Editor::Snapshot saved = ed.save();
+    int n = ed.replaceAll("l", "L");
+    show(ed, ("replaced " + std::to_string(n)).c_str());
+    check(n == 5, "5 matches");
+    ed.undo(); check(ed.text() == "hello world\nab\nlonger line", "one undo reverts all");
+    ed.redo(); ed.restore(saved); show(ed, "restored checkpoint");
+    ed.undo(); check(ed.text() == "heLLo worLd\nab\nLonger Line", "restore is undoable");
+    std::printf("4) Flyweight glyphs\n");
+    GlyphFactory f;
+    auto glyphs = ed.layout(f, "Mono-12");
+    std::printf("  %lu glyph references, %lu glyph objects\n", (unsigned long)glyphs.size(), (unsigned long)f.size());
+    check(glyphs[2] == glyphs[3], "same glyph object for both L");
+    std::printf("All %d checks passed\n", checks);
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Demo output</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+1) type 'hello world' one key at a time
+  text: "hello world|" at 1:12
+2) undo twice, redo once
+  undo: "hello |" at 1:7
+  undo: "|" at 1:1
+  redo: "hello |" at 1:7
+3) a new edit after undo clears redo
+  text: "hello there|" at 1:12
+4) multi-line text, arrows remember the column
+  text: "hello there\nab\nlonger line|" at 3:12
+  up: "hello there\nab|\nlonger line" at 2:3
+  up: "hello there|\nab\nlonger line" at 1:12
+  pgdn: "hello there\nab\nlonger line|" at 3:12
+  home, left: "hello there\nab|\nlonger line" at 2:3
+5) backspace and forward delete, then undo all three
+  2 x backspace: "hello there\n|\nlonger line" at 2:1
+  delete: "hello there\n|longer line" at 2:1
+  3 x undo: "hello there\nab|\nlonger line" at 2:3
+6) replace all is one undo step
+  replaced 4: "heL|Lo there\nab\nLonger Line" at 1:4
+  redo + type: "heL!|Lo there\nab\nLonger Line" at 1:5
+7) revert to the saved checkpoint (Memento), and undo the revert
+  restored: "hello there\nab|\nlonger line" at 2:3
+  undo revert: "heL!|Lo there\nab\nLonger Line" at 1:5
+8) bounded history keeps the newest 3 steps
+  after 3 undos: "a b "
+9) Flyweight glyphs
+  1200 glyph references, 8 glyph objects
+All 17 checks passed
+
+$ python main.py
+1) typed one key at a time: "hello world|", undo steps 2
+2) undo: "hello |"
+3) up from 3:12 -&gt; 2:3, up again -&gt; 1:12 (goal column kept)
+4) replaced 5: 'heLLo worLd\nab\nLonger Line'
+5) one undo: 'hello world\nab\nlonger line'
+6) 26 glyph references, 14 glyph objects
+
+$ python -m unittest test_main
+..........
+----------------------------------------------------------------------
+Ran 10 tests in 0.139s
+
+OK
+
+$ g++ -std=c++14 -Wall -O2 -o main main.cpp &amp;&amp; ./main
+1) type 'hello world' one key at a time
+  text: "hello world|" at 1:12
+  undo: "hello |" at 1:7
+2) arrows remember the column
+  up: "hello world\nab|\nlonger line" at 2:3
+  up: "hello world|\nab\nlonger line" at 1:12
+3) replace all, one undo
+  replaced 5: "heL|Lo worLd\nab\nLonger Line" at 1:4
+  restored checkpoint: "hello world\nab\nlonger line|" at 3:12
+4) Flyweight glyphs
+  26 glyph references, 14 glyph objects
+All 7 checks passed</code></pre>
+  <div class="callout note"><p>Read the Java steps 1 and 2 together: eleven keystrokes become two undo steps, "hello " and "world". Step 5 shows that undo restores the cursor as well as the text (back to 2:3). Step 6 replaces four matches and a single undo reverts all of them. Step 7 shows that reverting to a checkpoint is itself an ordinary command, so it can be undone too.</p></div>

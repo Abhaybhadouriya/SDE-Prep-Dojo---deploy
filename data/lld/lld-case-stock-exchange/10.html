@@ -1,0 +1,64 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>This is the part Meesho's SDE-3 round called out. Two kinds of shared state exist, and each gets its own guard:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two buy orders both fill against one resting ask; a single lock per order book makes matching sequential">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">Buyer A: buy 10 @ 100</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">Buyer B: buy 10 @ 100</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">INFY order book</text><text class="label small" x="400" y="166">1 ask: sell 10 @ 100</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. sees 10 left on the ask, fills 10</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. sees 10 left on the ask, fills 10</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">20 shares sold from a 10-share ask</text><text class="label bad" x="645" y="164">book and cash no longer add up</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A fills the ask; it leaves the book</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: one lock per symbol's book</text><text class="label mono" x="645" y="66">match() runs one order at a time</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">B matches after A: no ask left</text><text class="label small" x="645" y="242">B rests on the book as a bid</text><text class="label small" x="645" y="266">other symbols match in parallel</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Two buyers hit the same resting ask at the same moment. If matching ran on both threads at once, both would read "10 left" and both would fill 10: twenty shares sold from a ten-share order.</li>
+      <li>The guard: each symbol's book has one lock (a single writer per symbol), so <code>match()</code> handles one incoming order at a time in arrival order. That also gives price-time fairness and a deterministic result.</li>
+      <li>B is matched after A. The ask is gone, so B's order rests on the book as the new best bid. Orders for other symbols use other locks and run in parallel.</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>State</th><th>Guard</th><th>Why that guard</th></tr></thead>
+      <tbody>
+        <tr><td>Order book of one symbol</td><td>One fair <code>ReentrantLock</code> per book</td><td>Matching must be strictly sequential per symbol (determinism, price-time fairness). Different symbols run in parallel.</td></tr>
+        <tr><td>One user's cash and shares</td><td><code>synchronized(account)</code></td><td>Check-then-block must be atomic: two orders cannot both pass the funds check with the same money.</td></tr>
+        <tr><td>Registries (books, accounts, orders)</td><td><code>ConcurrentHashMap</code></td><td>Lookups from many threads; <code>putIfAbsent</code> for listing.</td></tr>
+        <tr><td>Order <code>filled</code>/<code>status</code></td><td>Written under the book lock; <code>volatile</code></td><td>Readers on other threads (the client polling status) see fresh values.</td></tr>
+        <tr><td>Listener list</td><td><code>CopyOnWriteArrayList</code></td><td>Read on every trade, written almost never.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Deadlock check: lock order</h3>
+  <p>The only nesting is <b>book lock, then one account lock</b> (settlement inside <code>onTrade</code>). Placing an order takes an account lock, <i>releases</i> it, and only then takes the book lock. Settlement takes the buyer's lock, releases it, then the seller's: never two account locks at once. So there is no cycle, and no deadlock. Say this explicitly; it is what "take care of concurrency" means. See <a href="{{BASE}}lld/lld-conc-deadlock">deadlocks and lock ordering</a>.</p>
+  <h3>How real engines do it</h3>
+  <p>Production matching engines avoid locks completely: each symbol (or shard of symbols) is owned by <b>one thread</b> that reads orders from an inbound queue, matches, and writes trades to an outbound queue. LMAX's published architecture is the best-known example: a single business-logic thread fed by ring buffers, with state rebuilt by replaying the input log. Our lock per book is the in-process, 90-minute version of the same rule: one writer per book.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is RSS / per-queue NAPI thinking. Hash flows to one CPU, and that CPU processes its queue without locks, in order. Here you hash symbols to one matching thread. Cross-symbol consistency is not needed, just as cross-flow ordering is not needed in the network stack.</p>
+  </div>
+  <div class="callout warn"><p><b>Calling listeners under the book lock</b> keeps settlement in trade order and is simple, but a slow listener now stalls matching for that symbol. Fine for an interview; in production publish trades to a queue and let consumers process them on their own threads (Observer becomes pub-sub).</p></div>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReentrantLock</code> = <code>pthread_mutex_t</code> of the recursive kind (the owning thread may lock it again), with <code>tryLock</code> like <code>mutex_trylock</code>.</li>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>CopyOnWriteArrayList</code> = an RCU-style list: readers walk a snapshot with no lock, writers copy the array and publish it; good for read-mostly listener sets.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

@@ -1,0 +1,118 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: requirements.</strong> Purpose (search, archive, price tracking?), scale (pages/month), content types, freshness, politeness, JavaScript? Write the numbers on the board.</li>
+          <li><strong>5-10: estimate.</strong> 400/s average, ~1,000/s peak, 100 TB/month raw, ~1,000 in flight, Bloom filter ~12 GB.</li>
+          <li><strong>10-20: draw the loop.</strong> Seeds -&gt; frontier -&gt; fetcher (DNS, robots) -&gt; store -&gt; parser -&gt; filter/dedup -&gt; frontier. Walk one URL through it.</li>
+          <li><strong>20-35: deep dives.</strong> Frontier (front/back queues + heap), shard by host, dedup (Bloom + SimHash), traps, failure of a fetcher.</li>
+          <li><strong>35-42: scale and fail.</strong> Box-by-box failure table, Kafka between stages, autoscaling limits, DNS.</li>
+          <li><strong>42-45: wrap up.</strong> Monitoring (fetch rate, error rate per host, frontier age, duplicate ratio, DNS p99) and what you would build next (JS rendering pool, freshness model).</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes:</b> one global FIFO queue (kills politeness and causes head-of-line blocking); no URL normalisation; ignoring robots.txt or caching it forever; storing the frontier only in memory; saying "use Kafka as the frontier" without explaining delays and priority; forgetting DNS; no answer for traps; diving into HTML parsing details for ten minutes (the learner's own warning: do not over-explain internals and forget the user and the API).</p></div>
+
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "A crawler is a loop: take a URL from the frontier, fetch it, store it, extract links, filter them and add new ones back. At a billion pages a month that is about 400 fetches a second, a thousand in flight, and 100 TB a month of raw HTML, so pages go to object storage and URL metadata to a sharded wide-column store. The hard part is the frontier: front queues for priority, one back queue per host plus a heap of next-allowed times for politeness, and I shard it by host hash so each host's state lives on one machine. I dedup URLs with a Bloom filter and content with SHA and SimHash, respect robots.txt with a 24-hour cache, cache DNS locally, and cap depth and URL length against traps. Fetchers and parsers are stateless pods connected by Kafka topics, so a crashed worker's tasks are simply redelivered."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Atlassian,Google">
+          <summary>Why not just use one big FIFO queue for the frontier?</summary>
+          <div class="answer">
+            <p>Because links cluster by host. A page from <code>shop.example</code> mostly links to <code>shop.example</code>, so a FIFO fills with one host at the head. Politeness forces a delay between requests to that host, so the whole crawler waits (head-of-line blocking). FIFO also has no notion of importance. Split it: priority front queues plus one back queue per host, with a heap of next-allowed times.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure (head-of-line blocking), then the two-layer fix, then one number (about 3x as many back queues as fetcher threads, per Mercator).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you stop low-priority URLs from starving?</li><li>What if one host has 100 million URLs?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Atlassian,Amazon">
+          <summary>How do you avoid crawling the same URL twice across 20 machines?</summary>
+          <div class="answer">
+            <p>Normalise the URL, hash it, and route it by host hash to the one shard that owns that host. That shard checks its own Bloom filter (fast, in RAM) and, when needed, the URL table (truth). Because one host always maps to one shard, two machines never race on the same URL. The URL table upsert keyed by url_hash makes a rare double insert harmless.</p>
+            <div class="approach"><h5>How to answer</h5><p>Ownership first (shard by host), then the data structure (Bloom), then why false positives are acceptable.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big is the Bloom filter? (do the math)</li><li>How do you delete from a Bloom filter?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>Size a Bloom filter for 10 billion URLs at a 1% false-positive rate.</summary>
+          <div class="answer">
+            <p>m = -n ln p / (ln 2)^2 = 10^10 x 4.6 / 0.48, about 9.6 x 10^10 bits, about 12 GB. k = (m/n) ln 2, about 6.6, so 7 hash functions. Split across shards (12 shards = about 1 GB each). In practice compute the k positions from two base hashes (h1 + i x h2) instead of 7 independent hash functions.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the formula, round loudly, give bytes per item (about 9.6 bits per URL at 1%), and say what a false positive costs here (a skipped page).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to the error rate if you insert 20 billion instead?</li><li>Bloom vs cuckoo filter?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Atlassian,Google">
+          <summary>How do you detect and escape crawler traps?</summary>
+          <div class="answer">
+            <p>Prevention: max URL length, max depth from seed, max pages per host per cycle, strip session/tracking parameters, detect repeating path segments. Detection: a host producing many new URLs but few new content fingerprints (same SimHash) is likely a trap or a faceted-search explosion; demote or cap it. Allow manual host overrides via the admin API.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give two concrete traps (infinite calendar, session IDs), then limits, then a signal-based detector.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Won't a per-host cap hurt big legitimate sites like Wikipedia?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google">
+          <summary>How do you detect near-duplicate pages?</summary>
+          <div class="answer">
+            <p>Exact duplicates: hash the body (SHA-256). Near duplicates: SimHash. Split the text into features (word shingles), hash each feature, add or subtract weights per bit, and keep the sign of each bit: similar pages produce fingerprints with few differing bits. Google's 2007 crawling paper used 64-bit fingerprints and a Hamming distance threshold of 3. To find neighbours fast, split the 64 bits into blocks and index by block, since two fingerprints within 3 bits must share at least one block exactly.</p>
+            <div class="approach"><h5>How to answer</h5><p>Two levels (exact, near); one algorithm explained in one sentence; how you search the index.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>SimHash vs MinHash?</li><li>What do you do when you find a duplicate - drop it or keep a canonical URL?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>A fetcher crashes in the middle of 200 fetches. What happens to those URLs?</summary>
+          <div class="answer">
+            <p>They were leased, not deleted. With Kafka, the fetcher had not committed their offsets, so after the group rebalances another fetcher re-reads them. With a custom frontier, each handed-out task has a lease timeout; when it expires the task is re-queued. Some URLs get fetched twice, which is fine because writes are keyed by url_hash (idempotent). That is at-least-once delivery.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "at-least-once plus idempotent stages" in the first sentence; that is the phrase they are listening for.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long should the lease be?</li><li>How do you avoid a poison URL crashing fetchers forever? (attempt counter -&gt; dead-letter)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>How do you decide when to recrawl a page?</summary>
+          <div class="answer">
+            <p>Each URL has a next_fetch time. Start from priority (important pages sooner). Adapt using history: if the content hash changed, shorten the interval; if not, lengthen it, within floor and cap. Use sitemaps' lastmod and conditional GET (ETag, If-Modified-Since) so unchanged pages cost a 304. A due-by-time table per shard feeds the frontier.</p>
+            <div class="approach"><h5>How to answer</h5><p>Change rate x importance = urgency. Mention the 304 trick; it saves bandwidth and the site's CPU.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you crawl breaking news within minutes?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Atlassian">
+          <summary>What does robots.txt require, and what if it is unreachable?</summary>
+          <div class="answer">
+            <p>Per RFC 9309: match your User-Agent group, longest matching rule wins (Allow wins ties), parse at least 500 KiB, do not use a cache older than 24 hours. If robots.txt returns 4xx, crawling is allowed. If it is unreachable (5xx or network error), assume complete disallow. So: fail closed on server errors, retry later.</p>
+            <div class="approach"><h5>How to answer</h5><p>Quote the RFC number; it signals you know this is a real standard, not folklore.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is Crawl-delay part of RFC 9309? (No, it is a common extension; Google ignores it.)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Flipkart">
+          <summary>Could Kafka be the entire frontier?</summary>
+          <div class="answer">
+            <p>Not on its own. A partition is a FIFO log: no priority reordering, no per-host delay without blocking the partition, no dedup. If you key by host, one slow host blocks every other host in its partition. Kafka is excellent between stages (durable, replayable, consumer groups for failover) and as the input to frontier shards, but the politeness scheduler has to live in the shard service. Queue-style share groups (KIP-932, production-ready in Kafka 4.2) add per-message acknowledgement but still not per-host timers.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say what Kafka is good at first, then the exact missing feature (time-delayed per-key scheduling).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would SQS with delay queues work? (per-message delay up to 15 minutes, but no per-host grouping)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Microsoft">
+          <summary>You go from 1 billion to 30 billion pages a month. What changes?</summary>
+          <div class="answer">
+            <p>30x everything: about 12,000 fetches/s average, about 3 PB/month raw. Fetchers and parsers just scale out. The frontier and seen-sets need more shards (use consistent hashing so resharding moves few hosts). DNS becomes a serious tier (dedicated resolver fleet). Per-IP politeness matters more because many hosts share CDNs. Storage moves to WARC packing plus tiered cold storage. Probably multi-region crawling to be close to sites, with each region owning a host range so politeness stays global.</p>
+            <div class="approach"><h5>How to answer</h5><p>Recompute the numbers first, then name which components are stateless (easy) and which are stateful (hard).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do two regions avoid crawling the same host at once?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Design it for an SDE-1 interview in 15 minutes. What do you keep?</summary>
+          <div class="answer">
+            <p>The loop, a frontier with per-host queues and a fixed delay, robots.txt check, a seen-set (a Bloom filter or a DB unique key), pages in object storage, metadata in a DB, workers that retry on failure. Skip SimHash and recrawl models unless asked. SDE-1 interviewers judge clarity and a working design; SDE-2 interviewers expect you to bring up politeness, sharding and failure without being asked.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know what to leave out and why.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the first thing that breaks as you scale this?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: a site owner emails "your bot took us down"</h4>
+          <div class="situation"><p>A small shop says your crawler sent hundreds of requests per second last night. Your politeness config says 1 request per second per host.</p></div>
+          <div class="bad"><p>Weak answer: "Our config says 1 per second, so it was not us."</p></div>
+          <div class="good"><p>Strong answer: check the logs by IP and User-Agent. Likely causes: the shop has many host names (subdomains or wildcard DNS) that all resolve to one small server, so per-host limits added up; or a resharding moved the host to two shards at once. Fix: enforce politeness per resolved IP as well as per host, add a global per-IP limiter, back off on slow responses and 503/429, and give site owners a clear bot info page and contact.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you enforce a per-IP limit if hosts of one IP are on different shards?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: fetch rate halves, CPU is idle</h4>
+          <div class="situation"><p>After a deploy, pages per second drops by 50%. Fetcher CPU and network are both low.</p></div>
+          <div class="bad"><p>Weak answer: "Add more fetcher pods."</p></div>
+          <div class="good"><p>Strong answer: idle CPU plus low throughput means the fetchers are waiting. Check, in order: DNS latency and cache hit ratio (a resolver config change is a classic), the number of hosts ready in the heap (if few are ready, the frontier is the limit), timeout settings, and lease/ack errors. Adding pods does nothing if the limit is politeness or DNS.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which three dashboards would you open first?</li></ul></div>
+        </div>
+      

@@ -1,0 +1,76 @@
+
+  <h2>Core flows</h2>
+  <h3 id="sequence">Order placed: event, submit, deliver over SMS with failover</h3>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 900 420" role="img" aria-label="Sequence diagram: order service publishes ORDER_PLACED, rule submits a request, service validates and enqueues, worker delivers, SMS chain fails over from sms-A to sms-B, history records SENT">
+      <rect class="box client" x="10" y="16" width="110" height="36"/><text class="label small" x="65" y="39">OrderService</text>
+      <rect class="box svc" x="140" y="16" width="110" height="36"/><text class="label small" x="195" y="39">EventBus + rule</text>
+      <rect class="box svc" x="270" y="16" width="130" height="36"/><text class="label small" x="335" y="39">NotificationService</text>
+      <rect class="box queue" x="420" y="16" width="110" height="36"/><text class="label small" x="475" y="39">worker</text>
+      <rect class="box kafka" x="550" y="16" width="110" height="36"/><text class="label small" x="605" y="39">Templates</text>
+      <rect class="box ok" x="680" y="16" width="100" height="36"/><text class="label small" x="730" y="39">SMS chain</text>
+      <rect class="box plain" x="800" y="16" width="90" height="36"/><text class="label small" x="845" y="39">sms-A / B</text>
+      <path class="arrow none dashed" d="M65 52 L65 410"/>
+      <path class="arrow none dashed" d="M195 52 L195 410"/>
+      <path class="arrow none dashed" d="M335 52 L335 410"/>
+      <path class="arrow none dashed" d="M475 52 L475 410"/>
+      <path class="arrow none dashed" d="M605 52 L605 410"/>
+      <path class="arrow none dashed" d="M730 52 L730 410"/>
+      <path class="arrow none dashed" d="M845 52 L845 410"/>
+      <text class="label small muted" x="475" y="72">waiting on changed</text>
+      <g data-step="1">
+        <path class="arrow" d="M65 92 L191 92"/><text class="label small" x="128" y="86">publish(ORDER_PLACED 101)</text>
+        <text class="label small mono" x="195" y="110">key 101/placed/customer</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow" d="M195 128 L331 128"/><text class="label small" x="263" y="122">submit(req)</text>
+        <path class="arrow" d="M335 146 L601 146"/><text class="label small" x="468" y="140">dry-run render (all params?)</text>
+        <path class="arrow dashed ok" d="M335 166 L69 166"/><text class="label small ok" x="200" y="182">n1: caller is done</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed bad" d="M195 204 L331 204"/><text class="label small bad" x="263" y="198">same key again</text>
+        <path class="arrow dashed bad" d="M335 222 L199 222"/><text class="label small bad" x="263" y="238">empty: duplicate</text>
+      </g>
+      <g data-step="4">
+        <path class="arrow" d="M335 258 L471 258"/><text class="label small" x="403" y="252">signal: job due</text>
+        <text class="label small mono" x="475" y="276">opt-out? address? template?</text>
+        <path class="arrow" d="M475 292 L601 292"/><text class="label small" x="538" y="286">render(SMS)</text>
+      </g>
+      <g data-step="5">
+        <path class="arrow" d="M475 318 L726 318"/><text class="label small" x="600" y="312">send(Message)</text>
+        <path class="arrow dashed bad" d="M730 338 L841 338"/><text class="label small bad" x="787" y="332">A: down</text>
+        <path class="arrow ok" d="M730 360 L841 360"/><text class="label small ok" x="787" y="354">B: ok</text>
+      </g>
+      <g data-step="6">
+        <path class="arrow dashed ok" d="M730 384 L479 384"/><text class="label small ok" x="604" y="378">"sms-B"</text>
+        <text class="label small mono ok" x="475" y="404">history += n1 SMS SENT via sms-B</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>The order service publishes <code>ORDER_PLACED</code> with the order data. Two rules are subscribed to that type: one for the customer, one for the seller. The customer rule builds a request with idempotency key <code>101/placed/customer</code> and channels e-mail, SMS and push.</li>
+      <li><code>submit</code> checks the user and template exist and does a dry-run render for each channel, so a missing <code>{name}</code> fails now, at the caller, not at 3 a.m. in a worker log. The key is new, so the job goes into the priority queue and the caller gets <code>n1</code> back immediately.</li>
+      <li>The upstream retried and published the same event again. <code>seenKeys.add</code> returns false, so <code>submit</code> returns empty and nothing is queued. This is how "published twice" turns into "sent once".</li>
+      <li>The enqueue signalled the condition variable. The worker wakes, takes the earliest due job under the lock, releases the lock, then for each channel checks opt-out, address and template support, and renders the SMS body.</li>
+      <li>The worker calls the one SMS sender it knows. Inside, the rate limiter counts it (1 of 3), the retry wrapper calls failover, failover tries sms-A (down, throws) and then sms-B, which succeeds. No backoff was needed because failover handled it.</li>
+      <li>The sender returns the provider name. The worker appends a <code>DeliveryRecord</code> for SMS with status SENT. E-mail and push are handled the same way, each with its own record, so one channel's failure never hides another's success.</li>
+    </ol>
+  </div>
+  <h3 id="ordering">What the queue does with mixed jobs</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Job</th><th>sendAt</th><th>priority</th><th>seq</th><th>Delivered</th></tr></thead>
+      <tbody>
+        <tr><td>promo push</td><td>now</td><td>LOW</td><td>6</td><td>2nd</td></tr>
+        <tr><td>OTP SMS</td><td>now</td><td>HIGH</td><td>7</td><td>1st (same time, higher priority)</td></tr>
+        <tr><td>rate-order e-mail</td><td>now + 1 h</td><td>LOW</td><td>8</td><td>only after the clock passes now + 1 h</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The comparator is <b>send time, then priority, then sequence</b>. Putting time first means a HIGH job scheduled for tomorrow does not jump ahead of a LOW job due now. If the interviewer wants "HIGH always first among due jobs, even if a LOW was due earlier", keep two structures: a delay queue by time that moves due jobs into a ready queue ordered by priority. Say the trade-off; both are defensible.</p>
+  <h3 id="flow-steps">The flows in words</h3>
+  <ol class="steps">
+    <li><strong>Submit</strong> Validate user, template and parameters; dedupe on the key; wrap in a <code>Job</code> with a sequence number; push into the queue under the lock; signal; return the id.</li>
+    <li><strong>Worker loop</strong> Under the lock, wait while the queue is empty or the head is not due (timed wait until the head's <code>sendAt</code>); poll the head; release the lock; deliver.</li>
+    <li><strong>Deliver</strong> For each requested channel: skip if opted out; skip with NO_ADDRESS if the user has no address, no sender or no template for it; else render and call the sender; map exceptions to FAILED or RATE_LIMITED; append a record.</li>
+    <li><strong>Synchronous mode</strong> <code>processDue()</code> runs the same delivery for all due jobs on the calling thread. Tests and the demo use it with a fake clock.</li>
+  </ol>

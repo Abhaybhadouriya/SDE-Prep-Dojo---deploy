@@ -1,0 +1,63 @@
+
+        <h2>Why Kafka is fast: the five secrets</h2>
+        <p class="chips level-chips"><span class="chip ok">must know</span></p>
+        <p>Interviewers ask "Why is Kafka fast?" all the time. The weak answer is "because it is distributed". The strong answer names five concrete mechanisms, and you can explain each one from first principles.</p>
+
+        <div class="stats">
+          <div class="stat"><b>1</b><span>Sequential appends, no random seeks</span></div>
+          <div class="stat"><b>2</b><span>OS page cache instead of a JVM cache</span></div>
+          <div class="stat"><b>3</b><span>Zero-copy sendfile() to the socket</span></div>
+          <div class="stat"><b>4</b><span>Batching + compression end to end</span></div>
+          <div class="stat"><b>5</b><span>Same binary format on wire and disk</span></div>
+        </div>
+
+        <h3>Secret 1: sequential I/O</h3>
+        <p>A partition is only ever appended to at the end. Reads by consumers are mostly sequential too: a consumer reads offset 100, then 101, then 102. Disks of every kind (spinning disks especially, but SSDs as well) are much better at long sequential transfers than at scattered small ones, and the kernel's read-ahead logic loves sequential patterns. A traditional database, in contrast, updates B-tree pages in place all over the file.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 195" role="img" aria-label="Random writes jump around the disk; Kafka appends at the end">
+            <text class="label" x="200" y="24">Random I/O (B-tree updates in place)</text>
+            <text class="label" x="600" y="24">Kafka: sequential append</text>
+            <g>
+              <rect class="cell" x="40" y="50" width="40" height="40"/><rect class="cell filled" x="85" y="50" width="40" height="40"/><rect class="cell" x="130" y="50" width="40" height="40"/><rect class="cell" x="175" y="50" width="40" height="40"/><rect class="cell filled" x="220" y="50" width="40" height="40"/><rect class="cell" x="265" y="50" width="40" height="40"/><rect class="cell" x="310" y="50" width="40" height="40"/>
+              <rect class="cell" x="40" y="100" width="40" height="40"/><rect class="cell" x="85" y="100" width="40" height="40"/><rect class="cell filled" x="130" y="100" width="40" height="40"/><rect class="cell" x="175" y="100" width="40" height="40"/><rect class="cell" x="220" y="100" width="40" height="40"/><rect class="cell" x="265" y="100" width="40" height="40"/><rect class="cell filled" x="310" y="100" width="40" height="40"/>
+              <circle class="packet bad" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M105 70 L240 70 L150 120 L330 120 L105 70"/></circle>
+              <text class="label small bad" x="200" y="170">head / FTL jumps around: seek, seek, seek</text>
+            </g>
+            <g>
+              <rect class="cell filled" x="440" y="75" width="40" height="40"/><rect class="cell filled" x="485" y="75" width="40" height="40"/><rect class="cell filled" x="530" y="75" width="40" height="40"/><rect class="cell filled" x="575" y="75" width="40" height="40"/><rect class="cell filled" x="620" y="75" width="40" height="40"/><rect class="cell new" x="665" y="75" width="40" height="40"/><rect class="cell" x="710" y="75" width="40" height="40"/>
+              <circle class="packet ok" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M460 95 L730 95"/></circle>
+              <text class="label small ok" x="595" y="170">always write at the tail: one long stream</text>
+            </g>
+          </svg>
+          <figcaption>Sequential appends let the disk and the kernel's read-ahead and write-back work at their best. Same disk, very different throughput. Kafka turns many small writes into one long sequential stream.</figcaption>
+        </figure>
+        <p>LinkedIn's classic 2014 benchmark, written up by Jay Kreps, showed a three-machine cluster of ordinary hardware taking about two million writes per second, and the explanation was exactly this: linear disk access plus batching. Treat that as a historical data point, not a promise for your hardware.</p>
+
+        <h3>Secret 2: trust the page cache</h3>
+        <p>Many systems keep their own in-process cache of hot data. Kafka mostly does not. The official design doc argues the opposite: write to the filesystem and let the operating system's <strong>page cache</strong> (the kernel's cache of file pages in free RAM) do the caching. Reasons:</p>
+        <ul>
+          <li>Objects on the JVM heap cost far more memory than the raw bytes, and a big heap means long garbage-collection pauses.</li>
+          <li>The page cache survives a broker process restart. A JVM cache would start cold.</li>
+          <li>The kernel already does read-ahead, write-back and LRU-style eviction, tuned over decades.</li>
+          <li>Consumers that keep up with producers ("tail readers") read data that was written seconds ago, which is still in the page cache. So most reads never touch the disk at all.</li>
+        </ul>
+        <p>That is why Kafka brokers typically run with a modest JVM heap (a few gigabytes) and leave most of the machine's RAM free for the page cache. When someone says "my broker has 64 GB of RAM but the JVM only uses 6", that is by design.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p><code>write()</code> on a Kafka log returns once the bytes are in the page cache and marked dirty. The kernel flushes them later with its normal write-back threads (governed by <code>vm.dirty_background_ratio</code>, <code>vm.dirty_ratio</code> and friends). Kafka does <b>not</b> call <code>fsync()</code> per message by default. Durability comes from <b>replication to other brokers</b> (see <a href="{{BASE}}devops/kafka-05">Replication &amp; ISR</a>), like RAID-1 across machines instead of waiting on one disk.</p>
+          <p><b>Where the analogy breaks:</b> if all replicas lose power at the same instant before write-back, unflushed data is lost. That is why replicas go in different racks or availability zones. If you truly need fsync, <code>flush.messages</code> / <code>flush.ms</code> exist per topic, at a big throughput cost.</p>
+        </div>
+
+        <h3>Secret 3: zero-copy with sendfile()</h3>
+        <p>This is the one you, as a kernel person, will enjoy most. It gets its own section below.</p>
+
+        <h3>Secret 4: batching and compression everywhere</h3>
+        <p>The producer waits up to <code>linger.ms</code> (default 5 ms since Kafka 4.0, it was 0 before) or until <code>batch.size</code> (default 16 KiB) fills, then sends one batch. The broker appends the batch with one write. The follower fetches many batches in one request. The consumer receives many batches per fetch. Each network round trip and each system call is shared by hundreds of records. With <code>compression.type=lz4</code> or <code>zstd</code>, the batch is compressed once by the producer, stored compressed and decompressed only by the consumer. The broker spends no CPU on it in the common case. See <a href="{{BASE}}devops/kafka-03">Producers</a> for the tuning knobs.</p>
+
+        <h3>Secret 5: one binary format and a "dumb" broker</h3>
+        <p>Because the log format and the network format are the same, the broker can pass bytes straight from the file to the socket. It also keeps almost no per-message state: it does not track which consumer read which record (consumers track their own offsets), and it does not delete records on acknowledgement. Compare a classic queue that must update per-message state on every ack. Less bookkeeping per message means more messages per second.</p>
+
+        <div class="callout interview"><p><b>Say this:</b> "Kafka is fast because it turns everything into large sequential I/O: producers batch, the broker appends batches to a log in the page cache without fsync, durability comes from replication, and consumers are served with <code>sendfile()</code> straight from the page cache to the socket. The broker never parses or re-encodes records on the hot path."</p></div>
+      

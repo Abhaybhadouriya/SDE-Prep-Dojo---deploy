@@ -1,0 +1,888 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java is split into four files the way you would in the round (one concern per file). Python and C++14 follow the same design. Everything below was compiled and run; the tests are in <code>Main.runTests()</code>, <code>test_snake_ladder.py</code> and the asserts at the end of <code>main.cpp</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: a fixed-dice game you can follow by hand.</li><li><code>Game.playTurn</code> and <code>applyRoll</code>: the turn rules in one place.</li><li><code>Board.resolve</code> and <code>Board.Builder</code>: jumps, validated at build time.</li><li><code>Dice</code>, <code>RandomDice</code>, <code>FixedDice</code>: the strategy that makes tests deterministic.</li><li>Skip on first read: the <code>Jump</code> record and <code>ConsolePrinter</code>.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java: Board.java">
+<pre><code class="language-java">import java.util.*;
+
+/** A snake or a ladder: landing on start moves the piece to end. */
+record Jump(int start, int end) {
+    boolean isSnake() { return end &lt; start; }
+    String kind() { return isSnake() ? "snake" : "ladder"; }
+}
+
+/** The board knows its size and its jumps. It never knows about players or dice. */
+final class Board {
+    private final int size;
+    private final Map&lt;Integer, Jump&gt; jumps;          // start cell -&gt; jump (at most one per cell)
+
+    private Board(int size, Map&lt;Integer, Jump&gt; jumps) {
+        this.size = size;
+        this.jumps = Map.copyOf(jumps);              // immutable after build
+    }
+
+    int size() { return size; }
+    Optional&lt;Jump&gt; jumpAt(int cell) { return Optional.ofNullable(jumps.get(cell)); }
+
+    /** Follow jumps until the piece rests (a ladder may end on a snake head). Cycles were rejected in build(). */
+    int resolve(int cell) {
+        Jump j;
+        while ((j = jumps.get(cell)) != null) cell = j.end();
+        return cell;
+    }
+
+    static Builder builder(int size) { return new Builder(size); }
+
+    static final class Builder {
+        private final int size;
+        private final Map&lt;Integer, Jump&gt; jumps = new HashMap&lt;&gt;();
+        Builder(int size) {
+            if (size &lt; 2) throw new IllegalArgumentException("board needs at least 2 cells");
+            this.size = size;
+        }
+        Builder snake(int head, int tail) {
+            if (tail &gt;= head) throw new IllegalArgumentException("snake must go down: " + head + "-&gt;" + tail);
+            return add(new Jump(head, tail));
+        }
+        Builder ladder(int bottom, int top) {
+            if (top &lt;= bottom) throw new IllegalArgumentException("ladder must go up: " + bottom + "-&gt;" + top);
+            return add(new Jump(bottom, top));
+        }
+        private Builder add(Jump j) {
+            if (j.start() &lt;= 0 || j.start() &gt;= size) throw new IllegalArgumentException("jump start out of range: " + j);
+            if (j.end() &lt;= 0 || j.end() &gt; size) throw new IllegalArgumentException("jump end out of range: " + j);
+            if (jumps.putIfAbsent(j.start(), j) != null) throw new IllegalArgumentException("cell " + j.start() + " already has a jump");
+            return this;
+        }
+        Board build() {
+            for (int start : jumps.keySet()) {               // reject loops such as 10-&gt;20 and 20-&gt;10
+                Set&lt;Integer&gt; seen = new HashSet&lt;&gt;();
+                int c = start;
+                while (jumps.containsKey(c)) {
+                    if (!seen.add(c)) throw new IllegalArgumentException("jump cycle through cell " + c);
+                    c = jumps.get(c).end();
+                }
+            }
+            return new Board(size, jumps);
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Dice.java">
+<pre><code class="language-java">import java.util.*;
+
+/** Strategy: how a turn's number is produced. The game only calls roll(). */
+interface Dice {
+    int roll();
+}
+
+/** count dice with faces 1..faces each; a seed makes games reproducible. */
+final class RandomDice implements Dice {
+    private final int count, faces;
+    private final Random rng;
+    RandomDice(int count, int faces, long seed) {
+        if (count &lt; 1 || faces &lt; 2) throw new IllegalArgumentException("bad dice");
+        this.count = count; this.faces = faces; this.rng = new Random(seed);
+    }
+    public int roll() {
+        int sum = 0;
+        for (int i = 0; i &lt; count; i++) sum += 1 + rng.nextInt(faces);
+        return sum;
+    }
+}
+
+/** Test double: returns a scripted sequence, so tests know every move in advance. */
+final class FixedDice implements Dice {
+    private final Deque&lt;Integer&gt; script;
+    FixedDice(int... values) {
+        script = new ArrayDeque&lt;&gt;();
+        for (int v : values) script.addLast(v);
+    }
+    public int roll() {
+        if (script.isEmpty()) throw new IllegalStateException("script ran out of rolls");
+        return script.pollFirst();
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Game.java">
+<pre><code class="language-java">import java.util.*;
+
+final class Player {
+    private final String name;
+    private int position;                  // 0 = not on the board yet
+    Player(String name) { this.name = name; }
+    String name() { return name; }
+    int position() { return position; }
+    void moveTo(int cell) { position = cell; }
+}
+
+/** Rule switches the interviewer adds as follow-ups. Defaults = classic game. */
+record Rules(boolean extraTurnOnSix, int sixesToCancel, boolean playUntilOneLeft) {
+    static Rules classic() { return new Rules(false, 0, false); }
+}
+
+/** Observer: the game reports events; printing, logging or a UI subscribe. */
+interface GameListener {
+    default void onMove(Player p, int roll, int from, int to, Optional&lt;Jump&gt; jump) {}
+    default void onOvershoot(Player p, int roll) {}
+    default void onTurnCancelled(Player p, int backTo) {}
+    default void onWin(Player p, int rank) {}
+}
+
+enum GameStatus { IN_PROGRESS, FINISHED }
+
+final class Game {
+    private final Board board;
+    private final Dice dice;
+    private final Rules rules;
+    private final Deque&lt;Player&gt; turnOrder = new ArrayDeque&lt;&gt;();
+    private final List&lt;Player&gt; winners = new ArrayList&lt;&gt;();
+    private final List&lt;GameListener&gt; listeners = new ArrayList&lt;&gt;();
+    private GameStatus status = GameStatus.IN_PROGRESS;
+
+    Game(Board board, Dice dice, Rules rules, List&lt;String&gt; names) {
+        if (names.size() &lt; 2) throw new IllegalArgumentException("need at least 2 players");
+        this.board = board; this.dice = dice; this.rules = rules;
+        for (String n : names) turnOrder.addLast(new Player(n));
+    }
+
+    void addListener(GameListener l) { listeners.add(l); }
+    GameStatus status() { return status; }
+    List&lt;Player&gt; winners() { return List.copyOf(winners); }
+    List&lt;Player&gt; stillPlaying() { return List.copyOf(turnOrder); }
+
+    /** One player's full turn (several rolls if a six grants a bonus). */
+    void playTurn() {
+        if (status == GameStatus.FINISHED) throw new IllegalStateException("game is over");
+        Player p = turnOrder.pollFirst();
+        int startOfTurn = p.position();
+        int sixes = 0;
+        boolean again;
+        do {
+            int roll = dice.roll();
+            boolean six = rules.extraTurnOnSix() &amp;&amp; roll == 6;
+            if (six &amp;&amp; rules.sixesToCancel() &gt; 0 &amp;&amp; ++sixes == rules.sixesToCancel()) {
+                p.moveTo(startOfTurn);                       // three sixes: undo the whole turn
+                listeners.forEach(l -&gt; l.onTurnCancelled(p, startOfTurn));
+                break;
+            }
+            applyRoll(p, roll);
+            again = six &amp;&amp; p.position() != board.size();
+        } while (again);
+
+        if (p.position() == board.size()) {
+            winners.add(p);
+            listeners.forEach(l -&gt; l.onWin(p, winners.size()));
+            if (!rules.playUntilOneLeft() || turnOrder.size() == 1) status = GameStatus.FINISHED;
+        } else {
+            turnOrder.addLast(p);                            // back of the queue = round robin
+        }
+    }
+
+    private void applyRoll(Player p, int roll) {
+        int from = p.position();
+        int target = from + roll;
+        if (target &gt; board.size()) {                         // must land exactly on the last cell
+            listeners.forEach(l -&gt; l.onOvershoot(p, roll));
+            return;
+        }
+        Optional&lt;Jump&gt; jump = board.jumpAt(target);
+        int to = board.resolve(target);
+        p.moveTo(to);
+        listeners.forEach(l -&gt; l.onMove(p, roll, from, to, jump));
+    }
+
+    /** Plays to the end; maxTurns guards against a bad script or a broken board. */
+    int playToEnd(int maxTurns) {
+        int turns = 0;
+        while (status == GameStatus.IN_PROGRESS) {
+            if (++turns &gt; maxTurns) throw new IllegalStateException("no winner after " + maxTurns + " turns");
+            playTurn();
+        }
+        return turns;
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.util.*;
+
+public class Main {
+    /** Console output in the format the problem asks for. */
+    static final class ConsolePrinter implements GameListener {
+        public void onMove(Player p, int roll, int from, int to, Optional&lt;Jump&gt; jump) {
+            String via = jump.map(j -&gt; " (" + j.kind() + " at " + j.start() + ")").orElse("");
+            System.out.println(p.name() + " rolled a " + roll + " and moved from " + from + " to " + to + via);
+        }
+        public void onOvershoot(Player p, int roll) {
+            System.out.println(p.name() + " rolled a " + roll + " and stays at " + p.position() + " (needs an exact roll)");
+        }
+        public void onTurnCancelled(Player p, int backTo) {
+            System.out.println(p.name() + " rolled three sixes: turn cancelled, back to " + backTo);
+        }
+        public void onWin(Player p, int rank) {
+            System.out.println(p.name() + (rank == 1 ? " wins the game" : " finishes at rank " + rank));
+        }
+    }
+
+    static Board classicBoard() {
+        return Board.builder(100)
+            .ladder(2, 23).ladder(8, 34).ladder(10, 29).ladder(20, 77).ladder(32, 68)
+            .ladder(41, 79).ladder(74, 88).ladder(85, 95)
+            .snake(29, 9).snake(38, 15).snake(47, 5).snake(53, 33).snake(62, 37)
+            .snake(86, 54).snake(92, 70).snake(97, 25)
+            .build();
+    }
+
+    public static void main(String[] args) {
+        System.out.println("== Demo 1: classic rules, scripted dice ==");
+        Game g = new Game(classicBoard(),
+                new FixedDice(2, 4, 6, 6, 5, 3, 6, 6, 6, 2, 2, 6, 6, 3, 5),
+                Rules.classic(), List.of("Alice", "Bob"));
+        g.addListener(new ConsolePrinter());
+        g.playToEnd(100);
+
+        System.out.println("== Demo 2: six = extra roll, three sixes cancel, play until one is left ==");
+        Game g2 = new Game(classicBoard(), new RandomDice(1, 6, 7L),
+                new Rules(true, 3, true), List.of("Asha", "Ravi", "Meera"));
+        g2.addListener(new GameListener() {
+            public void onTurnCancelled(Player p, int backTo) { System.out.println("  " + p.name() + ": three sixes, back to " + backTo); }
+            public void onWin(Player p, int rank) { System.out.println("  rank " + rank + ": " + p.name()); }
+        });
+        int turns = g2.playToEnd(10_000);
+        System.out.println("  last player: " + g2.stillPlaying().get(0).name() + ", turns played: " + turns);
+
+        runTests();
+    }
+
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+    static void expectThrows(Runnable r, String what) {
+        try { r.run(); } catch (IllegalArgumentException e) { checks++; return; }
+        throw new AssertionError("FAILED (no exception): " + what);
+    }
+
+    static void runTests() {
+        Board b = classicBoard();
+        check(b.resolve(10) == 9, "ladder 10-&gt;29 then snake 29-&gt;9 is followed as a chain");
+        check(b.resolve(50) == 50, "plain cell stays");
+
+        Game over = new Game(b, new FixedDice(5, 1), Rules.classic(), List.of("A", "B"));
+        over.stillPlaying().get(0).moveTo(97 - 1);           // A on 96
+        over.playTurn();                                     // 96 + 5 = 101 &gt; 100
+        check(over.stillPlaying().get(1).position() == 96, "overshoot leaves the player where they were");
+
+        expectThrows(() -&gt; Board.builder(100).snake(40, 10).ladder(40, 60), "two jumps on one cell");
+        expectThrows(() -&gt; Board.builder(100).snake(10, 40), "a snake that goes up");
+        expectThrows(() -&gt; Board.builder(100).snake(100, 1), "a snake on the winning cell");
+        expectThrows(() -&gt; Board.builder(100).ladder(10, 20).snake(20, 10).build(), "a jump cycle");
+        expectThrows(() -&gt; new Game(b, new FixedDice(1), Rules.classic(), List.of("solo")), "one player");
+
+        Board empty = Board.builder(100).build();
+        Game sixes = new Game(empty, new FixedDice(6, 6, 6, 6, 6, 1), new Rules(true, 3, false), List.of("A", "B"));
+        sixes.playTurn();                                    // A: 6, 6, 6 -&gt; cancelled
+        check(sixes.stillPlaying().get(1).position() == 0, "three sixes undo the turn");
+        sixes.playTurn();                                    // B: 6, 6, 1 -&gt; 13
+        check(sixes.stillPlaying().get(1).position() == 13, "two sixes then a 1 moves 13");
+
+        Board tiny = Board.builder(4).build();
+        Game rank = new Game(tiny, new FixedDice(4, 1, 4, 3), new Rules(false, 0, true), List.of("A", "B", "C"));
+        rank.playToEnd(10);
+        check(rank.winners().size() == 2 &amp;&amp; rank.winners().get(0).name().equals("A")
+                &amp;&amp; rank.winners().get(1).name().equals("C"), "ranks are kept until one player is left");
+        check(rank.stillPlaying().get(0).name().equals("B"), "B is the last player");
+
+        RandomDice two = new RandomDice(2, 6, 1L);
+        int lo = 99, hi = 0;
+        for (int i = 0; i &lt; 10_000; i++) { int r = two.roll(); lo = Math.min(lo, r); hi = Math.max(hi, r); }
+        check(lo == 2 &amp;&amp; hi == 12, "two dice roll 2..12");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: snake_ladder.py">
+<pre><code class="language-python">"""Snake &amp; Ladder - same design as the Java version: Board, Dice strategy, Game, listeners."""
+from __future__ import annotations
+
+import random
+from collections import deque
+from dataclasses import dataclass
+from enum import Enum
+from typing import Iterable, Optional, Protocol
+
+
+@dataclass(frozen=True)
+class Jump:
+    start: int
+    end: int
+
+    @property
+    def kind(self) -&gt; str:
+        return "snake" if self.end &lt; self.start else "ladder"
+
+
+class Board:
+    def __init__(self, size: int, jumps: dict[int, Jump]):
+        self.size = size
+        self._jumps = dict(jumps)
+
+    def jump_at(self, cell: int) -&gt; Optional[Jump]:
+        return self._jumps.get(cell)
+
+    def resolve(self, cell: int) -&gt; int:
+        while cell in self._jumps:          # chains allowed, cycles rejected by the builder
+            cell = self._jumps[cell].end
+        return cell
+
+
+class BoardBuilder:
+    def __init__(self, size: int):
+        if size &lt; 2:
+            raise ValueError("board needs at least 2 cells")
+        self.size = size
+        self._jumps: dict[int, Jump] = {}
+
+    def snake(self, head: int, tail: int) -&gt; "BoardBuilder":
+        if tail &gt;= head:
+            raise ValueError(f"snake must go down: {head}-&gt;{tail}")
+        return self._add(Jump(head, tail))
+
+    def ladder(self, bottom: int, top: int) -&gt; "BoardBuilder":
+        if top &lt;= bottom:
+            raise ValueError(f"ladder must go up: {bottom}-&gt;{top}")
+        return self._add(Jump(bottom, top))
+
+    def _add(self, j: Jump) -&gt; "BoardBuilder":
+        if not 0 &lt; j.start &lt; self.size:
+            raise ValueError(f"jump start out of range: {j}")
+        if not 0 &lt; j.end &lt;= self.size:
+            raise ValueError(f"jump end out of range: {j}")
+        if j.start in self._jumps:
+            raise ValueError(f"cell {j.start} already has a jump")
+        self._jumps[j.start] = j
+        return self
+
+    def build(self) -&gt; Board:
+        for start in self._jumps:
+            seen, c = set(), start
+            while c in self._jumps:
+                if c in seen:
+                    raise ValueError(f"jump cycle through cell {c}")
+                seen.add(c)
+                c = self._jumps[c].end
+        return Board(self.size, self._jumps)
+
+
+class Dice(Protocol):
+    def roll(self) -&gt; int: ...
+
+
+class RandomDice:
+    def __init__(self, count: int = 1, faces: int = 6, seed: Optional[int] = None):
+        if count &lt; 1 or faces &lt; 2:
+            raise ValueError("bad dice")
+        self.count, self.faces = count, faces
+        self._rng = random.Random(seed)
+
+    def roll(self) -&gt; int:
+        return sum(self._rng.randint(1, self.faces) for _ in range(self.count))
+
+
+class FixedDice:
+    """Test double: returns a scripted sequence."""
+
+    def __init__(self, *values: int):
+        self._script = deque(values)
+
+    def roll(self) -&gt; int:
+        if not self._script:
+            raise RuntimeError("script ran out of rolls")
+        return self._script.popleft()
+
+
+@dataclass
+class Player:
+    name: str
+    position: int = 0
+
+
+@dataclass(frozen=True)
+class Rules:
+    extra_turn_on_six: bool = False
+    sixes_to_cancel: int = 0
+    play_until_one_left: bool = False
+
+
+class GameListener:
+    """Observer with no-op defaults; override what you need."""
+
+    def on_move(self, p: Player, roll: int, frm: int, to: int, jump: Optional[Jump]) -&gt; None: ...
+    def on_overshoot(self, p: Player, roll: int) -&gt; None: ...
+    def on_turn_cancelled(self, p: Player, back_to: int) -&gt; None: ...
+    def on_win(self, p: Player, rank: int) -&gt; None: ...
+
+
+class GameStatus(Enum):
+    IN_PROGRESS = 1
+    FINISHED = 2
+
+
+class Game:
+    def __init__(self, board: Board, dice: Dice, rules: Rules, names: Iterable[str]):
+        names = list(names)
+        if len(names) &lt; 2:
+            raise ValueError("need at least 2 players")
+        self.board, self.dice, self.rules = board, dice, rules
+        self.turn_order: deque[Player] = deque(Player(n) for n in names)
+        self.winners: list[Player] = []
+        self.listeners: list[GameListener] = []
+        self.status = GameStatus.IN_PROGRESS
+
+    def add_listener(self, listener: GameListener) -&gt; None:
+        self.listeners.append(listener)
+
+    def play_turn(self) -&gt; None:
+        if self.status is GameStatus.FINISHED:
+            raise RuntimeError("game is over")
+        p = self.turn_order.popleft()
+        start_of_turn, sixes = p.position, 0
+        while True:
+            roll = self.dice.roll()
+            six = self.rules.extra_turn_on_six and roll == 6
+            if six and self.rules.sixes_to_cancel &gt; 0:
+                sixes += 1
+                if sixes == self.rules.sixes_to_cancel:
+                    p.position = start_of_turn
+                    for l in self.listeners:
+                        l.on_turn_cancelled(p, start_of_turn)
+                    break
+            self._apply_roll(p, roll)
+            if not (six and p.position != self.board.size):
+                break
+
+        if p.position == self.board.size:
+            self.winners.append(p)
+            for l in self.listeners:
+                l.on_win(p, len(self.winners))
+            if not self.rules.play_until_one_left or len(self.turn_order) == 1:
+                self.status = GameStatus.FINISHED
+        else:
+            self.turn_order.append(p)
+
+    def _apply_roll(self, p: Player, roll: int) -&gt; None:
+        frm, target = p.position, p.position + roll
+        if target &gt; self.board.size:
+            for l in self.listeners:
+                l.on_overshoot(p, roll)
+            return
+        jump = self.board.jump_at(target)
+        p.position = self.board.resolve(target)
+        for l in self.listeners:
+            l.on_move(p, roll, frm, p.position, jump)
+
+    def play_to_end(self, max_turns: int) -&gt; int:
+        turns = 0
+        while self.status is GameStatus.IN_PROGRESS:
+            turns += 1
+            if turns &gt; max_turns:
+                raise RuntimeError(f"no winner after {max_turns} turns")
+            self.play_turn()
+        return turns
+
+
+def classic_board() -&gt; Board:
+    b = BoardBuilder(100)
+    for lo, hi in [(2, 23), (8, 34), (10, 29), (20, 77), (32, 68), (41, 79), (74, 88), (85, 95)]:
+        b.ladder(lo, hi)
+    for head, tail in [(29, 9), (38, 15), (47, 5), (53, 33), (62, 37), (86, 54), (92, 70), (97, 25)]:
+        b.snake(head, tail)
+    return b.build()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">from snake_ladder import FixedDice, Game, GameListener, RandomDice, Rules, classic_board
+
+
+class ConsolePrinter(GameListener):
+    def on_move(self, p, roll, frm, to, jump):
+        via = f" ({jump.kind} at {jump.start})" if jump else ""
+        print(f"{p.name} rolled a {roll} and moved from {frm} to {to}{via}")
+
+    def on_overshoot(self, p, roll):
+        print(f"{p.name} rolled a {roll} and stays at {p.position} (needs an exact roll)")
+
+    def on_turn_cancelled(self, p, back_to):
+        print(f"{p.name} rolled three sixes: turn cancelled, back to {back_to}")
+
+    def on_win(self, p, rank):
+        print(f"{p.name} wins the game" if rank == 1 else f"{p.name} finishes at rank {rank}")
+
+
+class Summary(GameListener):
+    def on_turn_cancelled(self, p, back_to):
+        print(f"  {p.name}: three sixes, back to {back_to}")
+
+    def on_win(self, p, rank):
+        print(f"  rank {rank}: {p.name}")
+
+
+if __name__ == "__main__":
+    print("== Demo 1: classic rules, scripted dice ==")
+    g = Game(classic_board(), FixedDice(2, 4, 6, 6, 5, 3, 6, 6, 6, 2, 2, 6, 6, 3, 5), Rules(), ["Alice", "Bob"])
+    g.add_listener(ConsolePrinter())
+    g.play_to_end(100)
+
+    print("== Demo 2: six = extra roll, three sixes cancel, play until one is left ==")
+    g2 = Game(classic_board(), RandomDice(1, 6, seed=7), Rules(True, 3, True), ["Asha", "Ravi", "Meera"])
+    g2.add_listener(Summary())
+    turns = g2.play_to_end(10_000)
+    print(f"  last player: {g2.turn_order[0].name}, turns played: {turns}")</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import unittest
+
+from snake_ladder import BoardBuilder, FixedDice, Game, RandomDice, Rules, classic_board
+
+
+class SnakeLadderTest(unittest.TestCase):
+    def test_chain_is_followed(self):
+        self.assertEqual(classic_board().resolve(10), 9)   # ladder 10-&gt;29, then snake 29-&gt;9
+
+    def test_overshoot_stays(self):
+        g = Game(classic_board(), FixedDice(5), Rules(), ["A", "B"])
+        g.turn_order[0].position = 96
+        g.play_turn()
+        self.assertEqual(g.turn_order[1].position, 96)
+
+    def test_builder_rejects_bad_boards(self):
+        with self.assertRaises(ValueError):
+            BoardBuilder(100).snake(40, 10).ladder(40, 60)
+        with self.assertRaises(ValueError):
+            BoardBuilder(100).snake(10, 40)
+        with self.assertRaises(ValueError):
+            BoardBuilder(100).snake(100, 1)
+        with self.assertRaises(ValueError):
+            BoardBuilder(100).ladder(10, 20).snake(20, 10).build()
+
+    def test_three_sixes_cancel(self):
+        g = Game(BoardBuilder(100).build(), FixedDice(6, 6, 6, 6, 6, 1), Rules(True, 3), ["A", "B"])
+        g.play_turn()
+        self.assertEqual(g.turn_order[1].position, 0)
+        g.play_turn()
+        self.assertEqual(g.turn_order[1].position, 13)
+
+    def test_ranks_until_one_left(self):
+        g = Game(BoardBuilder(4).build(), FixedDice(4, 1, 4, 3), Rules(play_until_one_left=True), ["A", "B", "C"])
+        g.play_to_end(10)
+        self.assertEqual([p.name for p in g.winners], ["A", "C"])
+        self.assertEqual(g.turn_order[0].name, "B")
+
+    def test_two_dice_range(self):
+        d = RandomDice(2, 6, seed=1)
+        rolls = {d.roll() for _ in range(10_000)}
+        self.assertEqual((min(rolls), max(rolls)), (2, 12))
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14: main.cpp">
+<pre><code class="language-cpp">// Snake &amp; Ladder in C++14: same design as the Java version (Board, Dice strategy, Game, listeners).
+// Build: g++ -std=c++14 -Wall -O2 main.cpp -o snake &amp;&amp; ./snake
+#include &lt;cassert&gt;
+#include &lt;deque&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;random&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+struct Jump {
+    int start, end;
+    const char* kind() const { return end &lt; start ? "snake" : "ladder"; }
+};
+
+class Board {
+public:
+    Board(int size, std::map&lt;int, Jump&gt; jumps) : size_(size), jumps_(std::move(jumps)) {}
+    int size() const { return size_; }
+    const Jump* jumpAt(int cell) const {          // nullptr = no jump (no std::optional in C++14)
+        auto it = jumps_.find(cell);
+        return it == jumps_.end() ? nullptr : &amp;it-&gt;second;
+    }
+    int resolve(int cell) const {
+        for (const Jump* j = jumpAt(cell); j; j = jumpAt(cell)) cell = j-&gt;end;
+        return cell;
+    }
+private:
+    int size_;
+    std::map&lt;int, Jump&gt; jumps_;
+};
+
+class BoardBuilder {
+public:
+    explicit BoardBuilder(int size) : size_(size) {
+        if (size &lt; 2) throw std::invalid_argument("board needs at least 2 cells");
+    }
+    BoardBuilder&amp; snake(int head, int tail) {
+        if (tail &gt;= head) throw std::invalid_argument("snake must go down");
+        return add(Jump{head, tail});
+    }
+    BoardBuilder&amp; ladder(int bottom, int top) {
+        if (top &lt;= bottom) throw std::invalid_argument("ladder must go up");
+        return add(Jump{bottom, top});
+    }
+    Board build() const {
+        for (const auto&amp; kv : jumps_) {
+            std::set&lt;int&gt; seen;
+            int c = kv.first;
+            for (auto it = jumps_.find(c); it != jumps_.end(); it = jumps_.find(c)) {
+                if (!seen.insert(c).second) throw std::invalid_argument("jump cycle");
+                c = it-&gt;second.end;
+            }
+        }
+        return Board(size_, jumps_);
+    }
+private:
+    BoardBuilder&amp; add(Jump j) {
+        if (j.start &lt;= 0 || j.start &gt;= size_) throw std::invalid_argument("jump start out of range");
+        if (j.end &lt;= 0 || j.end &gt; size_) throw std::invalid_argument("jump end out of range");
+        if (!jumps_.emplace(j.start, j).second) throw std::invalid_argument("cell already has a jump");
+        return *this;
+    }
+    int size_;
+    std::map&lt;int, Jump&gt; jumps_;
+};
+
+// Strategy: an abstract class with one virtual method = a vtable with one slot.
+struct Dice {
+    virtual ~Dice() = default;
+    virtual int roll() = 0;
+};
+
+class RandomDice : public Dice {
+public:
+    RandomDice(int count, int faces, unsigned seed) : count_(count), dist_(1, faces), rng_(seed) {}
+    int roll() override {
+        int s = 0;
+        for (int i = 0; i &lt; count_; i++) s += dist_(rng_);
+        return s;
+    }
+private:
+    int count_;
+    std::uniform_int_distribution&lt;int&gt; dist_;
+    std::mt19937 rng_;
+};
+
+class FixedDice : public Dice {
+public:
+    FixedDice(std::initializer_list&lt;int&gt; v) : script_(v) {}
+    int roll() override {
+        if (script_.empty()) throw std::runtime_error("script ran out of rolls");
+        int v = script_.front();
+        script_.pop_front();
+        return v;
+    }
+private:
+    std::deque&lt;int&gt; script_;
+};
+
+struct Player {
+    std::string name;
+    int position = 0;
+};
+
+struct Rules {
+    bool extraTurnOnSix = false;
+    int sixesToCancel = 0;
+    bool playUntilOneLeft = false;
+};
+
+// Observer: like a notifier_block, the game calls every registered listener.
+struct GameListener {
+    virtual ~GameListener() = default;
+    virtual void onMove(const Player&amp;, int /*roll*/, int /*from*/, int /*to*/, const Jump*) {}
+    virtual void onOvershoot(const Player&amp;, int /*roll*/) {}
+    virtual void onTurnCancelled(const Player&amp;, int /*backTo*/) {}
+    virtual void onWin(const Player&amp;, int /*rank*/) {}
+};
+
+class Game {
+public:
+    Game(Board board, Dice&amp; dice, Rules rules, const std::vector&lt;std::string&gt;&amp; names)
+        : board_(std::move(board)), dice_(dice), rules_(rules) {
+        if (names.size() &lt; 2) throw std::invalid_argument("need at least 2 players");
+        for (const auto&amp; n : names) turnOrder_.push_back(Player{n, 0});
+    }
+    void addListener(GameListener* l) { listeners_.push_back(l); }
+    bool finished() const { return finished_; }
+    const std::vector&lt;Player&gt;&amp; winners() const { return winners_; }
+    std::deque&lt;Player&gt;&amp; stillPlaying() { return turnOrder_; }
+
+    void playTurn() {
+        if (finished_) throw std::logic_error("game is over");
+        Player p = turnOrder_.front();
+        turnOrder_.pop_front();
+        const int startOfTurn = p.position;
+        int sixes = 0;
+        for (;;) {
+            int roll = dice_.roll();
+            bool six = rules_.extraTurnOnSix &amp;&amp; roll == 6;
+            if (six &amp;&amp; rules_.sixesToCancel &gt; 0 &amp;&amp; ++sixes == rules_.sixesToCancel) {
+                p.position = startOfTurn;
+                for (auto* l : listeners_) l-&gt;onTurnCancelled(p, startOfTurn);
+                break;
+            }
+            applyRoll(p, roll);
+            if (!(six &amp;&amp; p.position != board_.size())) break;
+        }
+        if (p.position == board_.size()) {
+            winners_.push_back(p);
+            for (auto* l : listeners_) l-&gt;onWin(p, static_cast&lt;int&gt;(winners_.size()));
+            if (!rules_.playUntilOneLeft || turnOrder_.size() == 1) finished_ = true;
+        } else {
+            turnOrder_.push_back(p);
+        }
+    }
+
+    int playToEnd(int maxTurns) {
+        int turns = 0;
+        while (!finished_) {
+            if (++turns &gt; maxTurns) throw std::runtime_error("no winner");
+            playTurn();
+        }
+        return turns;
+    }
+
+private:
+    void applyRoll(Player&amp; p, int roll) {
+        int from = p.position, target = from + roll;
+        if (target &gt; board_.size()) {
+            for (auto* l : listeners_) l-&gt;onOvershoot(p, roll);
+            return;
+        }
+        const Jump* jump = board_.jumpAt(target);
+        p.position = board_.resolve(target);
+        for (auto* l : listeners_) l-&gt;onMove(p, roll, from, p.position, jump);
+    }
+
+    Board board_;
+    Dice&amp; dice_;                 // not owned: the caller keeps the dice alive
+    Rules rules_;
+    std::deque&lt;Player&gt; turnOrder_;
+    std::vector&lt;Player&gt; winners_;
+    std::vector&lt;GameListener*&gt; listeners_;
+    bool finished_ = false;
+};
+
+struct ConsolePrinter : GameListener {
+    void onMove(const Player&amp; p, int roll, int from, int to, const Jump* j) override {
+        std::cout &lt;&lt; p.name &lt;&lt; " rolled a " &lt;&lt; roll &lt;&lt; " and moved from " &lt;&lt; from &lt;&lt; " to " &lt;&lt; to;
+        if (j) std::cout &lt;&lt; " (" &lt;&lt; j-&gt;kind() &lt;&lt; " at " &lt;&lt; j-&gt;start &lt;&lt; ")";
+        std::cout &lt;&lt; "\n";
+    }
+    void onOvershoot(const Player&amp; p, int roll) override {
+        std::cout &lt;&lt; p.name &lt;&lt; " rolled a " &lt;&lt; roll &lt;&lt; " and stays at " &lt;&lt; p.position &lt;&lt; " (needs an exact roll)\n";
+    }
+    void onWin(const Player&amp; p, int rank) override {
+        if (rank == 1) std::cout &lt;&lt; p.name &lt;&lt; " wins the game\n";
+        else std::cout &lt;&lt; p.name &lt;&lt; " finishes at rank " &lt;&lt; rank &lt;&lt; "\n";
+    }
+};
+
+static Board classicBoard() {
+    BoardBuilder b(100);
+    b.ladder(2, 23).ladder(8, 34).ladder(10, 29).ladder(20, 77).ladder(32, 68)
+     .ladder(41, 79).ladder(74, 88).ladder(85, 95)
+     .snake(29, 9).snake(38, 15).snake(47, 5).snake(53, 33).snake(62, 37)
+     .snake(86, 54).snake(92, 70).snake(97, 25);
+    return b.build();
+}
+
+template &lt;class F&gt; static bool throwsInvalid(F f) {
+    try { f(); } catch (const std::invalid_argument&amp;) { return true; }
+    return false;
+}
+
+int main() {
+    std::cout &lt;&lt; "== Demo 1: classic rules, scripted dice ==\n";
+    FixedDice script{2, 4, 6, 6, 5, 3, 6, 6, 6, 2, 2, 6, 6, 3, 5};
+    Game g(classicBoard(), script, Rules{}, {"Alice", "Bob"});
+    ConsolePrinter printer;
+    g.addListener(&amp;printer);
+    g.playToEnd(100);
+
+    // tests (assert is active because we do not define NDEBUG)
+    Board b = classicBoard();
+    assert(b.resolve(10) == 9);
+    assert(throwsInvalid([] { BoardBuilder(100).snake(40, 10).ladder(40, 60); }));
+    assert(throwsInvalid([] { BoardBuilder(100).snake(100, 1); }));
+    assert(throwsInvalid([] { BoardBuilder(100).ladder(10, 20).snake(20, 10).build(); }));
+
+    FixedDice six{6, 6, 6, 6, 6, 1};
+    Game s(BoardBuilder(100).build(), six, Rules{true, 3, false}, {"A", "B"});
+    s.playTurn();
+    assert(s.stillPlaying()[1].position == 0);       // A cancelled
+    s.playTurn();
+    assert(s.stillPlaying()[1].position == 13);      // B: 6 + 6 + 1
+
+    FixedDice r{4, 1, 4, 3};
+    Game rank(BoardBuilder(4).build(), r, Rules{false, 0, true}, {"A", "B", "C"});
+    rank.playToEnd(10);
+    assert(rank.winners().size() == 2 &amp;&amp; rank.winners()[1].name == "C");
+    assert(rank.stillPlaying().front().name == "B");
+
+    std::cout &lt;&lt; "All C++ checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <p>Run it: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>, or <code>python main.py</code> and <code>python -m unittest</code>, or <code>g++ -std=c++14 -Wall main.cpp -o snake &amp;&amp; ./snake</code>. Java output:</p>
+<pre class="terminal"><code>== Demo 1: classic rules, scripted dice ==
+Alice rolled a 2 and moved from 0 to 23 (ladder at 2)
+Bob rolled a 4 and moved from 0 to 4
+Alice rolled a 6 and moved from 23 to 9 (snake at 29)
+Bob rolled a 6 and moved from 4 to 9 (ladder at 10)
+Alice rolled a 5 and moved from 9 to 14
+Bob rolled a 3 and moved from 9 to 12
+Alice rolled a 6 and moved from 14 to 77 (ladder at 20)
+Bob rolled a 6 and moved from 12 to 18
+Alice rolled a 6 and moved from 77 to 83
+Bob rolled a 2 and moved from 18 to 77 (ladder at 20)
+Alice rolled a 2 and moved from 83 to 95 (ladder at 85)
+Bob rolled a 6 and moved from 77 to 83
+Alice rolled a 6 and stays at 95 (needs an exact roll)
+Bob rolled a 3 and moved from 83 to 54 (snake at 86)
+Alice rolled a 5 and moved from 95 to 100
+Alice wins the game
+== Demo 2: six = extra roll, three sixes cancel, play until one is left ==
+  rank 1: Ravi
+  rank 2: Meera
+  last player: Asha, turns played: 86
+All 13 checks passed</code></pre>
+  <p>Demo 1 is identical in all three languages because the dice are scripted. Demo 2 uses a seeded random die, so the ranking differs between Java's <code>Random</code> and Python's <code>random</code>; that is expected and is exactly why tests use <code>FixedDice</code>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>In the C++ version <code>Dice</code> is an abstract class with one pure virtual function. Under the hood that is a vtable with one slot, the same thing you would write in C as <code>struct dice_ops { int (*roll)(struct dice *); };</code>. The <code>Game</code> holds a reference (<code>Dice&amp;</code>) and does not own the dice, so the caller controls its lifetime, like a driver that borrows a buffer it did not allocate.</p>
+  </div>

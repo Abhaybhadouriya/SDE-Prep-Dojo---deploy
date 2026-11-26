@@ -1,0 +1,52 @@
+
+        <h2>Data model: one big lookup table</h2>
+        <p>The heart of the system is a single mapping: <b>code → long URL</b>. Every redirect is "look up one row by its primary key". No joins, no range scans.</p>
+<pre><code class="language-sql">CREATE TABLE urls (
+  code        VARCHAR(16)  PRIMARY KEY,      -- 7 chars normally; custom aliases can be longer
+  long_url    TEXT         NOT NULL,
+  owner_id    BIGINT,                        -- who created it (nullable for anonymous)
+  created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  expires_at  TIMESTAMPTZ,                   -- NULL = never
+  status      SMALLINT     NOT NULL DEFAULT 0 -- 0 active, 1 disabled (abuse)
+);
+-- Optional: "same long URL from same owner returns the same code"
+CREATE INDEX urls_owner_long ON urls (owner_id, md5(long_url));
+
+-- Analytics lives elsewhere (a separate store fed by Kafka), never in this table:
+-- clicks_daily(code, day, country, clicks)  -- a counter table in Cassandra / ClickHouse</code></pre>
+
+        <h3>SQL or NoSQL? Say it in one sentence</h3>
+        <p><i>"The access pattern is a pure key lookup at very high read volume, with about 91 TB over 5 years and no joins, so a key-value store such as DynamoDB or Cassandra fits naturally. A sharded Postgres/MySQL with the code as the primary key also works and gives us a unique constraint for free."</i> Both are acceptable answers. What matters is the reason. More on choosing: <a href="{{BASE}}hld/hld-07">Data modeling and indexing</a>.</p>
+        <div class="proscons">
+          <div class="pros"><h5>Key-value / wide-column (DynamoDB, Cassandra)</h5><ul><li>Scales horizontally by design; partitioned by key.</li><li>Single-digit-ms key lookups.</li><li>Multi-region replication built in.</li></ul></div>
+          <div class="cons"><h5>Watch out</h5><ul><li>"Insert only if the code is new" needs a conditional write (DynamoDB <code>attribute_not_exists</code>, Cassandra lightweight transaction, which is slower).</li><li>Fewer ad-hoc queries ("all links of user X" needs a second table or index).</li></ul></div>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Codes are hashed onto four shards; each shard has a primary and replicas">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="24">Shard by hash(code)</text>
+            <rect class="box client" x="20" y="120" width="140" height="60"/>
+            <text class="label" x="90" y="142">code</text>
+            <text class="label mono" x="90" y="164">aZ3kP9q</text>
+            <rect class="box svc" x="210" y="120" width="160" height="60"/>
+            <text class="label" x="290" y="142">hash(code)</text>
+            <text class="label small" x="290" y="164">mod 4 → shard 2</text>
+            <path class="arrow" d="M160 150 L204 150"/>
+            <rect class="box db" x="450" y="44" width="150" height="46"/><text class="label" x="525" y="67">shard 0</text>
+            <rect class="box db" x="450" y="102" width="150" height="46"/><text class="label" x="525" y="125">shard 1</text>
+            <rect class="box db highlight" x="450" y="160" width="150" height="46"/><text class="label" x="525" y="183">shard 2</text>
+            <rect class="box db" x="450" y="218" width="150" height="46"/><text class="label" x="525" y="241">shard 3</text>
+            <path class="arrow" d="M370 150 L444 183"/>
+            <rect class="box ghost" x="640" y="160" width="62" height="46"/><text class="label small" x="671" y="183">rep 1</text>
+            <rect class="box ghost" x="712" y="160" width="62" height="46"/><text class="label small" x="743" y="183">rep 2</text>
+            <path class="arrow dashed" d="M600 183 L634 183"/>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M160 150 L210 150 L370 150 L450 183"/></circle>
+          </svg>
+          <figcaption>Every code lives on exactly one shard, chosen by hashing the code. In practice you use <a href="{{BASE}}hld/hld-02">consistent hashing</a> (or let DynamoDB/Cassandra do it) so adding a shard moves only a small share of keys. Each shard keeps 2 replicas.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Hashing the code to pick a shard is <b>ECMP flow hashing</b>: hash the 5-tuple, pick a path, and the same flow always lands on the same path. Consistent hashing is <b>resilient ECMP hashing</b>: when one next-hop dies, only its own flows move, not all of them. <i>Where it breaks:</i> a link can carry any flow at any moment, but a shard also <b>stores</b> data, so moving keys to a new shard means copying bytes (and serving reads during the copy), not just rehashing.</p>
+        </div>
+      

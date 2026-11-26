@@ -1,0 +1,79 @@
+
+        <h2>Two kinds of failure: poison and transient</h2>
+        <p>The most important design decision in a stream processor is not the happy path. It is: <b>when a record fails, is it the record's fault or the world's fault?</b></p>
+        <div class="proscons">
+          <div class="pros"><h5>Transient (the world's fault)</h5><ul><li>Price service timed out</li><li>Catalog database restarting</li><li>Network blip</li><li><b>Retrying later can work</b>, so send it to <code>orders.retry</code></li></ul></div>
+          <div class="cons"><h5>Poison (the record's fault)</h5><ul><li>Not valid JSON</li><li>Missing <code>items</code> field</li><li>Unknown product, quantity of -3</li><li><b>Retrying will never work</b>, so send it to <code>orders.dlq</code></li></ul></div>
+        </div>
+        <p>The enricher turns this decision into two Python exception classes. The business logic raises one or the other; the main loop routes by type. This is the real code:</p>
+<pre><code class="language-python"># services/enricher/enricher.py (excerpt)
+class PoisonMessage(Exception):
+    """Retrying cannot fix this record. Send it to the DLQ."""
+
+class TransientError(Exception):
+    """Might work later (dependency down / timeout). Send to retry topic."""
+
+def enrich(raw: bytes | None, catalog: Catalog) -&gt; dict:
+    """Pure-ish business logic: validate + add prices. Raises Poison/Transient."""
+    try:
+        order = json.loads(raw or b"")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise PoisonMessage(f"not valid JSON: {exc}") from exc
+    if not isinstance(order, dict):
+        raise PoisonMessage("event is not a JSON object")
+    for field in ("order_id", "customer_id", "items"):
+        if field not in order:
+            raise PoisonMessage(f"missing field {field}")
+    ...
+    for item in order["items"]:
+        qty = item.get("quantity") if isinstance(item, dict) else None
+        if not isinstance(qty, int) or qty &lt;= 0:
+            raise PoisonMessage(f"bad quantity in {item}")
+        name, unit = catalog.price(item.get("product_id", ""))   # may raise either kind
+        ...</code></pre>
+        <p>And inside <code>Catalog.price()</code>, a database connection error becomes <code>TransientError</code> ("try later"), while a product that is not in the catalog becomes <code>PoisonMessage</code> ("never going to work"). The split is made where the knowledge is.</p>
+
+        <div class="callout warn"><p><b>Careful:</b> if you treat everything as transient, one bad record loops forever through the retry topic and wastes capacity. If you treat everything as poison, a 30-second database restart fills your DLQ with thousands of perfectly good orders. (Honest note: ShopStream's default retry ladder lasts only about 30 s at most, so even a short restart can exhaust it. For real outages raise <code>BASE_BACKOFF_MS</code> and <code>MAX_ATTEMPTS</code>, for example 5000 and 6 gives caps of 5, 10, 20, 40, 60, 60 s, up to about 3 minutes.) Classify at the point where you know <em>why</em> it failed.</p></div>
+
+        <h3>Why not just retry in place?</h3>
+        <p>The simplest retry is "sleep and try again, right here". In Kafka that is a trap. A <a href="{{BASE}}interview/glossary#partition">partition</a> is a single ordered line, and one consumer owns it. If the consumer sleeps on record 57, records 58, 59, 60 and every other order in that partition wait too. This is called <b>head-of-line blocking</b>. Worse, if the consumer does not call <code>poll()</code> for longer than <code>max.poll.interval.ms</code> (5 minutes by default), the group coordinator decides it is dead and triggers a <a href="{{BASE}}interview/glossary#rebalance">rebalance</a>.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Top: retrying in place blocks every record behind the failing one. Bottom: moving the failing record to a retry topic keeps the partition flowing.">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="10" y="22">A. Retry in place: one stuck record blocks the line</text>
+            <rect class="cell filled" x="20" y="45" width="52" height="40"/><text class="label small" x="46" y="65">60</text>
+            <rect class="cell filled" x="76" y="45" width="52" height="40"/><text class="label small" x="102" y="65">59</text>
+            <rect class="cell filled" x="132" y="45" width="52" height="40"/><text class="label small" x="158" y="65">58</text>
+            <rect class="box fail" x="188" y="45" width="52" height="40"/><text class="label bad" x="214" y="65">57</text>
+            <path class="arrow bad" d="M244 65 L320 65"/>
+            <rect class="box svc" x="325" y="40" width="170" height="50"/>
+            <text class="label" x="410" y="58">enricher</text>
+            <text class="label small bad" x="410" y="78">sleep(8s)... again...</text>
+            <text class="label small" x="640" y="58">58, 59, 60 all wait.</text>
+            <text class="label small" x="640" y="80">Lag grows. Rebalance risk.</text>
+
+            <text class="label left" x="10" y="140">B. Retry topic: move the stuck record aside, keep going</text>
+            <rect class="cell filled" x="20" y="165" width="52" height="40"/><text class="label small" x="46" y="185">60</text>
+            <rect class="cell filled" x="76" y="165" width="52" height="40"/><text class="label small" x="102" y="185">59</text>
+            <rect class="cell filled" x="132" y="165" width="52" height="40"/><text class="label small" x="158" y="185">58</text>
+            <path class="arrow ok" d="M188 185 L320 185"/>
+            <rect class="box svc" x="325" y="160" width="170" height="50"/>
+            <text class="label" x="410" y="185">enricher</text>
+            <path class="arrow ok" d="M495 185 L590 185"/>
+            <rect class="box kafka" x="595" y="160" width="160" height="50"/>
+            <text class="label" x="675" y="185">orders.enriched</text>
+            <path class="arrow" d="M410 210 L410 245"/>
+            <rect class="box queue" x="325" y="248" width="170" height="44"/>
+            <text class="label" x="410" y="270">orders.retry: 57</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M20 185 L320 185 L495 185 L595 185"/></circle>
+            <circle class="packet gold" r="6"><animateMotion dur="3s" begin="0.8s" repeatCount="indefinite" path="M410 210 L410 270"/></circle>
+          </svg>
+          <figcaption>Head-of-line blocking (A) versus a retry topic (B). In B the failing record 57 waits on its own shelf while 58, 59, 60 keep flowing.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Head-of-line blocking is exactly the HOL problem in an input-queued switch: one packet waiting for a busy output port blocks the packets behind it that want free ports. The fix there is virtual output queues; the fix here is a separate queue (topic) for the slow cases. Where it breaks: switch VOQs keep per-flow order, but a Kafka retry topic does not (see the ordering note below).</p>
+        </div>
+      

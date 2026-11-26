@@ -1,0 +1,927 @@
+<h3>Python and C++14</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Python: elevator.py">
+<pre><code class="language-python">"""Elevator system - same design as the Java version: State per car, LOOK/SCAN movement policy,
+dispatch strategy across cars, requests as commands, and a controller as mediator."""
+from __future__ import annotations
+
+import queue
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional, Protocol
+
+
+class Direction(Enum):
+    UP = 1
+    DOWN = -1
+    IDLE = 0
+
+    def step(self) -&gt; int:
+        return self.value
+
+
+@dataclass(frozen=True)
+class HallCall:
+    floor: int
+    direction: Direction
+
+    def execute(self, c: "ElevatorController") -&gt; None:
+        c.assign_hall_call(self)
+
+
+@dataclass(frozen=True)
+class CarCall:
+    elevator_id: int
+    floor: int
+
+    def execute(self, c: "ElevatorController") -&gt; None:
+        c.elevator(self.elevator_id).add_car_call(self.floor)
+
+
+class ElevatorListener:
+    def on_dispatch(self, t: int, call: HallCall, e: "Elevator") -&gt; None: ...
+    def on_move(self, t: int, e: "Elevator") -&gt; None: ...
+    def on_doors_open(self, t: int, e: "Elevator") -&gt; None: ...
+    def on_state_change(self, t: int, e: "Elevator", frm: str, to: str) -&gt; None: ...
+
+
+# ---- movement policies (Strategy inside a car) ----
+class MovementPolicy(Protocol):
+    def continue_ahead(self, e: "Elevator", d: Direction) -&gt; bool: ...
+
+
+class LookPolicy:
+    def continue_ahead(self, e, d):
+        return e.has_stops_beyond(d)
+
+
+class ScanPolicy:
+    def continue_ahead(self, e, d):
+        return e.has_stops() and not e.at_end(d)
+
+
+# ---- dispatch strategies (Strategy across cars) ----
+class NearestCarDispatch:
+    def choose(self, cars, call):
+        return min(cars, key=lambda e: (abs(e.floor - call.floor), e.id), default=None)
+
+
+class DirectionalCostDispatch:
+    def choose(self, cars, call):
+        return min(cars, key=lambda e: (self.cost(e, call), e.id), default=None)
+
+    @staticmethod
+    def cost(e: "Elevator", call: HallCall) -&gt; int:
+        f, d = e.floor, e.direction
+        if d is Direction.IDLE:
+            return abs(f - call.floor)
+        ahead = (call.floor - f) * d.step() &gt;= 0
+        if ahead and call.direction is d:
+            return abs(call.floor - f)
+        turn = e.farthest_stop(d)
+        return abs(turn - f) + abs(turn - call.floor)
+
+
+# ---- states (State pattern) ----
+class State:
+    name = "?"
+
+    def tick(self, e: "Elevator") -&gt; "State":
+        raise NotImplementedError
+
+
+class Idle(State):
+    name = "IDLE"
+
+    def tick(self, e):
+        if e.has_call_at(e.floor):
+            e.serve_here()
+            return DOORS_OPEN
+        d = e.next_direction()
+        if d is Direction.IDLE:
+            return OUT_OF_SERVICE if e.maintenance_requested else self
+        e.direction = d
+        return MOVING
+
+
+class Moving(State):
+    name = "MOVING"
+
+    def tick(self, e):
+        e.move_one_floor()
+        if e.should_stop_here():
+            e.serve_here()
+            return DOORS_OPEN
+        d = e.next_direction()
+        e.direction = d
+        return IDLE if d is Direction.IDLE else self
+
+
+class DoorsOpen(State):
+    name = "DOORS_OPEN"
+
+    def tick(self, e):
+        e.door_ticks -= 1
+        if e.door_ticks &gt; 0:
+            return self
+        d = e.next_direction()
+        e.direction = d
+        if d is not Direction.IDLE:
+            return MOVING
+        return OUT_OF_SERVICE if e.maintenance_requested else IDLE
+
+
+class OutOfService(State):
+    name = "OUT_OF_SERVICE"
+
+    def tick(self, e):
+        return self
+
+
+IDLE, MOVING, DOORS_OPEN, OUT_OF_SERVICE = Idle(), Moving(), DoorsOpen(), OutOfService()
+DOOR_DWELL_TICKS = 1
+
+
+class Elevator:
+    def __init__(self, eid, min_floor, max_floor, start_floor, policy, listeners):
+        self.id, self.min_floor, self.max_floor = eid, min_floor, max_floor
+        self.floor, self.policy, self.listeners = start_floor, policy, listeners
+        self.car_calls, self.hall_up, self.hall_down = set(), set(), set()
+        self.direction, self.state = Direction.IDLE, IDLE
+        self.door_ticks = self.floors_travelled = self.now = 0
+        self.maintenance_requested = False
+
+    def __repr__(self):
+        return f"E{self.id}"
+
+    def accepts_new_calls(self) -&gt; bool:
+        return not self.maintenance_requested and self.state is not OUT_OF_SERVICE
+
+    def busy(self) -&gt; bool:
+        return self.has_stops() or self.state in (DOORS_OPEN, MOVING)
+
+    def add_car_call(self, f: int) -&gt; bool:
+        self._check(f)
+        if not self.accepts_new_calls():
+            return False
+        if f == self.floor and self.state is DOORS_OPEN:
+            self.door_ticks = DOOR_DWELL_TICKS
+            return True
+        self.car_calls.add(f)
+        return True
+
+    def add_hall_call(self, c: HallCall) -&gt; None:
+        self._check(c.floor)
+        self._hall(c.direction).add(c.floor)
+        if c.floor == self.floor and self.state is DOORS_OPEN:
+            self.serve_here()
+
+    def request_maintenance(self):
+        self.maintenance_requested = True
+
+    def end_maintenance(self):
+        self.maintenance_requested = False
+        if self.state is OUT_OF_SERVICE:
+            self._change(IDLE)
+
+    def tick(self, now: int) -&gt; None:
+        self.now = now
+        self._change(self.state.tick(self))
+
+    def _change(self, nxt: State) -&gt; None:
+        if nxt is self.state:
+            return
+        frm, self.state = self.state.name, nxt
+        for l in self.listeners:
+            l.on_state_change(self.now, self, frm, nxt.name)
+
+    # ---- helpers used by the states ----
+    def _hall(self, d: Direction) -&gt; set:
+        return self.hall_up if d is Direction.UP else self.hall_down
+
+    def has_stops(self) -&gt; bool:
+        return bool(self.car_calls or self.hall_up or self.hall_down)
+
+    def has_call_at(self, f: int) -&gt; bool:
+        return f in self.car_calls or f in self.hall_up or f in self.hall_down
+
+    def at_end(self, d: Direction) -&gt; bool:
+        if d is Direction.UP:
+            return self.floor &gt;= self.max_floor
+        if d is Direction.DOWN:
+            return self.floor &lt;= self.min_floor
+        return True
+
+    def has_stops_beyond(self, d: Direction) -&gt; bool:
+        stops = self.car_calls | self.hall_up | self.hall_down
+        if d is Direction.UP:
+            return any(s &gt; self.floor for s in stops)
+        if d is Direction.DOWN:
+            return any(s &lt; self.floor for s in stops)
+        return False
+
+    def farthest_stop(self, d: Direction) -&gt; int:
+        stops = self.car_calls | self.hall_up | self.hall_down | {self.floor}
+        return max(stops) if d is Direction.UP else min(stops)
+
+    def next_direction(self) -&gt; Direction:
+        if not self.has_stops():
+            return Direction.IDLE
+        if self.direction is not Direction.IDLE and self.policy.continue_ahead(self, self.direction):
+            return self.direction
+        if self.has_stops_beyond(Direction.UP):
+            return Direction.UP
+        if self.has_stops_beyond(Direction.DOWN):
+            return Direction.DOWN
+        return Direction.IDLE
+
+    def should_stop_here(self) -&gt; bool:
+        if self.floor in self.car_calls or self.floor in self._hall(self.direction):
+            return True
+        other = self.hall_down if self.direction is Direction.UP else self.hall_up
+        return self.floor in other and not self.policy.continue_ahead(self, self.direction)
+
+    def move_one_floor(self) -&gt; None:
+        if self.state is DOORS_OPEN:
+            raise RuntimeError("safety: moving with doors open")
+        nxt = self.floor + self.direction.step()
+        if not self.min_floor &lt;= nxt &lt;= self.max_floor:
+            raise RuntimeError(f"safety: floor {nxt} out of shaft")
+        self.floor = nxt
+        self.floors_travelled += 1
+        for l in self.listeners:
+            l.on_move(self.now, self)
+
+    def serve_here(self) -&gt; None:
+        self.car_calls.discard(self.floor)
+        if self.direction is not Direction.IDLE:
+            self._hall(self.direction).discard(self.floor)
+        leaving = self.next_direction()
+        if leaving is Direction.IDLE:
+            self.hall_up.discard(self.floor)
+            self.hall_down.discard(self.floor)
+        else:
+            self._hall(leaving).discard(self.floor)
+        self.door_ticks = DOOR_DWELL_TICKS
+        for l in self.listeners:
+            l.on_doors_open(self.now, self)
+
+    def _check(self, f: int) -&gt; None:
+        if not self.min_floor &lt;= f &lt;= self.max_floor:
+            raise ValueError(f"floor {f} outside {self.min_floor}..{self.max_floor}")
+
+
+class ElevatorController:
+    """Mediator. submit() is thread-safe (queue.Queue); tick() runs on one controller thread."""
+
+    def __init__(self, min_floor: int, max_floor: int, dispatch):
+        if max_floor &lt;= min_floor:
+            raise ValueError("need at least two floors")
+        self.min_floor, self.max_floor, self.dispatch = min_floor, max_floor, dispatch
+        self.elevators: list[Elevator] = []
+        self.inbox: "queue.Queue" = queue.Queue()
+        self.unassigned: list[HallCall] = []
+        self.listeners: list[ElevatorListener] = []
+        self.time = 0
+
+    def add_elevator(self, start_floor: int, policy) -&gt; Elevator:
+        e = Elevator(len(self.elevators) + 1, self.min_floor, self.max_floor, start_floor, policy, self.listeners)
+        self.elevators.append(e)
+        return e
+
+    def add_listener(self, l: ElevatorListener) -&gt; None:
+        self.listeners.append(l)
+
+    def submit(self, r) -&gt; None:
+        if isinstance(r, HallCall):
+            if not self.min_floor &lt;= r.floor &lt;= self.max_floor:
+                raise ValueError(f"no floor {r.floor}")
+            if r.direction is Direction.IDLE:
+                raise ValueError("hall call needs UP or DOWN")
+            if r.direction is Direction.UP and r.floor == self.max_floor:
+                raise ValueError("no UP button on the top floor")
+            if r.direction is Direction.DOWN and r.floor == self.min_floor:
+                raise ValueError("no DOWN button on the ground floor")
+        self.inbox.put(r)
+
+    def tick(self) -&gt; None:
+        self.time += 1
+        while True:
+            try:
+                self.inbox.get_nowait().execute(self)
+            except queue.Empty:
+                break
+        retry, self.unassigned = self.unassigned, []
+        for call in retry:
+            self.assign_hall_call(call)
+        for e in self.elevators:
+            e.tick(self.time)
+
+    def all_idle(self) -&gt; bool:
+        return self.inbox.empty() and not self.unassigned and not any(e.busy() for e in self.elevators)
+
+    def run_until_idle(self, max_ticks: int) -&gt; int:
+        start = self.time
+        while True:
+            if self.time - start &gt;= max_ticks:
+                raise RuntimeError(f"still busy after {max_ticks} ticks")
+            self.tick()
+            if self.all_idle():
+                return self.time - start
+
+    def assign_hall_call(self, call: HallCall) -&gt; None:
+        chosen: Optional[Elevator] = self.dispatch.choose([e for e in self.elevators if e.accepts_new_calls()], call)
+        if chosen is None:
+            self.unassigned.append(call)
+            return
+        chosen.add_hall_call(call)
+        for l in self.listeners:
+            l.on_dispatch(self.time, call, chosen)
+
+    def elevator(self, eid: int) -&gt; Elevator:
+        if not 1 &lt;= eid &lt;= len(self.elevators):
+            raise ValueError(f"no elevator {eid}")
+        return self.elevators[eid - 1]</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">from dataclasses import dataclass
+
+from elevator import (CarCall, Direction, DirectionalCostDispatch, ElevatorController, ElevatorListener, HallCall,
+                      LookPolicy, ScanPolicy)
+
+
+@dataclass(frozen=True)
+class Person:
+    name: str
+    frm: int
+    to: int
+    spawn_at: int
+
+    @property
+    def dir(self):
+        return Direction.UP if self.to &gt; self.frm else Direction.DOWN
+
+
+class Passengers(ElevatorListener):
+    """Simulated people: press a hall button, board a car going their way, press a car button, get off."""
+
+    def __init__(self, c: ElevatorController, show: bool):
+        self.c, self.show = c, show
+        self.pending, self.waiting, self.riding, self.times = [], [], {}, {}
+
+    def add(self, name, frm, to, spawn_at):
+        self.pending.append(Person(name, frm, to, spawn_at))
+
+    def spawn(self, now):
+        for p in [p for p in self.pending if p.spawn_at == now]:
+            self.pending.remove(p)
+            self.waiting.append(p)
+            self.c.submit(HallCall(p.frm, p.dir))
+
+    def done(self):
+        return not (self.pending or self.waiting or self.riding)
+
+    def on_dispatch(self, t, call, e):
+        if self.show:
+            print(f"t={t:2d}  hall call {call.floor} {call.direction.name} -&gt; {e} (at {e.floor}, {e.direction.name})")
+
+    def on_doors_open(self, t, e):
+        notes = []
+        for p, car in list(self.riding.items()):
+            if car is e and p.to == e.floor:
+                del self.riding[p]
+                self.times[p][1] = t
+                notes.append(f"{p.name} gets off")
+        going = e.next_direction()
+        for p in [p for p in self.waiting if p.frm == e.floor]:
+            if e.direction is p.dir or going is p.dir or going is Direction.IDLE:
+                self.waiting.remove(p)
+                self.riding[p] = e
+                self.times[p] = [t, -1]
+                self.c.submit(CarCall(e.id, p.to))
+                notes.append(f"{p.name} boards, presses {p.to}")
+        if self.show:
+            print(f"t={t:2d}  {e} doors open at {e.floor}" + "".join(f" | {n}" for n in notes))
+
+
+def run_scenario(c, ps, max_ticks):
+    while not (ps.done() and c.all_idle()):
+        if c.time &gt; max_ticks:
+            raise RuntimeError("scenario did not finish")
+        ps.spawn(c.time + 1)
+        c.tick()
+    return ps
+
+
+def travel(policy) -&gt; int:
+    c = ElevatorController(0, 10, DirectionalCostDispatch())
+    e = c.add_elevator(4, policy)
+    c.tick()
+    c.submit(CarCall(1, 6))
+    c.submit(CarCall(1, 2))
+    c.run_until_idle(100)
+    return e.floors_travelled
+
+
+if __name__ == "__main__":
+    print("== Two cars, floors 0..10, LOOK + directional dispatch ==")
+    c = ElevatorController(0, 10, DirectionalCostDispatch())
+    c.add_elevator(0, LookPolicy())
+    c.add_elevator(8, LookPolicy())
+    ps = Passengers(c, True)
+    c.add_listener(ps)
+    for args in [("Asha", 3, 8, 1), ("Ravi", 9, 0, 1), ("Meera", 6, 2, 3), ("Kabir", 0, 10, 4)]:
+        ps.add(*args)
+    run_scenario(c, ps, 200)
+    for p, (boarded, arrived) in ps.times.items():
+        print(f"  {p.name:&lt;5} {p.frm}-&gt;{p.to:&lt;2} waited {boarded - p.spawn_at}, rode {arrived - boarded}")
+    print("== One car at floor 4, car calls 6 and 2: LOOK vs SCAN ==")
+    print("  LOOK floors travelled:", travel(LookPolicy()))
+    print("  SCAN floors travelled:", travel(ScanPolicy()))</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from elevator import (CarCall, Direction, DirectionalCostDispatch, ElevatorController, ElevatorListener, HallCall,
+                      LookPolicy, NearestCarDispatch, ScanPolicy)
+from main import Passengers, run_scenario, travel
+
+
+class ElevatorTest(unittest.TestCase):
+    def test_look_vs_scan(self):
+        self.assertEqual(travel(LookPolicy()), 6)
+        self.assertEqual(travel(ScanPolicy()), 14)
+
+    def test_invalid_buttons(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        for call in [HallCall(10, Direction.UP), HallCall(0, Direction.DOWN), HallCall(11, Direction.DOWN),
+                     HallCall(5, Direction.IDLE)]:
+            with self.assertRaises(ValueError):
+                c.submit(call)
+
+    def test_dispatch_prefers_direction(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        e1, e2 = c.add_elevator(0, LookPolicy()), c.add_elevator(5, LookPolicy())
+        c.submit(CarCall(1, 10))
+        for _ in range(3):
+            c.tick()
+        self.assertEqual((e1.floor, e1.direction), (2, Direction.UP))
+        call = HallCall(3, Direction.DOWN)
+        self.assertIs(NearestCarDispatch().choose(c.elevators, call), e1)
+        self.assertIs(DirectionalCostDispatch().choose(c.elevators, call), e2)
+
+    def test_never_moves_with_doors_open(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        c.add_elevator(0, ScanPolicy())
+        bad = []
+
+        class Spy(ElevatorListener):
+            def on_move(self, t, e):
+                if e.state.name != "MOVING" or not 0 &lt;= e.floor &lt;= 10:
+                    bad.append(t)
+
+        c.add_listener(Spy())
+        rnd = random.Random(3)
+        for i in range(300):
+            if i % 3 == 0:
+                c.submit(CarCall(1, rnd.randrange(11)))
+            c.tick()
+        c.run_until_idle(500)
+        self.assertEqual(bad, [])
+
+    def test_maintenance(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        m1, m2 = c.add_elevator(0, LookPolicy()), c.add_elevator(10, LookPolicy())
+        c.submit(CarCall(1, 4))
+        c.tick()
+        m1.request_maintenance()
+        c.submit(HallCall(1, Direction.UP))
+        c.run_until_idle(100)
+        self.assertEqual((m1.state.name, m1.floor, m2.floor), ("OUT_OF_SERVICE", 4, 1))
+        m2.request_maintenance()
+        c.run_until_idle(10)
+        c.submit(HallCall(7, Direction.DOWN))
+        for _ in range(5):
+            c.tick()
+        self.assertFalse(c.all_idle())
+        m1.end_maintenance()
+        c.run_until_idle(100)
+        self.assertEqual(m1.floor, 7)
+
+    def test_everyone_arrives(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        c.add_elevator(0, LookPolicy())
+        c.add_elevator(10, LookPolicy())
+        ps = Passengers(c, False)
+        c.add_listener(ps)
+        rnd = random.Random(42)
+        for i in range(120):
+            frm = rnd.randrange(11)
+            to = rnd.choice([f for f in range(11) if f != frm])
+            ps.add(f"p{i}", frm, to, 1 + rnd.randrange(200))
+        run_scenario(c, ps, 5000)
+        self.assertEqual(len(ps.times), 120)
+        self.assertTrue(all(arrived &gt; 0 for _, arrived in ps.times.values()))
+
+    def test_concurrent_buttons(self):
+        c = ElevatorController(0, 10, DirectionalCostDispatch())
+        for f in (0, 5, 10):
+            c.add_elevator(f, LookPolicy())
+        count = []
+
+        class Count(ElevatorListener):
+            def on_dispatch(self, t, call, e):
+                count.append(1)
+
+        c.add_listener(Count())
+
+        def press(seed):
+            r = random.Random(seed)
+            for _ in range(200):
+                c.submit(HallCall(1 + r.randrange(9), r.choice([Direction.UP, Direction.DOWN])))
+
+        threads = [threading.Thread(target=press, args=(s,)) for s in range(4)]
+        ctl = threading.Thread(target=lambda: [c.tick() for _ in range(50)])
+        for t in threads + [ctl]:
+            t.start()
+        for t in threads + [ctl]:
+            t.join()
+        c.run_until_idle(1000)
+        self.assertEqual(len(count), 800)
+        self.assertTrue(c.all_idle())
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14: main.cpp">
+<pre><code class="language-cpp">// Elevator system in C++14: same design as the Java version.
+// State per car (vtable of tick), LOOK/SCAN policy, dispatch strategy, requests as commands, controller as mediator.
+// Build: g++ -std=c++14 -Wall -O2 main.cpp -o elevator &amp;&amp; ./elevator
+// Single-threaded demo: MinGW g++ 6.3 (win32 thread model) has no std::mutex / std::thread. In a threaded build,
+// add `std::mutex mu_;` to ElevatorController and take it ONLY in submitHall/submitCar (push) and in tick() (swap
+// the inbox out); every other line runs on the one controller thread, exactly like the Java version.
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;deque&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+enum class Direction { UP = 1, DOWN = -1, IDLE = 0 };
+static int step(Direction d) { return static_cast&lt;int&gt;(d); }
+static const char* name(Direction d) { return d == Direction::UP ? "UP" : d == Direction::DOWN ? "DOWN" : "IDLE"; }
+
+class Elevator;
+class ElevatorController;
+
+struct ElevatorListener {
+    virtual ~ElevatorListener() = default;
+    virtual void onDispatch(int, int /*floor*/, Direction, Elevator&amp;) {}
+    virtual void onMove(int, Elevator&amp;) {}
+    virtual void onDoorsOpen(int, Elevator&amp;) {}
+};
+
+// ---- Strategy inside a car ----
+struct MovementPolicy {
+    virtual ~MovementPolicy() = default;
+    virtual bool continueAhead(const Elevator&amp; e, Direction d) const = 0;
+};
+struct LookPolicy : MovementPolicy { bool continueAhead(const Elevator&amp; e, Direction d) const override; };
+struct ScanPolicy : MovementPolicy { bool continueAhead(const Elevator&amp; e, Direction d) const override; };
+
+// ---- State pattern ----
+struct ElevatorState {
+    virtual ~ElevatorState() = default;
+    virtual const ElevatorState* tick(Elevator&amp; e) const = 0;
+    virtual const char* name() const = 0;
+};
+struct IdleState : ElevatorState { const ElevatorState* tick(Elevator&amp;) const override; const char* name() const override { return "IDLE"; } };
+struct MovingState : ElevatorState { const ElevatorState* tick(Elevator&amp;) const override; const char* name() const override { return "MOVING"; } };
+struct DoorsOpenState : ElevatorState { const ElevatorState* tick(Elevator&amp;) const override; const char* name() const override { return "DOORS_OPEN"; } };
+struct OutOfServiceState : ElevatorState { const ElevatorState* tick(Elevator&amp;) const override { return this; } const char* name() const override { return "OUT_OF_SERVICE"; } };
+static const IdleState IDLE;
+static const MovingState MOVING;
+static const DoorsOpenState DOORS_OPEN;
+static const OutOfServiceState OUT_OF_SERVICE;
+
+class Elevator {
+public:
+    Elevator(int id, int minF, int maxF, int start, const MovementPolicy&amp; p, std::vector&lt;ElevatorListener*&gt;&amp; ls)
+        : id_(id), min_(minF), max_(maxF), floor_(start), policy_(p), listeners_(ls) {}
+
+    int id() const { return id_; }
+    int floor() const { return floor_; }
+    Direction direction() const { return dir_; }
+    const char* stateName() const { return state_-&gt;name(); }
+    int floorsTravelled() const { return travelled_; }
+    bool maintenanceRequested() const { return maintenance_; }
+    bool acceptsNewCalls() const { return !maintenance_ &amp;&amp; state_ != &amp;OUT_OF_SERVICE; }
+    bool busy() const { return hasStops() || state_ == &amp;DOORS_OPEN || state_ == &amp;MOVING; }
+
+    bool addCarCall(int f) {
+        check(f);
+        if (!acceptsNewCalls()) return false;
+        if (f == floor_ &amp;&amp; state_ == &amp;DOORS_OPEN) { doorTicks_ = 1; return true; }
+        car_.insert(f);
+        return true;
+    }
+    void addHallCall(int f, Direction d) {
+        check(f);
+        hall(d).insert(f);
+        if (f == floor_ &amp;&amp; state_ == &amp;DOORS_OPEN) serveHere();
+    }
+    void requestMaintenance() { maintenance_ = true; }
+    void endMaintenance() { maintenance_ = false; if (state_ == &amp;OUT_OF_SERVICE) state_ = &amp;IDLE; }
+    void tick(int now) { now_ = now; state_ = state_-&gt;tick(*this); }
+
+    // helpers used by states and policies
+    bool hasStops() const { return !car_.empty() || !up_.empty() || !down_.empty(); }
+    bool hasCallAt(int f) const { return car_.count(f) || up_.count(f) || down_.count(f); }
+    bool atEnd(Direction d) const { return d == Direction::UP ? floor_ &gt;= max_ : d == Direction::DOWN ? floor_ &lt;= min_ : true; }
+    bool hasStopsBeyond(Direction d) const {
+        for (const std::set&lt;int&gt;* s : {&amp;car_, &amp;up_, &amp;down_}) {
+            if (d == Direction::UP &amp;&amp; s-&gt;upper_bound(floor_) != s-&gt;end()) return true;
+            if (d == Direction::DOWN &amp;&amp; s-&gt;lower_bound(floor_) != s-&gt;begin()) return true;
+        }
+        return false;
+    }
+    int farthestStop(Direction d) const {
+        int best = floor_;
+        for (const std::set&lt;int&gt;* s : {&amp;car_, &amp;up_, &amp;down_}) {
+            if (s-&gt;empty()) continue;
+            best = d == Direction::UP ? std::max(best, *s-&gt;rbegin()) : std::min(best, *s-&gt;begin());
+        }
+        return best;
+    }
+    Direction nextDirection() const {
+        if (!hasStops()) return Direction::IDLE;
+        if (dir_ != Direction::IDLE &amp;&amp; policy_.continueAhead(*this, dir_)) return dir_;
+        if (hasStopsBeyond(Direction::UP)) return Direction::UP;
+        if (hasStopsBeyond(Direction::DOWN)) return Direction::DOWN;
+        return Direction::IDLE;
+    }
+    bool shouldStopHere() const {
+        if (car_.count(floor_) || hallC(dir_).count(floor_)) return true;
+        const std::set&lt;int&gt;&amp; other = dir_ == Direction::UP ? down_ : up_;
+        return other.count(floor_) &amp;&amp; !policy_.continueAhead(*this, dir_);
+    }
+    void moveOneFloor() {
+        if (state_ == &amp;DOORS_OPEN) throw std::logic_error("safety: moving with doors open");
+        int next = floor_ + step(dir_);
+        if (next &lt; min_ || next &gt; max_) throw std::logic_error("safety: out of shaft");
+        floor_ = next;
+        ++travelled_;
+        for (auto* l : listeners_) l-&gt;onMove(now_, *this);
+    }
+    void serveHere() {
+        car_.erase(floor_);
+        if (dir_ != Direction::IDLE) hall(dir_).erase(floor_);
+        Direction leaving = nextDirection();
+        if (leaving == Direction::IDLE) { up_.erase(floor_); down_.erase(floor_); }
+        else hall(leaving).erase(floor_);
+        doorTicks_ = 1;
+        for (auto* l : listeners_) l-&gt;onDoorsOpen(now_, *this);
+    }
+    bool holdDoors() { return --doorTicks_ &gt; 0; }
+    void setDirection(Direction d) { dir_ = d; }
+
+private:
+    std::set&lt;int&gt;&amp; hall(Direction d) { return d == Direction::UP ? up_ : down_; }
+    const std::set&lt;int&gt;&amp; hallC(Direction d) const { return d == Direction::UP ? up_ : down_; }
+    void check(int f) const { if (f &lt; min_ || f &gt; max_) throw std::invalid_argument("floor outside shaft"); }
+
+    int id_, min_, max_, floor_, doorTicks_ = 0, travelled_ = 0, now_ = 0;
+    Direction dir_ = Direction::IDLE;
+    const ElevatorState* state_ = &amp;IDLE;
+    bool maintenance_ = false;
+    const MovementPolicy&amp; policy_;
+    std::vector&lt;ElevatorListener*&gt;&amp; listeners_;
+    std::set&lt;int&gt; car_, up_, down_;
+};
+
+bool LookPolicy::continueAhead(const Elevator&amp; e, Direction d) const { return e.hasStopsBeyond(d); }
+bool ScanPolicy::continueAhead(const Elevator&amp; e, Direction d) const { return e.hasStops() &amp;&amp; !e.atEnd(d); }
+
+const ElevatorState* IdleState::tick(Elevator&amp; e) const {
+    if (e.hasCallAt(e.floor())) { e.serveHere(); return &amp;DOORS_OPEN; }
+    Direction d = e.nextDirection();
+    if (d == Direction::IDLE) return e.maintenanceRequested() ? static_cast&lt;const ElevatorState*&gt;(&amp;OUT_OF_SERVICE) : this;
+    e.setDirection(d);
+    return &amp;MOVING;
+}
+const ElevatorState* MovingState::tick(Elevator&amp; e) const {
+    e.moveOneFloor();
+    if (e.shouldStopHere()) { e.serveHere(); return &amp;DOORS_OPEN; }
+    Direction d = e.nextDirection();
+    e.setDirection(d);
+    return d == Direction::IDLE ? static_cast&lt;const ElevatorState*&gt;(&amp;IDLE) : this;
+}
+const ElevatorState* DoorsOpenState::tick(Elevator&amp; e) const {
+    if (e.holdDoors()) return this;
+    Direction d = e.nextDirection();
+    e.setDirection(d);
+    if (d != Direction::IDLE) return &amp;MOVING;
+    return e.maintenanceRequested() ? static_cast&lt;const ElevatorState*&gt;(&amp;OUT_OF_SERVICE) : &amp;IDLE;
+}
+
+// ---- Strategy across cars ----
+struct DispatchStrategy {
+    virtual ~DispatchStrategy() = default;
+    virtual Elevator* choose(const std::vector&lt;Elevator*&gt;&amp; cars, int floor, Direction d) const = 0;
+};
+struct DirectionalCostDispatch : DispatchStrategy {
+    static int cost(const Elevator&amp; e, int target, Direction want) {
+        int f = e.floor();
+        Direction d = e.direction();
+        if (d == Direction::IDLE) return std::abs(f - target);
+        bool ahead = (target - f) * step(d) &gt;= 0;
+        if (ahead &amp;&amp; want == d) return std::abs(target - f);
+        int turn = e.farthestStop(d);
+        return std::abs(turn - f) + std::abs(turn - target);
+    }
+    Elevator* choose(const std::vector&lt;Elevator*&gt;&amp; cars, int floor, Direction d) const override {
+        Elevator* best = nullptr;
+        for (Elevator* e : cars)
+            if (!best || cost(*e, floor, d) &lt; cost(*best, floor, d)) best = e;   // ties keep the lower id
+        return best;
+    }
+};
+
+// ---- Command ----
+struct Request {
+    virtual ~Request() = default;
+    virtual void execute(ElevatorController&amp; c) = 0;
+};
+
+class ElevatorController {
+public:
+    ElevatorController(int minF, int maxF, const DispatchStrategy&amp; d) : min_(minF), max_(maxF), dispatch_(d) {}
+    Elevator&amp; addElevator(int start, const MovementPolicy&amp; p) {
+        cars_.emplace_back(new Elevator(static_cast&lt;int&gt;(cars_.size()) + 1, min_, max_, start, p, listeners_));
+        return *cars_.back();
+    }
+    void addListener(ElevatorListener* l) { listeners_.push_back(l); }
+    int time() const { return time_; }
+
+    void submitHall(int floor, Direction d);          // any thread (threaded build: lock mu_)
+    void submitCar(int elevatorId, int floor);        // any thread (threaded build: lock mu_)
+
+    void tick() {
+        ++time_;
+        std::deque&lt;std::unique_ptr&lt;Request&gt;&gt; batch;
+        batch.swap(inbox_);               // threaded build: lock mu_ for this swap only
+        for (auto&amp; r : batch) r-&gt;execute(*this);
+        std::deque&lt;std::pair&lt;int, Direction&gt;&gt; retry;
+        retry.swap(unassigned_);
+        for (auto&amp; c : retry) assignHallCall(c.first, c.second);
+        for (auto&amp; e : cars_) e-&gt;tick(time_);
+    }
+    bool allIdle() {
+        if (!inbox_.empty()) return false;
+        if (!unassigned_.empty()) return false;
+        for (auto&amp; e : cars_) if (e-&gt;busy()) return false;
+        return true;
+    }
+    int runUntilIdle(int maxTicks) {
+        int start = time_;
+        do {
+            if (time_ - start &gt;= maxTicks) throw std::runtime_error("still busy");
+            tick();
+        } while (!allIdle());
+        return time_ - start;
+    }
+    void assignHallCall(int floor, Direction d) {
+        std::vector&lt;Elevator*&gt; cands;
+        for (auto&amp; e : cars_) if (e-&gt;acceptsNewCalls()) cands.push_back(e.get());
+        Elevator* chosen = dispatch_.choose(cands, floor, d);
+        if (!chosen) { unassigned_.emplace_back(floor, d); return; }
+        chosen-&gt;addHallCall(floor, d);
+        for (auto* l : listeners_) l-&gt;onDispatch(time_, floor, d, *chosen);
+    }
+    Elevator&amp; elevator(int id) { return *cars_.at(id - 1); }
+
+private:
+    int min_, max_, time_ = 0;
+    const DispatchStrategy&amp; dispatch_;
+    std::vector&lt;std::unique_ptr&lt;Elevator&gt;&gt; cars_;
+    std::vector&lt;ElevatorListener*&gt; listeners_;
+    std::deque&lt;std::unique_ptr&lt;Request&gt;&gt; inbox_;
+    std::deque&lt;std::pair&lt;int, Direction&gt;&gt; unassigned_;
+};
+
+struct HallCall : Request {
+    int floor; Direction dir;
+    HallCall(int f, Direction d) : floor(f), dir(d) {}
+    void execute(ElevatorController&amp; c) override { c.assignHallCall(floor, dir); }
+};
+struct CarCall : Request {
+    int car, floor;
+    CarCall(int e, int f) : car(e), floor(f) {}
+    void execute(ElevatorController&amp; c) override { c.elevator(car).addCarCall(floor); }
+};
+
+void ElevatorController::submitHall(int floor, Direction d) {
+    if (floor &lt; min_ || floor &gt; max_ || d == Direction::IDLE ||
+        (d == Direction::UP &amp;&amp; floor == max_) || (d == Direction::DOWN &amp;&amp; floor == min_))
+        throw std::invalid_argument("invalid hall call");
+    inbox_.emplace_back(new HallCall(floor, d));
+}
+void ElevatorController::submitCar(int elevatorId, int floor) {
+    inbox_.emplace_back(new CarCall(elevatorId, floor));
+}
+
+struct Printer : ElevatorListener {
+    void onDispatch(int t, int f, Direction d, Elevator&amp; e) override {
+        std::printf("t=%2d  hall call %d %s -&gt; E%d (at %d, %s)\n", t, f, name(d), e.id(), e.floor(), name(e.direction()));
+    }
+    void onDoorsOpen(int t, Elevator&amp; e) override { std::printf("t=%2d  E%d doors open at %d\n", t, e.id(), e.floor()); }
+};
+
+static int travel(const MovementPolicy&amp; p) {
+    DirectionalCostDispatch d;
+    ElevatorController c(0, 10, d);
+    Elevator&amp; e = c.addElevator(4, p);
+    c.tick();
+    c.submitCar(1, 6);
+    c.submitCar(1, 2);
+    c.runUntilIdle(100);
+    return e.floorsTravelled();
+}
+
+int main() {
+    LookPolicy look;
+    ScanPolicy scan;
+    DirectionalCostDispatch dispatch;
+
+    std::printf("== Two cars, floors 0..10: hall calls only ==\n");
+    ElevatorController c(0, 10, dispatch);
+    c.addElevator(0, look);
+    c.addElevator(8, look);
+    Printer printer;
+    c.addListener(&amp;printer);
+    c.submitHall(3, Direction::UP);
+    c.submitHall(9, Direction::DOWN);
+    c.tick();
+    c.submitCar(1, 8);              // the person who got in at 3 presses 8
+    c.submitHall(6, Direction::DOWN);
+    c.runUntilIdle(100);
+
+    std::printf("LOOK floors travelled: %d\n", travel(look));
+    std::printf("SCAN floors travelled: %d\n", travel(scan));
+    assert(travel(look) == 6 &amp;&amp; travel(scan) == 14);
+
+    // many button presses interleaved with controller ticks (threads in Java/Python; interleaved here)
+    ElevatorController cc(0, 10, dispatch);
+    cc.addElevator(0, look);
+    cc.addElevator(10, look);
+    struct Count : ElevatorListener { int n = 0; void onDispatch(int, int, Direction, Elevator&amp;) override { ++n; } } count;
+    cc.addListener(&amp;count);
+    unsigned s = 1234u;
+    for (int i = 0; i &lt; 800; ++i) {
+        s = s * 1103515245u + 12345u;
+        cc.submitHall(1 + static_cast&lt;int&gt;((s &gt;&gt; 16) % 9), (s &gt;&gt; 8) &amp; 1 ? Direction::UP : Direction::DOWN);
+        if (i % 16 == 0) cc.tick();
+    }
+    cc.runUntilIdle(1000);
+    assert(count.n == 800);
+    bool rejected = false;
+    try { cc.submitHall(10, Direction::UP); } catch (const std::invalid_argument&amp;) { rejected = true; }
+    assert(rejected);
+    std::printf("800 interleaved presses dispatched: %d\nAll C++ checks passed\n", count.n);
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <p>Python: <code>python main.py</code> prints the same scenario lines as Java, and <code>python -m unittest -v test_elevator</code> runs 7 tests. C++: <code>g++ -std=c++14 -Wall -O2 main.cpp -o elevator</code>. Test run and C++ output:</p>
+<pre class="terminal"><code>test_concurrent_buttons (test_elevator.ElevatorTest.test_concurrent_buttons) ... ok
+test_dispatch_prefers_direction (test_elevator.ElevatorTest.test_dispatch_prefers_direction) ... ok
+test_everyone_arrives (test_elevator.ElevatorTest.test_everyone_arrives) ... ok
+test_invalid_buttons (test_elevator.ElevatorTest.test_invalid_buttons) ... ok
+test_look_vs_scan (test_elevator.ElevatorTest.test_look_vs_scan) ... ok
+test_maintenance (test_elevator.ElevatorTest.test_maintenance) ... ok
+test_never_moves_with_doors_open (test_elevator.ElevatorTest.test_never_moves_with_doors_open) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.012s
+
+OK</code></pre>
+<pre class="terminal"><code>== Two cars, floors 0..10: hall calls only ==
+t= 1  hall call 3 UP -&gt; E1 (at 0, IDLE)
+t= 1  hall call 9 DOWN -&gt; E2 (at 8, IDLE)
+t= 2  hall call 6 DOWN -&gt; E2 (at 8, UP)
+t= 2  E2 doors open at 9
+t= 4  E1 doors open at 3
+t= 6  E2 doors open at 6
+t=10  E1 doors open at 8
+LOOK floors travelled: 6
+SCAN floors travelled: 14
+800 interleaved presses dispatched: 800
+All C++ checks passed</code></pre>
+  <p>The C++ build is single-threaded on purpose: the MinGW g++ 6.3 used here has no <code>std::thread</code> or <code>std::mutex</code>. The comment at the top of <code>main.cpp</code> says where the one mutex goes in a threaded build, and the demo interleaves 800 presses with ticks instead.</p>

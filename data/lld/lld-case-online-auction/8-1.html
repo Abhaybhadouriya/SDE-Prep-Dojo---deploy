@@ -1,0 +1,908 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Python: auction.py">
+<pre><code class="language-python">"""Online auction: Flipkart "highest unique bid" plus an English (ascending) variant.
+
+AuctionHouse is the mediator, AuctionRules the strategy, listeners the observers.
+Each Auction has its own lock; listeners are called after the lock is released.
+"""
+from __future__ import annotations
+
+import itertools
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional
+
+
+class AuctionError(Exception):
+    pass
+
+
+def money(paise: int) -&gt; str:
+    sign = "-" if paise &lt; 0 else ""
+    p = abs(paise)
+    return f"{sign}{p // 100}.{p % 100:02d}"
+
+
+class Buyer:
+    def __init__(self, name: str):
+        self.name = name
+        self.past_auctions = 0
+        self._lock = threading.Lock()
+
+    def record_participation(self) -&gt; None:
+        with self._lock:
+            self.past_auctions += 1
+
+    def is_preferred(self) -&gt; bool:
+        return self.past_auctions &gt; 2
+
+
+@dataclass(frozen=True)
+class Bid:
+    buyer: str
+    amount: int  # whole rupees
+    seq: int
+
+
+@dataclass(frozen=True)
+class AuctionResult:
+    auction_id: str
+    winner: Optional[Bid]
+    seller_profit_paise: int
+
+    def __str__(self) -&gt; str:
+        w = f"winner {self.winner.buyer} at {self.winner.amount}" if self.winner else "no winner"
+        return f"{self.auction_id}: {w}, seller profit {money(self.seller_profit_paise)}"
+
+
+class AuctionListener:
+    def on_bid(self, auction_id: str, bid: Bid) -&gt; None: ...
+    def on_outbid(self, auction_id: str, buyer: str, new_highest: int) -&gt; None: ...
+    def on_withdraw(self, auction_id: str, buyer: str) -&gt; None: ...
+    def on_closed(self, result: AuctionResult) -&gt; None: ...
+
+
+# ---------------- rules (Strategy) ----------------
+class AuctionRules:
+    allows_withdraw = True
+    name = "rules"
+
+    def validate(self, amount: int, low: int, high: int, best: Optional[Bid]) -&gt; None:
+        raise NotImplementedError
+
+    def pick_winner(self, bids: Iterable[Bid], is_preferred: Callable[[str], bool]) -&gt; Optional[Bid]:
+        raise NotImplementedError
+
+    def best(self, bids: Iterable[Bid]) -&gt; Optional[Bid]:
+        return None
+
+
+class HighestUniqueBidRules(AuctionRules):
+    name = "highest-unique"
+
+    def validate(self, amount, low, high, best):
+        if amount &lt; low or amount &gt; high:
+            raise AuctionError(f"bid {amount} outside limits [{low}, {high}]")
+
+    def pick_winner(self, bids, is_preferred):
+        by_amount: Dict[int, List[Bid]] = {}
+        for b in bids:
+            by_amount.setdefault(b.amount, []).append(b)
+        for amount in sorted(by_amount, reverse=True):
+            same = by_amount[amount]
+            if len(same) == 1:
+                return same[0]
+            preferred = [b for b in same if is_preferred(b.buyer)]
+            if len(preferred) == 1:          # bonus: one preferred buyer breaks the tie
+                return preferred[0]
+        return None
+
+
+class EnglishAuctionRules(AuctionRules):
+    allows_withdraw = False
+
+    def __init__(self, min_increment: int):
+        self.min_increment = min_increment
+        self.name = f"english+{min_increment}"
+
+    def validate(self, amount, low, high, best):
+        floor = best.amount + self.min_increment if best else low
+        if amount &lt; floor:
+            raise AuctionError(f"bid {amount} must be at least {floor}")
+        if amount &gt; high:
+            raise AuctionError(f"bid {amount} above cap {high}")
+
+    def pick_winner(self, bids, is_preferred):
+        return self.best(bids)
+
+    def best(self, bids):
+        top = None
+        for b in bids:
+            if top is None or b.amount &gt; top.amount or (b.amount == top.amount and b.seq &lt; top.seq):
+                top = b
+        return top
+
+
+# ---------------- auction ----------------
+class Auction:
+    def __init__(self, auction_id: str, seller: str, low: int, high: int, cost: int,
+                 rules: AuctionRules, clock: Callable[[], float], ends_at: Optional[float]):
+        if low &lt;= 0 or high &lt; low:
+            raise AuctionError(f"bad bid limits [{low}, {high}]")
+        self.id, self.seller, self.low, self.high, self.cost = auction_id, seller, low, high, cost
+        self.rules, self._clock, self.ends_at = rules, clock, ends_at
+        self._lock = threading.Lock()
+        self.open = True
+        self._live: Dict[str, Bid] = {}
+        self._participants: Dict[str, None] = {}   # ordered set
+        self._history: List[Bid] = []
+        self._seq = itertools.count(1)
+        self.result: Optional[AuctionResult] = None
+
+    def _ensure_open(self) -&gt; None:
+        if not self.open:
+            raise AuctionError(f"auction {self.id} is closed")
+        if self.ends_at is not None and self._clock() &gt;= self.ends_at:
+            raise AuctionError(f"auction {self.id} has ended")
+
+    def bid(self, buyer: str, amount: int, create: bool):
+        with self._lock:
+            self._ensure_open()
+            mine = self._live.get(buyer)
+            if create and mine is not None:
+                raise AuctionError(f"{buyer} already bid on {self.id}; use update")
+            if not create and mine is None:
+                raise AuctionError(f"{buyer} has no bid on {self.id} to update")
+            best = self.rules.best(self._live.values())
+            self.rules.validate(amount, self.low, self.high, best)
+            b = Bid(buyer, amount, next(self._seq))
+            self._live[buyer] = b
+            self._participants[buyer] = None
+            self._history.append(b)
+            outbid = best.buyer if best and best.buyer != buyer else None
+            return b, outbid
+
+    def withdraw(self, buyer: str) -&gt; None:
+        with self._lock:
+            self._ensure_open()
+            if not self.rules.allows_withdraw:
+                raise AuctionError(f"{self.rules.name} bids cannot be withdrawn")
+            if self._live.pop(buyer, None) is None:
+                raise AuctionError(f"{buyer} has no bid on {self.id}")
+
+    def close(self, is_preferred: Callable[[str], bool]) -&gt; Optional[AuctionResult]:
+        with self._lock:
+            if not self.open:
+                return None                      # idempotent: someone closed it first
+            self.open = False
+            winner = self.rules.pick_winner(list(self._live.values()), is_preferred)
+            share = len(self._participants) * self.cost * 20          # paise
+            profit = winner.amount * 100 + share - (self.low + self.high) * 50 if winner else share
+            self.result = AuctionResult(self.id, winner, profit)
+            return self.result
+
+    def participants(self) -&gt; List[str]:
+        with self._lock:
+            return list(self._participants)
+
+    def history(self) -&gt; List[Bid]:
+        with self._lock:
+            return list(self._history)
+
+    def best(self) -&gt; Optional[Bid]:
+        with self._lock:
+            return self.rules.best(self._live.values())
+
+
+# ---------------- mediator ----------------
+class AuctionHouse:
+    def __init__(self, clock: Callable[[], float] = time.monotonic):
+        self._clock = clock
+        self._buyers: Dict[str, Buyer] = {}
+        self._sellers: Dict[str, str] = {}
+        self._auctions: Dict[str, Auction] = {}
+        self._listeners: List[AuctionListener] = []
+        self._timers: List[threading.Timer] = []
+        self._lock = threading.Lock()               # guards the registries only
+
+    def add_listener(self, listener: AuctionListener) -&gt; None:
+        self._listeners.append(listener)
+
+    def add_buyer(self, name: str) -&gt; None:
+        with self._lock:
+            if name in self._buyers:
+                raise AuctionError(f"buyer exists: {name}")
+            self._buyers[name] = Buyer(name)
+
+    def add_seller(self, name: str) -&gt; None:
+        with self._lock:
+            if name in self._sellers:
+                raise AuctionError(f"seller exists: {name}")
+            self._sellers[name] = name
+
+    def create_auction(self, auction_id, low, high, cost, seller, rules, duration_s=None) -&gt; Auction:
+        if seller not in self._sellers:
+            raise AuctionError(f"unknown seller {seller}")
+        ends_at = None if duration_s is None else self._clock() + duration_s
+        a = Auction(auction_id, seller, low, high, cost, rules, self._clock, ends_at)
+        with self._lock:
+            if auction_id in self._auctions:
+                raise AuctionError(f"auction exists: {auction_id}")
+            self._auctions[auction_id] = a
+        if duration_s is not None:
+            t = threading.Timer(duration_s, self.close, args=(auction_id,))
+            t.daemon = True
+            self._timers.append(t)
+            t.start()
+        return a
+
+    def create_bid(self, buyer, auction_id, amount) -&gt; Bid:
+        return self._bid(buyer, auction_id, amount, True)
+
+    def update_bid(self, buyer, auction_id, amount) -&gt; Bid:
+        return self._bid(buyer, auction_id, amount, False)
+
+    def _bid(self, buyer, auction_id, amount, create) -&gt; Bid:
+        self._require_buyer(buyer)
+        bid, outbid = self.auction(auction_id).bid(buyer, amount, create)
+        for listener in self._listeners:                 # outside the auction lock
+            listener.on_bid(auction_id, bid)
+            if outbid:
+                listener.on_outbid(auction_id, outbid, bid.amount)
+        return bid
+
+    def withdraw_bid(self, buyer, auction_id) -&gt; None:
+        self._require_buyer(buyer)
+        self.auction(auction_id).withdraw(buyer)
+        for listener in self._listeners:
+            listener.on_withdraw(auction_id, buyer)
+
+    def close(self, auction_id) -&gt; AuctionResult:
+        a = self.auction(auction_id)
+        r = a.close(lambda name: self._buyers[name].is_preferred())
+        if r is None:
+            return a.result
+        for p in a.participants():
+            self._buyers[p].record_participation()
+        for listener in self._listeners:
+            listener.on_closed(r)
+        return r
+
+    def profit(self, seller, auction_id) -&gt; str:
+        a = self.auction(auction_id)
+        if a.seller != seller:
+            raise AuctionError(f"{seller} does not own {auction_id}")
+        if a.result is None:
+            raise AuctionError(f"{auction_id} is still open")
+        return money(a.result.seller_profit_paise)
+
+    def buyer(self, name) -&gt; Buyer:
+        return self._buyers[name]
+
+    def auction(self, auction_id) -&gt; Auction:
+        a = self._auctions.get(auction_id)
+        if a is None:
+            raise AuctionError(f"unknown auction {auction_id}")
+        return a
+
+    def _require_buyer(self, name) -&gt; None:
+        if name not in self._buyers:
+            raise AuctionError(f"unknown buyer {name}")
+
+    def shutdown(self) -&gt; None:
+        for t in self._timers:
+            t.cancel()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">"""Demo driver: the two Flipkart sample test cases, the preferred-buyer bonus and an English auction."""
+from auction import (AuctionError, AuctionHouse, AuctionListener, EnglishAuctionRules,
+                     HighestUniqueBidRules)
+
+
+class Printer(AuctionListener):
+    def __init__(self):
+        self.inbox = []
+
+    def on_outbid(self, auction_id, buyer, new_highest):
+        self.inbox.append(f"{buyer}: outbid on {auction_id} (now {new_highest})")
+
+    def on_closed(self, result):
+        print("  [notify]", result)
+
+
+def attempt(fn, *args):
+    try:
+        fn(*args)
+    except AuctionError as e:
+        print("  rejected:", e)
+
+
+def main():
+    house = AuctionHouse()
+    printer = Printer()
+    house.add_listener(printer)
+    unique = HighestUniqueBidRules()
+
+    print("== Test case 1 ==")
+    for b in ("buyer1", "buyer2", "buyer3"):
+        house.add_buyer(b)
+    house.add_seller("seller1")
+    house.create_auction("A1", 10, 50, 1, "seller1", unique)
+    house.create_bid("buyer1", "A1", 17)
+    house.create_bid("buyer2", "A1", 15)
+    house.update_bid("buyer2", "A1", 19)
+    house.create_bid("buyer3", "A1", 19)
+    house.close("A1")
+    print("  profit(seller1, A1) =", house.profit("seller1", "A1"))
+
+    print("== Test case 2 ==")
+    house.add_seller("seller2")
+    house.create_auction("A2", 5, 20, 2, "seller2", unique)
+    attempt(house.create_bid, "buyer3", "A2", 25)
+    house.create_bid("buyer2", "A2", 5)
+    house.withdraw_bid("buyer2", "A2")
+    house.close("A2")
+    print("  profit(seller2, A2) =", house.profit("seller2", "A2"))
+
+    print("== English auction ==")
+    house.add_buyer("quinn")
+    house.add_buyer("rae")
+    house.create_auction("E1", 100, 200, 0, "seller2", EnglishAuctionRules(10))
+    house.create_bid("quinn", "E1", 100)
+    house.create_bid("rae", "E1", 150)
+    attempt(house.update_bid, "quinn", "E1", 155)
+    house.update_bid("quinn", "E1", 160)
+    attempt(house.withdraw_bid, "quinn", "E1")
+    house.close("E1")
+    for m in printer.inbox:
+        print("  inbox", m)
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import threading
+import unittest
+
+from auction import (AuctionError, AuctionHouse, AuctionListener, EnglishAuctionRules,
+                     HighestUniqueBidRules)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+class AuctionTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self.h = AuctionHouse(self.clock)
+        for b in ("b1", "b2", "b3", "pat", "quinn", "rae"):
+            self.h.add_buyer(b)
+        self.h.add_seller("s1")
+        self.unique = HighestUniqueBidRules()
+
+    def tearDown(self):
+        self.h.shutdown()
+
+    def test_flipkart_case_1(self):
+        self.h.create_auction("A1", 10, 50, 1, "s1", self.unique)
+        self.h.create_bid("b1", "A1", 17)
+        self.h.create_bid("b2", "A1", 15)
+        self.h.update_bid("b2", "A1", 19)
+        self.h.create_bid("b3", "A1", 19)
+        self.assertEqual(self.h.close("A1").winner.buyer, "b1")
+        self.assertEqual(self.h.profit("s1", "A1"), "-12.40")
+
+    def test_flipkart_case_2_withdrawn_bidder_still_paid(self):
+        self.h.create_auction("A2", 5, 20, 2, "s1", self.unique)
+        with self.assertRaises(AuctionError):
+            self.h.create_bid("b3", "A2", 25)
+        self.h.create_bid("b2", "A2", 5)
+        self.h.withdraw_bid("b2", "A2")
+        self.assertIsNone(self.h.close("A2").winner)
+        self.assertEqual(self.h.profit("s1", "A2"), "0.40")
+
+    def test_highest_unique_example_from_statement(self):
+        self.h.add_buyer("d")
+        self.h.add_buyer("e")
+        self.h.add_buyer("f")
+        self.h.create_auction("X", 1, 100, 0, "s1", self.unique)
+        for b, amt in (("b1", 50), ("b2", 90), ("b3", 100), ("d", 90), ("e", 70), ("f", 100)):
+            self.h.create_bid(b, "X", amt)
+        self.assertEqual(self.h.close("X").winner.buyer, "e")
+
+    def test_preferred_buyer_breaks_tie(self):
+        for i in range(3):
+            self.h.create_auction(f"P{i}", 10, 100, 1, "s1", self.unique)
+            self.h.create_bid("pat", f"P{i}", 20)
+            self.h.close(f"P{i}")
+        self.assertTrue(self.h.buyer("pat").is_preferred())
+        self.h.create_auction("T", 10, 100, 1, "s1", self.unique)
+        self.h.create_bid("pat", "T", 40)
+        self.h.create_bid("quinn", "T", 40)
+        self.h.create_bid("rae", "T", 30)
+        self.assertEqual(self.h.close("T").winner.buyer, "pat")
+
+    def test_english_increment_outbid_and_binding(self):
+        inbox = []
+
+        class L(AuctionListener):
+            def on_outbid(self, a, buyer, amount):
+                inbox.append(buyer)
+
+        self.h.add_listener(L())
+        self.h.create_auction("E", 100, 200, 0, "s1", EnglishAuctionRules(10))
+        self.h.create_bid("quinn", "E", 100)
+        self.h.create_bid("rae", "E", 150)
+        with self.assertRaises(AuctionError):
+            self.h.update_bid("quinn", "E", 155)
+        self.h.update_bid("quinn", "E", 160)
+        with self.assertRaises(AuctionError):
+            self.h.withdraw_bid("quinn", "E")
+        self.assertEqual(inbox, ["quinn", "rae"])
+        self.assertEqual(self.h.close("E").winner.amount, 160)
+
+    def test_deadline_checked_on_bid_and_close_is_idempotent(self):
+        self.h.create_auction("D", 10, 100, 0, "s1", self.unique, duration_s=3600)
+        self.h.create_bid("b1", "D", 20)
+        self.clock.now += 3601                       # past the deadline; the timer has not fired
+        with self.assertRaises(AuctionError):
+            self.h.create_bid("b2", "D", 30)
+        first = self.h.close("D")
+        self.assertIs(self.h.close("D"), first)
+
+    def test_limits_are_inclusive_and_empty_auction_has_no_winner(self):
+        self.h.create_auction("L", 10, 50, 1, "s1", self.unique)
+        self.h.create_bid("b1", "L", 10)
+        self.h.create_bid("b2", "L", 50)
+        self.assertEqual(self.h.close("L").winner.buyer, "b2")
+        self.h.create_auction("Empty", 10, 50, 1, "s1", self.unique)
+        self.assertIsNone(self.h.close("Empty").winner)
+        self.assertEqual(self.h.profit("s1", "Empty"), "0.00")
+
+    def test_errors(self):
+        self.h.create_auction("Z", 10, 50, 1, "s1", self.unique)
+        with self.assertRaises(AuctionError):
+            self.h.create_bid("nobody", "Z", 20)
+        with self.assertRaises(AuctionError):
+            self.h.update_bid("b1", "Z", 20)
+        self.h.create_bid("b1", "Z", 20)
+        with self.assertRaises(AuctionError):
+            self.h.create_bid("b1", "Z", 21)
+        with self.assertRaises(AuctionError):
+            self.h.profit("s1", "Z")
+        self.h.close("Z")
+        with self.assertRaises(AuctionError):
+            self.h.create_bid("b2", "Z", 30)
+
+    def test_concurrent_english_bids_never_lose_an_update(self):
+        self.h.create_auction("R", 1, 10**9, 0, "s1", EnglishAuctionRules(5))
+        names = [f"bot{i}" for i in range(8)]
+        for n in names:
+            self.h.add_buyer(n)
+        accepted = []
+        acc_lock = threading.Lock()
+
+        def run(name):
+            placed = False
+            for _ in range(300):
+                best = self.h.auction("R").best()
+                nxt = best.amount + 5 if best else 1
+                try:
+                    (self.h.update_bid if placed else self.h.create_bid)(name, "R", nxt)
+                    placed = True
+                    with acc_lock:
+                        accepted.append(nxt)
+                except AuctionError:
+                    pass
+
+        ts = [threading.Thread(target=run, args=(n,)) for n in names]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        log = self.h.auction("R").history()
+        self.assertEqual(len(log), len(accepted))
+        self.assertTrue(all(b.amount &gt;= a.amount + 5 for a, b in zip(log, log[1:])))
+        self.assertEqual(self.h.close("R").winner.amount, log[-1].amount)
+
+    def test_timer_closes_auction(self):
+        real = AuctionHouse()
+        done = threading.Event()
+
+        class L(AuctionListener):
+            def on_closed(self, r):
+                done.set()
+
+        real.add_listener(L())
+        real.add_seller("s")
+        real.add_buyer("x")
+        real.create_auction("T1", 10, 100, 5, "s", HighestUniqueBidRules(), duration_s=0.15)
+        real.create_bid("x", "T1", 30)
+        self.assertTrue(done.wait(2))
+        self.assertFalse(real.auction("T1").open)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14: main.cpp">
+<pre><code class="language-cpp">// Online auction in C++14: same design as the Java version (rules = strategy, house = mediator,
+// listeners = observers). Locking as in Java: one mutex per Auction (m_) and one for the house registries (mu_).
+// Lock order: an auction lock may take the house lock (the preferred-buyer lookup in close()), so the house
+// never calls into an auction while holding mu_. Listeners run with no lock held.
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Build: g++ -std=c++14 -Wall -Wextra main.cpp -o auction
+// Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+#include &lt;cstdlib&gt;
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+// CHECK, not assert: assert() and any call inside it vanish under -DNDEBUG; CHECK always runs.
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed (line %d): %s\n", __LINE__, #x); std::exit(1); } } while (0)
+
+struct AuctionError : std::runtime_error {
+    explicit AuctionError(const std::string&amp; m) : std::runtime_error(m) {}
+};
+
+static std::string money(long long paise) {
+    long long p = paise &lt; 0 ? -paise : paise;
+    std::string cents = std::to_string(p % 100);
+    return (paise &lt; 0 ? "-" : "") + std::to_string(p / 100) + "." + (cents.size() &lt; 2 ? "0" : "") + cents;
+}
+
+struct Bid { std::string buyer; long long amount; long long seq; };
+using BidPtr = std::shared_ptr&lt;const Bid&gt;;            // immutable once made
+using Preferred = std::function&lt;bool(const std::string&amp;)&gt;;
+
+struct Result { std::string auction; BidPtr winner; long long profitPaise; };
+
+// ---- Strategy: an ops table, like struct file_operations ----
+struct AuctionRules {
+    virtual ~AuctionRules() {}
+    virtual void validate(long long amt, long long lo, long long hi, const BidPtr&amp; best) const = 0;
+    virtual BidPtr pickWinner(const std::vector&lt;BidPtr&gt;&amp; bids, const Preferred&amp; pref) const = 0;
+    virtual BidPtr best(const std::vector&lt;BidPtr&gt;&amp;) const { return nullptr; }
+    virtual bool allowsWithdraw() const { return true; }
+};
+
+struct HighestUniqueBidRules : AuctionRules {
+    void validate(long long amt, long long lo, long long hi, const BidPtr&amp;) const override {
+        if (amt &lt; lo || amt &gt; hi) throw AuctionError("bid " + std::to_string(amt) + " outside limits");
+    }
+    BidPtr pickWinner(const std::vector&lt;BidPtr&gt;&amp; bids, const Preferred&amp; pref) const override {
+        std::map&lt;long long, std::vector&lt;BidPtr&gt;, std::greater&lt;long long&gt;&gt; byAmount;
+        for (auto&amp; b : bids) byAmount[b-&gt;amount].push_back(b);
+        for (auto&amp; e : byAmount) {
+            if (e.second.size() == 1) return e.second[0];
+            BidPtr only; int n = 0;
+            for (auto&amp; b : e.second) if (pref(b-&gt;buyer)) { only = b; ++n; }
+            if (n == 1) return only;                      // one preferred buyer breaks the tie
+        }
+        return nullptr;
+    }
+};
+
+struct EnglishAuctionRules : AuctionRules {
+    long long inc;
+    explicit EnglishAuctionRules(long long i) : inc(i) {}
+    void validate(long long amt, long long lo, long long hi, const BidPtr&amp; best) const override {
+        long long floor = best ? best-&gt;amount + inc : lo;
+        if (amt &lt; floor) throw AuctionError("bid " + std::to_string(amt) + " must be at least " + std::to_string(floor));
+        if (amt &gt; hi) throw AuctionError("bid above cap");
+    }
+    BidPtr best(const std::vector&lt;BidPtr&gt;&amp; bids) const override {
+        BidPtr top;
+        for (auto&amp; b : bids) if (!top || b-&gt;amount &gt; top-&gt;amount) top = b;
+        return top;
+    }
+    BidPtr pickWinner(const std::vector&lt;BidPtr&gt;&amp; bids, const Preferred&amp;) const override { return best(bids); }
+    bool allowsWithdraw() const override { return false; }
+};
+
+// ---- Observer: virtuals with empty defaults ----
+struct AuctionListener {
+    virtual ~AuctionListener() {}
+    virtual void onOutbid(const std::string&amp;, const std::string&amp;, long long) {}
+    virtual void onClosed(const Result&amp;) {}
+};
+
+class Auction {
+public:
+    Auction(std::string id, std::string seller, long long lo, long long hi, long long cost,
+            std::shared_ptr&lt;const AuctionRules&gt; rules)
+        : id_(std::move(id)), seller_(std::move(seller)), lo_(lo), hi_(hi), cost_(cost), rules_(std::move(rules)) {
+        if (lo &lt;= 0 || hi &lt; lo) throw AuctionError("bad bid limits");
+    }
+    // returns the buyer who lost the lead ("" if none)
+    std::string bid(const std::string&amp; buyer, long long amt, bool create, BidPtr* out) {
+        std::lock_guard&lt;Mutex&gt; g(m_);
+        if (closed_) throw AuctionError("auction " + id_ + " is closed");
+        auto it = live_.find(buyer);
+        if (create &amp;&amp; it != live_.end()) throw AuctionError(buyer + " already bid; use update");
+        if (!create &amp;&amp; it == live_.end()) throw AuctionError(buyer + " has no bid to update");
+        BidPtr best = rules_-&gt;best(values());
+        rules_-&gt;validate(amt, lo_, hi_, best);
+        BidPtr b = std::make_shared&lt;const Bid&gt;(Bid{buyer, amt, ++seq_});
+        live_[buyer] = b;
+        if (std::find(participants_.begin(), participants_.end(), buyer) == participants_.end())
+            participants_.push_back(buyer);
+        history_.push_back(b);
+        *out = b;
+        return best &amp;&amp; best-&gt;buyer != buyer ? best-&gt;buyer : "";
+    }
+    void withdraw(const std::string&amp; buyer) {
+        std::lock_guard&lt;Mutex&gt; g(m_);
+        if (closed_) throw AuctionError("auction closed");
+        if (!rules_-&gt;allowsWithdraw()) throw AuctionError("bids cannot be withdrawn here");
+        if (!live_.erase(buyer)) throw AuctionError(buyer + " has no bid");
+    }
+    // first caller closes; returns false if it was already closed
+    bool close(const Preferred&amp; pref, Result* out) {
+        std::lock_guard&lt;Mutex&gt; g(m_);
+        if (closed_) { *out = result_; return false; }
+        closed_ = true;
+        BidPtr w = rules_-&gt;pickWinner(values(), pref);
+        long long share = (long long)participants_.size() * cost_ * 20;
+        result_ = Result{id_, w, w ? w-&gt;amount * 100 + share - (lo_ + hi_) * 50 : share};
+        *out = result_;
+        return true;
+    }
+    std::vector&lt;std::string&gt; participants() { std::lock_guard&lt;Mutex&gt; g(m_); return participants_; }
+    std::vector&lt;BidPtr&gt; history() { std::lock_guard&lt;Mutex&gt; g(m_); return history_; }
+    BidPtr best() { std::lock_guard&lt;Mutex&gt; g(m_); return rules_-&gt;best(values()); }
+    const std::string&amp; seller() const { return seller_; }
+
+private:
+    std::vector&lt;BidPtr&gt; values() const {
+        std::vector&lt;BidPtr&gt; v;
+        for (auto&amp; kv : live_) v.push_back(kv.second);
+        return v;
+    }
+    std::string id_, seller_;
+    long long lo_, hi_, cost_;
+    std::shared_ptr&lt;const AuctionRules&gt; rules_;
+    bool closed_ = false;
+    std::map&lt;std::string, BidPtr&gt; live_;
+    std::vector&lt;std::string&gt; participants_;
+    std::vector&lt;BidPtr&gt; history_;
+    long long seq_ = 0;
+    Result result_;
+    Mutex m_;                                          // one lock per auction: bids on different auctions run in parallel
+};
+
+class AuctionHouse {                                   // mediator
+public:
+    void addListener(AuctionListener* l) { listeners_.push_back(l); }   // not owned
+    void addBuyer(const std::string&amp; n) { std::lock_guard&lt;Mutex&gt; g(mu_); past_[n] = 0; }
+    void addSeller(const std::string&amp; n) { std::lock_guard&lt;Mutex&gt; g(mu_); sellers_[n] = true; }
+    Auction&amp; create(const std::string&amp; id, long long lo, long long hi, long long cost, const std::string&amp; seller,
+                    std::shared_ptr&lt;const AuctionRules&gt; rules) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (!sellers_.count(seller)) throw AuctionError("unknown seller " + seller);
+        if (auctions_.count(id)) throw AuctionError("auction exists " + id);
+        auctions_[id].reset(new Auction(id, seller, lo, hi, cost, std::move(rules)));
+        return *auctions_[id];
+    }
+    BidPtr createBid(const std::string&amp; b, const std::string&amp; a, long long amt) { return bid(b, a, amt, true); }
+    BidPtr updateBid(const std::string&amp; b, const std::string&amp; a, long long amt) { return bid(b, a, amt, false); }
+    void withdraw(const std::string&amp; b, const std::string&amp; a) { requireBuyer(b); get(a).withdraw(b); }
+    Result close(const std::string&amp; id) {
+        Auction&amp; a = get(id);
+        Result r;
+        bool first = a.close([this](const std::string&amp; n) { return pastOf(n) &gt; 2; }, &amp;r);
+        if (!first) return r;
+        std::vector&lt;std::string&gt; ps = a.participants();   // copy first: never hold mu_ while taking an auction lock
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);
+            for (auto&amp; p : ps) ++past_[p];
+        }
+        for (auto* l : listeners_) l-&gt;onClosed(r);
+        return r;
+    }
+    std::string profit(const std::string&amp; seller, const std::string&amp; id) {
+        Auction&amp; a = get(id);
+        if (a.seller() != seller) throw AuctionError(seller + " does not own " + id);
+        Result r; a.close([](const std::string&amp;) { return false; }, &amp;r);   // already closed: returns stored result
+        return money(r.profitPaise);
+    }
+    int pastOf(const std::string&amp; n) { std::lock_guard&lt;Mutex&gt; g(mu_); return past_[n]; }
+    Auction&amp; get(const std::string&amp; id) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        auto it = auctions_.find(id);
+        if (it == auctions_.end()) throw AuctionError("unknown auction " + id);
+        return *it-&gt;second;
+    }
+
+private:
+    BidPtr bid(const std::string&amp; b, const std::string&amp; a, long long amt, bool create) {
+        requireBuyer(b);
+        BidPtr out;
+        std::string lost = get(a).bid(b, amt, create, &amp;out);
+        if (!lost.empty()) for (auto* l : listeners_) l-&gt;onOutbid(a, lost, amt);   // outside the auction lock
+        return out;
+    }
+    void requireBuyer(const std::string&amp; b) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (!past_.count(b)) throw AuctionError("unknown buyer " + b);
+    }
+    std::unordered_map&lt;std::string, int&gt; past_;
+    std::unordered_map&lt;std::string, bool&gt; sellers_;
+    std::unordered_map&lt;std::string, std::unique_ptr&lt;Auction&gt;&gt; auctions_;
+    std::vector&lt;AuctionListener*&gt; listeners_;
+    Mutex mu_;                                         // guards past_, sellers_, auctions_
+};
+
+struct Printer : AuctionListener {
+    std::vector&lt;std::string&gt; inbox;
+    void onOutbid(const std::string&amp; a, const std::string&amp; b, long long amt) override {
+        inbox.push_back(b + ": outbid on " + a + " (now " + std::to_string(amt) + ")");
+    }
+    void onClosed(const Result&amp; r) override {
+        std::printf("  [notify] %s: %s, seller profit %s\n", r.auction.c_str(),
+                    r.winner ? ("winner " + r.winner-&gt;buyer + " at " + std::to_string(r.winner-&gt;amount)).c_str() : "no winner",
+                    money(r.profitPaise).c_str());
+    }
+};
+
+template &lt;class F&gt; static void expectError(F f) {
+    try { f(); } catch (const AuctionError&amp; e) { std::printf("  rejected: %s\n", e.what()); return; }
+    CHECK(!"expected an AuctionError");
+}
+
+int main() {
+    AuctionHouse h;
+    Printer printer;
+    h.addListener(&amp;printer);
+    auto unique = std::make_shared&lt;const HighestUniqueBidRules&gt;();
+
+    std::puts("== Test case 1 ==");
+    h.addBuyer("buyer1"); h.addBuyer("buyer2"); h.addBuyer("buyer3"); h.addSeller("seller1");
+    h.create("A1", 10, 50, 1, "seller1", unique);
+    h.createBid("buyer1", "A1", 17); h.createBid("buyer2", "A1", 15);
+    h.updateBid("buyer2", "A1", 19); h.createBid("buyer3", "A1", 19);
+    CHECK(h.close("A1").winner-&gt;buyer == "buyer1");
+    CHECK(h.profit("seller1", "A1") == "-12.40");
+
+    std::puts("== Test case 2 ==");
+    h.addSeller("seller2");
+    h.create("A2", 5, 20, 2, "seller2", unique);
+    expectError([&amp;] { h.createBid("buyer3", "A2", 25); });
+    h.createBid("buyer2", "A2", 5);
+    h.withdraw("buyer2", "A2");
+    CHECK(!h.close("A2").winner);
+    CHECK(h.profit("seller2", "A2") == "0.40");
+
+    std::puts("== Preferred buyer ==");
+    h.addBuyer("pat"); h.addBuyer("quinn"); h.addBuyer("rae");
+    for (int i = 3; i &lt;= 5; ++i) {
+        std::string id = "A" + std::to_string(i);
+        h.create(id, 10, 100, 1, "seller1", unique);
+        h.createBid("pat", id, 10 + i);
+        h.close(id);
+    }
+    h.create("A6", 10, 100, 1, "seller1", unique);
+    h.createBid("pat", "A6", 40); h.createBid("quinn", "A6", 40); h.createBid("rae", "A6", 30);
+    CHECK(h.close("A6").winner-&gt;buyer == "pat");
+
+    std::puts("== English auction ==");
+    h.create("E1", 100, 200, 0, "seller2", std::make_shared&lt;const EnglishAuctionRules&gt;(10));
+    h.createBid("quinn", "E1", 100); h.createBid("rae", "E1", 150);
+    expectError([&amp;] { h.updateBid("quinn", "E1", 155); });
+    h.updateBid("quinn", "E1", 160);
+    expectError([&amp;] { h.withdraw("quinn", "E1"); });
+    CHECK(printer.inbox.size() == 2);
+    for (auto&amp; m : printer.inbox) std::printf("  inbox %s\n", m.c_str());
+    Result e1 = h.close("E1");
+    CHECK(e1.winner-&gt;amount == 160 &amp;&amp; h.close("E1").winner == e1.winner);   // idempotent close
+
+    std::puts("== Stale bid (what a race looks like, one step at a time) ==");
+    Auction&amp; race = h.create("R1", 1, 100, 0, "seller1", std::make_shared&lt;const EnglishAuctionRules&gt;(5));
+    h.addBuyer("bot1"); h.addBuyer("bot2");
+    long long seenBy1 = 1, seenBy2 = 1;                 // both read "no bids yet, floor 1"
+    h.createBid("bot1", "R1", seenBy1);                 // bot1 wins the check-and-set
+    expectError([&amp;] { h.createBid("bot2", "R1", seenBy2); });   // bot2's view is stale: rejected, not lost
+    h.createBid("bot2", "R1", race.best()-&gt;amount + 5);
+    auto log = race.history();
+    CHECK(log.size() == 2 &amp;&amp; log[1]-&gt;amount == 6);
+    CHECK(h.close("R1").winner-&gt;buyer == "bot2");
+    std::puts("all C++ checks passed");
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it and see the output</h3>
+  <p>Run it: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>, or <code>python main.py</code> and <code>python -m unittest -v test_auction</code>, or <code>g++ -std=c++14 -Wall -Wextra main.cpp -o auction &amp;&amp; ./auction</code>. Java output (the counts in the last test change from run to run; the checks do not):</p>
+<pre class="terminal"><code>== Test case 1 (Flipkart statement) ==
+  [notify] A1: winner buyer1 at 17, seller profit -12.40
+  profit(seller1, A1) = -12.40
+== Test case 2 ==
+  rejected: bid 25 outside limits [5, 20]
+  [notify] A2: no winner, seller profit 0.40
+  profit(seller2, A2) = 0.40
+== Bonus: preferred buyer breaks a tie ==
+  [notify] A3: winner pat at 13, seller profit -41.80
+  [notify] A4: winner pat at 14, seller profit -40.80
+  [notify] A5: winner pat at 15, seller profit -39.80
+  [notify] A6: winner pat at 40, seller profit -14.40
+== English auction: outbid notifications, binding bids ==
+  rejected: bid 155 must be at least 160
+  rejected: english+10 bids cannot be withdrawn
+  inbox quinn: outbid on E1 (now 150)
+  inbox rae: outbid on E1 (now 160)
+== Deadline: a late bid fails even before the timer fires ==
+  rejected: auction E1 ended at 2026-11-24T11:00:00Z
+  [notify] E1: winner quinn at 160, seller profit 10.00
+== Errors ==
+  rejected: unknown buyer mallory
+  rejected: auction A1 is closed
+  rejected: rae has no bid on A7 to update
+  rejected: rae already bid on A7; use update
+  rejected: seller2 does not own A7
+  rejected: A7 is still open
+== Timer closes the auction (real clock) ==
+  [timer] T1: winner y at 40, seller profit -13.00
+== Concurrency: 8 threads race on one English auction ==
+  accepted 2111, rejected as stale 1889, winner bot6@10551
+checks passed: 26</code></pre>
+  <p>Python tests:</p>
+<pre class="terminal"><code>test_concurrent_english_bids_never_lose_an_update (test_auction.AuctionTests.test_concurrent_english_bids_never_lose_an_update) ... ok
+test_deadline_checked_on_bid_and_close_is_idempotent (test_auction.AuctionTests.test_deadline_checked_on_bid_and_close_is_idempotent) ... ok
+test_english_increment_outbid_and_binding (test_auction.AuctionTests.test_english_increment_outbid_and_binding) ... ok
+test_errors (test_auction.AuctionTests.test_errors) ... ok
+test_flipkart_case_1 (test_auction.AuctionTests.test_flipkart_case_1) ... ok
+test_flipkart_case_2_withdrawn_bidder_still_paid (test_auction.AuctionTests.test_flipkart_case_2_withdrawn_bidder_still_paid) ... ok
+test_highest_unique_example_from_statement (test_auction.AuctionTests.test_highest_unique_example_from_statement) ... ok
+test_limits_are_inclusive_and_empty_auction_has_no_winner (test_auction.AuctionTests.test_limits_are_inclusive_and_empty_auction_has_no_winner) ... ok
+test_preferred_buyer_breaks_tie (test_auction.AuctionTests.test_preferred_buyer_breaks_tie) ... ok
+test_timer_closes_auction (test_auction.AuctionTests.test_timer_closes_auction) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.168s
+
+OK</code></pre>
+  <p>C++14. The race is shown one step at a time; the per-auction and house locks are real <code>std::lock_guard</code> code. The MinGW.org g++ 6.3 used here has no <code>std::mutex</code>, so its <code>Mutex</code> is a no-op with the same interface; built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) it printed the same output (<code>run-cpp-linux.txt</code>). Checks use a <code>CHECK</code> macro, not <code>assert</code>, so the calls inside them still run under <code>-DNDEBUG</code>:</p>
+<pre class="terminal"><code>== Test case 1 ==
+  [notify] A1: winner buyer1 at 17, seller profit -12.40
+== Test case 2 ==
+  rejected: bid 25 outside limits
+  [notify] A2: no winner, seller profit 0.40
+== Preferred buyer ==
+  [notify] A3: winner pat at 13, seller profit -41.80
+  [notify] A4: winner pat at 14, seller profit -40.80
+  [notify] A5: winner pat at 15, seller profit -39.80
+  [notify] A6: winner pat at 40, seller profit -14.40
+== English auction ==
+  rejected: bid 155 must be at least 160
+  rejected: bids cannot be withdrawn here
+  inbox quinn: outbid on E1 (now 150)
+  inbox rae: outbid on E1 (now 160)
+  [notify] E1: winner quinn at 160, seller profit 10.00
+== Stale bid (what a race looks like, one step at a time) ==
+  rejected: bid 1 must be at least 6
+  [notify] R1: winner bot2 at 6, seller profit -44.50
+all C++ checks passed</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>In the C++ version a <code>Bid</code> is shared through <code>std::shared_ptr&lt;const Bid&gt;</code>: the history, the live map and a listener can all hold the same bid, and it is freed when the last holder drops it. That is <code>kref_get()</code> / <code>kref_put()</code> with the release function written for you. Making it <code>const</code> is what makes the sharing safe without a lock, the same reason RCU readers only ever see objects that are no longer changed.</p>
+  </div>

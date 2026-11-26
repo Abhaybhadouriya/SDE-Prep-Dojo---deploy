@@ -1,0 +1,36 @@
+
+        <h2>Zombie fencing: stopping the instance that came back</h2>
+        <p class="chips level-chips"><span class="chip accent">good to know</span></p>
+        <p>A <b>zombie</b> is an old instance of your app that everyone thinks is dead, but is still running. Maybe it had a 40-second garbage-collection pause, or a network partition cut it off. Kubernetes or the consumer group already started a replacement. Then the zombie wakes up and carries on writing as if nothing happened. Now two copies of "payment-validator-0" are writing the same results: duplicates, and possibly conflicting ones.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Zombie fencing: an old instance with epoch 4 is rejected after the new instance bumped the epoch to 5">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box ghost" x="10" y="30" width="210" height="80"/><text class="label" x="115" y="58">Old instance (zombie)</text><text class="label small muted" x="115" y="84">pv-0, epoch 4, was paused</text>
+            <rect class="box client" x="10" y="180" width="210" height="80"/><text class="label" x="115" y="208">New instance</text><text class="label small muted" x="115" y="234">pv-0, epoch 5</text>
+
+            <rect class="box kafka solid" x="330" y="105" width="190" height="80"/><text class="label white" x="425" y="135">Coordinator</text><text class="label small white" x="425" y="160">current epoch = 5</text>
+            <rect class="box kafka" x="620" y="105" width="170" height="80"/><text class="label" x="705" y="135">Partition</text><text class="label small muted" x="705" y="160">leader checks epoch</text>
+
+            <path class="arrow ok" d="M222 210 L328 165"/><text class="label small ok" x="270" y="215">init: epoch 5</text>
+            <path class="arrow bad" d="M222 60 L616 120"/>
+            <text class="label small bad" x="440" y="62">write with epoch 4</text>
+            <path class="arrow bad dashed" d="M618 140 L222 90"/>
+            <text class="label small bad" x="470" y="96">ProducerFenced: rejected</text>
+            <circle class="packet bad" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M222 60 L616 120 L222 90"/></circle>
+
+            <text class="label small" x="425" y="285">highest epoch wins</text>
+          </svg>
+          <figcaption>Fencing is "the newest generation wins": older epochs are refused by the coordinator and by every partition leader. The zombie's writes bounce, and it should shut itself down when it sees the fenced error.</figcaption>
+        </figure>
+
+        <p>Because both instances use the same <code>transactional.id</code>, the replacement's <code>initTransactions()</code> bumps the epoch to 5. From then on, any request carrying epoch 4 is refused with <code>ProducerFencedException</code> (or <code>InvalidProducerEpochException</code>). The zombie's half-done transaction is aborted. This is why <code>transactional.id</code> must be <b>stable and unique per logical producer</b>: two different live instances must never share one, and a restarted instance must reuse its old one.</p>
+
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain the epoch bump and "the newest instance wins", you are ready for most SDE-1 rounds. The two subsections below (KIP-447 and KIP-890 hanging transactions) are <b>deep dive, SDE-2+</b>: good for showing depth, rarely asked first.</p></div>
+        <h3>How to pick the transactional.id (old way vs KIP-447) <span class="chip warn">deep dive</span></h3>
+        <p>Before Kafka 2.5, fencing worked only per <code>transactional.id</code>, so apps used one producer per input partition with ids like <code>app-orders-5</code>. That meant many producers. <b>KIP-447</b> (Kafka 2.5) added a second fence: <code>sendOffsetsToTransaction</code> takes the consumer's <b>group metadata</b> (including its generation), so the coordinator can reject offset commits from a consumer that has already lost its partitions in a rebalance. Now one transactional producer per application instance is enough. Kafka Streams calls this mode <code>exactly_once_v2</code>; the older modes <code>exactly_once</code> and <code>exactly_once_beta</code> are removed in 4.x.</p>
+
+        <h3>Hanging transactions and KIP-890 <span class="chip warn">deep dive</span></h3>
+        <p>A rare but nasty bug: a producer's write is delayed in the network, the transaction it belonged to is already committed or aborted, and then the late write arrives and accidentally becomes part of a <em>new</em>, open transaction that never completes - a <b>hanging transaction</b>. KIP-890 (server-side defence, Kafka 4.0, <code>transaction.version=2</code>) closes this by bumping the producer epoch on <b>every</b> transaction and having the partition leader verify a transaction is really ongoing before accepting transactional writes. A late write from an old transaction now carries a stale epoch and is rejected.</p>
+        <p>Why does a hanging transaction hurt so much? The next section explains: it freezes every <code>read_committed</code> consumer of that partition.</p>
+      

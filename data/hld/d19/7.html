@@ -1,0 +1,119 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <h3>Docker: where the log line physically lives</h3>
+        <p>With plain Docker, the default <code>json-file</code> logging driver writes each line as JSON to <code>/var/lib/docker/containers/&lt;id&gt;/&lt;id&gt;-json.log</code>. On Kubernetes with containerd, the CRI writes a simple text format under <code>/var/log/pods/</code>, with symlinks in <code>/var/log/containers/</code>. Either way: <b>a file on the node</b>. That is why the agent runs on the node. (Basics: <a href="{{BASE}}devops/docker-04">Running &amp; managing containers</a>.)</p>
+<pre class="terminal"><code>$ docker run -d --name web nginx
+$ docker logs --tail 2 web
+/docker-entrypoint.sh: Configuration complete; ready for start up
+2026/11/23 10:15:02 [notice] 1#1: start worker processes
+
+# The same lines in the CRI file format on a Kubernetes node:
+$ sudo tail -n 1 /var/log/pods/checkout_payments-7c9f-x2k_*/payments/0.log
+2026-11-23T10:15:02.123456789Z stdout F {"msg":"charge timeout","order_id":"42"}</code></pre>
+
+        <h3>Kubernetes: the agent as a DaemonSet</h3>
+        <p>A <b>DaemonSet</b> runs exactly one copy of a pod on every node - like a process that must run on every line card. New node joins, it gets an agent automatically. The agent mounts the node's log directory read-only.</p>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="fluent-bit.conf">
+<div class="bridge">
+          <h4>From your world</h4>
+          <p>The dead-letter topic is the <b>punt path</b>. A line card forwards normal packets in hardware; anything it cannot handle (options, TTL expiry, unknown protocol) is punted to the route processor instead of stalling the forwarding pipeline. Our processors parse normal lines at full speed and punt the strange ones to <code>logs.dlq</code>, where a slower job or a human looks at them, and a replay sends them back once the parser is fixed. <b>Where this breaks:</b> a router rate-limits the punt path (CoPP) and drops excess; we must not drop, so the DLQ needs its own retention, size alerts and an owner, or it silently fills for weeks.</p>
+        </div>
+<pre><code class="language-bash">[SERVICE]
+    Flush             1
+    storage.path      /var/fluent-bit/state/buffer
+
+[INPUT]
+    Name              tail
+    Path              /var/log/containers/*.log
+    multiline.parser  docker, cri
+    Tag               kube.*
+    DB                /var/fluent-bit/state/tail.db
+    Mem_Buf_Limit     50MB
+    storage.type      filesystem
+    Skip_Long_Lines   On
+
+[FILTER]
+    Name              kubernetes
+    Match             kube.*
+    Merge_Log         On
+    Keep_Log          Off
+
+# build the Kafka key: tenant|app|bucket(pod), so one pod's lines keep their order
+[FILTER]
+    Name              lua
+    Match             kube.*
+    script            /fluent-bit/etc/key.lua
+    call              add_key
+
+[OUTPUT]
+    Name              kafka
+    Match             kube.*
+    Brokers           kafka-0.kafka:9092,kafka-1.kafka:9092,kafka-2.kafka:9092
+    Topics            logs.raw
+    Format            json
+    Message_Key_Field kafka_key
+    rdkafka.compression.codec  lz4
+    rdkafka.request.required.acks  -1</code></pre>
+<pre><code class="language-bash">-- key.lua: called for every record by the lua filter above
+function add_key(tag, ts, record)
+  local k = record["kubernetes"] or {}
+  local labels = k["labels"] or {}
+  local tenant = k["namespace_name"] or "none"
+  local app = labels["app"] or k["container_name"] or "none"
+  local pod = k["pod_name"] or ""
+  local h = 0
+  for i = 1, #pod do h = (h * 31 + pod:byte(i)) % 8 end   -- 8 buckets per app
+  record["kafka_key"] = tenant .. "|" .. app .. "|" .. h
+  return 2, ts, record                                    -- 2 = record changed, keep timestamp
+end</code></pre>
+        <p>Without <code>Message_Key_Field</code> the agent would send records with no key, and the Kafka client would spread them over partitions (sticky batches, then the next partition), so per-pod order would be lost and you could only sort by timestamp at query time.</p>
+          </div>
+          <div class="tab-panel" data-title="DaemonSet (trimmed)">
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit
+  namespace: logging
+spec:
+  selector:
+    matchLabels: { app: fluent-bit }
+  template:
+    metadata:
+      labels: { app: fluent-bit }
+    spec:
+      serviceAccountName: fluent-bit        # needs RBAC to read pod metadata
+      tolerations:
+        - operator: Exists                  # run on every node, even tainted ones
+      containers:
+        - name: fluent-bit
+          image: fluent/fluent-bit:5.1.5        # pin a current release; check config keys when changing majors
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+          volumeMounts:
+            - { name: varlog, mountPath: /var/log, readOnly: true }
+            - { name: state,  mountPath: /var/fluent-bit/state }
+      volumes:
+        - name: varlog
+          hostPath: { path: /var/log }
+        - name: state
+          hostPath: { path: /var/lib/fluent-bit, type: DirectoryOrCreate }</code></pre>
+          </div>
+        </div>
+        <p>The rest of the platform (processors, Loki/Elasticsearch, Grafana) runs as Deployments and StatefulSets. Processors scale with the <a href="{{BASE}}devops/k8s-09">HPA</a> on Kafka consumer lag (via KEDA or a custom metric), but never beyond the partition count. For K8s-side debugging tips see <a href="{{BASE}}devops/k8s-11">Observability &amp; Troubleshooting</a>.</p>
+
+        <h3>Kafka: the shock absorber</h3>
+<pre class="terminal"><code>$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic logs.raw \
+    --partitions 64 --replication-factor 3 \
+    --config retention.ms=259200000 \
+    --config compression.type=lz4 \
+    --config min.insync.replicas=2
+Created topic logs.raw.
+
+$ kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group log-indexer
+GROUP        TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG      CONSUMER-ID
+log-indexer  logs.raw  0          88412001        88412310        309      indexer-5f..
+log-indexer  logs.raw  1          87990120        88601554        611434   indexer-7a..</code></pre>
+        <p>Partition 1 has a lag of 611k lines while partition 0 is nearly caught up: classic sign of a <b>hot partition</b> or one slow consumer. Kafka gives us: durability (RF 3, <code>min.insync.replicas=2</code>), replay (reprocess 3 days after fixing a parser bug), fan-out (the security team's SIEM reads the same topic with its own consumer group), and decoupling (swap Elasticsearch for Loki without touching agents). Background: <a href="{{BASE}}devops/kafka-04">Consumers &amp; groups</a>, <a href="{{BASE}}devops/kafka-05">Replication &amp; ISR</a>, <a href="{{BASE}}devops/kafka-07">why Kafka is fast</a>, and the end-to-end <a href="{{BASE}}devops/pipeline-01">pipeline architecture</a>.</p>
+      

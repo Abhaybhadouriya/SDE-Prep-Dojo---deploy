@@ -1,0 +1,95 @@
+
+        <h2>Data model: the log on disk</h2>
+        <p>Learner question answered: "SQL or NoSQL?" Neither. The storage engine <i>is</i> a set of append-only files, because the only operations are "append at the end" and "read forward from position X". A database would add indexes, locks and in-place updates we never use.</p>
+        <ul>
+          <li>A <b>topic</b> is split into <b>partitions</b>. Each partition is an independent ordered log, and a directory on a broker: <code>orders-0/</code>, <code>orders-1/</code>.</li>
+          <li>Each partition directory holds <b>segment</b> files. The file name is the offset of the first record inside it (the base offset): <code>00000000000000000000.log</code>, then <code>00000000000000368769.log</code>. Only the newest (active) segment is written; Kafka's default segment size is 1 GiB.</li>
+          <li>Next to every <code>.log</code> are a <b>sparse offset index</b> (<code>.index</code>: offset to byte position, one entry every few KB, not every record) and a <b>time index</b> (<code>.timeindex</code>: timestamp to offset, used for "replay from 10:00").</li>
+          <li>Records are written in <b>batches</b>. A batch header carries the base offset, the producer ID, epoch and sequence number (for idempotence), a compression codec, and the records with small offset and timestamp deltas. The broker stores the batch exactly as the producer sent it (still compressed), so the bytes on disk are the bytes on the wire.</li>
+          <li>Consumer positions live in an internal compacted topic, <code>__consumer_offsets</code>, keyed by (group, topic, partition). Cluster metadata (topics, partitions, leaders, ISR) lives in the Raft-replicated <code>__cluster_metadata</code> log managed by the controllers (KRaft).</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="A partition directory with three segments; reading offset 368800 picks the segment by base offset, then the sparse index gives a byte position near the record">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone kafka" x="10" y="10" width="780" height="280"/>
+            <text class="zone-label" x="24" y="32">partition directory  orders-0/</text>
+            <rect class="box kafka" x="30" y="50" width="220" height="56"/><text class="label small" x="140" y="74">00000000000000000000.log</text><text class="label small" x="140" y="94">closed (deletable)</text>
+            <rect class="box kafka highlight" x="290" y="50" width="220" height="56"/><text class="label small" x="400" y="74">00000000000000368769.log</text><text class="label small" x="400" y="94">closed</text>
+            <rect class="box kafka solid" x="550" y="50" width="220" height="56"/><text class="label small on-solid" x="660" y="74">00000000000000737337.log</text><text class="label small on-solid" x="660" y="94">active: appends here</text>
+            <rect class="box cache" x="290" y="140" width="220" height="110"/>
+            <text class="label" x="400" y="162">.index (sparse)</text>
+            <text class="label small mono" x="400" y="186">368769 -&gt; 0</text>
+            <text class="label small mono" x="400" y="206">368790 -&gt; 4153</text>
+            <text class="label small mono" x="400" y="226">368812 -&gt; 8301</text>
+            <text class="label small left" x="30" y="150">read offset 368800:</text>
+            <text class="label small left" x="30" y="172">1. pick segment by base</text>
+            <text class="label small left" x="30" y="192">   offset (binary search)</text>
+            <text class="label small left" x="30" y="214">2. index: 368790 at 4153</text>
+            <text class="label small left" x="30" y="236">3. scan forward a few KB</text>
+            <text class="label small left" x="550" y="160">retention deletes</text>
+            <text class="label small left" x="550" y="180">whole closed segments,</text>
+            <text class="label small left" x="550" y="200">never single records</text>
+            <path class="arrow" d="M400 106 L400 134"/>
+            <path class="arrow dashed" d="M510 205 C 560 240, 640 240, 660 112"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M555 78 L765 78"/></circle>
+          </svg>
+          <figcaption>Finding a record by offset costs a binary search over segment names, a binary search in a small index, and a short sequential scan. Appends only ever touch the active segment (the moving dot).</figcaption>
+        </figure>
+        <p>A toy version in 40 lines of Python makes the idea concrete: fixed headers, an append-only file named by base offset, and a sparse index every 64 bytes.</p>
+<pre><code class="language-python">import os, struct
+
+class Segment:
+    """One append-only segment: &lt;base&gt;.log plus a sparse in-memory index."""
+    HDR = struct.Struct("&gt;QI")          # 8-byte offset, 4-byte length (big-endian)
+    INDEX_EVERY = 64                    # add an index entry every 64 bytes of log
+
+    def __init__(self, directory, base_offset):
+        name = f"{base_offset:020d}"
+        self.base = base_offset
+        self.log = open(os.path.join(directory, name + ".log"), "ab+")
+        self.index = []                 # sparse: (offset, byte_position)
+        self.next_offset = base_offset
+        self.bytes_since_index = self.INDEX_EVERY
+
+    def append(self, value: bytes) -&gt; int:
+        pos = self.log.seek(0, os.SEEK_END)
+        if self.bytes_since_index &gt;= self.INDEX_EVERY:
+            self.index.append((self.next_offset, pos))
+            self.bytes_since_index = 0
+        rec = self.HDR.pack(self.next_offset, len(value)) + value
+        self.log.write(rec)
+        self.bytes_since_index += len(rec)
+        self.next_offset += 1
+        return self.next_offset - 1
+
+    def read_from(self, offset: int, max_records=3):
+        # real systems binary-search the index; a linear scan keeps it short
+        start = max((p for o, p in self.index if o &lt;= offset), default=0)
+        self.log.flush(); self.log.seek(start)
+        out = []
+        while len(out) &lt; max_records:
+            hdr = self.log.read(self.HDR.size)
+            if len(hdr) &lt; self.HDR.size:
+                break
+            off, n = self.HDR.unpack(hdr)
+            val = self.log.read(n)
+            if off &gt;= offset:
+                out.append((off, val.decode()))
+        return start, out
+
+os.makedirs("orders-0", exist_ok=True)
+seg = Segment("orders-0", 0)
+for i in range(10):
+    seg.append(f"order-{i}".encode())
+print("files:", sorted(os.listdir("orders-0")))
+print("sparse index:", seg.index)
+print("read from offset 6 -&gt;", seg.read_from(6))</code></pre>
+<pre class="terminal"><code>$ python minilog.py
+files: ['00000000000000000000.log']
+sparse index: [(0, 0), (4, 76), (8, 152)]
+read from offset 6 -&gt; (76, [(6, 'order-6'), (7, 'order-7'), (8, 'order-8')])</code></pre>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A partition is a descriptor ring that lives on disk: the producer is the writer advancing the tail, each consumer group is a reader with its own head index, and the offset is the ring index. The difference: a ring buffer overwrites old slots as soon as the reader moves on; a Kafka log keeps them until retention deletes whole segments, so a reader can go back. <i>Where this breaks:</i> a NIC ring has one consumer (the driver); a log has any number of independent readers, each with its own index.</p>
+        </div>
+      

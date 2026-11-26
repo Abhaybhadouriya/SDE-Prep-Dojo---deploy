@@ -1,0 +1,119 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> Clarify: card, UPI, or marketplace orders? Synchronous decision? Latency budget? Scale? Who acts on CHALLENGE? Do we own the model, or only the platform?</li>
+          <li><strong>5-10 min:</strong> Estimate: scores/s at peak, feature reads/s, latency budget split, event storage, fraud rate and what it means for metrics.</li>
+          <li><strong>10-15 min:</strong> API (score, rules, labels) and the stores: online KV, Kafka, lake, SQL for rules.</li>
+          <li><strong>15-25 min:</strong> Draw the three paths; walk one payment through the sync path.</li>
+          <li><strong>25-40 min:</strong> Deep dives: streaming features + freshness gap, point-in-time training, labels and thresholds, fail-open with fallback, shadow mode.</li>
+          <li><strong>40-45 min:</strong> Failures, monitoring (lag in seconds, block rate, precision on early labels), fraud rings as an extension.</li>
+        </ol>
+        <div class="callout danger"><p><b>Common mistakes:</b> computing features with SQL queries on the payments database at request time; batch-only features; calling the model synchronously with no timeout or fallback; reporting accuracy; training with future data (leakage); ignoring label delay; deploying new rules straight to "block" without shadow mode; one implementation of a feature in training and a different one in serving; forgetting that blocked payments never get labels.</p></div>
+        <div class="callout interview"><p><b>60-second answer.</b> "The payment service calls a stateless risk scorer with a 100 ms timeout. The scorer fetches features in parallel from an in-memory feature store, updates a short synchronous velocity counter, runs a model and a rules engine, and returns allow, challenge or block, with a local fallback policy if it times out. Every payment, its features and decision go to Kafka. A Flink job keyed by card, device and IP computes sliding-window velocity features in event time and writes them back within seconds. Events land in a lake; labels like chargebacks arrive weeks later and are joined point-in-time for training. New models and rules run in shadow first. I watch Flink lag in seconds, block rate and precision on early labels."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>How do you fit feature lookups, a model and rules into 100 ms?</summary>
+          <div class="answer">
+            <p>Split the budget explicitly (network 10, features 15, model 20, rules 5, logging 5, about 45 ms headroom). Precompute everything you can: features are computed ahead of time by streaming and batch jobs and stored in an in-memory KV store, so the scorer only does batched point reads in parallel. The model is served from memory; trees or a compact network infer in milliseconds. Logging to Kafka is asynchronous. Each dependency has its own timeout and the scorer degrades (missing features, rules only) instead of blowing the budget.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the budget bar, then say "precompute, batch, parallelise, async-log, degrade".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is p99 harder than average? (Tails add up across parallel and serial calls; fan-out to many shards raises tail latency.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Amazon">
+          <summary>How do you compute "number of payments on this card in the last hour" in real time?</summary>
+          <div class="answer">
+            <p>Publish every payment to a Kafka topic keyed by card fingerprint. A Flink job keys the stream by card and keeps a sliding (hop) window in its state, for example 1 hour advancing every 10 seconds, in event time with a watermark for out-of-order events. Each window result is written to the online feature store. Because this takes seconds, the scorer also keeps a 60-second count itself in a Redis sorted set on the request path. Flink checkpoints give exactly-once state, and the state can be rebuilt from Kafka.</p>
+            <div class="approach"><h5>How to answer</h5><p>Key, window, time semantics, sink; then volunteer the freshness gap and its fix before they ask.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why event time? (Retries and mobile delays reorder events; processing time would count them in the wrong window.)</li><li>A merchant key is hot; what now? (Pre-aggregate or split the key.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>The scoring service is down during a sale. What happens to payments?</summary>
+          <div class="answer">
+            <p>The payment service times out after its budget and applies a local fallback policy: block-lists, limits on amount for new cards and devices, challenge above a threshold. That is fail-open with guard rails: payments mostly continue, the riskiest are challenged. We alert immediately and track fallback volume so finance knows the exposure. Pure fail-closed would turn a fraud outage into a payments outage; pure fail-open invites attackers who notice.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name both options, the cost of each, then the hybrid.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you keep the fallback rules fresh? (Pushed every few minutes; cached locally.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>What is training-serving skew and how do you prevent it?</summary>
+          <div class="answer">
+            <p>It is when features in training differ from features in production, so offline metrics look great and live performance is worse. Causes: two different implementations of the same feature, and leakage of future information into training rows. Prevent it by defining features once (a feature store), logging the exact feature vector the scorer used and training on those logs where possible, and using point-in-time joins so each training row only sees data available at the payment's time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Definition, the two causes, the two fixes. The leakage example with chargeback counts is memorable.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect skew in production? (Compare feature distributions online vs training.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Why is accuracy a bad metric here? What do you use instead?</summary>
+          <div class="answer">
+            <p>With about 1 fraud in 1,000, a model that always says "not fraud" is 99.9% accurate and useless. Use precision (how many flagged are really fraud), recall (how much fraud we catch), and the precision-recall curve. Then choose thresholds by cost: lost sales and customer friction for false positives, fraud loss and chargeback fees for false negatives. A CHALLENGE band in the middle reduces both costs.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the "always no" example, then precision/recall, then money-based thresholds.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle class imbalance in training? (Down-sample negatives, weight positives, calibrate scores afterwards.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>Labels arrive weeks late. How do you train and evaluate?</summary>
+          <div class="answer">
+            <p>Train on a window old enough to be mostly labelled (for example events from 2-6 months ago), and evaluate on the most recent fully labelled weeks. Use faster proxy labels (manual review outcomes, customer reports, issuer fraud alerts) to monitor recent performance. Keep in mind blocked payments never get labels, so keep a tiny exploration slice that is challenged instead of blocked, and compare models in shadow mode on full traffic.</p>
+            <div class="approach"><h5>How to answer</h5><p>Late, rare, biased: address each in one sentence.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How often do you retrain? (Regularly, for example weekly, plus on drift alerts. Stripe reported getting training under 2 hours, which makes frequent retraining cheap.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>Analysts see a new attack. How fast can you respond, and how do you avoid breaking things?</summary>
+          <div class="answer">
+            <p>Within minutes via rules: rules are versioned data pushed to scorers (and broadcast to Flink for stateful rules), so no deploy is needed. Every new rule starts in shadow mode: log what it would have done, check how many good payments it would hit, then enable it as CHALLENGE, then BLOCK. Guard rails roll back automatically if the block rate jumps. The ML model catches up at the next retrain with the new labels.</p>
+            <div class="approach"><h5>How to answer</h5><p>Speed (rules) plus safety (shadow, staged actions, auto-rollback).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do rules reach 500 scorer pods? (Compacted Kafka topic or polling a config service; version in every decision log.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Walmart,Flipkart">
+          <summary>Why Kafka between the scorer and Flink, and not direct writes to the feature store?</summary>
+          <div class="answer">
+            <p>The log decouples them: the scorer only appends and returns quickly; Flink, the lake loader, analytics and case management all consume the same events independently. It is durable and replayable, so after a bug in a feature you can recompute it from history, and you can backfill a new feature for training from the same events. Keying by card keeps a card's events ordered in one partition, which Flink relies on. Direct writes would put the feature logic on the hot path and lose replay.</p>
+            <div class="approach"><h5>How to answer</h5><p>Decouple, fan-out, replay, ordering by key.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many partitions? (At least the Flink parallelism you need at peak, with headroom; changing later remaps keys.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Amazon">
+          <summary>How would you detect a fraud ring of accounts that each look normal?</summary>
+          <div class="answer">
+            <p>Graph features. Link accounts through shared identifiers (device, card fingerprint, phone, address, IP block), run connected components and neighbour statistics in a periodic job (for example "number of accounts within 2 hops that have a fraud label", "cards per device"), and publish them as features. A new chargeback anywhere in a cluster raises the risk of the rest. Handle super-nodes (public Wi-Fi, shared corporate devices) by capping or excluding them. Keep heavy graph queries off the synchronous path.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the graph, name the features, mention super-nodes; it signals real experience.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How fresh do graph features need to be? (Minutes is often fine; rings build up over days.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>How would you explain a decline to a customer or a regulator?</summary>
+          <div class="answer">
+            <p>Store, with every decision, the model version, the score, the threshold, the rules that fired and the top contributing features (for tree models, per-feature contributions such as SHAP values). Map those to a short list of plain reason codes ("unusual amount for this card", "new device and new shipping address"). The customer gets a safe, generic message and a way to verify (step-up authentication, call support) - never the exact rule, or fraudsters learn to avoid it. A regulator or internal auditor gets the full stored record, which can be replayed because features were logged point-in-time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "log the decision, not just the outcome": model version + features + reasons. Then separate what the customer sees from what an auditor sees.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does explainability push you towards trees over a DNN? (Often yes for regulated markets; or keep a DNN and add a post-hoc explainer plus rule-based reason codes.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: card-testing attack on a small merchant</h4>
+          <div class="situation"><p>At 02:00, a small merchant gets 40,000 payments of Rs 1 in 10 minutes from thousands of different cards, all from a few IP ranges. Fraud alerts fire late; most of the cards are later used for big purchases elsewhere.</p></div>
+          <div class="bad"><p>Weak answer: "Retrain the model with these examples." It takes days and the attack is now.</p></div>
+          <div class="good"><p>Strong answer: per-card velocity did not fire because each card was used once. The signal is per merchant and per IP / device: payments per merchant per minute vs its normal rate, distinct cards per IP, tiny-amount ratio. Immediately: an analyst rule (shadow, then CHALLENGE) for tiny amounts from those IP ranges and a merchant-level rate limit. Then add merchant and IP velocity features to Flink, alert on merchant volume anomalies, and feed the tested card list to the block-list so the later big purchases are stopped.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you stop blocking the merchant's real customers? (CHALLENGE, not BLOCK; scope to the IP ranges and amount band.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the model got worse but nothing is broken</h4>
+          <div class="situation"><p>Over two weeks the block rate slowly drops and the chargeback rate rises. No errors, no alerts, all pods healthy.</p></div>
+          <div class="bad"><p>Weak answer: "Lower the threshold so we block more."</p></div>
+          <div class="good"><p>Strong answer: check the inputs before the model. Look at Flink consumer lag in seconds (stale features look normal but are wrong), the share of requests with missing features, and online vs training feature distributions (skew after a schema change in the payments topic). If inputs are fine, it is drift: fraudsters adapted; retrain with recent labels and review new patterns with analysts. Add monitors on feature freshness and distribution so next time it is an alert, not a slow surprise.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which single dashboard panel would you add first? (Feature freshness: lag in seconds per feature group.)</li></ul></div>
+        </div>
+      

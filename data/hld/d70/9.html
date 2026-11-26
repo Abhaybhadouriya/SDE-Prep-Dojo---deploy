@@ -1,0 +1,143 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (self-reported interview posts; read them for the full loops):</p>
+          <ul>
+            <li>Amazon SDE2, 2026-10, HLD round: design a smart-meter electricity monitoring system that collects household consumption and shows it on a dashboard. <a href="https://leetcode.com/discuss/post/8585902/" target="_blank" rel="noopener">post</a></li>
+            <li>Amazon SDE2 (L5), EU, 2026-09, selected: sensors spread across a continent emit temperature; show a heatmap of the latest temperature and allow historical queries. <a href="https://leetcode.com/discuss/post/8524405/" target="_blank" rel="noopener">post</a></li>
+            <li>Microsoft SDE 2, 2026-01, cleared: alert monitoring for machine sensors (temperature, pressure) with lower and upper thresholds per type; users view alerts and change state to acknowledged, resolved or ignored. <a href="https://leetcode.com/discuss/post/7523946/" target="_blank" rel="noopener">post</a></li>
+            <li>Uber SDE-2, 2026-03, offer at SDE-2 instead of senior: driver density and availability dashboard; the interviewer drilled into how Redis would act as cache and pub/sub pushing to WebSockets. <a href="https://leetcode.com/discuss/post/7682158/" target="_blank" rel="noopener">post</a></li>
+            <li>Uber L4, 2026-02: real-time heatmap of drivers (the same loop's LLD was a hit counter). <a href="https://leetcode.com/discuss/post/7584609/" target="_blank" rel="noopener">post</a></li>
+            <li>Uber L5A, 2025-08, bar raiser: city heatmap of drivers for analytics, near real time for the past 20 minutes plus a bucketed view available after 24 hours; treat it as a sub-system and choose stream vs batch. <a href="https://leetcode.com/discuss/post/7043175/" target="_blank" rel="noopener">post</a></li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> Which variant? Fixed or moving devices? Latest value, count or average? Freshness target? Write the numbers.</li>
+          <li><strong>5-10 min: estimation</strong> Readings per second, the synchronised-burst trap and jitter, storage per day raw vs compressed, number of cells.</li>
+          <li><strong>10-15 min: API and data model</strong> MQTT topics with seq numbers; snapshot + delta live API; TSDB with rollups; alerts table with the partial unique index.</li>
+          <li><strong>15-25 min: architecture</strong> Broker, Kafka, Flink, then three consumers: Redis + WebSocket, TSDB + S3, alert evaluator.</li>
+          <li><strong>25-40 min: deep dives</strong> Let the interviewer pick, but be ready with: late data and event time; H3; stream vs batch; the exact Redis pub/sub flow; the alert state machine; downsampling.</li>
+          <li><strong>40-45 min: wrap up</strong> Failure modes, monitoring (ingest lag, watermark lag, dropped-late count, push latency p99, devices silent), next steps.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Devices publish over MQTT with a per-device sequence number and jitter; a broker forwards to Kafka keyed by device. One Flink job dedupes, maps each reading to an H3 cell, and aggregates per cell in one-minute event-time windows with watermarks. It writes the live state to a Redis hash per city and publishes a versioned delta on a sharded pub/sub channel; WebSocket pods subscribe per city on demand, send a snapshot on connect and deltas after, and refetch on a version gap because pub/sub is at-most-once. Raw readings go to a TSDB with hourly and daily continuous aggregates and to S3, where a nightly batch builds the complete daily view. A second Flink job keyed by sensor evaluates per-type thresholds with debounce and hysteresis and opens one alert per incident, guarded by a unique index; users move it through acknowledged, resolved or ignored with compare-and-set updates."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: the pipeline (broker, Kafka, consumer, TSDB, dashboard), a sensible bucketing scheme, rollups for history, polling or a basic push, and alerts with thresholds. SDE-2 adds: event time vs processing time and late data, dedupe by sequence number, the jitter fix for bursts, distinct-driver counting, the exact Redis pub/sub + snapshot/version protocol, debounce and hysteresis, the unique-index guard, and stream vs batch as speed vs correctness.</p></div>
+
+        <h3>Follow-up questions</h3>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>You said Redis pub/sub pushes to WebSockets. Walk me through exactly how that works.</summary>
+          <div class="answer">
+            <p>Two structures: a hash <code>heat:{city}</code> holding current cell counts (the state) and a channel <code>heat:{city}</code> carrying versioned deltas (the signal). Once a second the Flink sink runs a Lua script: HSET changed cells, INCR the version, SPUBLISH the delta with that version. Each WebSocket pod keeps a map from channel to local sockets and SSUBSCRIBEs a city only while it has viewers for it. A new viewer gets HGETALL plus the version first, then deltas with a higher version. Pub/sub is at-most-once, so a client that sees a version gap refetches the snapshot. Sharded pub/sub in Redis 7 keeps each channel on one shard instead of broadcasting across the cluster.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the writer, Redis, two pods and browsers. Name the commands. Say "the channel is never the only copy of the data". This is the exact follow-up that cost one candidate the senior level.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens during a gateway deploy? (Graceful drain; clients reconnect with backoff and jitter, get a fresh snapshot.)</li><li>Why not Kafka to each pod? (Works and is replayable, but every pod reads every partition or you need routing; heavier for a one-message-per-second signal.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>The heatmap needs the last 20 minutes in near real time and a bucketed daily view after 24 hours. Stream or batch?</summary>
+          <div class="answer">
+            <p>Both, on purpose. Stream: Flink, one-minute tumbling buckets per H3 cell, a 20-bucket ring per cell summed for the live view; fast, slightly approximate because very late pings miss it. Batch: raw pings land in S3 as Parquet; a nightly job groups by cell and hour with all late data included and writes the daily table. The 24-hour delay in the requirement is exactly the room the batch path needs. If the interviewer prefers one system, Kappa: replay Kafka with a longer allowed lateness into the daily table.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie each path to its requirement (freshness vs completeness), then mention distinct-driver counting, because pings are not drivers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you count a driver once if they ping 300 times in 20 minutes? (Latest cell per driver in keyed state, or HyperLogLog per cell.)</li><li>What if live and daily disagree? (Daily is the source of truth; show live as "approximate".)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>10 million smart meters all report at exactly the quarter hour. What breaks and how do you fix it?</summary>
+          <div class="answer">
+            <p>The front door sees millions of connections and messages in a few seconds, then nothing: brokers, load balancers and Kafka producers saturate, devices retry and make it worse. Fix at the source with jitter pushed in device config (a random offset of up to 5 minutes, which spreads 10M readings to about 33K per second), and buffer with Kafka. Devices retry with exponential backoff and jitter. Readings keep their measured timestamp, so jitter changes arrival time, not the data.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the arithmetic: average 11K per second looks easy; the synchronised peak does not. Then the fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A meter was offline for 6 hours and uploads 24 readings. Which bucket do they go in? (Event time; the hourly rollup for those hours is refreshed.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Show the latest temperature as a heatmap for a whole continent. How do you bucket and store it?</summary>
+          <div class="answer">
+            <p>Compute an H3 cell for each sensor at registration (it does not move). In the stream, keep per cell the latest reading per sensor or a rolling average, and upsert the cell into a Redis hash. At resolution 5 (about 253 km<sup>2</sup>) Europe is roughly 40K cells, about 2 MB: the browser loads it in one request. Zoomed in, query resolution 7 for the visible bounding box only. Coarser levels are sums of children, so roll up from the finest resolution you compute.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say why not plot raw sensors (1M points, uneven density), then choose a grid and a resolution with numbers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A cell has no sensor. (Show it empty or interpolate from neighbours using a k-ring; label interpolated values.)</li><li>Why hexagons? (Equal-distance neighbours, near-uniform area.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>"What was the temperature in this area last March?" How do you serve historical queries fast?</summary>
+          <div class="answer">
+            <p>Do not scan raw data. Keep per-cell rollups (hourly and daily min, max, sum, count) as continuous aggregates in the TSDB or in an OLAP store. The query API picks the resolution from the range: a month at daily resolution is 31 rows per cell. Raw data stays 90 days for detail, then only rollups and S3 Parquet remain.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tiered retention table plus "store sum and count, not average".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Area query across 500 cells for 5 years? (OLAP store with cell and date columns, or pre-aggregate to coarser cells.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft">
+          <summary>Design thresholds per sensor type and the alert lifecycle with acknowledge, resolve and ignore.</summary>
+          <div class="answer">
+            <p>Rules table by sensor type with optional per-machine override; broadcast to the evaluator. Evaluator keyed by sensor keeps "in range or out since when". Open an alert after the value is out of range for a set time (debounce). States: OPEN, ACKNOWLEDGED (a person owns it), RESOLVED (auto when back in range with a margin, or manual), IGNORED (suppressed until a time). One active alert per (sensor, rule) enforced by a partial unique index. Transitions are compare-and-set updates with actor and timestamp for audit.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the state diagram. Then name flapping and how debounce and hysteresis prevent it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Two operators click acknowledge at once. (The CAS update succeeds for one; the other sees it is already acknowledged.)</li><li>An acknowledged alert gets worse. (Track peak value; escalate on a second, higher threshold.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>How do you make sure a duplicated or replayed reading never opens two alerts or double counts usage?</summary>
+          <div class="answer">
+            <p>Dedupe at three layers. Device: sequence number per reading. Stream: Flink keyed state per device remembers the last sequence (with TTL) and drops repeats; checkpoints plus Kafka offsets give exactly-once state. Sinks: idempotent writes (TSDB primary key on device and timestamp; HSET is a set, not an increment; alerts insert under a unique index). A replay after a crash then produces the same result.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "at-least-once delivery plus idempotent processing gives an exactly-once effect", then show each layer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Device resets and seq restarts at 0. (Include a boot id or epoch with seq.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Amazon">
+          <summary>Events arrive late or out of order. How does your aggregation stay correct?</summary>
+          <div class="answer">
+            <p>Use event time and watermarks. The watermark trails the maximum event time by a bound (say 30 s); a window fires when the watermark passes its end. Allowed lateness keeps the window state a little longer and re-emits a corrected result; later events go to a side output and to S3 for the batch path. Dashboards show watermark lag so users know when the data is behind.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast with processing time using the "meter reconnects in the morning" example.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you choose the watermark delay? (Measure the lateness distribution; trade freshness against completeness.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Which database for the readings, and why not just PostgreSQL or DynamoDB?</summary>
+          <div class="answer">
+            <p>A time-series store: append-only by time, compression of regular numeric series, time partitioning so old data is dropped by deleting chunks, and built-in rollups. TimescaleDB is PostgreSQL with these features, so plain SQL still works. DynamoDB with <code>device_id</code> as partition key and timestamp as sort key works for per-device ranges but makes area aggregations and rollups your job (streams plus Lambda). For cross-device analytics, add an OLAP store.</p>
+            <div class="approach"><h5>How to answer</h5><p>Match the store to the access patterns: per-device range, per-area aggregate, latest value.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid a hot partition in DynamoDB? (Partition by device, not by time bucket.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>One area suddenly gets 50x traffic (a stadium, a festival). What happens to your pipeline?</summary>
+          <div class="answer">
+            <p>Kafka is keyed by device, so ingest stays balanced. The skew appears where we key by cell. Pre-aggregate locally inside each device partition (a combine step per minute) before shuffling by cell, so a hot cell receives one partial count per upstream subtask rather than every ping. Pushing is unaffected: one delta per second per city regardless of activity.</p>
+            <div class="approach"><h5>How to answer</h5><p>Find where the key changes; that is where hot spots live. Then local combine.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if one city has too many viewers for one Redis channel? (It will not at one message per second; fan-out is per pod, not per viewer.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: the dashboard is 3 minutes behind</h4>
+          <div class="situation">Operations says the driver heatmap shows yesterday's pattern at rush hour. Ingest looks healthy.</div>
+          <div class="bad">Weak answer: "Add more Redis nodes."</div>
+          <div class="good">Strong answer: trace the timestamps. Compare event time, Kafka append time, Flink watermark and Redis version time. A lagging watermark usually means one idle or slow Kafka partition is holding it back (configure idleness), or consumer lag on the aggregation job (scale Flink, check the hot cell skew). If Redis is current but browsers are not, check that the pods are subscribed and that slow clients are not blocking the send loop.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>What metric would have caught it? (Watermark lag per job and push latency p99 from event time to socket write.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: 400 alerts in an hour from one machine</h4>
+          <div class="situation">A pressure sensor oscillates around its upper threshold. Operators start ignoring all alerts.</div>
+          <div class="bad">Weak answer: "Raise the threshold."</div>
+          <div class="good">Strong answer: one active alert per sensor and rule (unique index), debounce on open (out of range for 30 s), hysteresis on close (back below threshold minus margin), and group alerts per machine in notifications. Track flapping as its own signal: a sensor opening and closing more than N times an hour gets a "flapping" flag for maintenance.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>Where do debounce settings live? (In the rule, per sensor type, overridable per machine.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Writing every reading straight into a relational table from the API servers, with no buffer.</li>
+          <li>Using processing time for buckets, so offline backlogs land in the wrong hour.</li>
+          <li>Counting pings as drivers.</li>
+          <li>Saying "Redis pub/sub and WebSockets" without the snapshot, version and missed-message story.</li>
+          <li>One alert per breaching reading instead of one per incident.</li>
+          <li>Keeping raw data forever, or averaging averages in rollups.</li>
+          <li>Ignoring the device side: auth per device, sequence numbers, jitter, local buffering.</li>
+        </ul>
+      

@@ -1,0 +1,56 @@
+
+        <h2>Drill 4: rebalance</h2>
+        <p>The script scales the enricher 1, then 3, hard-kills one member, then goes back to 1, printing group membership each time. Run <code>python loadgen/loadgen.py --rps 20 --seconds 180</code> in a second terminal to see it under traffic.</p>
+<pre class="terminal"><code>==&gt; Now: 1 member owns all partitions
+GROUP     CONSUMER-ID           HOST         CLIENT-ID     #PARTITIONS  ASSIGNMENT
+enricher  a1b2c3d4e5f6-...      /172.18.0.9  a1b2c3d4e5f6  6            orders.created(0,1,2,3,4,5)
+
+==&gt; Scaling enricher to 3
+enricher  a1b2c3d4e5f6-...      /172.18.0.9  a1b2c3d4e5f6  2            orders.created(0,1)
+enricher  0f9e8d7c6b5a-...      /172.18.0.14 0f9e8d7c6b5a  2            orders.created(2,3)
+enricher  9a8b7c6d5e4f-...      /172.18.0.15 9a8b7c6d5e4f  2            orders.created(4,5)
+
+==&gt; Kill one member hard (no clean leave =&gt; group waits session.timeout.ms=45s)
+... after about 45 s, two members with 3 partitions each
+
+==&gt; Back to 1
+enricher  ...                                              6            orders.created(0,1,2,3,4,5)</code></pre>
+        <p>Which partitions go where will differ; the 2/2/2 split is the point.</p>
+        <p><b>What you see:</b> on scale-up, the six partitions split 2/2/2. With the <code>cooperative-sticky</code> assignor, the first member keeps two of its partitions and only gives away four, so it never stops processing completely. On the hard kill, that member's two partitions get <b>no progress for about 45 seconds</b>: the <b>Enricher lag by partition</b> panel shows exactly two lines climbing, then dropping once the coordinator gives up on the dead member and reassigns.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Timeline: a SIGKILLed member stops heartbeating, the coordinator waits 45 seconds of session timeout before reassigning its two partitions, while their lag climbs; a SIGTERM member sends leave-group and its partitions are reassigned at once">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="30">Hard kill (SIGKILL)</text>
+            <path class="arrow" d="M60 110 L830 110"/>
+            <text class="label small" x="100" y="132">t = 0</text>
+            <text class="label small" x="640" y="132">t = 45 s</text>
+            <rect class="box fail" x="100" y="50" width="540" height="40"/>
+            <text class="label small" x="370" y="74">heartbeats stop; p0, p1 owned by a dead member: no progress</text>
+            <rect class="box hot" x="640" y="50" width="190" height="40"/>
+            <text class="label small" x="735" y="74">reassign p0, p1</text>
+            <path class="arrow none dashed" d="M640 40 L640 120"/>
+            <path class="arrow bad" d="M110 100 L630 62"/>
+            <path class="arrow ok" d="M650 62 L740 100"/>
+            <text class="label small bad left" x="120" y="160">lag of p0, p1 climbs ...</text>
+            <text class="label small ok left" x="650" y="160">... then drains</text>
+
+            <text class="label left" x="20" y="200">Clean stop (SIGTERM)</text>
+            <path class="arrow" d="M60 270 L830 270"/>
+            <text class="label small" x="100" y="292">t = 0</text>
+            <rect class="box client" x="100" y="215" width="190" height="40"/>
+            <text class="label small" x="195" y="239">close(): leave-group</text>
+            <rect class="box hot" x="300" y="215" width="190" height="40"/>
+            <text class="label small" x="395" y="239">reassigned at once</text>
+            <text class="label small ok left" x="510" y="239">lag barely moves</text>
+            <circle class="packet bad" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M100 110 L640 110"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="1.5s" repeatCount="indefinite" path="M100 270 L300 270"/></circle>
+          </svg>
+          <figcaption>The 45-second gap is the cost of dying without saying goodbye: the group coordinator can only learn about it from missing heartbeats (<code>session.timeout.ms</code>). A SIGTERM lets the consumer send a leave-group request, so the coordinator reassigns its partitions immediately.</figcaption>
+        </figure>
+        <p><b>Why:</b> a clean shutdown (SIGTERM, which <code>docker compose stop</code> and Kubernetes both send) runs <code>consumer.close()</code>, which sends a leave-group request: rebalance at once. A SIGKILL sends nothing, so the coordinator can only notice missing heartbeats after <code>session.timeout.ms</code>. That is why ShopStream's <code>GracefulExit</code> class exists, and why the Kubernetes grace period matters.</p>
+        <div class="callout note"><p><b>Deep dive (good to know):</b> if the killed enricher had an open transaction, its uncommitted output in <code>orders.enriched</code> holds back <code>read_committed</code> readers of that partition (they stop at the last stable offset) until the transaction coordinator aborts it, at most <code>transaction.timeout.ms</code> (60 s in the enricher). So a hard kill can briefly stall the sink too. One more reason graceful shutdown matters.</p></div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A rebalance is re-hashing ECMP buckets when a member joins or leaves; cooperative-sticky is resilient hashing, which moves only the buckets that must move. <code>session.timeout.ms</code> is a BFD or hello dead interval: a member that vanishes without saying goodbye is only declared dead when the timer expires. A clean leave-group is like a graceful shutdown notification (a goodbye hello) that lets neighbours reconverge at once.</p>
+        </div>
+      

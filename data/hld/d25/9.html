@@ -1,0 +1,120 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min:</strong> Clarify: one-off and recurring? Delay precision needed (seconds or minutes)? What is a "job": HTTP call, message or container? Scale? Exactly-once expectations?</li>
+          <li><strong>5-10 min:</strong> Estimate: 1.2k/s average, ~10x at :00, Little's law for workers. Conclude: spikes, finding due jobs, and worker failure are the hard parts.</li>
+          <li><strong>10-18 min:</strong> API with idempotency key; jobs + job_runs tables; index on <code>next_run_at</code>.</li>
+          <li><strong>18-28 min:</strong> Draw the 6 boxes and walk one job through them.</li>
+          <li><strong>28-40 min:</strong> Deep dives: due-job lookup (poll + wheel), leases + fencing, at-least-once + idempotency, sharding the scheduler, the :00 spike.</li>
+          <li><strong>40-45 min:</strong> Failure of each box, metrics (start delay <a href="{{BASE}}interview/glossary#p99">p99</a>, lag, DLQ size), and extensions (DAGs).</li>
+        </ol>
+        <div class="callout danger"><p><b>Common mistakes:</b> a single scheduler process with no failover; scanning the whole jobs table every second; promising exactly-once; committing the queue offset before running the job; using wall-clock time from workers to decide expiry; putting all priorities in one FIFO; retrying without back-off or jitter; forgetting time zones and daylight saving for cron jobs; not saying what happens to runs missed during an outage.</p></div>
+
+        <div class="callout interview"><p><b>60-second answer.</b> "Clients create jobs through an API that stores definitions in a sharded SQL table with an index on next_run_at. For each shard, one scheduler instance holds a lease. Every second it selects due rows with SKIP LOCKED, creates a run whose id is job id plus scheduled time, and advances next_run_at in the same transaction. It publishes due runs to Kafka topics by priority, which absorbs the spikes at round times. Worker pods pull, claim the run with a lease and a fencing token, heartbeat while running, write the result and then commit the offset. Delivery is at-least-once, so jobs carry an idempotency key to their targets. Failed runs go through delayed retry topics with jittered back-off and end in a DLQ. A reaper re-queues runs whose lease expired. I watch start delay, lag and DLQ size."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>How does the scheduler know which jobs are due without scanning millions of rows?</summary>
+          <div class="answer">
+            <p>Store <code>next_run_at</code> on each job and index it together with the shard id, filtered to active jobs. The query "shard 7, next_run_at &lt;= now, limit 500" is a short index range scan, so it costs the same whether there are 1,000 jobs or 50 million. For better precision, the scheduler loads the next 60 seconds of due jobs into an in-memory timer wheel and fires each one at its exact second. In NoSQL stores, partition by (minute bucket, shard) so "due this minute" is one partition read.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with the index (the core idea), then add the wheel as the precision upgrade, and say the DB stays the source of truth.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the scheduler restarts? (Reload the window from the DB.)</li><li>What does SKIP LOCKED do? (Lets several threads take different rows without waiting on each other's locks.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Google">
+          <summary>Can you guarantee a job runs exactly once?</summary>
+          <div class="answer">
+            <p>Not for side effects outside our system. A worker can finish the HTTP call and crash before recording success; we cannot tell "did it, then died" from "died before doing it", so we must retry, which may duplicate. What we can guarantee: at-least-once delivery, no <em>concurrent</em> execution of one run (leases + fencing tokens), and exactly-once <em>effect</em> if the target honours an idempotency key (the run id). Inside Kafka-to-Kafka pipelines, Kafka transactions give exactly-once, but our job calls external systems.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "no" clearly, explain the crash window in one sentence, then give the three guarantees you can offer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the target cannot store idempotency keys? (Make the job check state first: "is this invoice already paid?")</li><li>Where exactly can duplicates appear? (Scheduler publish crash, worker crash before commit, paused worker.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Flipkart">
+          <summary>A worker holds a lease, freezes for 40 seconds, and wakes up after another worker took the job. What prevents damage?</summary>
+          <div class="answer">
+            <p>A fencing token. Each claim increments a counter on the run and returns it. Every write by the worker (status updates, and calls to the target if it supports it) carries the token, and the store accepts it only if the token is still the latest: <code>UPDATE ... WHERE run_id=? AND fencing_token=?</code>. The zombie worker's writes match zero rows. In addition, workers self-fence: if they miss N heartbeats they stop working, and the lease timeout is longer than that window.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure (process pause, not crash), show the timeline, then the token check. Mention that a lease alone is not enough.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not use a Redis lock? (Same pause problem; and async replication can lose the lock on failover.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>At midnight, 2 million jobs become due in the same second. What happens?</summary>
+          <div class="answer">
+            <p>First, prevent part of it: for jobs that allow it, add deterministic jitter within a flexible window, so "daily" jobs spread over minutes. Second, absorb the rest: schedulers write runs to Kafka quickly (sequential appends are cheap), and the spike becomes consumer lag. Workers autoscale on lag (KEDA). High-priority topics have their own pool, so payment retries do not wait behind marketing jobs. Start delay rises for low-priority jobs for a few minutes, which we accept and monitor against the SLO (<a href="{{BASE}}interview/glossary#sla-slo">SLO</a> = the latency/availability target you promise, e.g. "p99 start delay under 5 s").</p>
+            <div class="approach"><h5>How to answer</h5><p>Prevent, absorb, prioritise, scale. Name the metric you would watch (start delay p99 per priority).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Pods take 30-60 s to start; is autoscaling fast enough? (Keep a warm minimum before known peaks, scale on schedule.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>Why put Kafka between the scheduler and the workers? Why not call the workers directly?</summary>
+          <div class="answer">
+            <p>Decoupling and buffering. Direct calls tie the scheduler's speed to the slowest worker, and a spike becomes timeouts. With a durable queue, the scheduler only appends, workers pull at their own pace (natural backpressure), a worker crash means the message is redelivered, and we can replay. Kafka specifically gives high throughput and ordering per key; SQS would give per-message visibility timeouts with zero operations. Kafka cannot delay messages, so the delay logic stays in the scheduler.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the pattern: "I pick X because A, the cost is B, if C I switch to Y."</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>One slow job blocks its partition. How do you fix it? (More partitions, retry topics, or Kafka share groups / a consumer proxy.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do you make the scheduler itself highly available without running every job twice?</summary>
+          <div class="answer">
+            <p>Shard the job space (64 shards by hash of job id) and elect one leader per shard with an etcd or ZooKeeper lease. Many scheduler pods each own some shards; if one dies, its leases expire and others take over. Correctness does not depend on the election: the run id (job id + scheduled time) is a primary key, so two schedulers that both think they lead a shard still create only one run. The election saves work; the constraint keeps correctness.</p>
+            <div class="approach"><h5>How to answer</h5><p>Make the "efficiency vs correctness" split explicit. It shows maturity.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why 64 shards and not one per pod? (Move shards between pods without rehashing jobs.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>How do retries work, and why does jitter matter?</summary>
+          <div class="answer">
+            <p>On failure the worker marks the run FAILED with attempt + 1 and publishes it to a retry topic whose consumer waits until the retry time (10 s, then 1 min, then 10 min). After max attempts it goes to a DLQ and the owner is alerted. Jitter adds randomness to each delay. Without it, all jobs that failed during the same outage retry at exactly the same moment and knock the recovering service down again (a retry storm). Also separate retryable errors (timeout, 503) from fatal ones (400 bad input) that go straight to the DLQ.</p>
+            <div class="approach"><h5>How to answer</h5><p>Describe the ladder of retry topics, then jitter, then the retryable-vs-fatal split.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you replay the DLQ after a fix? (A tool that re-publishes DLQ messages to the first retry topic.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="k8s" data-company="Microsoft,Amazon">
+          <summary>Why not just use Kubernetes CronJobs for everything?</summary>
+          <div class="answer">
+            <p>CronJobs are great for dozens of in-cluster maintenance tasks, but they create a full Job and pod per run, which takes seconds of scheduling and image pulls and loads the API server and etcd. At 100 M runs per day that is far beyond what one control plane is built for. CronJobs also have no tenant quotas, no rich retry ladder, no run history API, and the docs themselves say a schedule can occasionally create zero or two Jobs. We use the same ideas (concurrency policy, starting deadline, backoff limit) in our own service.</p>
+            <div class="approach"><h5>How to answer</h5><p>Acknowledge where CronJob is right, then give two concrete limits (pod per run, control plane load).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What do Forbid, Allow and Replace mean? (Skip if running / overlap / kill old.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>The scheduler was down for 20 minutes. What happens to the runs that were due?</summary>
+          <div class="answer">
+            <p>The rows are still in the DB with <code>next_run_at</code> in the past, so the next leader sees them as due and will run them. Whether that is right depends on the job: a "send yesterday's report" job should catch up, a "refresh the cache every minute" job should run once, not 20 times. So each job has a misfire policy: <b>catch up</b> (run every missed occurrence), <b>run once</b> (collapse missed ones into one run), or <b>skip</b> if later than a starting deadline. Also rate-limit the catch-up so recovery does not create its own spike.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the DB keeps you safe, then show you know that "safe" has three meanings per job type.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you compute the next cron time across a daylight-saving change? (Compute it in the job's own time zone with a tz-aware library, then convert to UTC for next_run_at. Decide the two edge rules up front: a local time that does not exist on the spring-forward day runs at the next valid minute, and a time that happens twice on the fall-back day runs once, at its first occurrence.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Walmart">
+          <summary>How would you support "run job B only after job A succeeds"?</summary>
+          <div class="answer">
+            <p>Add a DAG layer. A workflow definition lists tasks and edges. When a run of A finishes, a completion event goes to Kafka; a workflow service consumes it, checks which downstream tasks now have all parents done, and creates their runs through the same scheduler. The workflow state (which tasks are done) lives in the DB keyed by workflow run id. This is how Airflow-style systems work; Temporal goes further by making the workflow code itself durable. In an interview I would name these and keep the core scheduler simple.</p>
+            <div class="approach"><h5>How to answer</h5><p>Keep it layered: the scheduler stays a durable timer; orchestration sits on top and is event-driven.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if A runs twice? (Downstream creation is idempotent on (workflow_run_id, task_id).)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: customers charged twice on the 1st of the month</h4>
+          <div class="situation"><p>On the 1st, support gets 300 complaints of double subscription charges. Logs show a worker node was CPU-throttled for about a minute at 09:00, and the run store shows those runs claimed twice.</p></div>
+          <div class="bad"><p>Weak answer: "Increase the lease timeout to 5 minutes." That only makes the window rarer, and every real crash now waits 5 minutes before retry.</p></div>
+          <div class="good"><p>Strong answer: the lease expired during the throttle, a second worker claimed the run, and both called billing. Two fixes, both needed. (1) Billing must accept an idempotency key (the run id) and return the original result on repeats; this is the real fix. (2) Fencing tokens on the run store and passed to billing, plus self-fencing after missed heartbeats. Then refund the 300 customers with an audited script, add an alert on "runs with more than one claim", and fix the CPU limits that caused throttling.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you find all affected customers? (Runs with claim count &gt; 1 joined with billing records.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: start delay p99 jumps from 3 s to 9 minutes</h4>
+          <div class="situation"><p>It is 00:00. Dashboards show Kafka lag on <code>jobs.low</code> growing fast; <code>jobs.high</code> is fine. One tenant created 5 million "daily" jobs last week.</p></div>
+          <div class="bad"><p>Weak answer: "Add more Kafka partitions right now." Adding partitions does not drain existing lag and changes key-to-partition mapping.</p></div>
+          <div class="good"><p>Strong answer: confirm with lag per tenant. Short term: scale the low-priority worker pool (lag-based HPA should already be doing it; check if it hit its max or the target service is the bottleneck). Apply the tenant's concurrency quota so other tenants are not starved. Long term: enforce jitter (flexible windows) for bulk daily jobs, per-tenant creation quotas, and a separate pool or topic for bulk tenants.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metric would have warned you last week? (Count of jobs due per minute, forecast for the next 24 h.)</li></ul></div>
+        </div>
+      

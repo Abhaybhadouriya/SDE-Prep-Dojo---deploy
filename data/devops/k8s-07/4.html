@@ -1,0 +1,97 @@
+
+        <h2>Protecting Secrets: four layers</h2>
+        <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+        <p>Here is the full path of a Secret, and where each protection sits.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="The path of a Secret: kubectl to API server with RBAC, envelope encryption with a KMS before etcd, then kubelet mounts it on tmpfs in the pod">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="40" width="120" height="56"/>
+            <text class="label" x="70" y="62">kubectl /</text>
+            <text class="label" x="70" y="82">CI pipeline</text>
+            <rect class="box k8s solid" x="180" y="40" width="160" height="56"/>
+            <text class="label white" x="260" y="62">API server</text>
+            <text class="label white" x="260" y="82" style="font-size:13px">1. RBAC check</text>
+            <rect class="box queue" x="390" y="40" width="170" height="56"/>
+            <text class="label" x="475" y="62">2. encryption</text>
+            <text class="label small" x="475" y="82">provider (KMS v2)</text>
+            <rect class="box cache" x="390" y="150" width="170" height="56"/>
+            <text class="label" x="475" y="172">cloud KMS / HSM</text>
+            <text class="label small" x="475" y="194">holds the key (KEK)</text>
+            <rect class="box db" x="610" y="40" width="170" height="56"/>
+            <text class="label" x="695" y="62">etcd</text>
+            <text class="label small" x="695" y="82">ciphertext only</text>
+            <rect class="box k8s" x="180" y="200" width="160" height="56"/>
+            <text class="label" x="260" y="222">kubelet</text>
+            <text class="label small" x="260" y="244">3. Node authorizer</text>
+            <rect class="box docker" x="10" y="200" width="130" height="56"/>
+            <text class="label" x="75" y="222">pod tmpfs</text>
+            <text class="label small" x="75" y="244">4. file, mode 0400</text>
+            <path class="arrow" d="M130 68 L175 68"/>
+            <path class="arrow" d="M340 68 L385 68"/>
+            <path class="arrow" d="M560 68 L605 68"/>
+            <path class="arrow both dashed" d="M475 96 L475 146"/>
+            <path class="arrow" d="M260 96 L260 196"/>
+            <path class="arrow" d="M180 228 L145 228"/>
+            <circle class="packet gold" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M130 68 L260 68 L475 68 L610 68"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M260 96 L260 228 L140 228"/></circle>
+          </svg>
+          <figcaption>Layer 1: who may read Secrets (RBAC). Layer 2: what etcd and its backups contain (encryption at rest). Layer 3: a kubelet can only fetch Secrets for pods on its own node (Node authorizer). Layer 4: on the node it lives in RAM, not on disk.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>RBAC least privilege.</strong> Very few people and service accounts should have <code>get</code>/<code>list</code>/<code>watch</code> on <code>secrets</code>. Remember that <code>list</code> returns the values too, and that permission to create pods in a namespace is effectively permission to read its Secrets. Details on <a href="{{BASE}}devops/k8s-12">Security &amp; RBAC</a>.</li>
+          <li><strong>Encryption at rest.</strong> By default, Secret data sits in etcd unencrypted (just base64). Configure the API server with an <code>EncryptionConfiguration</code>, ideally the <b>KMS v2</b> provider: the API server encrypts each object with a data key (DEK), and the DEK itself is encrypted by a key-encryption key (KEK) held in a cloud KMS or HSM. Managed <a href="{{BASE}}interview/glossary#cluster">clusters</a> (EKS, AKS, GKE) offer this as a setting.</li>
+          <li><strong>Node scoping.</strong> The Node authorizer and NodeRestriction admission plugin limit each kubelet to Secrets of pods scheduled on that node, so one compromised node does not leak everything.</li>
+          <li><strong>In the pod.</strong> Secret volumes are tmpfs; mount read-only with tight <code>defaultMode</code>; set <code>automountServiceAccountToken: false</code> when the pod does not call the API.</li>
+        </ol>
+<pre><code class="language-yaml"># /etc/kubernetes/encryption-config.yaml, passed to kube-apiserver with
+#   --encryption-provider-config=/etc/kubernetes/encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+- resources: ["secrets"]
+  providers:
+  - kms:
+      apiVersion: v2
+      name: cloud-kms
+      endpoint: unix:///var/run/kms-plugin/socket.sock   # local KMS plugin talks to the real KMS
+  - identity: {}          # fallback: lets the server still read old, unencrypted data</code></pre>
+<p>Here is the moment that makes it real. First, <b>before</b> encryption at rest is enabled. Anyone with <code>get</code> on the Secret, and anyone who can read etcd or an etcd backup, sees the value:</p>
+<pre class="terminal"><code># through the API: base64 is only an encoding
+$ kubectl get secret db-cred -n shop -o jsonpath='{.data.password}'
+UzNjcjN0IQ==
+$ kubectl get secret db-cred -n shop -o jsonpath='{.data.password}' | base64 -d
+S3cr3t!
+
+# straight from etcd (on a control-plane node, default kubeadm setup = no encryption)
+$ ETCDCTL_API=3 etcdctl get /registry/secrets/shop/db-cred | strings | grep -A1 password
+password
+S3cr3t!</code></pre>
+<p>Then <b>after</b> the EncryptionConfiguration above is in place and the API server has been restarted:</p>
+<pre class="terminal"><code># after enabling, rewrite existing Secrets so they get encrypted
+$ kubectl get secrets -A -o json | kubectl replace -f -
+
+# proof, on a control-plane node: the value in etcd is now ciphertext
+$ ETCDCTL_API=3 etcdctl get /registry/secrets/shop/db-cred | hexdump -C | head -2
+00000000  2f 72 65 67 69 73 74 72  79 2f 73 65 63 72 65 74  |/registry/secret|
+00000010  73 2f 73 68 6f 70 2f 64  62 2d 63 72 65 64 0a 6b  |s/shop/db-cred.k|
+# the next bytes begin with a "k8s:enc:kms:v2:" prefix followed by unreadable bytes
+
+# but the API still decrypts for anyone RBAC allows
+$ kubectl get secret db-cred -n shop -o jsonpath='{.data.password}' | base64 -d
+S3cr3t!</code></pre>
+        <p>So "is a Secret encrypted?" has three answers, one per place the Secret lives:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Where the Secret is</th><th>Encrypted by default?</th><th>What protects it</th></tr></thead>
+            <tbody>
+              <tr><td><b>At rest</b> (etcd files, etcd backups)</td><td>No. Plain base64 unless you set an <code>EncryptionConfiguration</code> (many managed clusters turn on envelope encryption for you; check yours)</td><td>KMS v2 envelope encryption, encrypted disks, guarded backups</td></tr>
+              <tr><td><b>In transit</b> (<a href="{{BASE}}interview/glossary#kubectl">kubectl</a> or kubelet to API server, API server to etcd)</td><td>Yes. All of these connections use TLS</td><td>TLS with client certificates or tokens</td></tr>
+              <tr><td><b>On the node</b> (inside the pod)</td><td>No. It is plain text, but on a tmpfs (RAM) volume that is never written to the node's disk</td><td>File mode (<code>defaultMode: 0400</code>), node authorizer (a kubelet only gets Secrets for its own pods), not using env vars</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Envelope encryption is the same key hierarchy you see in secure boot or MACsec key management: a long-lived master key (KEK) that never leaves the HSM wraps short-lived data keys (DEKs) that do the bulk encryption. Rotating the master key does not mean re-encrypting everything at once. Where it breaks: encryption at rest protects etcd files and backups, not the API - anyone allowed to <code>get</code> the Secret through the API still sees the plain value.</p>
+        </div>
+      

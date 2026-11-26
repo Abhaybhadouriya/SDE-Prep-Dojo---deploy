@@ -1,0 +1,118 @@
+
+  <h2>Run it: all three races in one program</h2>
+  <p>Everything above in one runnable file, <code>lld-code/lld-conc-basics/RaceDemo.java</code> (OpenJDK 21). Demo 1 is <a href="#rmw">Race 1</a> (<code>count++</code>), demo 2 is <a href="#check-then-act">Race 2</a> (check-then-act on the last seat), demo 3 is the <a href="#visibility">visibility</a> test (a plain flag vs a <code>volatile</code> one). The output snippets in those sections came from an earlier run; this is the captured run of the file as shown.</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+// Three classic thread-safety bugs and their fixes. Run several times: the broken numbers change.
+public class RaceDemo {
+
+    // ---------- 1. Read-modify-write: count++ is three steps ----------
+    static int plain = 0;
+    static int locked = 0;
+    static final Object LOCK = new Object();
+    static final AtomicInteger atomic = new AtomicInteger();
+
+    static void lostUpdates() throws InterruptedException {
+        final int threads = 4, perThread = 100_000;
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; threads; t++) {
+            Thread th = new Thread(() -&gt; {
+                for (int i = 0; i &lt; perThread; i++) {
+                    plain++;                                   // read, add, write: NOT atomic
+                    synchronized (LOCK) { locked++; }          // one thread at a time
+                    atomic.incrementAndGet();                  // one CAS instruction loop
+                }
+            });
+            ts.add(th);
+            th.start();
+        }
+        for (Thread th : ts) th.join();                        // join = happens-before: we see final values
+        System.out.printf("1) expected %d | plain %d | synchronized %d | AtomicInteger %d%n",
+                threads * perThread, plain, locked, atomic.get());
+    }
+
+    // ---------- 2. Check-then-act: two users book the last seat ----------
+    static final class UnsafeShow {
+        private int seatsLeft = 1;
+        boolean book(String user) throws InterruptedException {
+            if (seatsLeft &gt; 0) {                               // check
+                Thread.sleep(10);                              // widen the window (payment call, DB, GC pause...)
+                seatsLeft--;                                   // act on a stale check
+                System.out.println("   " + user + " booked, seatsLeft=" + seatsLeft);
+                return true;
+            }
+            System.out.println("   " + user + " sold out");
+            return false;
+        }
+    }
+    static final class SafeShow {
+        private int seatsLeft = 1;
+        synchronized boolean book(String user) throws InterruptedException {   // check + act are one atomic unit
+            if (seatsLeft &gt; 0) {
+                Thread.sleep(10);
+                seatsLeft--;
+                System.out.println("   " + user + " booked, seatsLeft=" + seatsLeft);
+                return true;
+            }
+            System.out.println("   " + user + " sold out");
+            return false;
+        }
+    }
+
+    interface Booker { boolean book(String u) throws InterruptedException; }
+
+    static void race(String label, Booker show) throws Exception {
+        System.out.println("2) " + label);
+        CountDownLatch go = new CountDownLatch(1);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        List&lt;Future&lt;Boolean&gt;&gt; results = new ArrayList&lt;&gt;();
+        for (String u : List.of("asha", "ravi"))
+            results.add(pool.submit(() -&gt; { go.await(); return show.book(u); }));
+        go.countDown();                                        // release both threads together
+        int ok = 0;
+        for (Future&lt;Boolean&gt; f : results) if (f.get()) ok++;
+        pool.shutdown();
+        System.out.println("   successful bookings for 1 seat: " + ok);
+    }
+
+    // ---------- 3. Visibility: a stop flag the worker never sees ----------
+    static boolean stopPlain = false;
+    static volatile boolean stopVolatile = false;
+
+    static void visibility() throws InterruptedException {
+        Thread w1 = new Thread(() -&gt; { long n = 0; while (!stopPlain) n++; });
+        Thread w2 = new Thread(() -&gt; { long n = 0; while (!stopVolatile) n++; });
+        w1.setDaemon(true);                                    // so a stuck thread cannot keep the JVM alive
+        w2.setDaemon(true);
+        w1.start(); w2.start();
+        Thread.sleep(500);                                     // let the JIT compile the hot loops
+        stopPlain = true;
+        stopVolatile = true;
+        w1.join(1000);
+        w2.join(1000);
+        System.out.println("3) plain flag worker still running after 1 s: " + w1.isAlive());
+        System.out.println("   volatile flag worker still running after 1 s: " + w2.isAlive());
+    }
+
+    public static void main(String[] args) throws Exception {
+        lostUpdates();
+        race("check-then-act WITHOUT a lock", new UnsafeShow()::book);
+        race("check-then-act WITH synchronized", new SafeShow()::book);
+        visibility();
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out RaceDemo.java &amp;&amp; java -cp out RaceDemo
+1) expected 400000 | plain 397690 | synchronized 400000 | AtomicInteger 400000
+2) check-then-act WITHOUT a lock
+   ravi booked, seatsLeft=-1
+   asha booked, seatsLeft=-1
+   successful bookings for 1 seat: 2
+2) check-then-act WITH synchronized
+   asha booked, seatsLeft=0
+   ravi sold out
+   successful bookings for 1 seat: 1
+3) plain flag worker still running after 1 s: true
+   volatile flag worker still running after 1 s: false</code></pre>
+  <p>The broken results (the plain counter, which buyer prints first, and the seat count going to -1) change from run to run; the fixed ones never do.</p>

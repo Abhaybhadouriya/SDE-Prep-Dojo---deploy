@@ -1,0 +1,105 @@
+
+  <h2>The full walkthrough with real SQL and code</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>Postgres syntax below; the ideas are the same on MySQL. Migrations are versioned files run by a tool such as Flyway or Liquibase, which records what ran in a history table and takes a lock so two runners cannot apply the same migration at once.</p>
+
+  <h3>Step 1 - Expand (migration V41)</h3>
+<pre><code class="language-sql">-- V41__add_phone_e164.sql
+SET lock_timeout = '3s';            -- give up instead of queueing behind a long query
+ALTER TABLE users ADD COLUMN phone_e164 text;   -- nullable, no default: catalog-only change</code></pre>
+  <p>Why it is safe for v1: v1 never mentions <code>phone_e164</code>. Two conditions make that true, and both are worth saying in an interview: the column is <b>nullable</b> (v1's inserts do not supply it), and v1 does not do <code>SELECT *</code> into a strict mapper that fails on unknown columns.</p>
+  <p>Why it is fast: in Postgres, adding a nullable column, or one with a constant default (Postgres 11+), only updates the catalog; existing rows are not rewritten. A <b>volatile</b> default such as <code>clock_timestamp()</code> forces a full table rewrite under an exclusive lock, which is an outage on a big table.</p>
+
+  <h3>Step 2 - Dual write (app v2)</h3>
+<pre><code class="language-java">// v2: write both, read old
+public void updatePhone(long userId, String raw) {
+    String e164 = PhoneNormalizer.toE164(raw, "IN");   // may return null if unparseable
+    jdbc.update("UPDATE users SET phone = ?, phone_e164 = ? WHERE id = ?",
+                raw, e164, userId);                     // ONE statement: both columns or neither
+}
+
+public String getPhone(long userId) {
+    return jdbc.queryForObject("SELECT phone FROM users WHERE id = ?", String.class, userId);
+}</code></pre>
+  <p>Write both columns in the <b>same statement or transaction</b>. Writing them in two separate calls lets a crash leave them disagreeing. If the data lived in two different stores (a table in another service, a search index), you could not get one transaction; you would use change data capture or an outbox instead, and treat the new store as eventually consistent.</p>
+
+  <h3>Step 3 - Backfill (a one-off Job)</h3>
+<pre><code class="language-sql">-- run repeatedly until it updates 0 rows; each run is one short transaction
+WITH batch AS (
+  SELECT id FROM users
+  WHERE phone IS NOT NULL
+    AND phone_e164 IS DISTINCT FROM normalize_e164(phone)   -- NULL *or* stale
+    AND id &gt; :last_id                -- keyset cursor, so each pass moves forward
+  ORDER BY id
+  LIMIT 5000
+  FOR UPDATE SKIP LOCKED          -- never wait on rows the live app is updating
+)
+UPDATE users u
+SET    phone_e164 = normalize_e164(u.phone)
+FROM   batch
+WHERE  u.id = batch.id
+RETURNING u.id;                     -- the job saves max(id) as the next :last_id</code></pre>
+<pre class="terminal"><code>$ ./backfill-phone.sh --batch 5000 --sleep-ms 200
+batch 1     updated 5000   last_id 41877     replica_lag 0.2s
+batch 2     updated 5000   last_id 83511     replica_lag 0.3s
+...
+batch 371   updated 642    last_id 9918034   replica_lag 0.1s
+done: 1849102 rows in 26m31s   (1843210 NULL + 5892 stale)
+
+$ psql -c "SELECT count(*) FILTER (WHERE phone_e164 IS NULL)              AS missing,
+                  count(*) FILTER (WHERE phone_e164 &lt;&gt; normalize_e164(phone)) AS mismatched
+           FROM users WHERE phone IS NOT NULL;"
+ missing | mismatched
+---------+------------
+       0 |          0
+(1 row)</code></pre>
+  <p>(Your counts and timings will differ; the shape of the output is the point.) Rules for a backfill that does not hurt production:</p>
+  <ul>
+    <li><b>Small batches, short transactions.</b> One giant <code>UPDATE users SET ...</code> holds row locks for the whole run, bloats the table and floods replication.</li>
+    <li><b>Throttle on a signal.</b> Sleep between batches and slow down when replica lag or p99 latency climbs.</li>
+    <li><b>Idempotent and resumable.</b> The filter selects only rows whose new column is missing <i>or disagrees</i> with the old one, and the job stores its <code>last_id</code> cursor, so a crashed run just starts again. Never keep progress only in memory.</li>
+    <li><b>Compare values, not NULLs.</b> During the v2 rollout a row can be written by a v2 pod (both columns set) and then updated by a v1 pod, which changes only <code>phone</code>. Its <code>phone_e164</code> is now stale but <i>not</i> NULL, so an <code>IS NULL</code> backfill and an <code>IS NULL</code> check would both miss it and v3 would read wrong data. Re-deriving the value with <code>IS DISTINCT FROM normalize_e164(phone)</code> catches both cases, and rewriting an already-correct row is harmless because the value is a pure function of <code>phone</code>. (If normalising in SQL is not possible, re-process every row with <code>updated_at</code> after the v2 rollout started, once v2 is at 100%.)</li>
+    <li><b>Trigger instead of app dual-write.</b> On hot tables many teams let a database trigger keep <code>phone_e164</code> in sync from <code>phone</code>. Every writer, old or new, goes through it, so there is no version race at all; drop the trigger at the contract step.</li>
+    <li><b>Unparseable values.</b> Decide up front: leave NULL and log, or write to a quarantine table for a human. Do not invent data.</li>
+  </ul>
+  <p>Optional hardening once the backfill is done: make the database enforce the invariant, without a long lock.</p>
+<pre><code class="language-sql">-- V42: enforce "if phone is set, phone_e164 is set" without a blocking scan
+ALTER TABLE users ADD CONSTRAINT phone_e164_present
+  CHECK (phone IS NULL OR phone_e164 IS NOT NULL) NOT VALID;    -- new writes checked now
+ALTER TABLE users VALIDATE CONSTRAINT phone_e164_present;        -- scans old rows, weaker lock
+
+-- and if lookups by the new column need an index:
+CREATE INDEX CONCURRENTLY idx_users_phone_e164 ON users (phone_e164);</code></pre>
+  <p>(On PostgreSQL 18 you can skip the CHECK detour: <code>ALTER TABLE users ADD CONSTRAINT phone_e164_nn NOT NULL phone_e164 NOT VALID;</code> then <code>VALIDATE CONSTRAINT</code>. Older versions need the CHECK shown here.) <code>NOT VALID</code> skips checking existing rows, so the <code>ALTER</code> is quick; <code>VALIDATE CONSTRAINT</code> then scans them holding only a <code>SHARE UPDATE EXCLUSIVE</code> lock, which does not block reads or writes. <code>CREATE INDEX CONCURRENTLY</code> builds without blocking writes (it cannot run inside a transaction block, so tell your migration tool).</p>
+
+  <h3>Step 4 - Switch reads (app v3)</h3>
+<pre><code class="language-java">public String getPhone(long userId) {
+    if (flags.isOn("read-phone-e164")) {                 // flip off = instant rollback of reads
+        return jdbc.queryForObject("SELECT phone_e164 FROM users WHERE id = ?", String.class, userId);
+    }
+    return jdbc.queryForObject("SELECT phone FROM users WHERE id = ?", String.class, userId);
+}
+// writes: still BOTH columns, exactly as v2</code></pre>
+  <p>Before trusting the new column, many teams run <b>shadow reads</b>: read both, return the old value, log any mismatch. Stripe described doing this for a large migration with GitHub's Scientist library, comparing results from the old and new data models in production before switching.</p>
+
+  <h3>Step 5 - Contract (app v4, then migration V43)</h3>
+<pre><code class="language-java">// v4: new column only
+jdbc.update("UPDATE users SET phone_e164 = ? WHERE id = ?", e164, userId);</code></pre>
+<pre><code class="language-sql">-- V43__drop_phone.sql   (ships days later, after v4 has baked)
+SET lock_timeout = '3s';
+ALTER TABLE users DROP COLUMN phone;</code></pre>
+  <p>Two details people miss. First, if <code>phone</code> was <code>NOT NULL</code>, drop that constraint <b>before</b> v4 ships, or v4's inserts (which no longer set it) fail. Second, with ORMs like Hibernate or ActiveRecord, the app must stop <i>referencing</i> the column before the drop (Rails has <code>ignored_columns</code> for exactly this), or the old code's cached column list breaks.</p>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Release</th><th>Schema</th><th>App writes</th><th>App reads</th><th>Pods live during rollout</th><th>Safe rollback to</th></tr></thead>
+      <tbody>
+        <tr><td>R1 migration V41</td><td>+ phone_e164</td><td>phone</td><td>phone</td><td>v1</td><td>v1 (no change)</td></tr>
+        <tr><td>R2 app v2</td><td>both</td><td>both</td><td>phone</td><td>v1 + v2</td><td>v1</td></tr>
+        <tr><td>R3 backfill</td><td>both (filled)</td><td>both</td><td>phone</td><td>v2</td><td>v1 or v2</td></tr>
+        <tr><td>R4 app v3</td><td>both</td><td>both</td><td>phone_e164</td><td>v2 + v3</td><td>v2</td></tr>
+        <tr><td>R5 app v4</td><td>both</td><td>phone_e164</td><td>phone_e164</td><td>v3 + v4</td><td>v3 (not v2: phone is stale)</td></tr>
+        <tr><td>R6 migration V43</td><td>- phone</td><td>phone_e164</td><td>phone_e164</td><td>v4</td><td>v4 only; backup restore otherwise</td></tr>
+      </tbody>
+    </table>
+  </div>

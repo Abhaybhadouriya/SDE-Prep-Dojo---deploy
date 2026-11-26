@@ -1,0 +1,77 @@
+
+        <h2>Data model: what we store and where</h2>
+        <p>Look at how the data is read. Almost every read is "give me the latest N messages of <i>this</i> chat" or "give me everything for <i>this</i> user since cursor X". There are no joins. Writes are huge (hundreds of thousands per second) and append-only. That pattern points to a <b>wide-column NoSQL store</b> (Cassandra, ScyllaDB, HBase, or DynamoDB) partitioned by chat. Users, groups and settings are small and relational, so they can live in SQL. The "who is connected where" table changes every second and can be rebuilt, so it lives in memory (Redis or the gateways themselves). See <a href="{{BASE}}hld/hld-08">Choosing Storage</a>.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 330" role="img" aria-label="Four stores: messages in wide-column, inbox per user, session registry in Redis, users and groups in SQL">
+            <rect class="zone db" x="10" y="10" width="420" height="180"/>
+            <text class="zone-label" x="26" y="32">Wide-column store (Cassandra / ScyllaDB)</text>
+            <rect class="box db" x="30" y="48" width="185" height="128"/>
+            <text class="label" x="122" y="68">messages</text>
+            <text class="label small" x="122" y="92">PK: (chat_id, bucket)</text>
+            <text class="label small" x="122" y="112">CK: seq DESC</text>
+            <text class="label small" x="122" y="132">msg_id, sender,</text>
+            <text class="label small" x="122" y="152">body, created_at</text>
+            <rect class="box db" x="228" y="48" width="185" height="128"/>
+            <text class="label" x="320" y="68">inbox</text>
+            <text class="label small" x="320" y="92">PK: (user_id)</text>
+            <text class="label small" x="320" y="112">CK: inbox_cursor</text>
+            <text class="label small" x="320" y="132">chat_id, msg_id</text>
+            <text class="label small" x="320" y="152">TTL ~30 days</text>
+            <rect class="zone" x="450" y="10" width="400" height="180"/>
+            <text class="zone-label" x="466" y="32">In memory (Redis / Valkey)</text>
+            <rect class="box cache" x="470" y="48" width="175" height="128"/>
+            <text class="label" x="557" y="68">sessions</text>
+            <text class="label small" x="557" y="92">key: user:device</text>
+            <text class="label small" x="557" y="112">val: gateway id</text>
+            <text class="label small" x="557" y="132">TTL 60 s,</text>
+            <text class="label small" x="557" y="152">refreshed by ping</text>
+            <rect class="box cache" x="657" y="48" width="175" height="128"/>
+            <text class="label" x="744" y="68">presence</text>
+            <text class="label small" x="744" y="92">key: user</text>
+            <text class="label small" x="744" y="112">val: online /</text>
+            <text class="label small" x="744" y="132">last_seen ts</text>
+            <text class="label small" x="744" y="152">TTL refresh</text>
+            <rect class="zone k8s" x="10" y="205" width="840" height="115"/>
+            <text class="zone-label" x="26" y="227">SQL (PostgreSQL / MySQL, sharded by user_id if needed)</text>
+            <rect class="box svc" x="30" y="240" width="250" height="66"/>
+            <text class="label" x="155" y="262">users</text>
+            <text class="label small" x="155" y="285">id, phone, keys, devices</text>
+            <rect class="box svc" x="300" y="240" width="250" height="66"/>
+            <text class="label" x="425" y="262">groups / members</text>
+            <text class="label small" x="425" y="285">group_id, user_id, role</text>
+            <rect class="box svc" x="570" y="240" width="262" height="66"/>
+            <text class="label" x="701" y="262">chat_state</text>
+            <text class="label small" x="701" y="285">chat_id, next_seq, read_upto</text>
+          </svg>
+          <figcaption>Each kind of data goes to the store that matches how it is used: append-heavy messages to wide-column, rebuildable state to memory, small relational data to SQL.</figcaption>
+        </figure>
+
+<pre><code class="language-sql">-- Cassandra CQL. One partition = one chat + one time bucket (e.g. 10 days),
+-- so a very old, busy chat never grows into one giant partition.
+CREATE TABLE messages (
+  chat_id    text,
+  bucket     int,          -- days_since_epoch / 10
+  seq        bigint,       -- per-chat order
+  msg_id     bigint,       -- Snowflake-style, globally unique, roughly time-sorted
+  client_msg_id uuid,      -- for de-duplicating retries
+  sender_id  text,
+  body       blob,         -- ciphertext
+  created_at timestamp,
+  PRIMARY KEY ((chat_id, bucket), seq)
+) WITH CLUSTERING ORDER BY (seq DESC);
+
+-- Latest 50 messages of a chat: hits exactly one partition, already sorted.
+SELECT seq, sender_id, body FROM messages
+ WHERE chat_id = 'dm:alice:ben' AND bucket = 2040 LIMIT 50;</code></pre>
+        <div class="callout tip"><p><b>Why the bucket?</b> Discord's engineering blog explains it partitions messages by <code>(channel_id, bucket)</code> where a bucket is a fixed time window, and uses Snowflake ids for messages. Without buckets, one chat that has existed for ten years would be one enormous partition on one set of nodes - a hot spot and a slow compaction.</p></div>
+        <div class="proscons">
+          <div class="pros"><h5>Why wide-column for messages</h5><ul><li>Writes are sequential appends (<b>LSM tree</b> = log-structured merge tree: writes go to memory and are flushed to sorted files in big sequential chunks, like log-structured flash writes), so hundreds of thousands per second is normal.</li><li>Adding nodes adds capacity linearly; data spreads by hashing the partition key.</li><li>"Latest N of chat X" is a single-partition, pre-sorted read.</li></ul></div>
+          <div class="cons"><h5>What you give up</h5><ul><li>No joins and no ad-hoc queries; you design tables per query.</li><li>Tunable but eventual consistency by default (use <b>QUORUM</b> writes and reads for messages: with 3 replicas, wait for 2 of 3 to answer).</li><li>Deletes create <b>tombstones</b> (a delete marker written instead of removing data; it is cleaned up later by <b>compaction</b>, the background job that merges sorted files). Many tombstones slow reads if you are careless.</li></ul></div>
+        </div>
+        <p>For more depth on LSM trees and compaction see <a href="{{BASE}}hld/hld-07">Data Modeling, Indexing &amp; Storage Engines</a>; for picking a wide-column store see <a href="{{BASE}}hld/hld-08">Choosing Storage</a>.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The partition key is a hash key, just like the 5-tuple hash that picks an ECMP next hop: the same chat always lands on the same replica set, so its messages stay together and in order. The clustering key (<code>seq</code>) is the sort order inside that bucket, like entries in a ring buffer ordered by index. <i>Where it breaks:</i> ECMP rehashes flows the moment a next hop dies, but a Cassandra partition key never moves data implicitly; adding or removing nodes streams data between them, which takes time and bandwidth.</p>
+        </div>
+      

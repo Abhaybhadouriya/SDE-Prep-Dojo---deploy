@@ -1,0 +1,83 @@
+
+  <h2>False positives and count mode: shipping rules safely</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>A WAF rule that blocks real customers is an outage you caused yourself. A <strong>false positive</strong> is a legitimate request matched as an attack: a support form whose text contains SQL keywords, a JSON body that looks like XSS, a corporate NAT that looks like one very busy IP. The standard way to avoid this is to never ship a new rule straight to Block.</p>
+  <ol class="steps">
+    <li><strong>Deploy in Count.</strong> For a managed rule group, set the group's override action to count; for your own rule, use the Count action. Traffic is unaffected.</li>
+    <li><strong>Watch the logs for a week</strong> (or through a full business cycle, including your peak). Which rules matched, on which URIs, for which clients?</li>
+    <li><strong>Tune.</strong> Add scope-down statements, exclude specific rules for specific paths (for example the rich-text editor endpoint), or raise a threshold.</li>
+    <li><strong>Flip to Block for one rule at a time</strong>, ideally first on a canary host or a share of traffic, with an alarm on the blocked-request rate.</li>
+    <li><strong>Keep a fast rollback</strong>: rules are code (Terraform), so reverting is one commit; an emergency allow-list rule at the top priority is your break-glass.</li>
+  </ol>
+  <pre><code class="language-hcl">resource "aws_wafv2_web_acl" "shop" {
+  name  = "shop-edge"
+  scope = "CLOUDFRONT"
+  default_action { allow {} }
+
+  rule {
+    name     = "aws-common"
+    priority = 10
+    override_action { count {} }          # observe first; change to none {} to enforce
+    statement {
+      managed_rule_group_statement {
+        vendor_name = "AWS"
+        name        = "AWSManagedRulesCommonRuleSet"
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "aws-common"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  rule {
+    name     = "login-rate"
+    priority = 20
+    action { block {} }
+    statement {
+      rate_based_statement {
+        limit                 = 100       # per IP per window
+        evaluation_window_sec = 300
+        aggregate_key_type    = "IP"
+        scope_down_statement {
+          byte_match_statement {
+            search_string         = "/login"
+            field_to_match { uri_path {} }
+            positional_constraint = "STARTS_WITH"
+            text_transformation {
+              priority = 0
+              type     = "NONE"
+            }
+          }
+        }
+      }
+    }
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "login-rate"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "shop-edge"
+    sampled_requests_enabled   = true
+  }
+}</code></pre>
+  <p>With WAF logs in CloudWatch Logs, a Logs Insights query shows what a counted rule <em>would</em> have blocked (output illustrative):</p>
+  <pre class="terminal"><code>fields @timestamp, httpRequest.clientIp, httpRequest.uri
+| filter nonTerminatingMatchingRules.0.ruleId = "aws-common"
+| stats count(*) as hits by httpRequest.uri
+| sort hits desc
+| limit 5
+
+httpRequest.uri            hits
+/api/support/ticket        4812
+/search                     219
+/wp-login.php               188
+/api/cart                    14
+/.env                         9</code></pre>
+  <p>Reading it: <code>/wp-login.php</code> and <code>/.env</code> are real attack probes (you do not run WordPress). But 4,812 hits on the support-ticket endpoint are almost certainly customers typing text that trips a rule. Exclude that rule for that path before enforcing, or you will block your own support queue.</p>
+  <div class="callout warn"><p><b>Rate limits and NAT.</b> A mobile carrier's CGNAT or an office proxy can put thousands of real users behind one IPv4 address. A per-IP rate limit sized for a single person blocks all of them at once. Prefer keys that identify a client better (session token, API key, account, or IP plus fingerprint) for authenticated flows, and keep per-IP limits generous for the anonymous ones.</p></div>

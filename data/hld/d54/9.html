@@ -1,0 +1,133 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> Find, reserve, drop off, notify, pick up, expire, returns. Numbers: 25,000+ locations, 3-day window, 6-digit code. Ask whether store pickup is in scope.</li>
+          <li><strong>5-10 min: estimation</strong> Show the load is small; point at correctness, the edge and security.</li>
+          <li><strong>10-18 min: APIs and data model</strong> Capacity counter, compartment state with version, assignment with code hash, idempotency keys.</li>
+          <li><strong>18-28 min: architecture</strong> Discovery, capacity, assignment, access, expiry, kiosk agent, device gateway, Kafka, notification.</li>
+          <li><strong>28-40 min: deep dives</strong> Reserve capacity vs box; CAS vs locks; offline kiosk; code security math; state machine.</li>
+          <li><strong>40-45 min: wrap up</strong> Failure modes, metrics (failed drops, expiry rate, kiosk offline minutes, wrong-code rate) and the store-pickup extension.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Scale is small, so the design is about correctness and the physical world. At checkout I reserve <i>capacity</i> at a locker for a delivery day, not a specific box, with a conditional counter update. At drop-off the assignment service picks a free compartment of the right size with a compare-and-set on its version, so two drivers never get one box. When the door closes on a parcel, the kiosk publishes an event; the access service issues a single-use six-digit code and pushes its HMAC, compartment and deadline down to the kiosk, so pickup works even if the kiosk is offline. Events flow up over MQTT to a device gateway and into Kafka, with an outbox and sequence numbers. A state machine with an expiry sweep returns unclaimed parcels after three days. Codes are protected by escalating lockouts, single use and a keyed hash whose key lives in hardware."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: the APIs, the tables, reserve-capacity-then-assign, CAS on the compartment row, the parcel state machine, a code per parcel and the three-day expiry. SDE-2 adds: the offline kiosk (desired vs reported state, local validation, outbox), the 1-in-25,000 code arithmetic with escalating lockouts and HMAC keys in a TPM, door-jam and "parcel never removed" failure modes, and the Walmart store-pickup slot variant.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>ticket booking.</b> Both hold-then-confirm, but a seat is a specific thing the user picks, while a locker box is interchangeable until the driver arrives, so you reserve a count first and choose the box later. Also do not confuse a <b>distributed lock</b> with a <b>conditional write</b>: here one row per compartment with a version check is enough, and a lock service would only add a dependency.</p></div>
+
+        <h3>Follow-up questions</h3>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Two drivers request a medium compartment at the same kiosk at the same time. How do you avoid giving both the same box?</summary>
+          <div class="answer">
+            <p>Claim the box with a conditional update: <code>SET state = ASSIGNED, version = v + 1 WHERE state = AVAILABLE AND version = v</code>. Only one update affects a row; the other gets zero rows and tries the next candidate. Add a unique request id so a retry returns the same box. The kiosk also serialises door commands per compartment.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the race first (two reads see AVAILABLE), then the fix in one SQL line, then idempotency for retries.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not a distributed lock? (Locks need fencing; the version column is the fence.)</li><li>What if the database is in another region from the kiosk? (Keep each locker's rows in its home region.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>When do you reserve a locker: at checkout, at shipping, or at delivery?</summary>
+          <div class="answer">
+            <p>Reserve <b>capacity</b> at checkout for (locker, size, delivery day), using an atomic conditional increment. Assign the <b>specific compartment</b> at drop-off. This avoids holding an empty box for days while still preventing over-booking. The bookable total for a day is the box count minus a forecast of parcels still inside, minus a buffer.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lay out the three options and their failure, then choose the hybrid.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The delivery is a day late. What happens to the reservation? (Move it to the new day if capacity allows; otherwise offer another locker.)</li><li>How do you build the forecast? (Pickup-time distribution per locker from history.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>The kiosk loses internet for six hours. What still works?</summary>
+          <div class="answer">
+            <p>Pickups: yes, because code hashes, compartments and deadlines were pushed down when issued, and the kiosk validates locally. Drop-offs: mostly, using compartments pre-assigned for expected parcels or a small pool the kiosk may allocate itself. Events go to a local outbox with sequence numbers and replay on reconnect; the cloud dedupes by (locker, seq). New reservations for that kiosk stop after a threshold so checkout does not over-promise. Revocations made while offline (expired codes) apply on reconnect, which is why deadlines are also stored locally.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the model: desired vs reported state with versions (like AWS IoT Device Shadow), plus an outbox. Then go through pickup, drop-off, reservation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A customer cancels the order while the kiosk is offline. Can they still open the box? (Yes until revocation arrives; accept that small window or require online check for cancelled orders.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Is a 6-digit pickup code secure enough?</summary>
+          <div class="answer">
+            <p>With 40 active codes per kiosk, a random guess opens some box with probability 40 in a million, 1 in 25,000. Lockout after 5 failures gives 1 in 5,000 per lockout window, which is not enough on its own if the attacker has days. So: escalating lockouts with alerts, codes from a secure random generator, single-use, bound to one kiosk and deadline, and app or barcode unlock for higher-value items. Store them as an HMAC whose key sits in the kiosk TPM and a cloud KMS: a plain or salted hash of a 6-digit code is brute-forced offline in seconds, so the key is what protects it.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the arithmetic, then the layers. Interviewers reward the maths.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not 8 digits? (100x safer, slightly harder to type; a fine trade-off to mention.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>How do you find nearby lockers with space for this parcel at checkout?</summary>
+          <div class="answer">
+            <p>Geo-index locations (geohash or a PostGIS index), query the cells around the address, filter by size, weight, hours and status from a cache, then check capacity for the delivery day. Locations change rarely, so cache aggressively; capacity is read from the counter or a short-lived cache of it. Be pessimistic: show a locker only if the forecast says it will have space.</p>
+            <div class="approach"><h5>How to answer</h5><p>Link to geo indexing basics and keep it short; the interesting part is capacity, not geometry.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why geohash neighbours? (A point near a cell edge has close lockers in the next cell.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>Nobody picks up the parcel in 3 days. Walk through what happens.</summary>
+          <div class="answer">
+            <p>A reminder goes out about a day before. At the deadline the expiry scheduler revokes the code (pushed to the kiosk), sets the box to EXPIRED, creates a retrieval task for the next driver visit, and emits ParcelExpired so the order service starts the return and refund. The box becomes AVAILABLE only when the driver removes the parcel and the sensor reports empty. Each step is idempotent, so a retried scheduler run does nothing twice.</p>
+            <div class="approach"><h5>How to answer</h5><p>Stress "expired is not empty": the physical world decides when a box is free.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does the scheduler find due items efficiently? (Index on code_expires_at, or a delayed-message queue.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>SQL or NoSQL for this system?</summary>
+          <div class="answer">
+            <p>Either works because the data is small and the key need is atomic single-row updates. SQL gives transactions across the reservation and capacity rows, unique constraints for idempotency, and easy reporting. DynamoDB gives conditional writes, TTL for old records and predictable latency. Partition by locker either way, so all writes for one kiosk hit one partition.</p>
+            <div class="approach"><h5>How to answer</h5><p>Decide by the access pattern (atomic per-locker updates), not by fashion. Mention the exact feature you rely on: conditional update.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What breaks if you use an atomic counter without a condition? (Retries over-count; it is not idempotent.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart">
+          <summary>Extend the design to buy-online-pick-up-in-store with time slots.</summary>
+          <div class="answer">
+            <p>Two reservations per order: item quantities at the store (conditional decrement of available-to-promise, with a hold timeout) and a pickup slot (counter per store and slot, measured in picking effort, not order count). Staff pick the order and stage it; the customer checks in from the app; staff or a pickup tower dispense it. Walmart describes slot availability as computed from order size and available labour, so the slot counter's capacity is set by a labour plan, not a fixed number.</p>
+            <div class="approach"><h5>How to answer</h5><p>Map each locker concept to its store equivalent: compartment to shelf stock, capacity day to slot capacity, drop-off to picking, pickup code to check-in.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>An item is out of stock when picking. (Substitute or partial refund; release the hold.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>The door opened for a drop-off but the driver did not put the parcel in. How does the system notice?</summary>
+          <div class="answer">
+            <p>The code is issued only on the event "door closed and occupancy sensor says occupied". If the door closes on an empty box, or never opens, the assignment times out and rolls back to AVAILABLE, and the kiosk tells the driver's handheld to retry. Never issue the code on "door opened".</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie every state change to a physical confirmation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The sensor is broken. (Mark OUT_OF_SERVICE, alert operations, reconcile nightly.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>How does the customer get notified, and what if the notification is delayed?</summary>
+          <div class="answer">
+            <p>The access service emits CodeIssued; the shared notification system sends email and app push with code, barcode and deadline. Delivery is at-least-once with dedupe by event id. The pickup window starts at drop-off, so a delayed notification eats into it; if notification lag is high, extend the deadline by the delay or send the reminder earlier. The app can always show the current code by calling the API.</p>
+            <div class="approach"><h5>How to answer</h5><p>Reuse the notification system rather than building one; mention dedupe and the deadline interaction.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can someone else pick up? (Yes with the forwarded code, as Amazon allows; that is a product decision with a security cost.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: Black Friday, every locker shows full</h4>
+          <div class="situation">During the holiday peak, checkout shows "no locker available" for most downtown lockers, but drivers report many boxes standing empty at the kiosks.</div>
+          <div class="bad">Weak answer: "Turn off the capacity check during peaks."</div>
+          <div class="good">Strong answer: the forecast is too pessimistic or reservations are leaking. Check (1) cancelled orders that never released their hold (missing DELETE or a lost event; add hold expiry), (2) late trucks that kept yesterday's holds alive, (3) a forecast that assumes parcels stay longer than they do (re-fit the pickup-time distribution), (4) OUT_OF_SERVICE boxes not returned to service. Compare held counts with actual drop-offs per day as a metric and alert on the gap.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>How would you over-book safely? (Small controlled over-booking with a fallback to a nearby locker, measured by failed-drop rate.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: codes are being guessed at one kiosk</h4>
+          <div class="situation">Monitoring shows 300 wrong-code attempts overnight at one kiosk and two parcels reported missing.</div>
+          <div class="bad">Weak answer: "Make codes longer for everyone."</div>
+          <div class="good">Strong answer: contain first - put that kiosk into app-or-barcode-only mode by pushing desired state, revoke and reissue codes for parcels inside, notify affected customers. Then fix the gap: escalating lockouts that survive kiosk reboots, an alert on wrong-code rate per kiosk, and camera review. Longer codes are a reasonable follow-up, but the real problem was that lockout allowed hundreds of tries.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>How do you push the mode change if the kiosk is offline? (It applies on reconnect; meanwhile the kiosk's own lockout must already be strict.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Treating it as a scale problem and spending 20 minutes on sharding.</li>
+          <li>Reserving a specific box at checkout.</li>
+          <li>Check-then-write allocation without a condition or version.</li>
+          <li>Freeing a box on expiry before the parcel is physically removed.</li>
+          <li>Requiring the cloud for every pickup, so an outage locks every customer out.</li>
+          <li>Storing pickup codes in plain text, or generating them from the order id.</li>
+          <li>Claiming a salted hash protects a 6-digit code. With only a million possible codes, the secret key (HMAC, key in a TPM/KMS) is what protects it.</li>
+        </ul>
+      

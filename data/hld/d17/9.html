@@ -1,0 +1,109 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: requirements.</strong> Read/write ratio, data size, value size, latency target, can we lose data, how stale is OK.</li>
+          <li><strong>5-10: estimate.</strong> RAM with overhead, nodes by memory vs by ops (take the bigger), replicas, bandwidth, the hot-key number.</li>
+          <li><strong>10-15: single node.</strong> Hash map + LRU (O(1)), TTL with lazy + active expiry. If it is an LLD-flavoured round, write the LRU code.</li>
+          <li><strong>15-25: distribute.</strong> Hash slots or consistent hashing (say why not modulo), smart client vs proxy, replicas across zones, failover.</li>
+          <li><strong>25-38: hard parts.</strong> Cache-aside vs write-through, invalidation race and fixes, hot keys, stampede.</li>
+          <li><strong>38-45: operate.</strong> Failure table, metrics (hit ratio, evictions, p99, memory, replication lag), and protecting the DB.</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes:</b> modulo-N hashing; no TTL; updating the cache on write instead of deleting; assuming Redis replication is synchronous; no plan for a stampede or a hot key; forgetting the default <code>noeviction</code>; treating the cache as the source of truth; ignoring what happens to the database when the cache is down.</p></div>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "I'd build a cluster of in-memory nodes, each a hash map with approximate LRU or LFU eviction and TTLs expired lazily plus by a background sampler. Keys map to 16,384 hash slots by CRC16, and a slot table maps slots to nodes, so adding a node moves only a few slots; smart clients route directly and follow MOVED redirects. Each primary has an async replica in another zone, promoted by majority vote on failure, so we may lose a few writes, which is fine for a cache. Apps use cache-aside: read the cache, on miss read the DB and set with a jittered TTL; on write, commit then delete. For hot keys I add a short-lived local cache and key replication; for stampedes, request coalescing or leases; for correctness, leases or versioned sets plus CDC-driven invalidation through Kafka. I'd alert on hit ratio, evictions, p99 and per-node skew."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>Design an LRU cache with O(1) get and put. Then make it distributed.</summary>
+          <div class="answer">
+            <p>Single node: a hash map from key to a node in a doubly linked list. Get: find via map, move node to head. Put: insert at head; if over capacity, remove the tail and its map entry. Both O(1). Add a lock (or shard the map into segments with a lock each) for concurrency. Distributed: partition keys over nodes with consistent hashing or hash slots, run one LRU per node, replicate each node asynchronously, and route with a smart client or proxy. Note that LRU is now per node, not global, which is fine.</p>
+            <div class="approach"><h5>How to answer</h5><p>Write the single-node code cleanly first (sentinel head/tail), state complexity, then scale out in three moves: partition, replicate, route.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you make it thread-safe without one global lock?</li><li>Why does Redis approximate LRU instead?</li><li>LRU vs LFU: when does LRU fail? (one big scan flushes the cache)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Why not use hash(key) mod N to pick a node?</summary>
+          <div class="answer">
+            <p>Because changing N remaps most keys: from 4 to 5 nodes about 80% of keys change node, so the hit ratio collapses and the DB is flooded. Consistent hashing with virtual nodes or fixed hash slots move only about 1/N of keys when a node is added.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the percentage, then the fix, then mention virtual nodes for even load.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why does Redis use 16,384 slots instead of a ring?</li><li>What are hash tags for?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Amazon">
+          <summary>Cache-aside vs write-through vs write-behind: which and why?</summary>
+          <div class="answer">
+            <p>Cache-aside for most read-heavy data: simple, the cache can fail without blocking writes, only requested data is cached. Write-through when data is read immediately after it is written and you want the cache always warm, at the cost of slower writes. Write-behind for very write-heavy data that tolerates loss (counters, view counts), because writes are batched into the DB later.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the trade-off sentence: pick X because A, cost B, switch to Y if C.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to write-behind data when a node dies?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Google">
+          <summary>A hot key is about to expire and 5,000 requests are waiting. What happens and how do you prevent it?</summary>
+          <div class="answer">
+            <p>Without protection all 5,000 miss and query the DB at once (a stampede). Prevent with: request coalescing per process; leases so only one client per key is allowed to refill (others wait or get the stale value); jittered TTLs; early background refresh before expiry; serving stale during refresh.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name it (stampede / thundering herd), give two fixes at two layers (in-process coalescing, server-side leases), then one preventive (jitter).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the refill query itself takes 10 s?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>Users see stale data after updating their profile. Walk through why and fix it.</summary>
+          <div class="answer">
+            <p>Check the order of operations. If the code sets the cache before committing, or updates rather than deletes, two writers can reorder. Even with "commit then delete", a slow reader can refill an old value after the delete. Fixes: delete (not set) after commit; leases or versioned compare-and-set to reject old fills; a TTL backstop; CDC-driven invalidation; and for the user's own view, read-your-writes by reading from the DB (or bypassing the cache) for a few seconds after their own write.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the three-step race on the board. Interviewers love seeing the actual interleaving.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you invalidate caches in another region?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>One product key gets 100,000 reads per second during a flash sale. What do you do?</summary>
+          <div class="answer">
+            <p>A single node cannot carry it. Add a local in-process cache with a 1-2 s TTL in every app server (staleness accepted for product details, not for stock count); replicate the key under salted names across nodes; serve reads from replicas. For the stock count, do not read it from cache for correctness: decrement atomically in one place (a Redis Lua script or the DB) and show an approximate number on the page.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "display data" (staleness OK) from "decision data" (must be exact). Link to <a href="{{BASE}}hld/hld-02">building blocks</a> and the flash-sale design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect hot keys before they hurt?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Google">
+          <summary>Is Redis replication synchronous? What can you lose?</summary>
+          <div class="answer">
+            <p>No, asynchronous. The primary replies to the client and then streams to replicas. If it crashes before the stream reaches a replica, and that replica is promoted, the acknowledged write is lost. <code>WAIT</code> lets a client block until N replicas ack, reducing the window, but failover can still lose data, so Redis is not a strongly consistent store.</p>
+            <div class="approach"><h5>How to answer</h5><p>One sentence of mechanism, one of consequence, one of mitigation, and "fine for a cache".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Then how would you build a reliable lock on Redis? (careful: fencing tokens)</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>The whole cache cluster goes down. What happens to the database?</summary>
+          <div class="answer">
+            <p>DB read load jumps by 1 / (1 - hit ratio): 20x at 95%. It will likely fall over. Prepare: circuit breakers so app servers fail fast and shed non-critical traffic; a local L1 cache that serves stale data; a gutter pool; rate-limited warm-up when the cache returns; and capacity planning that knows how much miss traffic the DB can survive.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do the multiplication out loud. Then talk about graceful degradation, not just "add replicas".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you warm a new cluster without hurting the DB?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>Redis or Memcached? Pick one for a session store and for a product-page cache.</summary>
+          <div class="answer">
+            <p>Sessions: Redis (TTL per key, replication and failover built in, optional persistence so a restart does not log everyone out). Product pages (big, simple blobs, huge volume): either works; Memcached is simpler and multi-threaded, Redis gives one tool for everything and built-in clustering. Many teams choose Redis for both to run one system.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie each choice to one concrete feature, not brand preference.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where would you store sessions if the cache is not allowed to lose them?</li></ul></div>
+          </div>
+        </details>
+        <details class="qa" data-level="5" data-topic="kafka" data-company="Walmart,Meta">
+          <summary>How do you invalidate caches across three regions?</summary>
+          <div class="answer">
+            <p>Make invalidation an event stream. CDC reads the primary DB's commit log and publishes changes to Kafka; each region runs an invalidator consumer group that deletes keys in its local cache. Order per key is kept by keying events by primary key. Keep TTLs as a backstop for lost or delayed events, and monitor consumer lag per region as your staleness metric.</p>
+            <div class="approach"><h5>How to answer</h5><p>Commit log -&gt; Kafka -&gt; per-region invalidators; then say lag = staleness.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if an invalidation arrives before the region's DB replica has the new row? (refill reads stale replica: delay or use versions)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: DB CPU hits 100% right after a deploy</h4>
+          <div class="situation"><p>Every deploy at 10:00 causes a 3-minute database overload. Cache hit ratio drops from 96% to 40% for those minutes.</p></div>
+          <div class="bad"><p>Weak answer: "Scale up the database."</p></div>
+          <div class="good"><p>Strong answer: the deploy is changing keys or emptying caches. Likely the key format includes a version that changed, or in-process caches are cold in all new pods at once, or the cache was flushed. Fix: roll pods gradually so caches warm in steps; keep key formats backward compatible or pre-warm the new keys; coalesce misses; add jitter to TTLs set at startup. Verify with the hit-ratio and miss-by-key-prefix dashboards.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you pre-warm safely?</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: Redis pod keeps restarting with OOMKilled</h4>
+          <div class="situation"><p>On Kubernetes, the Redis pod restarts every few hours; <code>kubectl describe pod</code> shows <code>OOMKilled</code>, exit code 137. Redis logs show no eviction.</p></div>
+          <div class="bad"><p>Weak answer: "Double the memory limit."</p></div>
+          <div class="good"><p>Strong answer: the container limit equals or is below what Redis really uses. <code>maxmemory</code> counts the dataset, not replication buffers, client output buffers or the copy-on-write pages of a background save fork. Set <code>maxmemory</code> to about 60-75% of the container limit (a rule of thumb), pick an eviction policy, disable snapshots if not needed, and watch <code>used_memory_rss</code> vs the cgroup limit.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why exit code 137? (128 + SIGKILL 9)</li></ul></div>
+        </div>
+      

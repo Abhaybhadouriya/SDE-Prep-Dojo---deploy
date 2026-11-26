@@ -1,0 +1,106 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Kafka topics between upload API, orchestrator, workers and downstream consumers inside a Kubernetes cluster">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="840" height="280"/>
+            <text class="zone-label" x="24" y="32">Kubernetes cluster (per region)</text>
+            <rect class="box svc" x="30" y="60" width="140" height="56"/>
+            <text class="label" x="100" y="84">upload-api</text>
+            <text class="label small" x="100" y="104">Deployment + HPA</text>
+            <rect class="box kafka" x="220" y="60" width="160" height="56"/>
+            <text class="label small" x="300" y="84">video.uploaded</text>
+            <text class="label small" x="300" y="104">key = video_id</text>
+            <rect class="box svc" x="430" y="60" width="150" height="56"/>
+            <text class="label" x="505" y="84">orchestrator</text>
+            <text class="label small" x="505" y="104">or Temporal</text>
+            <rect class="box kafka" x="630" y="60" width="200" height="56"/>
+            <text class="label small" x="730" y="84">transcode.tasks</text>
+            <text class="label small" x="730" y="104">many partitions</text>
+            <rect class="box k8s" x="630" y="160" width="200" height="56"/>
+            <text class="label small" x="730" y="184">transcoder pods</text>
+            <text class="label small" x="730" y="204">KEDA scales on lag</text>
+            <rect class="box kafka" x="430" y="160" width="150" height="56"/>
+            <text class="label small" x="505" y="184">transcode.results</text>
+            <text class="label small" x="505" y="204">fan-in</text>
+            <rect class="box kafka" x="220" y="160" width="160" height="56"/>
+            <text class="label small" x="300" y="184">video.ready</text>
+            <text class="label small" x="300" y="204">notify / search</text>
+            <rect class="box kafka" x="30" y="220" width="140" height="56"/>
+            <text class="label small" x="100" y="244">view.events</text>
+            <text class="label small" x="100" y="264">counts, trends</text>
+            <path class="arrow kafka" d="M170 88 L213 88"/>
+            <path class="arrow kafka" d="M380 88 L423 88"/>
+            <path class="arrow kafka" d="M580 88 L623 88"/>
+            <path class="arrow kafka" d="M730 116 L730 153"/>
+            <path class="arrow kafka" d="M630 188 L587 188"/>
+            <path class="arrow kafka" d="M505 160 L505 123"/>
+            <path class="arrow kafka" d="M430 200 L387 200"/>
+            <circle class="packet" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M170 88 L220 88 L380 88 L430 88 L580 88 L630 88 L730 116 L730 160 L630 188 L580 188 L505 160 L505 116"/></circle>
+          </svg>
+          <figcaption>Kafka carries the events between stages; Kubernetes runs every stage as a separately scaled workload; each stage ships as its own Docker image.</figcaption>
+        </figure>
+        <h3>Kafka</h3>
+        <ul>
+          <li><b>Lifecycle events</b> (<code>video.uploaded</code>, <code>video.ready</code>, <code>video.blocked</code>) are a perfect fit: small, durable, replayable, and many independent consumers (search, notifications, recommendations, analytics) each read them in their own <a href="{{BASE}}devops/kafka-04">consumer group</a>. Key by <code>video_id</code> so events for one video stay ordered in one partition (<a href="{{BASE}}devops/kafka-02">why keys matter</a>).</li>
+          <li><b>Never put video bytes in Kafka.</b> The default max message is about 1 MB. Put a pointer (the blob key) in the event. This is the "claim check" pattern.</li>
+          <li><b>Task queue caveat.</b> Encoding tasks are long (seconds to minutes) and uneven. In a classic consumer group one slow task blocks its whole partition, and parallelism is capped at the partition count. Options: many partitions plus a worker that hands tasks to a local pool and commits carefully; Kafka <b>share groups</b> (KIP-932, production-ready since Kafka 4.2), which let many consumers share a partition with per-record acknowledgement; or a classic work queue such as SQS or RabbitMQ for the task hop while Kafka keeps the lifecycle events. Saying this trade-off out loud is an SDE-2 signal.</li>
+          <li><b>View events</b> are a high-volume stream: Kafka plus a stream processor (Flink / Kafka Streams) for counts and trending. See <a href="{{BASE}}devops/pipeline-01">the end-to-end pipeline</a> for the same shape.</li>
+        </ul>
+        <h3>Kubernetes</h3>
+        <p>Transcoder pods are stateless, CPU-hungry and safe to kill, which is the ideal Kubernetes batch workload. Scale them on queue depth (consumer lag), not CPU, using <a href="https://keda.sh/docs/latest/scalers/apache-kafka/" target="_blank" rel="noopener">KEDA's Kafka scaler</a>. Run them on a spot node pool with a low PriorityClass so the upload API always wins. (Background: <a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>.)</p>
+<pre><code class="language-yaml">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: transcoder
+spec:
+  scaleTargetRef:
+    name: transcoder            # a Deployment of ffmpeg workers
+  minReplicaCount: 5
+  maxReplicaCount: 256          # = partitions on transcode.tasks; 2000 needs >= 2000 partitions or share groups (Kafka 4.2+)
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka-bootstrap:9092
+        consumerGroup: transcoder
+        topic: transcode.tasks
+        lagThreshold: "4"       # about 4 waiting tasks per pod
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder
+spec:
+  replicas: 5                  # starting size; KEDA owns it after that
+  selector:
+    matchLabels: { app: transcoder }
+  template:
+    metadata:
+      labels: { app: transcoder }
+    spec:
+      priorityClassName: batch-low
+      nodeSelector: { pool: spot-cpu }
+      terminationGracePeriodSeconds: 120   # finish or abandon the current segment
+      containers:
+        - name: worker
+          image: registry.example.com/transcoder:1.8.2
+          resources:
+            requests: { cpu: "4", memory: 4Gi }
+            limits:   { memory: 6Gi }       # no CPU limit: avoid CFS throttling</code></pre>
+        <div class="callout warn"><p><b>Gotcha:</b> by default KEDA's Kafka scaler will not scale a classic consumer group above the topic's partition count, because the extra consumers would sit idle. If you want 2,000 workers, the topic needs at least 2,000 partitions, or use share groups / a different queue.</p></div>
+        <h3>Docker</h3>
+        <p>Each stage is its own image. The transcoder image pins the exact ffmpeg build, because a different ffmpeg version can produce different output. Learn the basics in <a href="{{BASE}}devops/docker-03">Writing a Dockerfile</a>.</p>
+<pre><code class="language-dockerfile">FROM debian:trixie-slim
+RUN apt-get update \
+ &amp;&amp; apt-get install -y --no-install-recommends ffmpeg python3 python3-pip ca-certificates \
+ &amp;&amp; rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY worker.py .
+# do not run ffmpeg as root on untrusted input
+USER 10001
+ENTRYPOINT ["python3", "worker.py"]</code></pre>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Splitting a video into segments and spreading them across workers is RSS (receive side scaling) for video: hash flows across CPU cores so no single core is the bottleneck. Consumer lag is the queue depth on that ring. <b>Where it breaks:</b> RSS keeps a flow on one core for ordering; here we deliberately spread one video's segments everywhere and restore order at the end (fan-in), because segments are independent.</p>
+        </div>
+      

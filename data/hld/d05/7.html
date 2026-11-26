@@ -1,0 +1,134 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+
+        <h3>Kafka</h3>
+        <p>Kafka is the spine between "a post was saved" and "everything that reacts to it": fan-out, search indexing, notifications ("Mia posted for the first time in a while"), counters, ranking features and analytics. Each of those is a separate <b>consumer group</b> reading the same topic at its own pace. If you are new to these words, read <a href="{{BASE}}devops/kafka-02">Core Concepts</a> and <a href="{{BASE}}devops/kafka-04">Consumers &amp; Groups</a>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 260" role="img" aria-label="Post service writes to the post-events topic with 3 partitions; four consumer groups read it: fan-out, search indexer, notifications, counters and analytics">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="15" y="100" width="140" height="60"/>
+            <text class="label" x="85" y="125">Post service</text>
+            <text class="label small" x="85" y="146">+ outbox</text>
+            <rect class="zone kafka" x="200" y="30" width="270" height="200"/>
+            <text class="zone-label" x="216" y="52">topic: post-events (key = author_id)</text>
+            <rect class="box kafka" x="220" y="66" width="230" height="40"/>
+            <text class="label small" x="335" y="91">partition 0</text>
+            <rect class="box kafka" x="220" y="116" width="230" height="40"/>
+            <text class="label small" x="335" y="141">partition 1</text>
+            <rect class="box kafka" x="220" y="166" width="230" height="40"/>
+            <text class="label small" x="335" y="191">partition 2 ...</text>
+            <rect class="box k8s" x="540" y="20" width="265" height="44"/>
+            <text class="label small" x="672" y="47">group: fanout-workers</text>
+            <rect class="box k8s" x="540" y="78" width="265" height="44"/>
+            <text class="label small" x="672" y="105">group: search-indexer</text>
+            <rect class="box k8s" x="540" y="136" width="265" height="44"/>
+            <text class="label small" x="672" y="163">group: notifier</text>
+            <rect class="box k8s" x="540" y="194" width="265" height="44"/>
+            <text class="label small" x="672" y="221">group: counters + analytics</text>
+            <path class="arrow kafka" d="M155 130 L213 130"/>
+            <path class="arrow" d="M470 120 L533 42"/>
+            <path class="arrow" d="M470 125 L533 100"/>
+            <path class="arrow" d="M470 135 L533 158"/>
+            <path class="arrow" d="M470 140 L533 216"/>
+            <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M155 130 L335 136 L470 125 L540 42"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite" path="M155 130 L335 136 L470 135 L540 158"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite" path="M155 130 L335 136 L470 140 L540 216"/></circle>
+          </svg>
+          <figcaption>One event, many independent readers. Each consumer group keeps its own offsets, so a slow search indexer never delays the feed.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Key choice</b>: key <code>post-events</code> by <code>author_id</code> so one author's create/edit/delete events stay in order. For the internal <code>fanout-chunks</code> topic, key by <code>post_id + chunk_no</code> (or leave keyless) so chunks spread evenly, because order between chunks does not matter.</li>
+          <li><b>Separate lanes</b>: a <code>fanout-chunks-big</code> topic for accounts near the celebrity line keeps them from blocking everyone else (the "classic outage" above).</li>
+          <li><b>Delivery</b>: at-least-once plus idempotent <code>ZADD</code> is enough; no Kafka transactions needed. See <a href="{{BASE}}devops/kafka-06">Delivery Semantics</a>.</li>
+          <li><b>Do not dual-write</b>: "save to DB, then send to Kafka" can lose the event if the process dies in between. Use the transactional outbox or CDC (Debezium). See <a href="{{BASE}}devops/pipeline-01">Pipeline Architecture</a> and <a href="{{BASE}}hld/d28">CDC Data Pipeline</a>.</li>
+        </ul>
+<pre class="terminal"><code>$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic post-events \
+    --partitions 12 --replication-factor 3 --config min.insync.replicas=2
+Created topic post-events.
+$ kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group fanout-workers
+GROUP           TOPIC        PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CONSUMER-ID       HOST         CLIENT-ID
+fanout-workers  post-events  0          482113          482120          7     fanout-1-6c1e...  /10.1.4.17   fanout-1
+fanout-workers  post-events  1          479850          479850          0     fanout-2-91ab...  /10.1.6.22   fanout-2
+fanout-workers  post-events  2          480771          493004          12233 fanout-3-0d4f...  /10.1.7.9    fanout-3</code></pre>
+        <p class="muted">Output columns as printed by Kafka 3.x/4.x tools; numbers are illustrative. Partition 2's lag of 12,233 is the thing to alert on: that worker is slow (maybe a celebrity chunk) and its followers' feeds are late.</p>
+
+        <h3>Kubernetes</h3>
+        <p>Every service here except the stores is stateless, which is the easy case for Kubernetes: Deployments behind Services, scaled by an autoscaler. The fan-out workers should scale on <b>consumer lag</b>, not CPU, because lag is what users feel. A common way is KEDA (an add-on that feeds Kafka lag into the Horizontal Pod Autoscaler). Note that more consumers than partitions do nothing, so the partition count caps how far workers can scale. See <a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>.</p>
+<pre><code class="language-yaml">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fanout-workers
+spec:
+  scaleTargetRef:
+    name: fanout-workers          # a normal Deployment
+  minReplicaCount: 4
+  maxReplicaCount: 48             # never more than the topic's partition count
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-bootstrap.kafka.svc:9092
+      consumerGroup: fanout-workers
+      topic: fanout-chunks
+      lagThreshold: "5000"        # target lag per replica
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feed-service
+spec:
+  replicas: 60
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 10% }
+  selector:
+    matchLabels: { app: feed-service }
+  template:
+    metadata:
+      labels: { app: feed-service }     # Services and the PodDisruptionBudget select pods by this label
+    spec:
+      containers:
+      - name: feed
+        image: registry.example.com/feed-service:3.8.1
+        readinessProbe:
+          httpGet: { path: /ready, port: 8080 }   # ready only after cache clients connect
+        resources:
+          requests: { cpu: "2", memory: "4Gi" }
+          limits:   { memory: "4Gi" }</code></pre>
+        <ul>
+          <li>Redis/Valkey feed caches and Cassandra run as StatefulSets with operators, or (more often) as managed services; Kafka can run on Kubernetes with Strimzi (<a href="{{BASE}}devops/kafka-11">Kafka on K8s</a>).</li>
+          <li>Use a PodDisruptionBudget on the feed service so node maintenance never removes too many replicas at once, and spread pods across zones with topology spread constraints.</li>
+        </ul>
+
+        <h3>Docker</h3>
+        <p>Each service ships as a small image built with a multi-stage Dockerfile (<a href="{{BASE}}devops/docker-03">Writing a Dockerfile</a>). For local learning, one Compose file gives you the whole write path on a laptop:</p>
+<pre><code class="language-yaml"># compose.yaml - a tiny local news feed lab
+services:
+  kafka:
+    image: apache/kafka:4.3.2          # Kafka 4.x: KRaft only, no ZooKeeper (same image as Build It Locally)
+    ports: ["29092:29092"]             # host tools use localhost:29092; containers use kafka:9092
+    environment:                       # once you set any KAFKA_* variable, the image needs the full set
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+  post-service:
+    build: ./post-service
+    environment: { KAFKA_BOOTSTRAP: "kafka:9092" }
+    depends_on: [kafka]
+  fanout-worker:
+    build: ./fanout-worker
+    environment: { KAFKA_BOOTSTRAP: "kafka:9092", REDIS_URL: "redis://redis:6379" }
+    deploy: { replicas: 2 }            # two consumers in one group
+    depends_on: [kafka, redis]</code></pre>
+        <p>Post a few times, watch <code>ZRANGE feed:sara 0 -1</code> fill up, then stop one worker and watch the lag on the other. The <a href="{{BASE}}devops/pipeline-02">Build It Locally</a> page walks through a full Compose lab like this, and <a href="{{BASE}}devops/docker-07">Docker Compose</a> explains the file.</p>
+        <div class="callout warn"><p><b>Why the long Kafka block?</b> With no settings, the image advertises <code>localhost:9092</code>. A client in another container bootstraps to <code>kafka:9092</code>, receives "talk to localhost:9092" in the metadata, and then fails to connect, because localhost inside that container is itself. <code>KAFKA_ADVERTISED_LISTENERS</code> fixes it: containers are told <code>kafka:9092</code>, your laptop is told <code>localhost:29092</code>.</p></div>
+      

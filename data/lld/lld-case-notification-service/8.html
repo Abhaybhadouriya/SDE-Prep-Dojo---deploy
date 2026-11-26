@@ -1,0 +1,1231 @@
+
+  <h2>Full code</h2>
+  <p>All three versions were compiled and run; the output shown is real. Java (21, records and switch expressions) is the primary version, Python mirrors it with <code>heapq</code> and <code>threading.Condition</code>, and C++14 keeps the single-threaded core (synchronous <code>processDue</code> with an injected clock) because MinGW g++ 6.3 on Windows has no <code>std::thread</code>; it is in <a href="#code-cpp">its own section below</a>. Files: <code>lld-code/lld-case-notification-service/</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: the delivery records it prints.</li><li><code>NotificationService.submit</code> and <code>processDue</code>: validate, render, schedule by priority, send.</li><li><code>ChannelSender</code> and the decorators <code>RetryingSender</code>, <code>FailoverSender</code>, <code>RateLimitingSender</code> (Decorators.java). This stacking is the heart.</li><li><code>EventBus</code>: domain events to notifications (Observer).</li><li>Skip on first read: the records in Domain.java, Clock.java, Templates.java.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+      <p><b>Domain.java</b> - enums and immutable records</p>
+<pre><code class="language-java">import java.util.EnumSet;
+import java.util.Map;
+import java.util.Set;
+
+enum Channel { EMAIL, SMS, PUSH, IN_APP }
+
+/** Declaration order is queue order: HIGH first among jobs due at the same time. */
+enum Priority { HIGH, MEDIUM, LOW }
+
+enum DeliveryStatus { SENT, FAILED, SKIPPED_OPT_OUT, NO_ADDRESS, RATE_LIMITED }
+
+record User(String id, String name, String email, String phone, String deviceToken) {
+    /** Where a message for this channel goes; null = user has no address for it. */
+    String addressFor(Channel c) {
+        return switch (c) {
+            case EMAIL -&gt; email;
+            case SMS -&gt; phone;
+            case PUSH -&gt; deviceToken;
+            case IN_APP -&gt; id;                       // in-app inbox is keyed by user id
+        };
+    }
+}
+
+/** What a caller asks for. sendAtMs = 0 means "now". idempotencyKey makes retries by the caller safe. */
+record NotificationRequest(String idempotencyKey, String userId, String templateId, Map&lt;String, String&gt; params,
+                           Set&lt;Channel&gt; channels, Priority priority, long sendAtMs) {
+    static NotificationRequest of(String key, String userId, String templateId, Map&lt;String, String&gt; params,
+                                  Priority priority, long sendAtMs, Channel first, Channel... rest) {
+        return new NotificationRequest(key, userId, templateId, Map.copyOf(params), EnumSet.of(first, rest),
+                                       priority, sendAtMs);
+    }
+}
+
+/** One rendered message for one channel, handed to a sender. */
+record Message(String notificationId, String userId, Channel channel, String to, String body, Priority priority) {}
+
+/** One line of history: what happened to one channel of one notification. */
+record DeliveryRecord(String notificationId, String userId, Channel channel, DeliveryStatus status, String detail,
+                      long atMs) {
+    @Override
+    public String toString() {
+        return notificationId + " " + channel + " " + status + (detail.isEmpty() ? "" : " (" + detail + ")");
+    }
+}</code></pre>
+      <p><b>Clock.java</b> - injected time and sleep</p>
+<pre><code class="language-java">import java.util.concurrent.atomic.AtomicLong;
+
+/** Time is injected so scheduling and rate limits can be tested without sleeping. */
+interface Clock {
+    long nowMs();
+
+    Clock SYSTEM = System::currentTimeMillis;
+}
+
+final class FakeClock implements Clock {
+    private final AtomicLong now = new AtomicLong();
+
+    FakeClock(long startMs) { now.set(startMs); }
+
+    @Override public long nowMs() { return now.get(); }
+
+    void advance(long ms) { now.addAndGet(ms); }
+}
+
+interface Sleeper {
+    void sleep(long ms) throws InterruptedException;
+
+    Sleeper REAL = Thread::sleep;
+    Sleeper NONE = ms -&gt; { };                    // tests: retry without waiting
+}</code></pre>
+      <p><b>Templates.java</b></p>
+<pre><code class="language-java">import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/** One template id, one body per channel: "Hi {name}, order {orderId} is on its way". */
+final class TemplateRegistry {
+    private static final Pattern VAR = Pattern.compile("\\{(\\w+)}");
+    private final Map&lt;String, Map&lt;Channel, String&gt;&gt; bodies = new ConcurrentHashMap&lt;&gt;();
+
+    TemplateRegistry register(String templateId, Channel channel, String body) {
+        bodies.computeIfAbsent(templateId, k -&gt; new ConcurrentHashMap&lt;&gt;()).put(channel, body);
+        return this;
+    }
+
+    boolean exists(String templateId) { return bodies.containsKey(templateId); }
+
+    boolean supports(String templateId, Channel c) {
+        Map&lt;Channel, String&gt; m = bodies.get(templateId);
+        return m != null &amp;&amp; m.containsKey(c);
+    }
+
+    String render(String templateId, Channel c, Map&lt;String, String&gt; params) {
+        String body = bodies.get(templateId).get(c);
+        Matcher mt = VAR.matcher(body);
+        StringBuilder out = new StringBuilder();
+        while (mt.find()) {
+            String v = params.get(mt.group(1));
+            if (v == null) throw new IllegalArgumentException("missing {" + mt.group(1) + "} for " + templateId);
+            mt.appendReplacement(out, Matcher.quoteReplacement(v));
+        }
+        return mt.appendTail(out).toString();
+    }
+}</code></pre>
+      <p><b>Senders.java</b> - the Strategy interface and a fake provider</p>
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+class DeliveryException extends Exception {
+    final boolean retryable;
+
+    DeliveryException(String msg, boolean retryable) {
+        super(msg);
+        this.retryable = retryable;
+    }
+}
+
+final class RateLimitedException extends DeliveryException {
+    RateLimitedException(String msg) { super(msg, false); }
+}
+
+/** Strategy per channel. Returns the name of the provider that actually delivered. */
+interface ChannelSender {
+    String send(Message m) throws DeliveryException;
+}
+
+/** Stand-in for a real gateway (SES, Twilio, FCM ...). Can be told to fail. */
+final class FakeProvider implements ChannelSender {
+    private final String name;
+    private int failNext;                 // fail this many calls with a retryable error
+    private boolean down;                 // fail every call
+    final List&lt;String&gt; delivered = Collections.synchronizedList(new ArrayList&lt;&gt;());
+
+    FakeProvider(String name) { this.name = name; }
+
+    synchronized FakeProvider failNext(int n) { failNext = n; return this; }
+
+    synchronized FakeProvider down(boolean d) { down = d; return this; }
+
+    @Override
+    public String send(Message m) throws DeliveryException {
+        synchronized (this) {
+            if (down) throw new DeliveryException(name + " is down", true);
+            if (failNext &gt; 0) {
+                failNext--;
+                throw new DeliveryException(name + " timeout", true);
+            }
+        }
+        delivered.add(m.to() + ": " + m.body());
+        return name;
+    }
+}</code></pre>
+      <p><b>Decorators.java</b> - retry, failover, rate limit</p>
+<pre><code class="language-java">import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Decorator: same interface, adds retries with exponential backoff for retryable errors. */
+final class RetryingSender implements ChannelSender {
+    private final ChannelSender inner;
+    private final int maxAttempts;
+    private final long baseBackoffMs;
+    private final Sleeper sleeper;
+    final AtomicInteger retries = new AtomicInteger();
+
+    RetryingSender(ChannelSender inner, int maxAttempts, long baseBackoffMs, Sleeper sleeper) {
+        this.inner = inner;
+        this.maxAttempts = maxAttempts;
+        this.baseBackoffMs = baseBackoffMs;
+        this.sleeper = sleeper;
+    }
+
+    @Override
+    public String send(Message m) throws DeliveryException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return inner.send(m);
+            } catch (DeliveryException e) {
+                if (!e.retryable || attempt &gt;= maxAttempts) throw e;
+                retries.incrementAndGet();
+                try {
+                    sleeper.sleep(baseBackoffMs &lt;&lt; (attempt - 1));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new DeliveryException("interrupted", false);
+                }
+            }
+        }
+    }
+}
+
+/** Tries providers in order; the first success wins (PhonePe: many providers per channel). */
+final class FailoverSender implements ChannelSender {
+    private final List&lt;ChannelSender&gt; providers;
+
+    FailoverSender(List&lt;ChannelSender&gt; providers) {
+        if (providers.isEmpty()) throw new IllegalArgumentException("need at least one provider");
+        this.providers = List.copyOf(providers);
+    }
+
+    @Override
+    public String send(Message m) throws DeliveryException {
+        DeliveryException last = null;
+        for (ChannelSender p : providers) {
+            try {
+                return p.send(m);
+            } catch (DeliveryException e) {
+                last = e;
+            }
+        }
+        throw new DeliveryException("all providers failed, last: " + last.getMessage(), true);
+    }
+}
+
+/** Decorator: at most maxPerWindow messages per user per window. HIGH priority (OTP) is exempt. */
+final class RateLimitingSender implements ChannelSender {
+    private final ChannelSender inner;
+    private final int maxPerWindow;
+    private final long windowMs;
+    private final Clock clock;
+    private final Map&lt;String, Deque&lt;Long&gt;&gt; sentAt = new HashMap&lt;&gt;();
+
+    RateLimitingSender(ChannelSender inner, int maxPerWindow, long windowMs, Clock clock) {
+        this.inner = inner;
+        this.maxPerWindow = maxPerWindow;
+        this.windowMs = windowMs;
+        this.clock = clock;
+    }
+
+    @Override
+    public String send(Message m) throws DeliveryException {
+        if (m.priority() != Priority.HIGH) {
+            synchronized (this) {                                    // sliding-window log per user
+                long now = clock.nowMs();
+                Deque&lt;Long&gt; q = sentAt.computeIfAbsent(m.userId(), k -&gt; new ArrayDeque&lt;&gt;());
+                while (!q.isEmpty() &amp;&amp; q.peekFirst() &lt;= now - windowMs) q.pollFirst();
+                if (q.size() &gt;= maxPerWindow)
+                    throw new RateLimitedException(maxPerWindow + " per " + windowMs / 1000 + "s for " + m.userId());
+                q.addLast(now);
+            }
+        }
+        return inner.send(m);
+    }
+}</code></pre>
+      <p><b>EventBus.java</b> - Observer</p>
+<pre><code class="language-java">import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+record DomainEvent(String type, Map&lt;String, String&gt; data) {}
+
+/** Observer: business services publish events; notification rules subscribe to the types they care about. */
+interface EventListener {
+    void onEvent(DomainEvent e);
+}
+
+final class EventBus {
+    private final Map&lt;String, List&lt;EventListener&gt;&gt; listeners = new ConcurrentHashMap&lt;&gt;();
+
+    void subscribe(String type, EventListener l) {
+        listeners.computeIfAbsent(type, k -&gt; new CopyOnWriteArrayList&lt;&gt;()).add(l);
+    }
+
+    void publish(DomainEvent e) {
+        for (EventListener l : listeners.getOrDefault(e.type(), List.of())) {
+            try {
+                l.onEvent(e);
+            } catch (RuntimeException ex) {                 // one bad rule must not stop the others
+                System.out.println("  [bus] listener failed on " + e.type() + ": " + ex.getMessage());
+            }
+        }
+    }
+}</code></pre>
+      <p><b>NotificationService.java</b> - the facade, queue and worker</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * Facade: accept requests (dedupe, validate), keep them in a time + priority queue, and deliver due ones
+ * through one ChannelSender per channel, honouring user preferences. Every outcome goes to history.
+ */
+final class NotificationService {
+    private record Job(String id, NotificationRequest req, long seq) {}
+
+    private static final Comparator&lt;Job&gt; ORDER = Comparator
+        .comparingLong((Job j) -&gt; j.req().sendAtMs())        // earliest due first
+        .thenComparing(j -&gt; j.req().priority())               // then HIGH before LOW
+        .thenComparingLong(Job::seq);                         // then FIFO
+
+    private final Clock clock;
+    private final TemplateRegistry templates;
+    private final Map&lt;String, User&gt; users = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Set&lt;Channel&gt;&gt; optedOut = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;Channel, ChannelSender&gt; senders = new ConcurrentHashMap&lt;&gt;();
+    private final Set&lt;String&gt; seenKeys = ConcurrentHashMap.newKeySet();
+    private final List&lt;DeliveryRecord&gt; history = Collections.synchronizedList(new ArrayList&lt;&gt;());
+    private final PriorityQueue&lt;Job&gt; queue = new PriorityQueue&lt;&gt;(ORDER);
+    private final ReentrantLock lock = new ReentrantLock();
+    private final Condition changed = lock.newCondition();
+    private final AtomicLong seq = new AtomicLong();
+    private volatile boolean running;
+    private Thread worker;
+
+    NotificationService(Clock clock, TemplateRegistry templates) {
+        this.clock = clock;
+        this.templates = templates;
+    }
+
+    void registerUser(User u) { users.put(u.id(), u); }
+
+    void registerSender(Channel c, ChannelSender s) { senders.put(c, s); }
+
+    void optOut(String userId, Channel c) {
+        optedOut.computeIfAbsent(userId, k -&gt; ConcurrentHashMap.newKeySet()).add(c);
+    }
+
+    /** Returns the notification id, or empty if this idempotency key was already accepted. */
+    Optional&lt;String&gt; submit(NotificationRequest r) {
+        if (!users.containsKey(r.userId())) throw new IllegalArgumentException("unknown user " + r.userId());
+        if (!templates.exists(r.templateId())) throw new IllegalArgumentException("unknown template " + r.templateId());
+        for (Channel c : r.channels())                      // fail fast on missing params, not at 3 a.m.
+            if (templates.supports(r.templateId(), c)) templates.render(r.templateId(), c, r.params());
+        if (r.idempotencyKey() != null &amp;&amp; !seenKeys.add(r.idempotencyKey())) return Optional.empty();
+        long s = seq.incrementAndGet();
+        Job job = new Job("n" + s, r, s);
+        lock.lock();
+        try {
+            queue.add(job);
+            changed.signal();                               // wake the worker: maybe a new earliest job
+        } finally {
+            lock.unlock();
+        }
+        return Optional.of(job.id());
+    }
+
+    /** Synchronous mode (tests, demos): deliver every job that is due now. */
+    int processDue() {
+        int n = 0;
+        for (Job j; (j = pollDue()) != null; n++) deliver(j);
+        return n;
+    }
+
+    private Job pollDue() {
+        lock.lock();
+        try {
+            Job head = queue.peek();
+            return head != null &amp;&amp; head.req().sendAtMs() &lt;= clock.nowMs() ? queue.poll() : null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Background mode: one worker sleeps until the earliest job is due or a new job arrives. */
+    void start() {
+        running = true;
+        worker = new Thread(() -&gt; {
+            while (running) {
+                Job j;
+                lock.lock();
+                try {
+                    while (running &amp;&amp; (queue.isEmpty() || queue.peek().req().sendAtMs() &gt; clock.nowMs())) {
+                        long wait = queue.isEmpty() ? 1000 : queue.peek().req().sendAtMs() - clock.nowMs();
+                        changed.await(Math.max(1, wait), TimeUnit.MILLISECONDS);
+                    }
+                    if (!running) return;
+                    j = queue.poll();
+                } catch (InterruptedException e) {
+                    return;
+                } finally {
+                    lock.unlock();
+                }
+                deliver(j);                                  // outside the lock: senders are slow
+            }
+        }, "notification-worker");
+        worker.start();
+    }
+
+    void stop() throws InterruptedException {
+        running = false;
+        lock.lock();
+        try { changed.signalAll(); } finally { lock.unlock(); }
+        if (worker != null) worker.join(2000);
+    }
+
+    int pending() {
+        lock.lock();
+        try { return queue.size(); } finally { lock.unlock(); }
+    }
+
+    private void deliver(Job j) {
+        NotificationRequest r = j.req();
+        User u = users.get(r.userId());
+        for (Channel c : r.channels()) {
+            DeliveryStatus status;
+            String detail = "";
+            String to = u.addressFor(c);
+            if (optedOut.getOrDefault(u.id(), Set.of()).contains(c)) {
+                status = DeliveryStatus.SKIPPED_OPT_OUT;
+            } else if (to == null || !senders.containsKey(c) || !templates.supports(r.templateId(), c)) {
+                status = DeliveryStatus.NO_ADDRESS;
+                detail = to == null ? "no " + c + " address" : "no sender/template for " + c;
+            } else {
+                Message m = new Message(j.id(), u.id(), c, to, templates.render(r.templateId(), c, r.params()),
+                                        r.priority());
+                try {
+                    detail = "via " + senders.get(c).send(m);
+                    status = DeliveryStatus.SENT;
+                } catch (RateLimitedException e) {
+                    status = DeliveryStatus.RATE_LIMITED;
+                    detail = e.getMessage();
+                } catch (DeliveryException e) {
+                    status = DeliveryStatus.FAILED;
+                    detail = e.getMessage();
+                }
+            }
+            history.add(new DeliveryRecord(j.id(), u.id(), c, status, detail, clock.nowMs()));
+        }
+    }
+
+    List&lt;DeliveryRecord&gt; historyOf(String userId) {
+        synchronized (history) {
+            return history.stream().filter(d -&gt; d.userId().equals(userId)).toList();
+        }
+    }
+
+    List&lt;DeliveryRecord&gt; history() {
+        synchronized (history) { return List.copyOf(history); }
+    }
+}</code></pre>
+      <p><b>Main.java</b> - demo driver with assertions</p>
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Demo driver with simple assertions. Build: javac -d out *.java   Run: java -cp out Main */
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static int printed = 0;
+
+    /** Print history lines added since the last call. */
+    static List&lt;DeliveryRecord&gt; newRecords(NotificationService svc) {
+        List&lt;DeliveryRecord&gt; all = svc.history();
+        List&lt;DeliveryRecord&gt; fresh = all.subList(printed, all.size());
+        fresh.forEach(d -&gt; System.out.println("  " + d.userId() + ": " + d));
+        printed = all.size();
+        return fresh;
+    }
+
+    public static void main(String[] args) throws Exception {
+        FakeClock clock = new FakeClock(0);
+        TemplateRegistry t = new TemplateRegistry()
+            .register("order_placed", Channel.EMAIL, "Hi {name}, order {orderId} is confirmed. Total Rs {amount}.")
+            .register("order_placed", Channel.SMS, "Order {orderId} confirmed.")
+            .register("order_placed", Channel.PUSH, "Order {orderId} confirmed")
+            .register("seller_new_order", Channel.IN_APP, "New order {orderId}: please pack it")
+            .register("order_shipped", Channel.SMS, "Order {orderId} shipped")
+            .register("order_shipped", Channel.PUSH, "Order {orderId} is on its way")
+            .register("pickup_request", Channel.IN_APP, "Pick up {orderId} from {seller}")
+            .register("rate_order", Channel.EMAIL, "How was order {orderId}?")
+            .register("otp", Channel.SMS, "OTP {otp}, valid 5 min")
+            .register("promo", Channel.PUSH, "{name}, 20% off today");
+
+        NotificationService svc = new NotificationService(clock, t);
+        svc.registerUser(new User("asha", "Asha", "asha@example.com", "+91-90000-00001", "dev-asha"));
+        svc.registerUser(new User("ravi", "Ravi", "ravi@example.com", "+91-90000-00002", null));
+        svc.registerUser(new User("seller-7", "Kirana 7", null, null, null));
+        svc.registerUser(new User("ekart", "Ekart", null, null, null));
+        svc.optOut("ravi", Channel.SMS);
+
+        FakeProvider ses = new FakeProvider("ses").failNext(1);              // one transient failure
+        FakeProvider smsA = new FakeProvider("sms-A").down(true);            // primary gateway is down
+        FakeProvider smsB = new FakeProvider("sms-B");
+        FakeProvider fcm = new FakeProvider("fcm"), inbox = new FakeProvider("inbox");
+        RetryingSender email = new RetryingSender(ses, 3, 100, Sleeper.NONE);
+        ChannelSender sms = new RateLimitingSender(
+            new RetryingSender(new FailoverSender(List.of(smsA, smsB)), 3, 100, Sleeper.NONE), 3, 60_000, clock);
+        svc.registerSender(Channel.EMAIL, email);
+        svc.registerSender(Channel.SMS, sms);
+        svc.registerSender(Channel.PUSH, fcm);
+        svc.registerSender(Channel.IN_APP, inbox);
+
+        // Observer: who hears about which order event is configuration, not code in OrderService.
+        EventBus bus = new EventBus();
+        AtomicInteger duplicates = new AtomicInteger();
+        java.util.function.Consumer&lt;NotificationRequest&gt; submit =
+            r -&gt; { if (svc.submit(r).isEmpty()) duplicates.incrementAndGet(); };
+        bus.subscribe("ORDER_PLACED", e -&gt; submit.accept(NotificationRequest.of(
+            e.data().get("orderId") + "/placed/customer", e.data().get("customer"), "order_placed", e.data(),
+            Priority.MEDIUM, 0, Channel.EMAIL, Channel.SMS, Channel.PUSH)));
+        bus.subscribe("ORDER_PLACED", e -&gt; submit.accept(NotificationRequest.of(
+            e.data().get("orderId") + "/placed/seller", e.data().get("seller"), "seller_new_order", e.data(),
+            Priority.MEDIUM, 0, Channel.IN_APP)));
+        bus.subscribe("ORDER_SHIPPED", e -&gt; submit.accept(NotificationRequest.of(
+            e.data().get("orderId") + "/shipped/customer", e.data().get("customer"), "order_shipped", e.data(),
+            Priority.MEDIUM, 0, Channel.SMS, Channel.PUSH)));
+        bus.subscribe("ORDER_SHIPPED", e -&gt; submit.accept(NotificationRequest.of(
+            e.data().get("orderId") + "/shipped/logistics", "ekart", "pickup_request", e.data(),
+            Priority.MEDIUM, 0, Channel.IN_APP)));
+        bus.subscribe("ORDER_DELIVERED", e -&gt; submit.accept(NotificationRequest.of(
+            e.data().get("orderId") + "/rate", e.data().get("customer"), "rate_order", e.data(),
+            Priority.LOW, clock.nowMs() + 3_600_000, Channel.EMAIL)));          // ask for a rating in 1 hour
+
+        Map&lt;String, String&gt; o101 = Map.of("orderId", "101", "customer", "asha", "name", "Asha",
+                                          "seller", "seller-7", "amount", "499");
+        System.out.println("== ORDER_PLACED 101 (published twice by an upstream retry) ==");
+        bus.publish(new DomainEvent("ORDER_PLACED", o101));
+        bus.publish(new DomainEvent("ORDER_PLACED", o101));
+        System.out.println("  duplicates suppressed: " + duplicates.get());
+        svc.processDue();
+        List&lt;DeliveryRecord&gt; r1 = newRecords(svc);
+        check(duplicates.get() == 2 &amp;&amp; r1.size() == 4, "dedupe: 3 channels + seller, once");
+        check(r1.stream().allMatch(d -&gt; d.status() == DeliveryStatus.SENT), "all sent");
+        check(email.retries.get() == 1, "email retried once");
+        check(smsB.delivered.size() == 1 &amp;&amp; smsA.delivered.isEmpty(), "sms failed over to B");
+
+        System.out.println("== ORDER_PLACED 102 for ravi (opted out of SMS, no push device) ==");
+        bus.publish(new DomainEvent("ORDER_PLACED", Map.of("orderId", "102", "customer", "ravi", "name", "Ravi",
+                                                           "seller", "seller-7", "amount", "120")));
+        svc.processDue();
+        List&lt;DeliveryRecord&gt; r2 = newRecords(svc);
+        check(r2.stream().anyMatch(d -&gt; d.status() == DeliveryStatus.SKIPPED_OPT_OUT), "opt-out honoured");
+        check(r2.stream().anyMatch(d -&gt; d.status() == DeliveryStatus.NO_ADDRESS), "no device token");
+
+        System.out.println("== Priority: LOW promo submitted before HIGH OTP, both due now ==");
+        svc.submit(NotificationRequest.of(null, "asha", "promo", Map.of("name", "Asha"), Priority.LOW, 0, Channel.PUSH));
+        svc.submit(NotificationRequest.of(null, "asha", "otp", Map.of("otp", "4321"), Priority.HIGH, 0, Channel.SMS));
+        svc.processDue();
+        List&lt;DeliveryRecord&gt; r3 = newRecords(svc);
+        check(r3.get(0).channel() == Channel.SMS &amp;&amp; r3.get(1).channel() == Channel.PUSH, "HIGH first");
+
+        System.out.println("== Rate limit: 3 non-urgent SMS per minute per user ==");
+        bus.publish(new DomainEvent("ORDER_SHIPPED", o101));                  // asha's 2nd non-urgent SMS
+        for (String id : List.of("103", "104"))                               // 3rd ok, 4th limited
+            svc.submit(NotificationRequest.of(null, "asha", "order_shipped", Map.of("orderId", id),
+                                              Priority.MEDIUM, 0, Channel.SMS));
+        svc.submit(NotificationRequest.of(null, "asha", "otp", Map.of("otp", "9876"), Priority.HIGH, 0, Channel.SMS));
+        svc.processDue();
+        List&lt;DeliveryRecord&gt; r4 = newRecords(svc);
+        check(r4.stream().filter(d -&gt; d.status() == DeliveryStatus.RATE_LIMITED).count() == 1, "one limited");
+        check(r4.get(0).status() == DeliveryStatus.SENT &amp;&amp; r4.get(0).detail().equals("via sms-B"), "OTP exempt");
+
+        System.out.println("== Scheduling: ORDER_DELIVERED asks for a rating 1 hour later ==");
+        bus.publish(new DomainEvent("ORDER_DELIVERED", o101));
+        System.out.println("  now: delivered " + svc.processDue() + ", pending " + svc.pending());
+        clock.advance(3_600_000);
+        System.out.println("  +1h: delivered " + svc.processDue() + ", pending " + svc.pending());
+        List&lt;DeliveryRecord&gt; r5 = newRecords(svc);
+        check(r5.size() == 1 &amp;&amp; r5.get(0).status() == DeliveryStatus.SENT, "scheduled send");
+
+        System.out.println("== Validation ==");
+        try {
+            svc.submit(NotificationRequest.of(null, "asha", "order_placed", Map.of("orderId", "105"),
+                                              Priority.MEDIUM, 0, Channel.EMAIL));
+        } catch (IllegalArgumentException e) {
+            System.out.println("  rejected: " + e.getMessage());
+            checks++;
+        }
+        System.out.println("asha's history: " + svc.historyOf("asha").size() + " records");
+
+        System.out.println("== Concurrency: worker thread, 4 producers x 50 requests, same keys ==");
+        FakeProvider inbox2 = new FakeProvider("inbox");
+        NotificationService live = new NotificationService(Clock.SYSTEM,
+            new TemplateRegistry().register("ping", Channel.IN_APP, "ping {i}"));
+        live.registerUser(new User("u1", "U1", null, null, null));
+        live.registerSender(Channel.IN_APP, inbox2);
+        live.start();
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        AtomicInteger accepted = new AtomicInteger(), dupes = new AtomicInteger();
+        for (int th = 0; th &lt; 4; th++)
+            pool.submit(() -&gt; {
+                for (int i = 0; i &lt; 50; i++) {
+                    var r = NotificationRequest.of("bulk-" + i, "u1", "ping", Map.of("i", "" + i),
+                                                   Priority.MEDIUM, 0, Channel.IN_APP);
+                    if (live.submit(r).isPresent()) accepted.incrementAndGet(); else dupes.incrementAndGet();
+                }
+            });
+        pool.shutdown();
+        pool.awaitTermination(5, TimeUnit.SECONDS);
+        for (int i = 0; i &lt; 200 &amp;&amp; live.history().size() &lt; 50; i++) Thread.sleep(10);
+        live.stop();
+        System.out.println("  accepted " + accepted + ", duplicates " + dupes + ", delivered " + inbox2.delivered.size()
+                           + ", pending " + live.pending());
+        check(accepted.get() == 50 &amp;&amp; dupes.get() == 150 &amp;&amp; inbox2.delivered.size() == 50, "exactly once per key");
+
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+}</code></pre>
+      <p><code>javac -d out *.java &amp;&amp; java -cp out Main</code></p>
+<pre class="terminal"><code>== ORDER_PLACED 101 (published twice by an upstream retry) ==
+  duplicates suppressed: 2
+  asha: n1 EMAIL SENT (via ses)
+  asha: n1 SMS SENT (via sms-B)
+  asha: n1 PUSH SENT (via fcm)
+  seller-7: n2 IN_APP SENT (via inbox)
+== ORDER_PLACED 102 for ravi (opted out of SMS, no push device) ==
+  ravi: n3 EMAIL SENT (via ses)
+  ravi: n3 SMS SKIPPED_OPT_OUT
+  ravi: n3 PUSH NO_ADDRESS (no PUSH address)
+  seller-7: n4 IN_APP SENT (via inbox)
+== Priority: LOW promo submitted before HIGH OTP, both due now ==
+  asha: n6 SMS SENT (via sms-B)
+  asha: n5 PUSH SENT (via fcm)
+== Rate limit: 3 non-urgent SMS per minute per user ==
+  asha: n11 SMS SENT (via sms-B)
+  asha: n7 SMS SENT (via sms-B)
+  asha: n7 PUSH SENT (via fcm)
+  ekart: n8 IN_APP SENT (via inbox)
+  asha: n9 SMS SENT (via sms-B)
+  asha: n10 SMS RATE_LIMITED (3 per 60s for asha)
+== Scheduling: ORDER_DELIVERED asks for a rating 1 hour later ==
+  now: delivered 0, pending 1
+  +1h: delivered 1, pending 0
+  asha: n12 EMAIL SENT (via ses)
+== Validation ==
+  rejected: missing {name} for order_placed
+asha's history: 11 records
+== Concurrency: worker thread, 4 producers x 50 requests, same keys ==
+  accepted 50, duplicates 150, delivered 50, pending 0
+ALL 12 CHECKS PASSED</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+      <p><b>notify.py</b></p>
+<pre><code class="language-python">"""Notification service LLD: Observer event bus, channel Strategy, Decorator retries / failover / rate limit,
+templates, scheduling with a time + priority queue, idempotency, history, background worker."""
+from __future__ import annotations
+
+import heapq
+import itertools
+import re
+import threading
+import time
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Dict, FrozenSet, List, Optional
+
+class Channel(Enum):
+    EMAIL = "EMAIL"
+    SMS = "SMS"
+    PUSH = "PUSH"
+    IN_APP = "IN_APP"
+
+class Priority(Enum):          # value = queue order
+    HIGH = 0
+    MEDIUM = 1
+    LOW = 2
+
+class Status(Enum):
+    SENT = "SENT"
+    FAILED = "FAILED"
+    SKIPPED_OPT_OUT = "SKIPPED_OPT_OUT"
+    NO_ADDRESS = "NO_ADDRESS"
+    RATE_LIMITED = "RATE_LIMITED"
+
+@dataclass(frozen=True)
+class User:
+    id: str
+    name: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    device_token: Optional[str] = None
+
+    def address_for(self, c: Channel) -&gt; Optional[str]:
+        return {Channel.EMAIL: self.email, Channel.SMS: self.phone,
+                Channel.PUSH: self.device_token, Channel.IN_APP: self.id}[c]
+
+@dataclass(frozen=True)
+class Request:
+    key: Optional[str]                     # idempotency key
+    user_id: str
+    template_id: str
+    params: Dict[str, str]
+    channels: FrozenSet[Channel]
+    priority: Priority = Priority.MEDIUM
+    send_at: float = 0.0                   # seconds; 0 = now
+
+@dataclass(frozen=True)
+class Message:
+    notification_id: str
+    user_id: str
+    channel: Channel
+    to: str
+    body: str
+    priority: Priority
+
+@dataclass(frozen=True)
+class Record:
+    notification_id: str
+    user_id: str
+    channel: Channel
+    status: Status
+    detail: str = ""
+
+    def __str__(self) -&gt; str:
+        return f"{self.notification_id} {self.channel.value} {self.status.value}" + \
+            (f" ({self.detail})" if self.detail else "")
+
+class DeliveryError(Exception):
+    def __init__(self, msg: str, retryable: bool = True) -&gt; None:
+        super().__init__(msg)
+        self.retryable = retryable
+
+class RateLimited(DeliveryError):
+    def __init__(self, msg: str) -&gt; None:
+        super().__init__(msg, retryable=False)
+
+class FakeProvider:
+    """Strategy implementation standing in for SES / Twilio / FCM. send() returns the provider name."""
+
+    def __init__(self, name: str, fail_next: int = 0, down: bool = False) -&gt; None:
+        self.name, self.fail_next, self.down = name, fail_next, down
+        self.delivered: List[str] = []
+        self._lock = threading.Lock()
+
+    def send(self, m: Message) -&gt; str:
+        with self._lock:
+            if self.down:
+                raise DeliveryError(f"{self.name} is down")
+            if self.fail_next &gt; 0:
+                self.fail_next -= 1
+                raise DeliveryError(f"{self.name} timeout")
+            self.delivered.append(f"{m.to}: {m.body}")
+        return self.name
+
+class Retrying:
+    """Decorator: retry retryable errors with exponential backoff."""
+
+    def __init__(self, inner, max_attempts: int, base_s: float, sleep: Callable[[float], None] = time.sleep):
+        self.inner, self.max_attempts, self.base_s, self.sleep = inner, max_attempts, base_s, sleep
+        self.retries = 0
+
+    def send(self, m: Message) -&gt; str:
+        attempt = 1
+        while True:
+            try:
+                return self.inner.send(m)
+            except DeliveryError as e:
+                if not e.retryable or attempt &gt;= self.max_attempts:
+                    raise
+                self.retries += 1
+                self.sleep(self.base_s * 2 ** (attempt - 1))
+                attempt += 1
+
+class Failover:
+    """Try providers in order; first success wins."""
+
+    def __init__(self, providers) -&gt; None:
+        if not providers:
+            raise ValueError("need at least one provider")
+        self.providers = list(providers)
+
+    def send(self, m: Message) -&gt; str:
+        last = None
+        for p in self.providers:
+            try:
+                return p.send(m)
+            except DeliveryError as e:
+                last = e
+        raise DeliveryError(f"all providers failed, last: {last}")
+
+class RateLimiting:
+    """Decorator: sliding-window log per user; HIGH priority is exempt."""
+
+    def __init__(self, inner, max_per_window: int, window_s: float, clock: Callable[[], float]) -&gt; None:
+        self.inner, self.max, self.window, self.clock = inner, max_per_window, window_s, clock
+        self._sent = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def send(self, m: Message) -&gt; str:
+        if m.priority is not Priority.HIGH:
+            with self._lock:
+                now, q = self.clock(), self._sent[m.user_id]
+                while q and q[0] &lt;= now - self.window:
+                    q.popleft()
+                if len(q) &gt;= self.max:
+                    raise RateLimited(f"{self.max} per {int(self.window)}s for {m.user_id}")
+                q.append(now)
+        return self.inner.send(m)
+
+class Templates:
+    VAR = re.compile(r"\{(\w+)\}")
+
+    def __init__(self) -&gt; None:
+        self._bodies: Dict[str, Dict[Channel, str]] = defaultdict(dict)
+
+    def register(self, tid: str, c: Channel, body: str) -&gt; "Templates":
+        self._bodies[tid][c] = body
+        return self
+
+    def exists(self, tid: str) -&gt; bool:
+        return tid in self._bodies
+
+    def supports(self, tid: str, c: Channel) -&gt; bool:
+        return c in self._bodies.get(tid, {})
+
+    def render(self, tid: str, c: Channel, params: Dict[str, str]) -&gt; str:
+        def sub(mt):
+            if mt.group(1) not in params:
+                raise ValueError(f"missing {{{mt.group(1)}}} for {tid}")
+            return params[mt.group(1)]
+        return self.VAR.sub(sub, self._bodies[tid][c])
+
+class EventBus:
+    """Observer: event type -&gt; listeners. A failing listener does not stop the others."""
+
+    def __init__(self) -&gt; None:
+        self._listeners: Dict[str, List[Callable[[dict], None]]] = defaultdict(list)
+
+    def subscribe(self, event_type: str, listener: Callable[[dict], None]) -&gt; None:
+        self._listeners[event_type].append(listener)
+
+    def publish(self, event_type: str, data: dict) -&gt; None:
+        for listener in list(self._listeners[event_type]):
+            try:
+                listener(data)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [bus] listener failed on {event_type}: {e}")
+
+@dataclass(order=True)
+class _Job:
+    send_at: float
+    priority: int
+    seq: int
+    id: str = field(compare=False)
+    req: Request = field(compare=False)
+
+class NotificationService:
+    def __init__(self, clock: Callable[[], float], templates: Templates) -&gt; None:
+        self.clock, self.templates = clock, templates
+        self.users: Dict[str, User] = {}
+        self.opted_out: Dict[str, set] = defaultdict(set)
+        self.senders: Dict[Channel, object] = {}
+        self._seen = set()
+        self._heap: List[_Job] = []
+        self._seq = itertools.count(1)
+        self._cv = threading.Condition()       # guards heap, seen-keys and seq
+        self.history: List[Record] = []
+        self._hist_lock = threading.Lock()
+        self._running = False
+        self._worker: Optional[threading.Thread] = None
+
+    def register_user(self, u: User) -&gt; None:
+        self.users[u.id] = u
+
+    def register_sender(self, c: Channel, s) -&gt; None:
+        self.senders[c] = s
+
+    def opt_out(self, user_id: str, c: Channel) -&gt; None:
+        self.opted_out[user_id].add(c)
+
+    def submit(self, r: Request) -&gt; Optional[str]:
+        if r.user_id not in self.users:
+            raise ValueError(f"unknown user {r.user_id}")
+        if not self.templates.exists(r.template_id):
+            raise ValueError(f"unknown template {r.template_id}")
+        for c in sorted(r.channels, key=lambda ch: list(Channel).index(ch)):
+            if self.templates.supports(r.template_id, c):
+                self.templates.render(r.template_id, c, r.params)     # fail fast
+        with self._cv:
+            if r.key is not None:
+                if r.key in self._seen:
+                    return None
+                self._seen.add(r.key)
+            seq = next(self._seq)
+            job = _Job(r.send_at, r.priority.value, seq, f"n{seq}", r)
+            heapq.heappush(self._heap, job)
+            self._cv.notify()
+            return job.id
+
+    def _poll_due(self) -&gt; Optional[_Job]:
+        with self._cv:
+            if self._heap and self._heap[0].send_at &lt;= self.clock():
+                return heapq.heappop(self._heap)
+            return None
+
+    def process_due(self) -&gt; int:
+        n = 0
+        while (job := self._poll_due()) is not None:
+            self._deliver(job)
+            n += 1
+        return n
+
+    def pending(self) -&gt; int:
+        with self._cv:
+            return len(self._heap)
+
+    def start(self) -&gt; None:
+        self._running = True
+
+        def loop():
+            while True:
+                with self._cv:
+                    while self._running and (not self._heap or self._heap[0].send_at &gt; self.clock()):
+                        wait = 1.0 if not self._heap else max(0.001, self._heap[0].send_at - self.clock())
+                        self._cv.wait(wait)
+                    if not self._running:
+                        return
+                    job = heapq.heappop(self._heap)
+                self._deliver(job)                       # outside the lock
+        self._worker = threading.Thread(target=loop, name="notification-worker", daemon=True)
+        self._worker.start()
+
+    def stop(self) -&gt; None:
+        with self._cv:
+            self._running = False
+            self._cv.notify_all()
+        if self._worker:
+            self._worker.join(2)
+
+    def _deliver(self, job: _Job) -&gt; None:
+        r, u = job.req, self.users[job.req.user_id]
+        for c in sorted(r.channels, key=lambda ch: list(Channel).index(ch)):
+            to, detail = u.address_for(c), ""
+            if c in self.opted_out[u.id]:
+                status = Status.SKIPPED_OPT_OUT
+            elif to is None or c not in self.senders or not self.templates.supports(r.template_id, c):
+                status, detail = Status.NO_ADDRESS, (f"no {c.value} address" if to is None
+                                                     else f"no sender/template for {c.value}")
+            else:
+                msg = Message(job.id, u.id, c, to, self.templates.render(r.template_id, c, r.params), r.priority)
+                try:
+                    status, detail = Status.SENT, "via " + self.senders[c].send(msg)
+                except RateLimited as e:
+                    status, detail = Status.RATE_LIMITED, str(e)
+                except DeliveryError as e:
+                    status, detail = Status.FAILED, str(e)
+            with self._hist_lock:
+                self.history.append(Record(job.id, u.id, c, status, detail))
+
+    def history_of(self, user_id: str) -&gt; List[Record]:
+        with self._hist_lock:
+            return [h for h in self.history if h.user_id == user_id]
+
+def request(key, user, template, params, priority=Priority.MEDIUM, send_at=0.0, *channels) -&gt; Request:
+    return Request(key, user, template, dict(params), frozenset(channels), priority, send_at)</code></pre>
+      <p><b>main.py</b> - demo driver</p>
+<pre><code class="language-python">"""Demo driver: python main.py"""
+import threading
+import time
+
+from notify import (Channel as C, EventBus, Failover, FakeProvider, NotificationService, Priority as P,
+                    RateLimiting, Retrying, Status, Templates, User, request)
+
+class FakeClock:
+    def __init__(self) -&gt; None:
+        self.t = 0.0
+
+    def __call__(self) -&gt; float:
+        return self.t
+
+def main() -&gt; None:
+    clock = FakeClock()
+    t = (Templates()
+         .register("order_placed", C.EMAIL, "Hi {name}, order {orderId} is confirmed. Total Rs {amount}.")
+         .register("order_placed", C.SMS, "Order {orderId} confirmed.")
+         .register("order_placed", C.PUSH, "Order {orderId} confirmed")
+         .register("seller_new_order", C.IN_APP, "New order {orderId}: please pack it")
+         .register("order_shipped", C.SMS, "Order {orderId} shipped")
+         .register("order_shipped", C.PUSH, "Order {orderId} is on its way")
+         .register("pickup_request", C.IN_APP, "Pick up {orderId} from {seller}")
+         .register("rate_order", C.EMAIL, "How was order {orderId}?")
+         .register("otp", C.SMS, "OTP {otp}, valid 5 min")
+         .register("promo", C.PUSH, "{name}, 20% off today"))
+    svc = NotificationService(clock, t)
+    svc.register_user(User("asha", "Asha", "asha@example.com", "+91-90000-00001", "dev-asha"))
+    svc.register_user(User("ravi", "Ravi", "ravi@example.com", "+91-90000-00002"))
+    svc.register_user(User("seller-7", "Kirana 7"))
+    svc.register_user(User("ekart", "Ekart"))
+    svc.opt_out("ravi", C.SMS)
+
+    ses = FakeProvider("ses", fail_next=1)
+    sms_a, sms_b = FakeProvider("sms-A", down=True), FakeProvider("sms-B")
+    email = Retrying(ses, 3, 0.1, sleep=lambda s: None)
+    svc.register_sender(C.EMAIL, email)
+    svc.register_sender(C.SMS, RateLimiting(Retrying(Failover([sms_a, sms_b]), 3, 0.1, lambda s: None),
+                                            3, 60, clock))
+    svc.register_sender(C.PUSH, FakeProvider("fcm"))
+    svc.register_sender(C.IN_APP, FakeProvider("inbox"))
+
+    bus, dupes = EventBus(), [0]
+
+    def submit(r):
+        if svc.submit(r) is None:
+            dupes[0] += 1
+    bus.subscribe("ORDER_PLACED", lambda d: submit(request(
+        f"{d['orderId']}/placed/customer", d["customer"], "order_placed", d, P.MEDIUM, 0, C.EMAIL, C.SMS, C.PUSH)))
+    bus.subscribe("ORDER_PLACED", lambda d: submit(request(
+        f"{d['orderId']}/placed/seller", d["seller"], "seller_new_order", d, P.MEDIUM, 0, C.IN_APP)))
+    bus.subscribe("ORDER_SHIPPED", lambda d: submit(request(
+        f"{d['orderId']}/shipped/customer", d["customer"], "order_shipped", d, P.MEDIUM, 0, C.SMS, C.PUSH)))
+    bus.subscribe("ORDER_SHIPPED", lambda d: submit(request(
+        f"{d['orderId']}/shipped/logistics", "ekart", "pickup_request", d, P.MEDIUM, 0, C.IN_APP)))
+    bus.subscribe("ORDER_DELIVERED", lambda d: submit(request(
+        f"{d['orderId']}/rate", d["customer"], "rate_order", d, P.LOW, clock() + 3600, C.EMAIL)))
+
+    printed = [0]
+
+    def new_records():
+        fresh = svc.history[printed[0]:]
+        for h in fresh:
+            print(f"  {h.user_id}: {h}")
+        printed[0] = len(svc.history)
+        return fresh
+
+    o101 = {"orderId": "101", "customer": "asha", "name": "Asha", "seller": "seller-7", "amount": "499"}
+    print("== ORDER_PLACED 101 (published twice by an upstream retry) ==")
+    bus.publish("ORDER_PLACED", o101)
+    bus.publish("ORDER_PLACED", o101)
+    print(f"  duplicates suppressed: {dupes[0]}")
+    svc.process_due()
+    r1 = new_records()
+    assert dupes[0] == 2 and len(r1) == 4 and all(h.status is Status.SENT for h in r1)
+    assert email.retries == 1 and len(sms_b.delivered) == 1 and not sms_a.delivered
+
+    print("== ORDER_PLACED 102 for ravi (opted out of SMS, no push device) ==")
+    bus.publish("ORDER_PLACED", {"orderId": "102", "customer": "ravi", "name": "Ravi",
+                                 "seller": "seller-7", "amount": "120"})
+    svc.process_due()
+    r2 = new_records()
+    assert {Status.SKIPPED_OPT_OUT, Status.NO_ADDRESS} &lt;= {h.status for h in r2}
+
+    print("== Priority: LOW promo submitted before HIGH OTP, both due now ==")
+    svc.submit(request(None, "asha", "promo", {"name": "Asha"}, P.LOW, 0, C.PUSH))
+    svc.submit(request(None, "asha", "otp", {"otp": "4321"}, P.HIGH, 0, C.SMS))
+    svc.process_due()
+    r3 = new_records()
+    assert r3[0].channel is C.SMS and r3[1].channel is C.PUSH
+
+    print("== Rate limit: 3 non-urgent SMS per minute per user ==")
+    bus.publish("ORDER_SHIPPED", o101)
+    for oid in ("103", "104"):
+        svc.submit(request(None, "asha", "order_shipped", {"orderId": oid}, P.MEDIUM, 0, C.SMS))
+    svc.submit(request(None, "asha", "otp", {"otp": "9876"}, P.HIGH, 0, C.SMS))
+    svc.process_due()
+    r4 = new_records()
+    assert sum(h.status is Status.RATE_LIMITED for h in r4) == 1 and r4[0].detail == "via sms-B"
+
+    print("== Scheduling: ORDER_DELIVERED asks for a rating 1 hour later ==")
+    bus.publish("ORDER_DELIVERED", o101)
+    print(f"  now: delivered {svc.process_due()}, pending {svc.pending()}")
+    clock.t += 3600
+    print(f"  +1h: delivered {svc.process_due()}, pending {svc.pending()}")
+    r5 = new_records()
+    assert len(r5) == 1 and r5[0].status is Status.SENT
+
+    print("== Validation ==")
+    try:
+        svc.submit(request(None, "asha", "order_placed", {"orderId": "105"}, P.MEDIUM, 0, C.EMAIL))
+        raise AssertionError("should be rejected")
+    except ValueError as e:
+        print(f"  rejected: {e}")
+    print(f"asha's history: {len(svc.history_of('asha'))} records")
+
+    print("== Concurrency: worker thread, 4 producers x 50 requests, same keys ==")
+    inbox = FakeProvider("inbox")
+    live = NotificationService(time.time, Templates().register("ping", C.IN_APP, "ping {i}"))
+    live.register_user(User("u1", "U1"))
+    live.register_sender(C.IN_APP, inbox)
+    live.start()
+    counts, lock = {"accepted": 0, "dupes": 0}, threading.Lock()
+
+    def producer():
+        for i in range(50):
+            ok = live.submit(request(f"bulk-{i}", "u1", "ping", {"i": str(i)}, P.MEDIUM, 0, C.IN_APP))
+            with lock:
+                counts["accepted" if ok else "dupes"] += 1
+    threads = [threading.Thread(target=producer) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    for _ in range(200):
+        if len(live.history) &gt;= 50:
+            break
+        time.sleep(0.01)
+    live.stop()
+    print(f"  accepted {counts['accepted']}, duplicates {counts['dupes']}, delivered {len(inbox.delivered)}, "
+          f"pending {live.pending()}")
+    assert counts == {"accepted": 50, "dupes": 150} and len(inbox.delivered) == 50
+    print("ALL CHECKS PASSED")
+
+if __name__ == "__main__":
+    main()</code></pre>
+      <p><b>test_notify.py</b> - unit tests</p>
+<pre><code class="language-python">"""python -m unittest -v test_notify"""
+import unittest
+
+from notify import (Channel as C, DeliveryError, Failover, FakeProvider, Message, NotificationService,
+                    Priority as P, RateLimiting, Retrying, Status, Templates, User, request)
+
+def msg(priority=P.MEDIUM, user="u"):
+    return Message("n1", user, C.SMS, "+1", "hi", priority)
+
+class NotifyTest(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.t = Templates().register("hello", C.EMAIL, "Hello {name}").register("hello", C.SMS, "Hi {name}")
+        self.svc = NotificationService(lambda: self.now, self.t)
+        self.svc.register_user(User("u", "U", email="u@x", phone="+1"))
+        self.email, self.sms = FakeProvider("mail"), FakeProvider("sms")
+        self.svc.register_sender(C.EMAIL, self.email)
+        self.svc.register_sender(C.SMS, self.sms)
+
+    def test_template_render_and_missing_param(self):
+        self.assertEqual(self.t.render("hello", C.EMAIL, {"name": "Asha"}), "Hello Asha")
+        with self.assertRaises(ValueError):
+            self.svc.submit(request(None, "u", "hello", {}, P.MEDIUM, 0, C.EMAIL))
+
+    def test_idempotency(self):
+        self.assertIsNotNone(self.svc.submit(request("k", "u", "hello", {"name": "A"}, P.LOW, 0, C.EMAIL)))
+        self.assertIsNone(self.svc.submit(request("k", "u", "hello", {"name": "A"}, P.LOW, 0, C.EMAIL)))
+
+    def test_schedule_waits_until_due(self):
+        self.svc.submit(request(None, "u", "hello", {"name": "A"}, P.LOW, 10, C.EMAIL))
+        self.assertEqual(self.svc.process_due(), 0)
+        self.now = 10
+        self.assertEqual(self.svc.process_due(), 1)
+
+    def test_priority_order_for_same_time(self):
+        self.svc.submit(request(None, "u", "hello", {"name": "low"}, P.LOW, 0, C.EMAIL))
+        self.svc.submit(request(None, "u", "hello", {"name": "high"}, P.HIGH, 0, C.EMAIL))
+        self.svc.process_due()
+        self.assertEqual(self.email.delivered, ["u@x: Hello high", "u@x: Hello low"])
+
+    def test_retry_then_give_up(self):
+        flaky = FakeProvider("f", fail_next=5)
+        r = Retrying(flaky, 3, 0, sleep=lambda s: None)
+        with self.assertRaises(DeliveryError):
+            r.send(msg())
+        self.assertEqual(r.retries, 2)
+
+    def test_failover(self):
+        f = Failover([FakeProvider("a", down=True), FakeProvider("b")])
+        self.assertEqual(f.send(msg()), "b")
+
+    def test_rate_limit_window_and_high_exempt(self):
+        clock = [0.0]
+        rl = RateLimiting(FakeProvider("p"), 1, 60, lambda: clock[0])
+        rl.send(msg())
+        with self.assertRaises(DeliveryError):
+            rl.send(msg())
+        rl.send(msg(P.HIGH))            # exempt
+        clock[0] = 61
+        rl.send(msg())                  # window slid
+
+    def test_opt_out_recorded(self):
+        self.svc.opt_out("u", C.SMS)
+        self.svc.submit(request(None, "u", "hello", {"name": "A"}, P.LOW, 0, C.EMAIL, C.SMS))
+        self.svc.process_due()
+        self.assertEqual([h.status for h in self.svc.history_of("u")], [Status.SENT, Status.SKIPPED_OPT_OUT])
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+      <p><code>python main.py</code></p>
+<pre class="terminal"><code>== ORDER_PLACED 101 (published twice by an upstream retry) ==
+  duplicates suppressed: 2
+  asha: n1 EMAIL SENT (via ses)
+  asha: n1 SMS SENT (via sms-B)
+  asha: n1 PUSH SENT (via fcm)
+  seller-7: n2 IN_APP SENT (via inbox)
+== ORDER_PLACED 102 for ravi (opted out of SMS, no push device) ==
+  ravi: n3 EMAIL SENT (via ses)
+  ravi: n3 SMS SKIPPED_OPT_OUT
+  ravi: n3 PUSH NO_ADDRESS (no PUSH address)
+  seller-7: n4 IN_APP SENT (via inbox)
+== Priority: LOW promo submitted before HIGH OTP, both due now ==
+  asha: n6 SMS SENT (via sms-B)
+  asha: n5 PUSH SENT (via fcm)
+== Rate limit: 3 non-urgent SMS per minute per user ==
+  asha: n11 SMS SENT (via sms-B)
+  asha: n7 SMS SENT (via sms-B)
+  asha: n7 PUSH SENT (via fcm)
+  ekart: n8 IN_APP SENT (via inbox)
+  asha: n9 SMS SENT (via sms-B)
+  asha: n10 SMS RATE_LIMITED (3 per 60s for asha)
+== Scheduling: ORDER_DELIVERED asks for a rating 1 hour later ==
+  now: delivered 0, pending 1
+  +1h: delivered 1, pending 0
+  asha: n12 EMAIL SENT (via ses)
+== Validation ==
+  rejected: missing {name} for order_placed
+asha's history: 11 records
+== Concurrency: worker thread, 4 producers x 50 requests, same keys ==
+  accepted 50, duplicates 150, delivered 50, pending 0
+ALL CHECKS PASSED</code></pre>
+      <p><code>python -m unittest -q</code></p>
+<pre class="terminal"><code>----------------------------------------------------------------------
+Ran 8 tests in 0.001s
+
+OK</code></pre>
+    </div>
+  </div>
+  <p>Read the Java output against the requirements. Order 101 was published twice and sent once per channel (two duplicates suppressed: the customer rule and the seller rule). E-mail survived one SES timeout by retrying; SMS skipped the dead sms-A without any backoff. Ravi's SMS was skipped because he opted out, and his push was skipped because he has no device token; neither is an error. The HIGH OTP went before the LOW promo even though it was submitted later. In the rate-limit block the OTP passed first and was exempt, three MEDIUM SMS used asha's budget of 3 per minute (the order-placed SMS earlier counts too), and the fourth was RATE_LIMITED. The rating e-mail waited until the fake clock moved one hour. Finally, four threads submitting the same 50 keys produced exactly 50 deliveries.</p>

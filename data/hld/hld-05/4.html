@@ -1,0 +1,90 @@
+
+        <h2>L4 vs L7 load balancing</h2>
+        <p>The layer numbers are the OSI layers you know. An <strong>L4 load balancer</strong> looks only at the IP and TCP/UDP headers (the 5-tuple). It picks a backend once per <em>connection</em> and then forwards every packet of that connection to the same backend. An <strong>L7 load balancer</strong> terminates the TCP (and usually TLS) connection, reads the HTTP request, picks a backend per <em>request</em>, and opens or reuses a separate connection to that backend.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 300" role="img" aria-label="L4 forwards one connection end to end, L7 terminates and opens new connections per request">
+            
+            <text class="label title" x="200" y="24">L4: one connection, passed through</text>
+            <rect class="box client" x="20" y="60" width="100" height="44"/>
+            <text class="label" x="70" y="82">client</text>
+            <rect class="box svc" x="160" y="60" width="90" height="44"/>
+            <text class="label" x="205" y="82">L4 LB</text>
+            <rect class="box svc" x="300" y="40" width="90" height="36"/>
+            <text class="label small" x="345" y="58">backend A</text>
+            <rect class="box svc" x="300" y="90" width="90" height="36"/>
+            <text class="label small" x="345" y="108">backend B</text>
+            <path class="arrow" d="M120 82 L154 82"/>
+            <path class="arrow" d="M250 76 L294 60"/>
+            <path class="arrow dashed" d="M250 90 L294 106"/>
+            <text class="label small" x="205" y="140">picks A at SYN; all packets follow</text>
+            <text class="label small" x="205" y="160">sees: src/dst IP, ports, protocol</text>
+            <circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M120 82 L205 82 L300 58"/></circle>
+
+            <text class="label title" x="620" y="24">L7: terminate, read, re-send</text>
+            <rect class="box client" x="440" y="60" width="100" height="44"/>
+            <text class="label" x="490" y="82">client</text>
+            <rect class="box k8s" x="580" y="60" width="90" height="44"/>
+            <text class="label" x="625" y="82">L7 LB</text>
+            <rect class="box svc" x="710" y="30" width="100" height="36"/>
+            <text class="label small" x="760" y="48">/api to API</text>
+            <rect class="box svc" x="710" y="76" width="100" height="36"/>
+            <text class="label small" x="760" y="94">/img to static</text>
+            <rect class="box svc" x="710" y="122" width="100" height="36"/>
+            <text class="label small" x="760" y="140">/ws to realtime</text>
+            <path class="arrow" d="M540 82 L574 82"/>
+            <path class="arrow" d="M670 74 L704 50"/>
+            <path class="arrow" d="M670 82 L704 94"/>
+            <path class="arrow" d="M670 92 L704 138"/>
+            <text class="label small" x="625" y="180">TCP 1: client to LB (TLS ends here)</text>
+            <text class="label small" x="625" y="200">TCP 2..n: LB to backends (pooled)</text>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M540 82 L625 82 L710 48"/></circle>
+            <circle class="packet ok" r="5"><animateMotion dur="2s" begin="1s" repeatCount="indefinite" path="M540 82 L625 82 L710 94"/></circle>
+
+            <rect class="box plain" x="20" y="230" width="790" height="54"/>
+            <text class="label small" x="415" y="248">L4: cheap per packet, protocol-agnostic (any TCP/UDP), great for WebSockets, gRPC passthrough, databases, game UDP.</text>
+            <text class="label small" x="415" y="270">L7: per-request routing, retries, header rewrite, auth, caching; costs CPU for TLS and parsing.</text>
+          </svg>
+          <figcaption>Left: an L4 balancer decides once per connection. Right: an L7 balancer is two separate TCP connections glued together by a proxy that reads every request.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Question</th><th>L4</th><th>L7</th></tr></thead>
+            <tbody>
+              <tr><td>Unit of balancing</td><td>Connection (or UDP flow)</td><td>Request</td></tr>
+              <tr><td>Can route by URL, header, cookie?</td><td>No</td><td>Yes</td></tr>
+              <tr><td>Sees TLS plaintext?</td><td>No (passthrough)</td><td>Yes, if it terminates TLS</td></tr>
+              <tr><td>Long-lived connections (WebSocket, gRPC stream)</td><td>Natural fit; one backend for the life of the connection</td><td>Works, but HTTP/2 or gRPC multiplexing means one connection carries many requests, so L7 is needed to balance them</td></tr>
+              <tr><td>Cost</td><td>Very low; kernel or NIC fast path</td><td>Higher; user-space proxy, TLS crypto, parsing</td></tr>
+              <tr><td>Products</td><td>AWS NLB, Google Maglev, Linux IPVS, Katran</td><td>AWS ALB, Envoy, NGINX, HAProxy (http mode)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>The gRPC trap:</b> gRPC runs over HTTP/2, which keeps one long TCP connection and multiplexes many calls on it. Put an L4 balancer in front and every call from a client sticks to whichever backend got the connection, so new pods get no traffic. Fix it with an L7 (HTTP/2-aware) balancer, a service mesh sidecar like Envoy, or client-side load balancing. This is a favourite follow-up for anyone who says "gRPC between services".</p></div>
+
+        <h3>Algorithms</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Algorithm</th><th>How it picks</th><th>Good for</th><th>Breaks when</th></tr></thead>
+            <tbody>
+              <tr><td>Round robin / weighted</td><td>Next server in a list (weights for bigger boxes)</td><td>Stateless HTTP, equal-cost requests</td><td>Requests vary a lot in cost</td></tr>
+              <tr><td>Least connections</td><td>Server with fewest open connections</td><td>Long-lived connections: WebSocket, SSE, chat</td><td>Connections are idle vs busy (count is not load)</td></tr>
+              <tr><td>Least response time / power of two choices</td><td>Pick 2 at random, send to the less loaded</td><td>Large fleets, avoids herding on one "best" server</td><td>Load signal is stale</td></tr>
+              <tr><td>IP hash / consistent hash</td><td>hash(client IP or key) to a server on a ring</td><td>Stickiness, cache locality, L4 balancers like Maglev</td><td>Hot keys; NAT puts many users behind one IP</td></tr>
+              <tr><td>Random</td><td>Any healthy server</td><td>Simple, surprisingly fine at scale</td><td>Small fleets (uneven)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Hello Interview's rule of thumb matches what you would guess from the table: round robin or random for stateless services, least connections for persistent connections like WebSockets and SSE.</p>
+
+        <h3>Health checks, stickiness and draining</h3>
+        <ul>
+          <li><b>Health checks:</b> an L4 check only proves the port accepts a TCP connection. An L7 check calls something like <code>GET /healthz</code> and expects a 200. A good health endpoint checks the process can do real work, but not every dependency, or one slow database marks the whole fleet unhealthy at once.</li>
+          <li><b>Sticky sessions:</b> a cookie or IP hash keeps a user on one server. It makes servers stateful and hurts balancing; prefer stateless servers with the session in Redis.</li>
+          <li><b>Connection draining:</b> when you remove a server (deploy, scale-in), stop sending <em>new</em> connections and let existing ones finish for a grace period. Kubernetes does the same with a pod's terminating state and <code>preStop</code>; see <a href="{{BASE}}devops/k8s-04">Deployments &amp; rollouts</a>.</li>
+          <li><b>The LB is not a single point of failure</b> if you run it as a fleet: an active-passive pair sharing a virtual IP (VRRP or keepalived), or an active-active fleet behind ECMP and anycast.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>An L4 LB is essentially DNAT with a conntrack table. The Kubernetes <code>Service</code> does exactly this with iptables or IPVS rules on every node (see <a href="{{BASE}}devops/k8s-05">Services &amp; cluster networking</a>). <b>Direct server return</b> (DSR) is the trick where the LB rewrites only the destination MAC, the backend owns the VIP on a loopback interface, and replies go straight back to the client, so the LB only sees the small inbound half of the traffic. Google's <b>Maglev</b> paper describes a software L4 balancer on commodity Linux servers, fed by ECMP from routers, using consistent hashing plus connection tracking so that a machine failure moves as few connections as possible. Google says it has run in production since 2008 and one machine can saturate a 10 Gbps link with small packets.</p>
+        </div>
+      

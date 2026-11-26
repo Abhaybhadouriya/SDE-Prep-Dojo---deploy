@@ -1,0 +1,60 @@
+
+<h2>Deadlock, read-write locks and atomics</h2>
+<details class="qa" data-level="3" data-topic="lld" data-company="Amazon,Microsoft">
+<summary>What are the four conditions for deadlock, and how do you prevent it in an LLD?</summary>
+<div class="answer"><p>Coffman conditions: mutual exclusion, hold and wait, no preemption, circular wait. All four must hold, so break one. In LLD code the practical fixes are: <b>lock ordering</b> (take locks in a global order such as entity id: breaks circular wait), <b>take everything at once</b> or <code>tryLock</code> with timeout and back off (breaks hold and wait), and the best one: <b>design so you never hold two locks</b> (one lock per operation, or hand work to a single owner thread).</p>
+<p class="small">Related report: avoid deadlock at a four-way intersection where each vehicle occupies two road segments (<a href="https://leetcode.com/discuss/post/4736697/" target="_blank" rel="noopener">LeetCode Discuss, 2024-02-16</a>). Deep dive: <a href="{{BASE}}lld/lld-conc-deadlock">Deadlock, Livelock &amp; Starvation</a>.</p>
+<div class="approach"><h5>How to answer</h5><p>Four conditions, then the fix you would ship (ordering), then how you would detect one (thread dump).</p></div>
+<div class="followups"><h5>Likely follow-ups</h5><ul><li>Detect a deadlock in a running JVM. (<code>jstack</code>, <code>ThreadMXBean.findDeadlockedThreads()</code>)</li><li>Livelock vs starvation?</li></ul></div></div>
+</details>
+<details class="qa" data-level="3" data-topic="lld" data-company="Walmart,Goldman Sachs">
+<summary>Transfer money between two accounts concurrently without deadlock.</summary>
+<div class="answer"><p>Transfer A to B locks A then B; transfer B to A locks B then A: two threads can each hold one lock and wait for the other. Fix: always lock the account with the <b>smaller id first</b>, whatever the direction. Check the balance and move the money inside both locks. Our test ran 100,000 transfers each way at the same time: no deadlock, and the total stayed at exactly 2,000,000.</p>
+<pre><code class="language-java">static void transfer(Account from, Account to, long amount) {
+    Account first = from.id &lt; to.id ? from : to;          // global order by id
+    Account second = from.id &lt; to.id ? to : from;
+    first.lock.lock();
+    try {
+        second.lock.lock();
+        try {
+            if (from.balance &lt; amount) throw new IllegalStateException("insufficient funds");
+            from.balance -= amount;
+            to.balance += amount;
+        } finally { second.lock.unlock(); }
+    } finally { first.lock.unlock(); }
+}</code></pre>
+<div class="approach"><h5>How to answer</h5><p>Show the deadlock interleaving in two lines first, then the ordering fix. Mention that in a database the same rule applies to row locks.</p></div>
+<div class="followups"><h5>Likely follow-ups</h5><ul><li>What if accounts have no natural order? (<code>System.identityHashCode</code> plus a tie-breaker lock.)</li><li>What if a transfer touches N accounts? (Sort them.)</li></ul></div></div>
+</details>
+<details class="qa" data-level="4" data-topic="lld" data-company="Rubrik">
+<summary>Implement a read-write lock. How do you stop writers from starving?</summary>
+<div class="answer"><p>State: <code>readers</code> count, <code>writing</code> flag, <code>waitingWriters</code> count, all under one monitor. <code>lockRead</code> waits while a writer is active <b>or waiting</b>; <code>lockWrite</code> registers as waiting, then waits while anyone holds the lock. Counting waiting writers is what gives writer preference: new readers stop entering, so the writer gets in once current readers leave. Our test: 2 writers and 4 readers, and readers never saw a half-finished write. A second test cancels a waiting writer and checks that a reader queued behind it gets in.</p>
+<pre><code class="language-java">synchronized void lockRead() throws InterruptedException {
+    while (writing || waitingWriters &gt; 0) wait();          // queue behind a waiting writer
+    readers++;
+}
+synchronized void unlockRead() { if (--readers == 0) notifyAll(); }
+synchronized void lockWrite() throws InterruptedException {
+    waitingWriters++;
+    try { while (writing || readers &gt; 0) wait(); }
+    catch (InterruptedException e) {                        // cancelled while waiting:
+        waitingWriters--;
+        notifyAll();                                        // readers queued behind us may enter now
+        throw e;
+    }
+    waitingWriters--;
+    writing = true;
+}
+synchronized void unlockWrite() { writing = false; notifyAll(); }</code></pre>
+<p class="small">Reported: Rubrik, "implement reader writer lock, various cases" (<a href="https://leetcode.com/discuss/post/7947916/" target="_blank" rel="noopener">LeetCode Discuss, 2026-04-16</a>). Deep dive: <a href="{{BASE}}lld/lld-conc-rwlock">Read-Write Locks, StampedLock &amp; Read-Mostly Data</a>.</p>
+<div class="approach"><h5>How to answer</h5><p>Start with the reader-preferring version, show how writers starve, then add <code>waitingWriters</code>. Mention that writer preference can starve readers instead, and that a fair queue alternates.</p></div>
+<div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a waiting writer is interrupted? (It must undo <code>waitingWriters++</code> <b>and</b> call <code>notifyAll()</code>. A plain <code>finally { waitingWriters--; }</code> leaves the readers that queued behind it asleep until some unrelated unlock.)</li><li>Can a reader upgrade to a writer? (Not safely: two upgraders deadlock. Release the read lock and take the write lock, then re-check.)</li></ul></div>
+<div class="followups"><h5>Likely follow-ups</h5><ul><li>Support upgrading a read lock to a write lock. (Why it can deadlock with two upgraders.)</li><li>What does <code>StampedLock</code>'s optimistic read add? Bridge: seqlock.</li></ul></div></div>
+</details>
+<details class="qa" data-level="3" data-topic="lld" data-company="Uber,Cleartrip">
+<summary>What is CAS, when is it better than a lock, and what is the ABA problem?</summary>
+<div class="answer"><p>Compare-and-swap atomically sets a value only if it still equals the expected old value, and reports success. A CAS loop (read, compute, CAS, retry on failure) never blocks a thread, so it suits a single hot field such as a counter, a state flag (<code>AVAILABLE</code> to <code>ASSIGNED</code>) or a stack head. Under heavy contention many retries waste CPU; and it cannot protect an invariant across several fields. ABA: a value changes A to B and back to A between your read and your CAS, so the CAS succeeds although the world changed (a popped and re-pushed node). Fix: a version stamp (<code>AtomicStampedReference</code>) or never reusing nodes.</p>
+<p class="small">Related report: Uber cab allocation needed "proper locking on driver state transitions (available to assigned)" (<a href="https://leetcode.com/discuss/post/8488522/" target="_blank" rel="noopener">LeetCode Discuss, 2026-08-29</a>); a 2026 practice post compares a <code>synchronized</code> counter with an <code>AtomicInteger</code> one (<a href="https://leetcode.com/discuss/post/8453941/" target="_blank" rel="noopener">LeetCode Discuss, 2026-08-11</a>).</p>
+<div class="approach"><h5>How to answer</h5><p>Definition, the loop, when it wins, when it loses, ABA. Bridge: <code>cmpxchg</code> and <code>atomic_cmpxchg()</code>.</p></div>
+<div class="followups"><h5>Likely follow-ups</h5><ul><li><code>AtomicLong</code> vs <code>LongAdder</code>? (LongAdder stripes the count over cells like per-CPU counters; faster writes, slower exact reads.)</li><li>Write a lock-free stack push.</li></ul></div></div>
+</details>

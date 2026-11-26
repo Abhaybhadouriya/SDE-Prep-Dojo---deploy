@@ -1,0 +1,61 @@
+
+  <h2>Concurrency and atomic balances</h2>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Risk</th><th>Example</th><th>Guard in the code</th></tr></thead>
+      <tbody>
+        <tr><td>Lost update</td><td>Two debits read 500, both write 200</td><td>Balance changes only under the wallet's lock</td></tr>
+        <tr><td>Check-then-act</td><td>Two transfers both pass "balance &gt;= 300"</td><td>Check and debit in one critical section (<code>apply</code>)</td></tr>
+        <tr><td>Half transfer</td><td>Debit done, crash or exception before credit</td><td>Both wallets locked; debit first (can fail), then credit (cannot fail), then ledger, then SUCCESS</td></tr>
+        <tr><td>Deadlock</td><td>A to B and B to A at the same moment</td><td>Lock wallets in id order, always</td></tr>
+        <tr><td>Duplicate key race</td><td>Two copies of k1 arrive together</td><td>Atomic <code>putIfAbsent</code> picks one owner; the other waits on the transaction's lock and returns its result</td></tr>
+        <tr><td>Reversal race</td><td>Two agents reverse T6 at once</td><td>Reversal key is <code>"reverse:" + txnId</code>, so it is one transaction; plus the original's lock</td></tr>
+        <tr><td>Hot system account</td><td>Every deposit and withdrawal posts against the one <code>SYS_BANK</code> wallet, so all of them queue on one monitor: a global hot lock</td><td>Not solved in the demo (it is fine at this scale); see the Q&amp;A below for the two fixes: post the external leg without a balance lock, or shard the system account</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Lock hierarchy, stated once: <b>transaction lock, then (for a reversal) the original transaction's lock, then the two wallet locks in id order</b>. Nobody takes them in another order, so there is no cycle. The ledger list has its own small lock and is touched only while holding wallet locks, never the other way round.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two opposite transfers deadlock when each locks its own source first; locking in id order removes the cycle">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">T1: asha to bala</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">T2: bala to asha</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">W_asha and W_bala</text><text class="label small" x="400" y="166">two wallet locks</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. locks W_asha, then wants W_bala</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. locks W_bala, then wants W_asha</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">each holds one lock, waits for other</text><text class="label bad" x="645" y="164">deadlock: both stop forever</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. T1 locks W_asha, then W_bala</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: lock in id order</text><text class="label mono" x="645" y="66">first = min(from.id, to.id)</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">T2 also starts with W_asha: it waits</text><text class="label small" x="645" y="242">holding nothing, so no cycle</text><text class="label small" x="645" y="266">then it runs when T1 unlocks</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>T1 moves money from asha to bala and locks its source first; T2 does the opposite at the same moment. Each holds one wallet lock and waits for the other: the classic AB-BA deadlock.</li>
+      <li>The guard: <code>post()</code> always locks the wallet with the smaller id first, whatever the direction. This is the kernel rule of a fixed lock order (for example <code>double_rq_lock()</code> locks the two runqueues by address).</li>
+      <li>T2 now asks for W_asha first too, so it waits while holding nothing. There is no cycle, so no deadlock; T2 runs as soon as T1 has debited, credited and unlocked.</li>
+    </ol>
+  </div>
+
+  <h3>Why not <code>AtomicLong</code> balances?</h3>
+  <p>A single-wallet debit can be a lock-free <code>compareAndSet</code> loop. A transfer cannot: it changes two balances and appends two ledger lines as one unit, and CAS works on one word. You would need two-wallet locking anyway, or a different model: in a database, a single transaction with <code>SELECT ... FOR UPDATE</code> on both rows (ordered by id) or <a href="{{BASE}}interview/glossary#optimistic-locking">optimistic locking</a> with a version column and retry. Mention both; they are the production versions of the same idea. See <a href="{{BASE}}lld/lld-conc-locks">locks</a> and <a href="{{BASE}}lld/lld-conc-deadlock">deadlock and lock ordering</a>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p><code>double_rq_lock()</code> in the scheduler locks two runqueues by address order for exactly this reason when migrating a task between CPUs. Our <code>post()</code> is a double-runqueue-lock for money.</p>
+  </div>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

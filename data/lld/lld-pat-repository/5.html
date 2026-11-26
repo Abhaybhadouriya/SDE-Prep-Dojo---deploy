@@ -1,0 +1,488 @@
+
+  <h2>Code: a lending library in three layers</h2>
+  <p>Each tab is a complete program that was compiled and run. Java shows a generic <code>InMemoryRepository&lt;T, ID&gt;</code> base so each concrete repository is a few lines. Python uses abstract base classes for two repositories and plain duck typing for the third. C++14 uses pure virtual interfaces (an ops table) and returns copies so callers never hold pointers into the repository's storage. Files live in <code>lld-code/lld-pat-repository/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>LibraryDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Entities</td><td><code>Book, Member, Loan</code></td><td>13-38</td><td>domain objects with rules</td></tr>
+    <tr><td>Repository interfaces</td><td><code>Repository, BookRepository, MemberRepository, LoanRepository</code></td><td>45-58</td><td>collection-like, in domain words</td></tr>
+    <tr><td>Storage implementations</td><td><code>InMemoryRepository, InMemoryBookRepository, InMemoryMemberRepository, InMemoryLoanRepository</code></td><td>61-88</td><td>depend upward on the interfaces</td></tr>
+    <tr><td>Service</td><td><code>LendingService</code></td><td>91-116</td><td>business rules, holds the lock</td></tr>
+    <tr><td>Composition root</td><td><code>main</code></td><td>119-139</td><td>picks in-memory storage</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+// Repository + Service layer in one file (a real project splits it into packages:
+// model/ repository/ service/ exception/ Main.java).
+public class LibraryDemo {
+
+    // ---------- model (entities): data + their own invariants, no storage code ----------
+    enum BookStatus { AVAILABLE, LENT }
+
+    static final class Book {
+        private final String id; private final String title; private BookStatus status = BookStatus.AVAILABLE;
+        Book(String id, String title) { this.id = id; this.title = title; }
+        String id() { return id; }
+        String title() { return title; }
+        BookStatus status() { return status; }
+        void markLent() {
+            if (status == BookStatus.LENT) throw new IllegalStateException(id + " already lent");
+            status = BookStatus.LENT;
+        }
+        void markReturned() { status = BookStatus.AVAILABLE; }
+    }
+
+    record Member(String id, String name) { }
+
+    static final class Loan {
+        private final String id; private final String memberId; private final String bookId;
+        private boolean open = true;
+        Loan(String id, String memberId, String bookId) { this.id = id; this.memberId = memberId; this.bookId = bookId; }
+        String id() { return id; }
+        String memberId() { return memberId; }
+        String bookId() { return bookId; }
+        boolean isOpen() { return open; }
+        void close() { open = false; }
+        @Override public String toString() { return "Loan[" + id + " " + memberId + "-&gt;" + bookId + (open ? " open]" : " closed]"); }
+    }
+
+    // ---------- exceptions: named business errors ----------
+    static class NotFoundException extends RuntimeException { NotFoundException(String m) { super(m); } }
+    static class LimitExceededException extends RuntimeException { LimitExceededException(String m) { super(m); } }
+
+    // ---------- repository interfaces: collection-like, in domain words ----------
+    interface Repository&lt;T, ID&gt; {
+        Optional&lt;T&gt; findById(ID id);
+        List&lt;T&gt; findAll();
+        T save(T entity);                   // insert or update
+        void deleteById(ID id);
+    }
+    interface BookRepository extends Repository&lt;Book, String&gt; {
+        List&lt;Book&gt; findByStatus(BookStatus status);
+    }
+    interface MemberRepository extends Repository&lt;Member, String&gt; { }
+    interface LoanRepository extends Repository&lt;Loan, String&gt; {
+        List&lt;Loan&gt; findOpenByMember(String memberId);
+        String nextId();
+    }
+
+    // ---------- in-memory implementations (what a machine-coding round expects) ----------
+    static class InMemoryRepository&lt;T, ID&gt; implements Repository&lt;T, ID&gt; {
+        protected final Map&lt;ID, T&gt; store = new ConcurrentHashMap&lt;&gt;();
+        private final java.util.function.Function&lt;T, ID&gt; idOf;
+        InMemoryRepository(java.util.function.Function&lt;T, ID&gt; idOf) { this.idOf = idOf; }
+        public Optional&lt;T&gt; findById(ID id) { return Optional.ofNullable(store.get(id)); }
+        public List&lt;T&gt; findAll() { return new ArrayList&lt;&gt;(store.values()); }    // a copy, never the map
+        public T save(T e) { store.put(idOf.apply(e), e); return e; }
+        public void deleteById(ID id) { store.remove(id); }
+    }
+    static final class InMemoryBookRepository extends InMemoryRepository&lt;Book, String&gt; implements BookRepository {
+        InMemoryBookRepository() { super(Book::id); }
+        public List&lt;Book&gt; findByStatus(BookStatus s) {
+            return store.values().stream().filter(b -&gt; b.status() == s)
+                        .sorted(Comparator.comparing(Book::id)).collect(Collectors.toList());
+        }
+    }
+    static final class InMemoryMemberRepository extends InMemoryRepository&lt;Member, String&gt; implements MemberRepository {
+        InMemoryMemberRepository() { super(Member::id); }
+    }
+    static final class InMemoryLoanRepository extends InMemoryRepository&lt;Loan, String&gt; implements LoanRepository {
+        private final AtomicLong seq = new AtomicLong();
+        InMemoryLoanRepository() { super(Loan::id); }
+        public List&lt;Loan&gt; findOpenByMember(String memberId) {
+            return store.values().stream().filter(l -&gt; l.isOpen() &amp;&amp; l.memberId().equals(memberId))
+                        .collect(Collectors.toList());
+        }
+        public String nextId() { return "L" + seq.incrementAndGet(); }
+    }
+
+    // ---------- service: the use cases and business rules; depends only on interfaces ----------
+    static final class LendingService {
+        static final int MAX_OPEN_LOANS = 2;
+        private final BookRepository books; private final MemberRepository members; private final LoanRepository loans;
+        LendingService(BookRepository books, MemberRepository members, LoanRepository loans) {
+            this.books = books; this.members = members; this.loans = loans;    // constructor injection
+        }
+        synchronized Loan borrow(String memberId, String bookId) {          // one lock: simple and correct
+            // &lt;-- the pattern: the service sees only repository interfaces
+            Member m = members.findById(memberId).orElseThrow(() -&gt; new NotFoundException("member " + memberId));
+            Book b = books.findById(bookId).orElseThrow(() -&gt; new NotFoundException("book " + bookId));
+            if (loans.findOpenByMember(m.id()).size() &gt;= MAX_OPEN_LOANS)
+                throw new LimitExceededException(m.name() + " already has " + MAX_OPEN_LOANS + " books");
+            b.markLent();                                                  // entity guards its own state
+            books.save(b);
+            return loans.save(new Loan(loans.nextId(), m.id(), b.id()));
+        }
+        synchronized void giveBack(String loanId) {
+            Loan l = loans.findById(loanId).orElseThrow(() -&gt; new NotFoundException("loan " + loanId));
+            l.close(); loans.save(l);
+            Book b = books.findById(l.bookId()).orElseThrow();
+            b.markReturned(); books.save(b);
+        }
+        List&lt;String&gt; availableTitles() {
+            return books.findByStatus(BookStatus.AVAILABLE).stream().map(Book::title).collect(Collectors.toList());
+        }
+    }
+
+    // ---------- driver: the composition root wires concrete classes once ----------
+    public static void main(String[] args) {
+        BookRepository books = new InMemoryBookRepository();
+        MemberRepository members = new InMemoryMemberRepository();
+        LoanRepository loans = new InMemoryLoanRepository();
+        LendingService svc = new LendingService(books, members, loans);
+
+        books.save(new Book("B1", "Linux Device Drivers"));
+        books.save(new Book("B2", "TCP/IP Illustrated"));
+        books.save(new Book("B3", "Clean Code"));
+        members.save(new Member("M1", "Asha"));
+
+        Loan l1 = svc.borrow("M1", "B1");
+        Loan l2 = svc.borrow("M1", "B2");
+        System.out.println("borrowed " + l1 + " and " + l2);
+        System.out.println("available: " + svc.availableTitles());
+        tryRun(() -&gt; svc.borrow("M1", "B3"));     // limit
+        tryRun(() -&gt; svc.borrow("M9", "B3"));     // unknown member
+        svc.giveBack(l1.id());
+        System.out.println("after return: " + svc.availableTitles());
+        tryRun(() -&gt; System.out.println("borrowed " + svc.borrow("M1", "B3")));
+    }
+    static void tryRun(Runnable r) {
+        try { r.run(); } catch (RuntimeException e) { System.out.println("error: " + e.getClass().getSimpleName() + ": " + e.getMessage()); }
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out LibraryDemo.java &amp;&amp; java -cp out LibraryDemo
+borrowed Loan[L1 M1-&gt;B1 open] and Loan[L2 M1-&gt;B2 open]
+available: [Clean Code]
+error: LimitExceededException: Asha already has 2 books
+error: NotFoundException: member M9
+after return: [Linux Device Drivers, Clean Code]
+borrowed Loan[L3 M1-&gt;B3 open]</code></pre>
+      <p><code>findAll()</code> returns a <b>copy</b> of the values. Returning the live map would let callers bypass the repository and mutate storage directly, the same bug as handing out a pointer to a kernel-internal list without its lock.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Repository + service layer: entities, repository interfaces, in-memory repos, a service, a driver."""
+from __future__ import annotations
+
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from itertools import count
+
+
+# ---------- model ----------
+@dataclass
+class Book:
+    id: str
+    title: str
+    lent: bool = False
+
+
+@dataclass(frozen=True)
+class Member:
+    id: str
+    name: str
+
+
+@dataclass
+class Loan:
+    id: str
+    member_id: str
+    book_id: str
+    open: bool = True
+
+
+class NotFound(Exception):
+    pass
+
+
+class LimitExceeded(Exception):
+    pass
+
+
+# ---------- repository interfaces ----------
+class BookRepository(ABC):
+    @abstractmethod
+    def find_by_id(self, book_id: str) -&gt; Book | None: ...
+    @abstractmethod
+    def save(self, book: Book) -&gt; Book: ...
+    @abstractmethod
+    def find_available(self) -&gt; list[Book]: ...
+
+
+class LoanRepository(ABC):
+    @abstractmethod
+    def find_by_id(self, loan_id: str) -&gt; Loan | None: ...
+    @abstractmethod
+    def save(self, loan: Loan) -&gt; Loan: ...
+    @abstractmethod
+    def open_loans_of(self, member_id: str) -&gt; list[Loan]: ...
+    @abstractmethod
+    def next_id(self) -&gt; str: ...
+
+
+# ---------- in-memory implementations ----------
+class InMemoryBookRepository(BookRepository):
+    def __init__(self):
+        self._rows: dict[str, Book] = {}
+
+    def find_by_id(self, book_id):
+        return self._rows.get(book_id)
+
+    def save(self, book):
+        self._rows[book.id] = book
+        return book
+
+    def find_available(self):
+        return sorted((b for b in self._rows.values() if not b.lent), key=lambda b: b.id)
+
+
+class InMemoryLoanRepository(LoanRepository):
+    def __init__(self):
+        self._rows: dict[str, Loan] = {}
+        self._seq = count(1)
+
+    def find_by_id(self, loan_id):
+        return self._rows.get(loan_id)
+
+    def save(self, loan):
+        self._rows[loan.id] = loan
+        return loan
+
+    def open_loans_of(self, member_id):
+        return [l for l in self._rows.values() if l.open and l.member_id == member_id]
+
+    def next_id(self):
+        return f"L{next(self._seq)}"
+
+
+class InMemoryMemberRepository:
+    """Duck-typed: Python does not need an ABC to be swappable."""
+    def __init__(self):
+        self._rows: dict[str, Member] = {}
+
+    def find_by_id(self, member_id):
+        return self._rows.get(member_id)
+
+    def save(self, m):
+        self._rows[m.id] = m
+        return m
+
+
+# ---------- service ----------
+class LendingService:
+    MAX_OPEN = 2
+
+    def __init__(self, books: BookRepository, members, loans: LoanRepository):
+        self._books, self._members, self._loans = books, members, loans
+        self._lock = threading.Lock()
+
+    def borrow(self, member_id: str, book_id: str) -&gt; Loan:
+        with self._lock:
+            member = self._members.find_by_id(member_id) or self._missing("member", member_id)
+            book = self._books.find_by_id(book_id) or self._missing("book", book_id)
+            if len(self._loans.open_loans_of(member.id)) &gt;= self.MAX_OPEN:
+                raise LimitExceeded(f"{member.name} already has {self.MAX_OPEN} books")
+            if book.lent:
+                raise LimitExceeded(f"{book.id} already lent")
+            book.lent = True
+            self._books.save(book)
+            return self._loans.save(Loan(self._loans.next_id(), member.id, book.id))
+
+    def give_back(self, loan_id: str) -&gt; None:
+        with self._lock:
+            loan = self._loans.find_by_id(loan_id) or self._missing("loan", loan_id)
+            loan.open = False
+            self._loans.save(loan)
+            book = self._books.find_by_id(loan.book_id)
+            book.lent = False
+            self._books.save(book)
+
+    def available_titles(self) -&gt; list[str]:
+        return [b.title for b in self._books.find_available()]
+
+    @staticmethod
+    def _missing(kind, key):
+        raise NotFound(f"{kind} {key}")
+
+
+def attempt(fn):
+    try:
+        return fn()
+    except (NotFound, LimitExceeded) as e:
+        print(f"error: {type(e).__name__}: {e}")
+
+
+if __name__ == "__main__":
+    books, members, loans = InMemoryBookRepository(), InMemoryMemberRepository(), InMemoryLoanRepository()
+    svc = LendingService(books, members, loans)
+    for b in (Book("B1", "Linux Device Drivers"), Book("B2", "TCP/IP Illustrated"), Book("B3", "Clean Code")):
+        books.save(b)
+    members.save(Member("M1", "Asha"))
+
+    l1 = svc.borrow("M1", "B1")
+    l2 = svc.borrow("M1", "B2")
+    print("borrowed", l1.id, l2.id)
+    print("available:", svc.available_titles())
+    attempt(lambda: svc.borrow("M1", "B3"))
+    attempt(lambda: svc.borrow("M9", "B3"))
+    svc.give_back(l1.id)
+    print("after return:", svc.available_titles())
+    print("borrowed", attempt(lambda: svc.borrow("M1", "B3")))</code></pre>
+<pre class="terminal"><code>$ python library.py
+borrowed L1 L2
+available: ['Clean Code']
+error: LimitExceeded: Asha already has 2 books
+error: NotFound: member M9
+after return: ['Linux Device Drivers', 'Clean Code']
+borrowed Loan(id='L3', member_id='M1', book_id='B3', open=True)</code></pre>
+      <p>In Python the ABC is optional. It documents the contract and makes a missing method fail at construction time instead of at the first call. <code>InMemoryMemberRepository</code> shows that duck typing alone is enough to be swappable.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Repository + service layer in C++14. Build: g++ -std=c++14 -Wall library.cpp -o library
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+// ---------- model ----------
+struct Book { std::string id, title; bool lent = false; };
+struct Loan { std::string id, memberId, bookId; bool open = true; };
+
+struct NotFound : std::runtime_error { using std::runtime_error::runtime_error; };
+struct LimitExceeded : std::runtime_error { using std::runtime_error::runtime_error; };
+
+// ---------- repository interfaces (pure virtual = an ops table) ----------
+class BookRepository {
+public:
+    virtual ~BookRepository() = default;
+    virtual bool findById(const std::string&amp; id, Book&amp; out) const = 0;   // copy out: callers never hold our storage
+    virtual void save(const Book&amp; b) = 0;
+    virtual std::vector&lt;Book&gt; findAvailable() const = 0;
+};
+class LoanRepository {
+public:
+    virtual ~LoanRepository() = default;
+    virtual bool findById(const std::string&amp; id, Loan&amp; out) const = 0;
+    virtual void save(const Loan&amp; l) = 0;
+    virtual int countOpen(const std::string&amp; memberId) const = 0;
+    virtual std::string nextId() = 0;
+};
+
+// ---------- in-memory implementations ----------
+class InMemoryBookRepository : public BookRepository {
+    std::map&lt;std::string, Book&gt; rows_;
+public:
+    bool findById(const std::string&amp; id, Book&amp; out) const override {
+        auto it = rows_.find(id);
+        if (it == rows_.end()) return false;
+        out = it-&gt;second; return true;
+    }
+    void save(const Book&amp; b) override { rows_[b.id] = b; }
+    std::vector&lt;Book&gt; findAvailable() const override {
+        std::vector&lt;Book&gt; v;
+        for (const auto&amp; kv : rows_) if (!kv.second.lent) v.push_back(kv.second);
+        return v;
+    }
+};
+class InMemoryLoanRepository : public LoanRepository {
+    std::map&lt;std::string, Loan&gt; rows_;
+    int seq_ = 0;
+public:
+    bool findById(const std::string&amp; id, Loan&amp; out) const override {
+        auto it = rows_.find(id);
+        if (it == rows_.end()) return false;
+        out = it-&gt;second; return true;
+    }
+    void save(const Loan&amp; l) override { rows_[l.id] = l; }
+    int countOpen(const std::string&amp; m) const override {
+        int n = 0;
+        for (const auto&amp; kv : rows_) if (kv.second.open &amp;&amp; kv.second.memberId == m) ++n;
+        return n;
+    }
+    std::string nextId() override { return "L" + std::to_string(++seq_); }
+};
+
+// ---------- service: rules live here, storage lives behind the interfaces ----------
+class LendingService {
+    BookRepository&amp; books_;
+    LoanRepository&amp; loans_;
+    // Single-threaded demo. In a threaded build add a std::mutex and lock it in borrow/giveBack.
+public:
+    static const int kMaxOpen = 2;
+    LendingService(BookRepository&amp; b, LoanRepository&amp; l) : books_(b), loans_(l) {}
+
+    Loan borrow(const std::string&amp; member, const std::string&amp; bookId) {
+        Book b;
+        if (!books_.findById(bookId, b)) throw NotFound("book " + bookId);
+        if (b.lent) throw LimitExceeded(bookId + " already lent");
+        if (loans_.countOpen(member) &gt;= kMaxOpen) throw LimitExceeded(member + " has 2 books");
+        b.lent = true;
+        books_.save(b);                                   // write back: the repo owns the state
+        Loan l{loans_.nextId(), member, bookId, true};
+        loans_.save(l);
+        return l;
+    }
+    void giveBack(const std::string&amp; loanId) {
+        Loan l; Book b;
+        if (!loans_.findById(loanId, l)) throw NotFound("loan " + loanId);
+        l.open = false; loans_.save(l);
+        books_.findById(l.bookId, b);
+        b.lent = false; books_.save(b);
+    }
+    void printAvailable(const char* label) {
+        std::cout &lt;&lt; label;
+        for (const auto&amp; b : books_.findAvailable()) std::cout &lt;&lt; " [" &lt;&lt; b.title &lt;&lt; "]";
+        std::cout &lt;&lt; "\n";
+    }
+};
+
+int main() {
+    InMemoryBookRepository books;
+    InMemoryLoanRepository loans;
+    LendingService svc(books, loans);
+    books.save({"B1", "Linux Device Drivers"});
+    books.save({"B2", "TCP/IP Illustrated"});
+    books.save({"B3", "Clean Code"});
+
+    Loan l1 = svc.borrow("M1", "B1");
+    Loan l2 = svc.borrow("M1", "B2");
+    std::cout &lt;&lt; "borrowed " &lt;&lt; l1.id &lt;&lt; " and " &lt;&lt; l2.id &lt;&lt; "\n";
+    svc.printAvailable("available:");
+    try { svc.borrow("M1", "B3"); } catch (const std::exception&amp; e) { std::cout &lt;&lt; "error: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    try { svc.borrow("M1", "B9"); } catch (const std::exception&amp; e) { std::cout &lt;&lt; "error: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    svc.giveBack(l1.id);
+    svc.printAvailable("after return:");
+    std::cout &lt;&lt; "borrowed " &lt;&lt; svc.borrow("M1", "B3").id &lt;&lt; "\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall library.cpp -o library &amp;&amp; ./library
+borrowed L1 and L2
+available: [Clean Code]
+error: M1 has 2 books
+error: book B9
+after return: [Linux Device Drivers] [Clean Code]
+borrowed L3</code></pre>
+      <p>The service holds references to the abstract classes, the C++ version of a <code>struct ops *</code>. <code>findById</code> copies the entity out; the service changes its copy and calls <code>save()</code>, so the repository stays the single owner of state, just like a database row.</p>
+    </div>
+  </div>
+
+  <h3 id="layout">The machine-coding package layout</h3>
+  <p>In a real round, split the same code into packages. Reviewers open the folder tree before they open a file, so make it readable at a glance:</p>
+<pre><code class="language-bash">src/main/java/com/lib/
+  model/        Book.java  Member.java  Loan.java  BookStatus.java      # entities + enums
+  exception/    NotFoundException.java  LimitExceededException.java
+  repository/   BookRepository.java  LoanRepository.java  MemberRepository.java   # interfaces
+  repository/inmemory/  InMemoryBookRepository.java ...                 # HashMap implementations
+  service/      LendingService.java  SearchService.java                 # use cases, rules, locks
+  strategy/     FinePolicy.java  PerDayFine.java                        # pluggable rules (if any)
+  Main.java     # driver: wiring + demo of every requirement + edge cases</code></pre>
+  <p>Our <a href="{{BASE}}lld/lld-int-code-layout">code layout page</a> has the full skeleton with tests and a 60-second "how my code is organised" pitch.</p>
+
+  <h3 id="swap">Swapping the store: the review-call answer</h3>
+  <p>"How would you move this to MySQL?" The prepared answer: write <code>JdbcBookRepository implements BookRepository</code> (or a Spring Data interface), change one line in the composition root, and leave the service and entities untouched. The service tests keep running against the in-memory version. Two honest caveats to add: the lock on the service becomes a database transaction (and probably row locks or optimistic versioning on <code>Book</code>), and queries like <code>findOpenByMember</code> become indexed SQL instead of a scan.</p>

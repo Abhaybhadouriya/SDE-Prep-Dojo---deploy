@@ -1,0 +1,298 @@
+
+  <h2>Code: parking fees (Java), bill splitting (Python), congestion control (C++14)</h2>
+  <p>All three programs were compiled and run; the output under each is real. Java shows a strategy interface, three strategies (one wraps another), a registry, a runtime swap and <code>Comparator</code>. Python shows that a plain function can be a strategy. The C++14 tab is a toy of Linux congestion control so you can map it onto <code>tcp_congestion_ops</code>. Files live in <code>lld-code/lld-pat-strategy/</code>.</p>
+  <div class="callout note syntax-notes">
+    <p><b>Syntax you will meet in this code</b>, mapped to C. Skim it now and come back when a line puzzles you:</p>
+    <ul>
+      <li><b>Java <code>interface</code></b>: a struct of function pointers with no data. A class that <code>implements</code> it must fill every slot.</li>
+      <li><b><code>record Foo(int a, String b)</code></b> (Java): an immutable struct with a constructor, getters (<code>a()</code>, <code>b()</code>), <code>equals</code> and <code>toString</code> generated for you.</li>
+      <li><b>Lambda <code>x -&gt; x * 2</code></b>: a function pointer plus the variables it captured, packed into one object (like a callback with a <code>void *ctx</code>).</li>
+      <li><b>Method reference <code>Foo::new</code>, <code>obj::method</code></b>: shorthand for a lambda that just calls that constructor or method.</li>
+      <li><b><code>Supplier&lt;T&gt;</code>, <code>Consumer&lt;T&gt;</code>, <code>Function&lt;A,B&gt;</code></b>: ready-made one-slot interfaces: "returns a T", "takes a T", "maps A to B". A lambda can fill any of them.</li>
+      <li><b><code>Map.of(k1, v1, ...)</code>, <code>List.of(...)</code></b>: build a small read-only map or list in one expression.</li>
+      <li><b>Anonymous class <code>new Foo() { ... }</code></b>: defines and creates a one-off implementation in place, like a static ops table filled inline.</li>
+      <li><b><code>static { ... }</code></b>: a block that runs once when the class is loaded, like a module init function.</li>
+      <li><b><code>Comparator.comparingLong(f).reversed()</code></b>: builds a compare function (like the one you pass to <code>qsort</code>) from a key extractor, then flips its order.</li>
+      <li><b>Python <code>Protocol</code></b>: an interface checked by shape: any class with the right method names fits, without inheriting from it.</li>
+      <li><b><code>virtual void f() = 0;</code></b> (C++): a pure virtual function: a <code>NULL</code> slot in the ops table that every subclass must fill. <code>override</code> marks the function that fills it.</li>
+      <li><b><code>std::unique_ptr&lt;T&gt;</code></b>: an owning pointer that frees the object when it goes out of scope (no manual <code>free</code>); <code>std::move</code> hands that ownership to someone else.</li>
+      <li><b><code>std::function&lt;R(Args)&gt;</code></b>: holds any callable: a plain function pointer, a lambda with captured state, or an object with <code>operator()</code>.</li>
+    </ul>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c">OOP from C</a>; records, lambdas, generics and the rest also have short entries in <a href="{{BASE}}lld/lld-oop-toolkit">the OOP toolkit</a>.</p>
+  </div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.function.*;
+
+public class StrategyDemo {
+
+    enum VehicleType { BIKE, CAR, TRUCK }
+
+    record Stay(VehicleType type, int minutes, boolean weekend) { }
+
+    // ---- Strategy: one job ("how much does this stay cost?"), many ways to do it ----
+    interface FeeStrategy {
+        String name();
+        long feeRupees(Stay s);
+    }
+
+    // Concrete strategy 1: per started hour, rate depends on the vehicle
+    static final class HourlyFee implements FeeStrategy {
+        private final Map&lt;VehicleType, Long&gt; ratePerHour;
+        HourlyFee(Map&lt;VehicleType, Long&gt; ratePerHour) { this.ratePerHour = ratePerHour; }
+        public String name() { return "hourly"; }
+        public long feeRupees(Stay s) {
+            long hours = Math.max(1, (s.minutes() + 59) / 60);         // round up, minimum 1 hour
+            return hours * ratePerHour.get(s.type());
+        }
+    }
+
+    // Concrete strategy 2: first 2 hours flat, then hourly
+    static final class FirstHoursFlatFee implements FeeStrategy {
+        public String name() { return "flat-2h-then-hourly"; }
+        public long feeRupees(Stay s) {
+            long hours = Math.max(1, (s.minutes() + 59) / 60);
+            return 50 + Math.max(0, hours - 2) * 30;
+        }
+    }
+
+    // Concrete strategy 3: a decorator-like strategy that wraps another one
+    static final class WeekendSurcharge implements FeeStrategy {
+        private final FeeStrategy base;
+        WeekendSurcharge(FeeStrategy base) { this.base = base; }
+        public String name() { return base.name() + "+weekend"; }
+        public long feeRupees(Stay s) {
+            long fee = base.feeRupees(s);
+            return s.weekend() ? fee + fee / 4 : fee;                  // +25% on weekends
+        }
+    }
+
+    // ---- Context: knows WHEN to charge, not HOW the price is computed ----
+    static final class ExitGate {
+        private FeeStrategy pricing;
+        ExitGate(FeeStrategy pricing) { this.pricing = Objects.requireNonNull(pricing); }
+        void setPricing(FeeStrategy p) { this.pricing = Objects.requireNonNull(p); }  // swap at runtime
+        String checkout(String ticket, Stay s) {
+            long fee = pricing.feeRupees(s);                           // the one delegated call
+            return String.format("%-6s %-5s %4d min  %-28s Rs %d", ticket, s.type(), s.minutes(), pricing.name(), fee);
+        }
+    }
+
+    // ---- Registry: picks a strategy by config key, so callers do not need "new" ----
+    static final Map&lt;String, Supplier&lt;FeeStrategy&gt;&gt; REGISTRY = new LinkedHashMap&lt;&gt;();
+    static {
+        REGISTRY.put("hourly", () -&gt; new HourlyFee(Map.of(VehicleType.BIKE, 10L, VehicleType.CAR, 40L, VehicleType.TRUCK, 100L)));
+        REGISTRY.put("mall", FirstHoursFlatFee::new);
+        REGISTRY.put("mall-weekend", () -&gt; new WeekendSurcharge(new FirstHoursFlatFee()));
+    }
+    static FeeStrategy pricingFor(String key) {
+        Supplier&lt;FeeStrategy&gt; s = REGISTRY.get(key);
+        if (s == null) throw new IllegalArgumentException("unknown pricing: " + key);
+        return s.get();
+    }
+
+    public static void main(String[] args) {
+        List&lt;Stay&gt; stays = List.of(
+                new Stay(VehicleType.CAR, 45, false),
+                new Stay(VehicleType.CAR, 200, true),
+                new Stay(VehicleType.TRUCK, 130, false));
+
+        for (String key : REGISTRY.keySet()) {
+            ExitGate gate = new ExitGate(pricingFor(key));
+            int i = 1;
+            for (Stay s : stays) System.out.println(gate.checkout("T-" + i++, s));
+        }
+
+        // A one-off strategy needs no named class (with a single-method interface it could be a lambda).
+        FeeStrategy festival = new FeeStrategy() {
+            public String name() { return "festival-free"; }
+            public long feeRupees(Stay s) { return 0; }
+        };
+        ExitGate gate = new ExitGate(pricingFor("hourly"));
+        gate.setPricing(festival);                                     // runtime swap, no if/else
+        System.out.println(gate.checkout("T-9", stays.get(1)));
+
+        // The JDK's most famous strategy: Comparator passed to sort()
+        List&lt;Stay&gt; byCost = new ArrayList&lt;&gt;(stays);
+        FeeStrategy hourly = pricingFor("hourly");
+        byCost.sort(Comparator.comparingLong(hourly::feeRupees).reversed());
+        System.out.println("Most expensive first (hourly): " + byCost.stream().map(s -&gt; s.type() + "/" + s.minutes()).toList());
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out StrategyDemo.java &amp;&amp; java -cp out StrategyDemo
+T-1    CAR     45 min  hourly                       Rs 40
+T-2    CAR    200 min  hourly                       Rs 160
+T-3    TRUCK  130 min  hourly                       Rs 300
+T-1    CAR     45 min  flat-2h-then-hourly          Rs 50
+T-2    CAR    200 min  flat-2h-then-hourly          Rs 110
+T-3    TRUCK  130 min  flat-2h-then-hourly          Rs 80
+T-1    CAR     45 min  flat-2h-then-hourly+weekend  Rs 50
+T-2    CAR    200 min  flat-2h-then-hourly+weekend  Rs 137
+T-3    TRUCK  130 min  flat-2h-then-hourly+weekend  Rs 80
+T-9    CAR    200 min  festival-free                Rs 0
+Most expensive first (hourly): [TRUCK/130, CAR/200, CAR/45]</code></pre>
+      <p>Look at the T-2 row of each block (the 200-minute car): Rs 160, Rs 110 or Rs 137, depending only on the strategy object. <code>ExitGate.checkout</code> was written once. <code>WeekendSurcharge</code> wraps another strategy, so "weekend" is combined with any base tariff instead of being copied into each.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Strategy in Python: split-expense strategies (Splitwise style).
+
+Two flavours: classes behind a Protocol, and plain functions (a function IS a strategy).
+"""
+from typing import Callable, Dict, List, Protocol
+
+
+class SplitStrategy(Protocol):
+    def split(self, amount: int, people: List[str]) -&gt; Dict[str, int]: ...
+
+
+class EqualSplit:
+    def split(self, amount, people):
+        share, extra = divmod(amount, len(people))
+        # the first `extra` people pay one more paisa so the total is exact
+        return {p: share + (1 if i &lt; extra else 0) for i, p in enumerate(people)}
+
+
+class PercentSplit:
+    def __init__(self, percents: Dict[str, int]):
+        if sum(percents.values()) != 100:
+            raise ValueError("percentages must add up to 100")
+        self.percents = percents
+
+    def split(self, amount, people):
+        out = {p: amount * self.percents[p] // 100 for p in people}
+        out[people[0]] += amount - sum(out.values())   # rounding remainder to the payer
+        return out
+
+
+class Expense:                                        # the Context
+    def __init__(self, paid_by: str, amount: int, people: List[str], strategy: SplitStrategy):
+        self.paid_by, self.amount, self.people, self.strategy = paid_by, amount, people, strategy
+
+    def shares(self) -&gt; Dict[str, int]:
+        return self.strategy.split(self.amount, self.people)
+
+
+def exact(shares: Dict[str, int]) -&gt; Callable:
+    """A strategy built from a closure: no class needed."""
+    def split(amount, people):
+        if sum(shares.values()) != amount:
+            raise ValueError("exact shares must add up to the amount")
+        return dict(shares)
+    return split
+
+
+class FunctionStrategy:                               # adapts a plain function to the interface
+    def __init__(self, fn):
+        self.split = fn
+
+
+if __name__ == "__main__":
+    people = ["asha", "ravi", "meera"]
+    for strategy in (EqualSplit(),
+                     PercentSplit({"asha": 50, "ravi": 30, "meera": 20}),
+                     FunctionStrategy(exact({"asha": 400, "ravi": 300, "meera": 300}))):
+        e = Expense("asha", 1000, people, strategy)
+        print(f"{type(strategy).__name__:&lt;16} {e.shares()}")
+
+    # The stdlib's everyday strategy: the key function passed to sorted()
+    bills = [("dinner", 1000), ("cab", 350), ("movie", 900)]
+    print(sorted(bills, key=lambda b: b[1], reverse=True))</code></pre>
+<pre class="terminal"><code>$ python strategy.py
+EqualSplit       {'asha': 334, 'ravi': 333, 'meera': 333}
+PercentSplit     {'asha': 500, 'ravi': 300, 'meera': 200}
+FunctionStrategy {'asha': 400, 'ravi': 300, 'meera': 300}
+[('dinner', 1000), ('movie', 900), ('cab', 350)]</code></pre>
+      <p>In Python, any callable with the right signature is a strategy, so a whole class is often too much. <code>exact()</code> returns a closure, and the <code>key=</code> argument of <code>sorted()</code> is the standard library's everyday strategy. Classes still help when a strategy has configuration and validation (<code>PercentSplit</code> checks that percentages add to 100).</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Strategy in C++14: a toy of Linux TCP congestion control.
+// Each algorithm is a strategy object; the socket (context) calls it on ACK and on loss.
+// Build: g++ -std=c++14 -Wall strategy.cpp -o strategy
+#include &lt;algorithm&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+
+// Strategy interface: like struct tcp_congestion_ops (name, cong_avoid, ssthresh ...)
+class CongestionControl {
+public:
+    virtual ~CongestionControl() = default;
+    virtual const char* name() const = 0;
+    virtual void onAck(int&amp; cwnd, int ssthresh) = 0;      // grow the window
+    virtual int onLoss(int cwnd) = 0;                      // return the new ssthresh
+};
+
+class Reno : public CongestionControl {                   // slow start, then +1 per RTT
+    int acked_ = 0;
+public:
+    const char* name() const override { return "reno"; }
+    void onAck(int&amp; cwnd, int ssthresh) override {
+        if (cwnd &lt; ssthresh) { cwnd += 1; return; }        // slow start: doubles per RTT
+        if (++acked_ &gt;= cwnd) { cwnd += 1; acked_ = 0; }   // congestion avoidance
+    }
+    int onLoss(int cwnd) override { return std::max(cwnd / 2, 2); }
+};
+
+class Gentle : public CongestionControl {                 // made-up: never slow starts, small backoff
+public:
+    const char* name() const override { return "gentle"; }
+    void onAck(int&amp; cwnd, int) override { cwnd += 1; }
+    int onLoss(int cwnd) override { return std::max(cwnd * 3 / 4, 2); }
+};
+
+// Registry: like tcp_register_congestion_control() + a lookup by name
+std::map&lt;std::string, std::function&lt;std::unique_ptr&lt;CongestionControl&gt;()&gt;&gt;&amp; registry() {
+    static std::map&lt;std::string, std::function&lt;std::unique_ptr&lt;CongestionControl&gt;()&gt;&gt; r;
+    return r;
+}
+bool registerCC(const std::string&amp; n, std::function&lt;std::unique_ptr&lt;CongestionControl&gt;()&gt; f) {
+    return registry().emplace(n, std::move(f)).second;
+}
+
+// Context: the socket owns the state (cwnd, ssthresh) and the algorithm choice.
+class Socket {
+    std::unique_ptr&lt;CongestionControl&gt; cc_;
+    int cwnd_ = 1, ssthresh_ = 8;
+public:
+    explicit Socket(const std::string&amp; algo) { setCongestion(algo); }
+    bool setCongestion(const std::string&amp; algo) {          // like setsockopt(TCP_CONGESTION)
+        auto it = registry().find(algo);
+        if (it == registry().end()) return false;          // like -ENOENT
+        cc_ = it-&gt;second();
+        return true;
+    }
+    void ack() { cc_-&gt;onAck(cwnd_, ssthresh_); }
+    void loss() { ssthresh_ = cc_-&gt;onLoss(cwnd_); cwnd_ = ssthresh_; }
+    std::string trace(const char* ev) const {
+        return std::string(cc_-&gt;name()) + " " + ev + " cwnd=" + std::to_string(cwnd_) +
+               " ssthresh=" + std::to_string(ssthresh_);
+    }
+};
+
+int main() {
+    registerCC("reno", [] { return std::unique_ptr&lt;CongestionControl&gt;(new Reno); });
+    registerCC("gentle", [] { return std::unique_ptr&lt;CongestionControl&gt;(new Gentle); });
+
+    for (const char* algo : {"reno", "gentle"}) {
+        Socket s(algo);
+        for (int i = 0; i &lt; 10; ++i) s.ack();
+        std::cout &lt;&lt; s.trace("after 10 acks:") &lt;&lt; "\n";
+        s.loss();
+        std::cout &lt;&lt; s.trace("after loss:   ") &lt;&lt; "\n";
+    }
+    Socket s("reno");
+    std::cout &lt;&lt; "set bbr: " &lt;&lt; (s.setCongestion("bbr") ? "ok" : "ENOENT (not registered)") &lt;&lt; "\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall strategy.cpp -o strategy &amp;&amp; ./strategy
+reno after 10 acks: cwnd=8 ssthresh=8
+reno after loss:    cwnd=4 ssthresh=4
+gentle after 10 acks: cwnd=11 ssthresh=8
+gentle after loss:    cwnd=8 ssthresh=8
+set bbr: ENOENT (not registered)</code></pre>
+      <p>The socket owns <code>cwnd</code> and <code>ssthresh</code>; the algorithm only decides how they change. That split of ownership (context holds state, strategy holds the rule) is the same in the kernel, where congestion state lives in <code>struct tcp_sock</code> and the per-algorithm private data sits in a small area the algorithm can use.</p>
+    </div>
+  </div>

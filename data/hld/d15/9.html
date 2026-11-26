@@ -1,0 +1,106 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope</strong> Top how many? Prefix only or fuzzy? Personalised? Languages? Freshness target ("trends within 15 minutes")? Latency target (about 100 ms end to end).</li>
+          <li><strong>5-10 min: numbers</strong> 10M DAU x 10 searches x 20 chars gives about 24k req/s without debounce. Trie of 10-75 GB depending on pruning. Conclude: in-memory, precomputed, cached at the client and edge.</li>
+          <li><strong>10-15 min: API + data</strong> <code>GET /suggest?q=</code> with Cache-Control; logs of submitted searches; versioned trie snapshots.</li>
+          <li><strong>15-25 min: diagram</strong> Two halves: serving path and data path (the stepper).</li>
+          <li><strong>25-40 min: deep dives</strong> Top-k at each node, debounce and caches, sharding with skew, freshness with a trending layer and safe snapshot swaps.</li>
+          <li><strong>40-45 min: wrap up</strong> Failures and metrics: p99 suggest latency, cache hit ratio at browser/CDN/server, suggestion click-through rate, time from a trend starting to it appearing, snapshot age.</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"I store queries in a trie and keep the top 5 at every node, so a lookup is just walking the prefix. A daily job rebuilds the trie from search logs. The client debounces and caches responses. Several servers hold copies behind a load balancer." Clear and correct.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"Only submitted searches count, weighted by unique users with time decay. Logs go through Kafka keyed by query with producer-side pre-aggregation. A Flink job produces a trending boost every few minutes; the daily trie is built offline, validated, sharded by load-balanced prefix ranges, and hot-swapped like RCU with rollback. Global responses are CDN-cacheable; personal ones are a separate call." Numbers, freshness, failure handling, abuse.</p></div>
+        </div>
+        <div class="callout interview"><p><b>60-second answer</b> (say it out loud): "Keystrokes are a read-heavy, latency-critical path, so the client debounces and caches, the CDN serves common short prefixes, and trie servers answer the rest from memory. Each trie node stores its precomputed top-k, so a lookup is just walking the prefix. Only submitted searches count: they go through Kafka, a daily batch job computes counts with time decay and the builder makes a filtered, versioned trie snapshot that servers load beside the old one and swap atomically, with rollback. A streaming job adds a trending boost every few minutes. If the trie does not fit in one node's RAM, I shard by load-balanced prefix ranges. Personal suggestions are a separate call so global responses stay cacheable."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> querying a SQL <code>LIKE 'har%'</code> per keystroke; sorting all completions at request time; counting every keystroke as a search; sharding by first letter without thinking about skew; forgetting the client (debounce, cache, cancel); rebuilding the trie in place while serving; mixing personal results into cacheable responses; no blocklist; making autocomplete failures visible to the user.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon,Microsoft">
+          <summary>Why a trie, and why store the top-k at every node?</summary>
+          <div class="answer">
+            <p>A trie maps each prefix to one node, so finding the node for "har" costs one step per character, no matter how many queries exist. Without precomputation, you would then have to visit every completion under that node and sort them, which for a short prefix like "s" means millions of entries. Storing the top-k at each node moves that work to build time; a lookup becomes "walk the prefix, return the list", which is O(prefix length). The cost is memory (k entries per node) and the need to rebuild when rankings change.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the naive cost first (subtree scan plus sort), then the fix, then its price (memory, staleness).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you build top-k efficiently? (Bottom-up merge of children's top-k lists.)</li><li>Store full strings or IDs at each node? (IDs into a string table, to save memory.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Why not just use <code>SELECT ... WHERE query LIKE 'har%' ORDER BY count DESC LIMIT 5</code>?</summary>
+          <div class="answer">
+            <p>For a small catalog it works, and with a B-tree index a prefix <code>LIKE</code> can use the index to find the range. But the range for a short prefix contains millions of rows that must be sorted by count on every keystroke, at tens of thousands of requests per second. Latency and load grow with the data. Precomputed top-k (trie, FST, or per-prefix sorted sets) makes the cost independent of data size.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give it credit ("fine for 10k products"), then show where it breaks with your QPS number.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>At what size would you switch?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Microsoft">
+          <summary>Every keystroke is a request. How do you keep the load down?</summary>
+          <div class="answer">
+            <p>Mostly on the client: debounce (send only after a pause of about 100-300 ms), cache responses in the browser with <code>Cache-Control</code>, skip or statically serve 1-character prefixes, filter the previous result locally while waiting, and cancel in-flight requests for outdated prefixes. Then the CDN caches popular global prefixes. Only what is left reaches the in-memory servers, which can answer in microseconds anyway.</p>
+            <div class="approach"><h5>How to answer</h5><p>Go outside-in: client, edge, server. Use your estimate to show the effect.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What breaks if you cache personalised suggestions at the CDN? (Privacy leak; keep them separate and private.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>How do you shard the trie? What about the letter "s"?</summary>
+          <div class="answer">
+            <p>First check whether you need to: after pruning, a full replica may fit in RAM, and then you simply replicate. If not, shard by prefix range so that one lookup hits one shard, and choose the boundaries from measured traffic, not from the alphabet: "s" might be split into "s-sh" and "si-sz" while "q-z" share one shard. A shard map (from the builder) tells the router which shard owns which range. Hot shards get more replicas, and the hottest short prefixes are served from the CDN.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Do I need to shard?" first, then range sharding by load, then the router, then hot prefixes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not hash the query? (Completions of one prefix would scatter across all shards.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft,Amazon">
+          <summary>A big news event happens. How fast can it appear in suggestions?</summary>
+          <div class="answer">
+            <p>With only a daily rebuild, up to a day, which is too slow. Add a streaming layer: submitted searches flow through Kafka into a Flink job that counts per 5-minute window and compares against a baseline; queries that spike get a time-limited boost and are pushed to a small trending store that serving nodes merge at query time. That gets trends into suggestions within minutes. Guard it with minimum unique-user thresholds and safety filters, because fast paths are also the easiest to abuse.</p>
+            <div class="approach"><h5>How to answer</h5><p>Two layers: slow and complete, fast and small. Merge at query time. Then abuse protection.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect a spike vs a normally popular query?</li><li>Why not rebuild the full trie every 5 minutes? (Cost, and the risk of shipping a bad build often.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Amazon">
+          <summary>How do you deploy a new trie without serving errors or empty results?</summary>
+          <div class="answer">
+            <p>Build offline, validate (size, sample lookups, blocklist applied), write a versioned snapshot to object storage, and roll it out to a canary. Each serving node loads the new snapshot into memory next to the old one, then swaps a single pointer; in-flight lookups finish on the old copy, which is freed after a grace period (the RCU pattern). New pods report ready only after the load completes. Keep the previous version for instant rollback. Plan memory for two copies during the swap.</p>
+            <div class="approach"><h5>How to answer</h5><p>Validate, canary, double-buffer, swap, rollback. Five words to remember.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the nodes don't have memory for two copies? (Rolling restart with readiness gating and extra replicas.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Flipkart,Walmart">
+          <summary>How would you use Kafka to collect query logs at this scale?</summary>
+          <div class="answer">
+            <p>The search service publishes each submitted query (normalised, with locale and timestamp) to <code>search.queries</code>, keyed by the normalised query so per-query counts aggregate within a partition. Use compression and batching for throughput. Very popular queries create hot partitions, so pre-aggregate in the producer or in a first stream stage before keying. Several consumer groups read the same topic independently: a Flink trending job, an S3 sink for the batch builder, analytics. Since popularity is statistical, this topic can accept cheaper durability settings than a payments topic.</p>
+            <div class="approach"><h5>How to answer</h5><p>Topic, key, hot-key fix, consumers, and a durability choice that fits the data.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle a user's privacy request to delete their search history?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How do you add personalisation without breaking caching?</summary>
+          <div class="answer">
+            <p>Keep the global suggestions as one cacheable response (public, a few minutes in the browser and a bit longer on the CDN), and fetch personal ones in a separate small call (private, short max-age) from a per-user store of recent queries that match the prefix. Merge them on the client or in a thin server layer: personal matches first, then global ones, deduplicated. This keeps the CDN hit ratio high and never leaks one user's history into another user's cached response.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the conflict (personal vs cacheable), split the response, explain the merge.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where do you store each user's recent searches, and for how long?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Amazon">
+          <summary>Someone is trying to push an offensive phrase into suggestions. What stops them?</summary>
+          <div class="answer">
+            <p>Defence in layers. Count distinct users (or distinct devices), not raw searches, and cap any one user's contribution. Require a minimum number of distinct users before a query becomes eligible. Rate-limit and detect bots at the search API. Run safety classifiers and a human-maintained blocklist in the builder and again at serving time, and make blocklist changes take effect within minutes without a rebuild. Watch for sudden spikes from narrow sources in the trending layer.</p>
+            <div class="approach"><h5>How to answer</h5><p>Data hygiene, eligibility thresholds, filters at two points, fast takedown.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you handle a legal removal request for one country only?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: suggestions are suddenly empty for half the users</h4>
+          <div class="situation"><p>After the nightly deploy, about half of all suggest requests return an empty list. Error rates are zero.</p></div>
+          <div class="bad"><p>Weak answer: "Restart the servers."</p></div>
+          <div class="good"><p>Strong answer: zero errors plus empty results points at data, not code. Check the snapshot version on the affected pods: maybe half of the shards loaded a new snapshot that failed silently (truncated file) or a shard map no longer matches the snapshot ranges. Roll those pods back to the previous version now. Then add pre-publish validation, readiness that checks a sample lookup, and an alert on "empty result rate".</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metric would have caught this before users did?</li></ul></div>
+        </div>
+      

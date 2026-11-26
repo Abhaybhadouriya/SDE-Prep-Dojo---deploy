@@ -1,0 +1,119 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1:</b> deep dives 1, 2 and 4 (idempotency, the unknown outcome, reconciliation), plus the state machine above, are the must-know core. Deep dives 3, 5 and 6 are good to know; 7 onwards is SDE-2 material.</p></div>
+
+        <h3>1. Idempotency, done properly (must know)</h3>
+        <p>"Store the key" sounds easy. The trap is the gap between steps. Suppose we save the key, call the PSP, and crash before saving the response. On retry, what do we do? Brandur Leach's Stripe-style design answers this with <b>atomic phases</b> and <b>recovery points</b>: the work is split into chunks, each chunk is one local database transaction, and after each chunk we save a recovery point on the key row. A retry reads the recovery point and resumes from there.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Atomic phases with recovery points: started, payment created, PSP called, finished">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box cache" x="15" y="70" width="170" height="80"/>
+            <text class="label" x="100" y="100">Phase 1 (txn)</text>
+            <text class="label small" x="100" y="122">insert key, lock it</text>
+            <text class="label small" x="100" y="140">point: started</text>
+            <rect class="box db" x="225" y="70" width="170" height="80"/>
+            <text class="label" x="310" y="100">Phase 2 (txn)</text>
+            <text class="label small" x="310" y="122">insert payment row</text>
+            <text class="label small" x="310" y="140">point: created</text>
+            <rect class="box queue" x="435" y="70" width="170" height="80"/>
+            <text class="label" x="520" y="100">Phase 3 (RPC)</text>
+            <text class="label small" x="520" y="122">call PSP, its key =</text>
+            <text class="label small" x="520" y="140">payment_id</text>
+            <rect class="box svc" x="645" y="70" width="200" height="80"/>
+            <text class="label" x="745" y="100">Phase 4 (txn)</text>
+            <text class="label small" x="745" y="122">save result + outbox</text>
+            <text class="label small" x="745" y="140">point: finished, unlock</text>
+            <path class="arrow" d="M185 110 L219 110"/>
+            <path class="arrow" d="M395 110 L429 110"/>
+            <path class="arrow" d="M605 110 L639 110"/>
+            <rect class="box fail" x="380" y="180" width="280" height="60"/>
+            <text class="label bad" x="520" y="205">Crash here? Retry reads "created",</text>
+            <text class="label small" x="520" y="226">re-calls PSP with the SAME key: safe</text>
+            <path class="arrow dashed bad" d="M520 176 L520 156"/>
+            <circle class="packet" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M100 110 L310 110 L520 110 L745 110"/></circle>
+          </svg>
+          <figcaption>Each box is either one local transaction or one external call. Because the PSP call reuses a stable key, repeating phase 3 after a crash cannot double charge.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Who creates the key?</b> The <b>client</b>, once per logical action (one checkout attempt), before the first try. A key made by the server after receiving the request is useless: the retry would get a new one.</li>
+          <li><b>Read and write keys on the primary</b>, never a replica. Airbnb's Orpheus library makes this point: a lagging replica might say "never seen this key" and you charge twice.</li>
+          <li><b>Classify errors.</b> Orpheus also separates retryable failures (network errors, 5xx) from non-retryable ones (4xx validation, card declined). Do not retry a decline.</li>
+          <li><b>Keep keys long enough</b> to cover client retry windows (24 hours is common), then prune.</li>
+          <li><b>Retries need backoff with jitter</b>, otherwise thousands of clients retry at the same instant and knock the service over again (Stripe's idempotency post and the Amazon Builders' Library both explain this).</li>
+        </ul>
+
+        <h3>2. The unknown outcome, the most important interview moment (must know)</h3>
+        <p>We called the PSP and got a timeout. Three things could be true: the request never arrived, it arrived and failed, or it arrived and <em>succeeded</em>. A beginner retries with a new request. That is how double charges happen. The right moves, in order:</p>
+        <ol class="steps">
+          <li><strong>Mark it unknown.</strong> Save <code>status = unknown</code>. Show the shopper "We are confirming your payment" instead of "failed".</li>
+          <li><strong>Ask, do not act.</strong> Call the PSP's "get payment" API using our stable reference. If the PSP supports idempotency, re-sending the exact same request with the same key is also safe.</li>
+          <li><strong>Wait for the webhook.</strong> The PSP will often tell us on its own within minutes.</li>
+          <li><strong>Reconcile.</strong> Anything still unknown after N minutes goes to a sweeper job, and finally the daily settlement reconciliation settles it for good. If money moved but the order was cancelled, issue an automatic refund.</li>
+        </ol>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the <b>two generals problem</b> you met in networking. No number of messages over a lossy link can make both sides certain. Protocols such as TCP's FIN handshake live with this by using timeouts plus state that can be queried later. Payments do the same: an <code>unknown</code> state plus a query API plus an end-of-day "truth" file from the bank. <b>Where it breaks:</b> in networking you can often just drop and resend; in payments a resend can move real money, so the "query before resend" rule is strict.</p>
+        </div>
+
+        <h3>3. Webhooks in and out (good to know)</h3>
+        <ul>
+          <li><b>Inbound (PSP to us):</b> verify the HMAC signature and timestamp, insert <code>(psp, event_id)</code> into <code>psp_events_seen</code> (a duplicate insert fails, so we skip it), apply the state change through the forward-only update, and return 2xx quickly. Do heavy work async. Razorpay's guidance also says to dedupe webhooks by event ID, because providers retry them.</li>
+          <li><b>Webhooks arrive out of order and more than once.</b> The state machine plus <code>version</code> makes that harmless.</li>
+          <li><b>Outbound (us to merchants):</b> a webhook sender consumes <code>payment-events</code>, signs each body, posts it, and retries with exponential backoff (for example 1 min, 5 min, 30 min, 2 h ... over a day). After the last try it parks the event in a dead-letter topic and alerts. Merchants should dedupe by our <code>event_id</code>.</li>
+          <li><b>Never depend only on webhooks.</b> Give merchants a <code>GET</code> status API and tell the checkout page to poll it for a short while.</li>
+        </ul>
+
+        <h3>4. Reconciliation: the safety net (must know)</h3>
+        <p>Every day, each PSP and bank sends a <b>settlement report</b>: "these charges, refunds and fees settled for you". A reconciliation job compares three sources: <b>our payments table</b>, <b>our ledger</b>, and <b>the PSP's report</b>. Every row should match on id, amount and status.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Three-way reconciliation between payments DB, ledger and PSP settlement file">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box db" x="20" y="20" width="200" height="56"/>
+            <text class="label" x="120" y="45">Payments DB</text>
+            <text class="label small" x="120" y="65">what we think happened</text>
+            <rect class="box svc" x="20" y="100" width="200" height="56"/>
+            <text class="label" x="120" y="125">Ledger</text>
+            <text class="label small" x="120" y="145">where money sits</text>
+            <rect class="box client" x="20" y="180" width="200" height="56"/>
+            <text class="label" x="120" y="205">PSP settlement file</text>
+            <text class="label small" x="120" y="225">what really settled</text>
+            <rect class="box queue" x="330" y="90" width="190" height="76"/>
+            <text class="label" x="425" y="120">Recon job</text>
+            <text class="label small" x="425" y="142">match by id + amount</text>
+            <path class="arrow" d="M220 48 L324 110"/>
+            <path class="arrow" d="M220 128 L324 128"/>
+            <path class="arrow" d="M220 208 L324 146"/>
+            <rect class="box db solid" x="620" y="20" width="220" height="50"/>
+            <text class="label white" x="730" y="50">matched (most rows)</text>
+            <rect class="box cache" x="620" y="90" width="220" height="70"/>
+            <text class="label" x="730" y="115">auto-fix</text>
+            <text class="label small" x="730" y="137">unknown -&gt; succeeded,</text>
+            <text class="label small" x="730" y="153">orphan charge -&gt; refund</text>
+            <rect class="box fail" x="620" y="180" width="220" height="56"/>
+            <text class="label bad" x="730" y="205">human review queue</text>
+            <text class="label small" x="730" y="225">amount mismatch, fees</text>
+            <path class="arrow" d="M520 116 L614 48"/>
+            <path class="arrow" d="M520 128 L614 125"/>
+            <path class="arrow" d="M520 142 L614 205"/>
+            <circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M220 48 L330 115 L520 120 L620 48"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M220 208 L330 140 L520 140 L620 205"/></circle>
+          </svg>
+          <figcaption>Reconciliation turns "we think" into "we know". Most rows match; known patterns are fixed automatically; the rest go to people.</figcaption>
+        </figure>
+        <p>Typical mismatch types: a charge we marked failed but the bank settled (refund or fulfil it), a charge we marked succeeded that never settled (investigate), amount differences (fees, currency conversion), and missing rows. Reconciliation is why a payment system can be "eventually correct" even when individual calls fail.</p>
+
+        <h3>5. Exactly-once is really "at-least-once plus idempotent" (good to know)</h3>
+        <p>The <b>dual-write problem</b>: if we commit the database and then publish to Kafka, a crash in between loses the event; if we publish first, a rollback leaves a ghost event. The <b>transactional outbox</b> fixes it: the outbox row is in the same commit as the business change, and a relay publishes it later (maybe more than once). Consumers then dedupe by <code>event_id</code>. Kafka's own exactly-once (idempotent producer plus transactions) only covers Kafka-to-Kafka; once you call a bank or send an email, you need idempotency on that side too. More on this in <a href="{{BASE}}devops/kafka-06">Delivery Semantics &amp; Exactly-Once</a> and <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Event-Driven Data</a>.</p>
+
+        <h3>6. Security and PCI scope (good to know)</h3>
+        <ul>
+          <li><b>Do not touch raw card numbers if you can avoid it.</b> Let the PSP's hosted fields or SDK collect the card and give you a <b>token</b>. Your systems then stay mostly out of PCI-DSS scope.</li>
+          <li><b>Never store CVV.</b> If you must store cards (card-on-file), use a separate, tightly locked <b>vault</b> service; in India, RBI rules require card-on-file tokenisation through the networks.</li>
+          <li><b>Secrets</b> (PSP API keys, webhook secrets) live in a secret manager, rotated, and never in images or Git.</li>
+          <li><b>Audit trail</b>: append-only <code>payment_events</code>, plus who did what in admin tools (refunds by support staff).</li>
+        </ul>
+        <div class="callout note"><p><b>SDE-2 starts here.</b> If you can explain idempotency keys, the state machine, the unknown outcome and reconciliation clearly, you have passed the core of this question. The next sections are what SDE-2 candidates are expected to add without being asked.</p></div>
+
+        <h3>7. Multiple PSPs and smart routing (SDE-2 extra)</h3>
+        <p>Big merchants connect to several PSPs. A <b>router</b> picks one per payment by method, cost, success rate in the last few minutes and health. If a PSP's success rate drops, a circuit breaker stops sending it traffic. Careful: <b>failing over a single payment</b> to a second PSP after a timeout is dangerous, because the first one might have charged. Fail over only on a clear "not processed" error, or for new payments.</p>
+      

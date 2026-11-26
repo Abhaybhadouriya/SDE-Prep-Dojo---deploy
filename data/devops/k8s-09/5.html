@@ -1,0 +1,183 @@
+
+        <h2>The autoscaling family</h2>
+        <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+        <p>"Autoscaling" is really five separate controllers, each answering a different question. Mixing them up is the most common interview slip.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Autoscaler</th><th>Changes</th><th>Triggered by</th><th>Where it runs</th></tr></thead>
+            <tbody>
+              <tr><td><b>HPA</b> (Horizontal Pod Autoscaler)</td><td>Number of pod replicas</td><td>A metric vs a target (CPU % of request, RPS, queue lag)</td><td>Built in: <a href="{{BASE}}interview/glossary#kube-controller-manager">kube-controller-manager</a></td></tr>
+              <tr><td><b>VPA</b> (Vertical Pod Autoscaler)</td><td>Requests/limits of each pod</td><td>Observed usage history</td><td>Add-on (recommender, updater, admission webhook)</td></tr>
+              <tr><td><b>Cluster Autoscaler</b></td><td>Number of nodes in existing node groups</td><td><b>Pending pods</b> that do not fit; underused nodes</td><td>Add-on <a href="{{BASE}}interview/glossary#deployment">Deployment</a>, talks to the cloud's node groups</td></tr>
+              <tr><td><b>Karpenter</b></td><td>Nodes, choosing instance types per batch</td><td>Pending pods; consolidation to cheaper nodes</td><td>Add-on (kubernetes-sigs), AWS and Azure</td></tr>
+              <tr><td><b><a href="{{BASE}}interview/glossary#keda">KEDA</a></b></td><td>Replicas, including down to zero</td><td>External events: Kafka lag, SQS depth, cron, <a href="{{BASE}}interview/glossary#prometheus">Prometheus</a></td><td>Add-on that creates and feeds an HPA</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>HPA: the control loop and its formula</h3>
+        <p>Every <b>15 seconds</b> (the default <code>--horizontal-pod-autoscaler-sync-period</code>) the HPA controller inside kube-controller-manager does this for each HPA object:</p>
+        <ol class="steps">
+          <li><strong>Read metrics</strong> from the metrics APIs: <code>metrics.k8s.io</code> (served by <a href="{{BASE}}interview/glossary#metrics-server">metrics-server</a>, from each kubelet) for CPU and memory, or <code>custom.metrics.k8s.io</code> / <code>external.metrics.k8s.io</code> (served by an adapter such as Prometheus Adapter or KEDA).</li>
+          <li><strong>Compute</strong> <code>desired = ceil(current replicas x current metric / target metric)</code>. For CPU the metric is the average across pods, as a percentage of their <b>request</b>.</li>
+          <li><strong>Apply tolerance</strong>: if the ratio is within 10% of 1.0 (default tolerance 0.1, now configurable per HPA), do nothing - this stops flapping.</li>
+          <li><strong>Apply behaviour rules</strong>: scale-down uses a <b>5-minute stabilization window</b> by default (it picks the highest recommendation of the last 5 minutes), plus any rate policies.</li>
+          <li><strong>Write</strong> the new replica count to the Deployment's <code>scale</code> subresource. The Deployment and <a href="{{BASE}}interview/glossary#replicaset">ReplicaSet</a> controllers then create pods; the scheduler places them.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="HPA control loop: kubelets to metrics-server to HPA controller to Deployment scale to pods">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="40" y="40" width="200" height="60"/>
+            <text class="label" x="140" y="66">pods (4)</text>
+            <text class="label small" x="140" y="86">avg CPU 90% of request</text>
+            <rect class="box queue" x="300" y="40" width="200" height="60"/>
+            <text class="label" x="400" y="66">kubelet / cAdvisor</text>
+            <text class="label small" x="400" y="86">measures each container</text>
+            <rect class="box cache" x="560" y="40" width="200" height="60"/>
+            <text class="label" x="660" y="66">metrics-server</text>
+            <text class="label small" x="660" y="86">metrics.k8s.io API</text>
+            <rect class="box k8s" x="560" y="200" width="200" height="70"/>
+            <text class="label" x="660" y="226">HPA controller</text>
+            <text class="label small" x="660" y="246">ceil(4 x 90 / 50) = 8</text>
+            <text class="label small" x="660" y="262">every 15 s</text>
+            <rect class="box k8s" x="300" y="200" width="200" height="70"/>
+            <text class="label" x="400" y="226">Deployment /scale</text>
+            <text class="label small" x="400" y="246">replicas: 4 -> 8</text>
+            <rect class="box k8s" x="40" y="200" width="200" height="70"/>
+            <text class="label" x="140" y="226">ReplicaSet + scheduler</text>
+            <text class="label small" x="140" y="246">4 new pods placed</text>
+            <path class="arrow" d="M240 70 L294 70"/>
+            <path class="arrow" d="M500 70 L554 70"/>
+            <path class="arrow" d="M660 100 L660 194"/>
+            <path class="arrow" d="M560 235 L506 235"/>
+            <path class="arrow" d="M300 235 L246 235"/>
+            <path class="arrow" d="M140 200 L140 106"/>
+            <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M140 100 L140 70 L300 70 L560 70 L660 70 L660 200 L560 235 L300 235 L140 235 L140 100"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="5s" begin="2.5s" repeatCount="indefinite" path="M140 100 L140 70 L300 70 L560 70 L660 70 L660 200 L560 235 L300 235 L140 235 L140 100"/></circle>
+          </svg>
+          <figcaption>The HPA is a feedback loop like a thermostat: measure, compare with the target, adjust, repeat. With a 50% target and 90% measured, 4 replicas become ceil(7.2) = 8. The dots travel the loop: metrics up, decisions down.</figcaption>
+        </figure>
+<pre><code class="language-yaml">apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 60 }
+  behavior:
+    scaleUp:
+      policies:
+        - { type: Percent, value: 100, periodSeconds: 30 }   # at most double every 30 s
+    scaleDown:
+      stabilizationWindowSeconds: 300                       # the default, written out
+      policies:
+        - { type: Pods, value: 2, periodSeconds: 60 }        # remove at most 2 pods a minute</code></pre>
+<pre class="terminal"><code>$ kubectl get hpa api
+NAME   REFERENCE        TARGETS         MINPODS   MAXPODS   REPLICAS   AGE
+api    Deployment/api   cpu: 92%/60%    3         30        6          4m
+
+$ kubectl get hpa api      # if the pods have no CPU request
+NAME   REFERENCE        TARGETS              MINPODS   MAXPODS   REPLICAS   AGE
+api    Deployment/api   cpu: &lt;unknown&gt;/60%   3         30        3          1m</code></pre>
+        <div class="callout warn"><p><b>Careful:</b> <code>&lt;unknown&gt;</code> means the HPA cannot compute - usually metrics-server is not installed or the pods have <b>no CPU request</b> (utilization is a percentage of the request, and x / 0 is undefined). Also remove <code>replicas:</code> from the Deployment <a href="{{BASE}}interview/glossary#yaml">YAML</a> once an HPA owns it, or every <code>kubectl apply</code> resets the count.</p></div>
+        <p>Two recent additions worth knowing: per-HPA configurable tolerance is stable in v1.37, and <b>HPA scale to zero</b> (<code>minReplicas: 0</code>) is beta (on by default) in v1.37. Before that, scale to zero was KEDA's main selling point. <b>Catch:</b> it only works when the HPA scales on an <code>Object</code> or <code>External</code> metric (for example queue depth or Kafka lag). A pod CPU or memory metric cannot wake a Deployment that has zero pods, because with zero pods there is no CPU number to read. KEDA still adds the 0-to-1 activation logic and dozens of event sources.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The HPA is a discrete-time control loop with a deadband (the 10% tolerance) and asymmetric damping (fast up, slow down via the stabilization window) - the same reasons you add hysteresis to a fan controller or hold-down timers to route flapping. Adding replicas behind a Service is like adding members to an ECMP group when link utilization crosses a threshold. <b>Where this breaks:</b> a new pod is not instant capacity; it needs to be scheduled, pull its image, start and pass readiness, which can take from seconds to minutes.</p>
+        </div>
+
+        <h3>VPA: right-sizing the pod</h3>
+        <p>VPA watches real usage over time and recommends (or applies) better requests. Modes: <code>Off</code> (recommend only - the safe start), <code>Initial</code> (set at pod creation), <code>Recreate</code> (evict and recreate pods with new values), and <code>InPlaceOrRecreate</code>, which uses the GA in-place resize. Rule: <b>never let HPA and VPA act on the same CPU/memory metric</b>, or they fight: VPA raises the request, utilization percentage drops, HPA removes pods, usage per pod rises, and so on. Combine them only when the HPA scales on a different metric (RPS, lag).</p>
+
+        <h3>Node autoscaling: Cluster Autoscaler and Karpenter</h3>
+        <p>The HPA can ask for 30 pods, but if the nodes are full those pods are just <b>Pending</b>. The node autoscalers react to exactly that signal - not to node CPU usage.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 330" role="img" aria-label="Traffic spike: HPA adds pods, some are Pending, node autoscaler adds a node, pods schedule">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="20" y="20" width="240" height="190"/>
+            <text class="zone-label" x="36" y="42">node-1 (full)</text>
+            <rect class="box svc solid" x="40" y="60" width="90" height="40"/><text class="label white" x="85" y="85">pod</text>
+            <rect class="box svc solid" x="150" y="60" width="90" height="40"/><text class="label white" x="195" y="85">pod</text>
+            <rect class="zone k8s" x="280" y="20" width="240" height="190"/>
+            <text class="zone-label" x="296" y="42">node-2 (full)</text>
+            <rect class="box svc solid" x="300" y="60" width="90" height="40"/><text class="label white" x="345" y="85">pod</text>
+            <rect class="box svc solid" x="410" y="60" width="90" height="40"/><text class="label white" x="455" y="85">pod</text>
+
+            <g data-step="2">
+              <rect class="box svc solid" x="40" y="120" width="90" height="40"/><text class="label white" x="85" y="145">pod</text>
+              <rect class="box svc solid" x="300" y="120" width="90" height="40"/><text class="label white" x="345" y="145">pod</text>
+            </g>
+            <!-- Pending pods and the autoscaler exist only while pods wait (steps 2-4) -->
+            <g data-step-only="2">
+              <rect class="box fail" x="160" y="250" width="110" height="44"/><text class="label small bad" x="215" y="277">Pending</text>
+              <rect class="box fail" x="290" y="250" width="110" height="44"/><text class="label small bad" x="345" y="277">Pending</text>
+            </g>
+            <g data-step-only="3">
+              <rect class="box fail" x="160" y="250" width="110" height="44"/><text class="label small bad" x="215" y="277">Pending</text>
+              <rect class="box fail" x="290" y="250" width="110" height="44"/><text class="label small bad" x="345" y="277">Pending</text>
+              <rect class="box queue" x="560" y="240" width="220" height="60"/>
+              <text class="label small" x="670" y="265">Cluster Autoscaler /</text>
+              <text class="label small" x="670" y="285">Karpenter sees Pending</text>
+              <path class="arrow" d="M400 272 L554 272"/>
+            </g>
+            <g data-step-only="4">
+              <rect class="box fail" x="160" y="250" width="110" height="44"/><text class="label small bad" x="215" y="277">Pending</text>
+              <rect class="box fail" x="290" y="250" width="110" height="44"/><text class="label small bad" x="345" y="277">Pending</text>
+              <rect class="box queue" x="560" y="240" width="220" height="60"/>
+              <text class="label small" x="670" y="265">Cluster Autoscaler /</text>
+              <text class="label small" x="670" y="285">Karpenter sees Pending</text>
+              <path class="arrow" d="M400 272 L554 272"/>
+              <path class="arrow" d="M670 240 L670 216"/>
+              <text class="label small" x="660" y="150">booting, joining...</text>
+            </g>
+            <g data-step="4">
+              <rect class="zone k8s" x="540" y="20" width="240" height="190"/>
+              <text class="zone-label" x="556" y="42">node-3 (new)</text>
+            </g>
+            <g data-step="5">
+              <rect class="box svc solid" x="560" y="60" width="90" height="40"/><text class="label white" x="605" y="85">pod</text>
+              <rect class="box svc solid" x="670" y="60" width="90" height="40"/><text class="label white" x="715" y="85">pod</text>
+              <text class="label small ok" x="400" y="262">Pending pods scheduled on node-3</text>
+              <text class="label small" x="400" y="284">(about 1-3 min end to end, rule of thumb)</text>
+              <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M215 250 L400 220 L605 100"/></circle>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Steady state.</b> Two nodes, four pods. Each node is "full" in terms of <i>requests</i>, even if real CPU use is lower.</li>
+            <li><b>Spike.</b> The HPA raises replicas. Two new pods fit; two more fail the scheduler's resource filter and stay <b>Pending</b> with "Insufficient cpu".</li>
+            <li><b>Detect.</b> The node autoscaler watches for unschedulable pods. It simulates: "if I added a node of this type, would these pods fit?" Cluster Autoscaler picks a node group (an AWS Auto Scaling group, Azure VM scale set, GCP managed instance group); Karpenter picks the cheapest instance type that fits the whole batch.</li>
+            <li><b>Provision.</b> The cloud boots a VM. It runs the kubelet, registers a Node object and becomes Ready. This is the slow part - typically on the order of a minute or more, depending on cloud, image and node setup (rule of thumb, measure in your cluster).</li>
+            <li><b>Schedule.</b> The scheduler places the Pending pods on node-3. They pull images, start and pass readiness. Later, when load falls, the autoscaler removes underused nodes (Cluster Autoscaler: by default when requests are below 50% of the node for about 10 minutes and its pods can move elsewhere).</li>
+          </ol>
+        </div>
+        <p>Add up the chain for a cold spike: metrics lag + 15 s HPA loop + pod Pending + node boot + image pull + app warm-up + readiness. That can be <b>minutes</b>. For a flash sale that starts at a known second, reactive autoscaling alone is too late, which leads to the strongest interview answer on this page (see the scenario below).</p>
+        <div class="callout note"><p><b>What blocks scale-down?</b> From the Cluster Autoscaler FAQ: pods that cannot be moved, such as pods without a controller, pods with local storage (emptyDir) unless marked safe to evict, pods whose PodDisruptionBudget would be violated, and pods annotated <code>cluster-autoscaler.kubernetes.io/safe-to-evict: "false"</code>. A single such pod can keep an expensive node alive for weeks.</p></div>
+
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> Requests, the scheduler, the HPA and node autoscaling are the must-know core. KEDA, VPA details and the flash-sale tuning below are good to know for SDE-2 and platform roles; skim them, then jump to the interview questions.</p></div>
+        <h3>KEDA: scaling Kafka consumers on lag</h3>
+        <p>CPU is a poor signal for a Kafka consumer: a consumer waiting on a slow database uses little CPU while its backlog grows. The right signal is <b>consumer lag</b> - how many messages are waiting (<a href="{{BASE}}devops/kafka-04">Consumers &amp; Consumer Groups</a>). KEDA reads lag straight from Kafka and drives an HPA for you:</p>
+<pre><code class="language-yaml">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: order-consumer
+spec:
+  scaleTargetRef:
+    name: order-consumer            # a Deployment
+  minReplicaCount: 1
+  maxReplicaCount: 12               # = partitions of the topic; more would sit idle
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: my-cluster-kafka-bootstrap.kafka:9092
+        consumerGroup: order-consumer
+        topic: orders
+        lagThreshold: "500"         # target lag per replica</code></pre>
+        <div class="callout interview"><p><b>Interviewers love this:</b> "I cap consumer replicas at the partition count, because in a consumer group each partition is read by at most one consumer - the 13th consumer of a 12-partition topic would sit idle. And every scale event triggers a rebalance, so I add a stabilization window and use the cooperative rebalance protocol to keep pauses short." This ties K8s scaling to Kafka internals; see the <a href="{{BASE}}devops/pipeline-04">pipeline deploy page</a> for the full setup.</p></div>
+        <div class="callout tip"><p><b>Go deeper.</b> Karpenter NodePools, Spot and consolidation on AWS are taught in <a href="{{BASE}}devops/devops-aws-04#karpenter">Containers on AWS: Karpenter</a>; turning requests into money saved is in <a href="{{BASE}}devops/devops-sre-02#rightsizing">Cloud Cost: right-sizing</a>.</p></div>
+      

@@ -1,0 +1,123 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> If you can explain the architecture above, the data model and at-least-once + idempotency, you have a solid SDE-1 answer. Deep dives 1-3 are expected at SDE-2. Deep dives 4-5 are "good to know".</p></div>
+
+        <h3>1. Finding due jobs fast (must know)</h3>
+        <p>Three ways, from simple to fancy:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Approach</th><th>How</th><th>Good</th><th>Breaks when</th></tr></thead>
+            <tbody>
+              <tr><td>DB polling</td><td>Index on <code>(shard, next_run_at)</code>, poll every 1-2 s</td><td>Simple, durable, easy to debug. Dropbox's ATF polls its store about every 2 s</td><td>Precision is limited to the poll interval; very high rates hammer the index</td></tr>
+              <tr><td>Sorted set / delay queue</td><td><a href="{{BASE}}interview/glossary#redis">Redis</a> <code>ZADD due_jobs &lt;epoch&gt; job_id</code>; <code>ZRANGEBYSCORE due_jobs 0 now</code></td><td>Fast, sub-second precision</td><td>Redis replication is async, so a failover can lose entries; keep the DB as the truth</td></tr>
+              <tr><td>Hierarchical timer wheel</td><td>In-memory wheel of buckets (seconds, minutes, hours); load the next minute from DB</td><td>O(1) insert and fire; millisecond precision</td><td>Memory only, so it must be rebuilt from the DB after a restart</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>Best answer: combine them.</b> The database is the source of truth. Each scheduler leader loads "jobs due in the next 60 s" from its shard into an in-memory timer wheel and fires them on time. If the leader dies, the new leader just reloads the window. Nothing is lost, because the DB still has the rows.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Hierarchical timer wheel: a seconds wheel and a minutes wheel, with a pointer ticking">
+            <circle cx="180" cy="150" r="110" fill="none" stroke="var(--k8s)" stroke-width="3"/>
+            <circle cx="180" cy="150" r="6" fill="var(--k8s)"/>
+            <text class="label" x="180" y="22">seconds wheel (60 slots)</text>
+            <g>
+              <line x1="180" y1="150" x2="180" y2="50" stroke="var(--kafka)" stroke-width="4"/>
+              <animateTransform attributeName="transform" type="rotate" from="0 180 150" to="360 180 150" dur="12s" repeatCount="indefinite"/>
+            </g>
+            <rect class="box queue" x="255" y="60" width="70" height="30"/>
+            <text class="label small" x="290" y="80">slot 12</text>
+            <rect class="box queue" x="275" y="180" width="70" height="30"/>
+            <text class="label small" x="310" y="200">slot 25</text>
+            <rect class="box queue" x="40" y="230" width="70" height="30"/>
+            <text class="label small" x="75" y="250">slot 41</text>
+            <circle cx="560" cy="150" r="90" fill="none" stroke="var(--db)" stroke-width="3" stroke-dasharray="6 4"/>
+            <text class="label" x="560" y="42">minutes wheel (60 slots)</text>
+            <text class="label small" x="560" y="146">jobs due later</text>
+            <text class="label small" x="560" y="166">cascade down</text>
+            <path class="arrow dashed" d="M470 150 L300 150"/>
+            <text class="label small" x="385" y="138">when its minute comes</text>
+            <rect class="box db" x="680" y="230" width="110" height="50"/>
+            <text class="label" x="735" y="252">Jobs DB</text>
+            <text class="label small" x="735" y="270">next 60 s</text>
+            <path class="arrow" d="M680 245 L640 205"/>
+          </svg>
+          <figcaption>The orange hand ticks once per second. Each slot holds a list of jobs due at that second. Jobs further away sit in the coarser minutes wheel and drop into the seconds wheel when their minute comes, exactly like the kernel's cascading timer wheel. Paper: Varghese and Lauck, "Hashed and Hierarchical Timing Wheels" (SOSP 1987).</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the Linux timer wheel (<code>kernel/time/timer.c</code>) moved into user space. Insert is O(1): hash the deadline to a bucket. Each tick only looks at one bucket. <b>Where this breaks:</b> the kernel never loses its wheel unless the box reboots; ours lives on one pod that Kubernetes may kill at any time, so it is only a <em>cache</em> of the next minute. The database is the RIB, the wheel is the FIB.</p>
+        </div>
+
+        <h3>2. Never run the same run twice at the same time: leases and fencing tokens (must know)</h3>
+        <p>A worker claims a run and gets a lease that expires in 30 s. (A <a href="{{BASE}}interview/glossary#gc-pause">GC pause</a> = the runtime stops all threads to reclaim memory, sometimes for seconds - like a process frozen by SIGSTOP. The process does not know it was frozen.) It must renew it. If the worker dies, the lease expires and the reaper gives the run to someone else. Simple. But here is the trap interviewers love:</p>
+        <p><b>The worker is not dead, only paused.</b> A long garbage-collection pause, a CPU-throttled container, or a network partition can freeze worker A for 40 s. Its lease expires, worker B claims the run, and then A wakes up and keeps writing. Now two workers do the same job. A lease alone does not prevent this, because A does not know its lease expired.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Fencing token timeline: worker A pauses, lease expires, worker B gets token 34, A's late write with token 33 is rejected">
+            <line x1="60" y1="60" x2="760" y2="60" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="60" y1="150" x2="760" y2="150" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="60" y1="240" x2="760" y2="240" stroke="var(--svg-muted)" stroke-width="2"/>
+            <text class="label left" x="10" y="44">Worker A</text>
+            <text class="label left" x="10" y="134">Run store</text>
+            <text class="label left" x="10" y="224">Worker B</text>
+            <path class="arrow" d="M100 60 L140 145"/>
+            <text class="label small" x="150" y="100">claim -&gt; token 33</text>
+            <rect class="box fail" x="200" y="40" width="250" height="40"/>
+            <text class="label" x="325" y="65">long GC pause (40 s)</text>
+            <rect class="box cache" x="330" y="135" width="110" height="30"/>
+            <text class="label small" x="385" y="155">lease expires</text>
+            <path class="arrow ok" d="M480 240 L520 155"/>
+            <text class="label small" x="560" y="200">claim -&gt; token 34</text>
+            <path class="arrow bad" d="M600 60 L640 145"/>
+            <text class="label small bad" x="690" y="96">write(token 33)</text>
+            <rect class="box db" x="600" y="160" width="160" height="34"/>
+            <text class="label small bad" x="680" y="182">REJECT: 33 &lt; 34</text>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M600 60 L640 145"/></circle>
+          </svg>
+          <figcaption>Every claim returns a bigger fencing token. The run store (and ideally the job's target system) rejects any write carrying an older token. Worker A's zombie write is refused, even though A believed it still held the lease.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Fencing token:</b> a counter that increases with every claim of the run. Every status write says "I am token 33". The store does <code>UPDATE job_runs SET status=... WHERE run_id=? AND fencing_token=33</code>. If B already holds 34, A's update matches zero rows.</li>
+          <li>Pass the token to the target too (for example an <code>X-Fencing-Token</code> header), so the billing service can refuse stale calls. This idea is explained well in Martin Kleppmann's post "How to do distributed locking".</li>
+          <li><b>Self-fencing:</b> Dropbox's executors kill themselves after three missed heartbeats, and the lease timeout is longer than that window, so a worker that cannot reach the store stops before anyone else is allowed to start.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Fencing tokens are the <b>STONITH</b> ("shoot the other node in the head") and <b>generation numbers</b> of HA clusters, or a TCP sequence number check: the receiver drops a segment from an old incarnation. In Kafka itself, the same idea is the <b>producer epoch</b>: a new transactional producer bumps the epoch and the broker fences the old "zombie" one. See <a href="{{BASE}}devops/kafka-05">Kafka replication</a> for leader epochs. <b>Where it breaks:</b> STONITH physically powers the old node off, so it cannot do anything; a fencing token only makes its late writes <i>rejected</i>, and only if the target checks the token. A target that ignores tokens (a plain HTTP endpoint, an email API) still receives the zombie's call, so those jobs need their own idempotency key.</p>
+        </div>
+
+        <h3>3. At-least-once + idempotent jobs = "effectively once" (must know)</h3>
+        <p>There are three places where a run can be duplicated: the scheduler crashes after publishing but before marking QUEUED; the worker finishes but crashes before committing the Kafka offset; a paused worker's lease expires. And there is one place where a run can be <b>lost</b>: the scheduler commits the <code>job_runs</code> row (PENDING) and crashes <em>before</em> publishing. Committing to the DB and publishing to Kafka are two separate writes (a <a href="{{BASE}}interview/glossary#dual-write">dual write</a>), so one can succeed without the other.</p>
+        <div class="callout warn"><p><b>Close the loss gap.</b> Treat the <code>job_runs</code> row as an <b><a href="{{BASE}}interview/glossary#outbox">outbox</a></b>: the reaper (or a small relay) re-publishes every run that is still PENDING/QUEUED past <code>scheduled_at</code> + N seconds, and only marks it QUEUED after Kafka acks. A run published twice is harmless because of the natural run id and the claim below; a run never published is a silent miss, which is far worse. A heavier option is a real outbox table relayed by <a href="{{BASE}}interview/glossary#cdc">CDC</a> (see <a href="{{BASE}}hld/d28">CDC Pipeline</a>).</p></div>
+        <p>You cannot remove all of the duplicate sources. So:</p>
+        <ol class="steps">
+          <li><strong>Natural run id.</strong> <code>run_id = job_id + scheduled_at</code>. Two schedulers creating the same occurrence collide on the primary key; only one row exists.</li>
+          <li><strong>Idempotency key to the target.</strong> The worker sends <code>Idempotency-Key: run_id</code> to the billing service. Billing stores processed keys and returns the old result for a repeat. Charging twice becomes impossible.</li>
+          <li><strong>Commit the offset after the side effect.</strong> Process, write status, then commit. The reverse order (commit first) gives at-most-once: a crash loses the run.</li>
+        </ol>
+        <div class="callout interview"><p>If the interviewer says "but I want exactly-once", answer: "Kafka's exactly-once covers read-from-Kafka, process, write-to-Kafka. Our job calls an external HTTP service, which Kafka cannot roll back. So the honest design is at-least-once delivery plus an idempotency key at the target; the effect happens once even if the delivery happens twice." See <a href="{{BASE}}devops/kafka-06">Kafka delivery semantics</a>.</p></div>
+
+        <h3>4. Leader election and sharding the scheduler (should know)</h3>
+        <ul>
+          <li>One scheduler for everything is a single point of failure and a throughput cap. Split jobs into <b>64 logical shards</b> by <code>hash(job_id)</code>. Many scheduler pods compete for shard leases in etcd; each shard has exactly one owner at a time, and a pod may own several shards.</li>
+          <li>When a pod dies, its etcd leases expire (for example after 10 s) and other pods pick up those shards. Use the lease <b>revision</b> as the fencing token for the scheduler's own DB writes.</li>
+          <li>Even without perfect leader election, the design stays correct: two schedulers on the same shard would both try to insert the same <code>run_id</code> and the primary key stops the duplicate. Leader election is for <em>efficiency</em>; the database constraint is for <em>correctness</em>. Say this sentence in the interview.</li>
+          <li>Rebalancing: more shards than pods (64 vs, say, 8) means you can move shards around without rehashing jobs, the same trick as Kafka partitions and Redis Cluster's 16,384 slots.</li>
+        </ul>
+
+        <h3>5. The thundering herd at :00, priorities and fairness (good to know)</h3>
+        <ul>
+          <li><b>Spread the load:</b> for jobs that say "hourly" but do not care about the exact second, add <b>deterministic jitter</b>: run at <code>:00 + hash(job_id) % 300</code> seconds. Kubernetes does not do this for you; many cloud schedulers offer a "flexible time window" for exactly this reason (AWS EventBridge Scheduler has one).</li>
+          <li><b>Kafka absorbs the rest:</b> the spike becomes consumer lag, not errors. Workers autoscale on lag with KEDA's Kafka scaler (<a href="{{BASE}}interview/glossary#keda">KEDA</a> = a Kubernetes autoscaler that scales pods on external metrics such as Kafka consumer lag, not just CPU). Start delay grows a little for low-priority jobs, which is acceptable.</li>
+          <li><b>Priorities:</b> separate topics (<code>jobs.high</code>, <code>jobs.low</code>) with separate worker pools. Never put both in one FIFO, or a batch of 1 M low-priority emails sits in front of a payment retry.</li>
+          <li><b>Tenant fairness:</b> per-tenant quotas at submit time (token bucket on job creation) and at run time (max concurrent runs per tenant). Dropbox's ATF gives each "lambda" its own queue and worker cluster for the same reason.</li>
+          <li><b>Retries with back-off and jitter:</b> exponential back-off (10 s, 20 s, 40 s...) with random jitter, so 10,000 jobs that failed because the target was down do not all retry in the same second and knock it down again. Read the AWS Builders' Library article on backoff with jitter.</li>
+        </ul>
+
+        <h3>6. Long jobs, cancellation and dependencies (deep dive)</h3>
+        <ul>
+          <li><b>Long jobs</b> (a 2-hour report): keep heartbeating; checkpoint progress in the job's own storage, so a retry resumes instead of restarting.</li>
+          <li><b>Cancel:</b> set the run's desired state to CANCELLED; the worker sees it in its next heartbeat response and stops. Same pattern as a Kubernetes controller: write the desired state, let the owner react.</li>
+          <li><b>Concurrency policy</b> per job, copied from Kubernetes CronJob: <code>Allow</code> (overlap ok), <code>Forbid</code> (skip if the last run is still running), <code>Replace</code> (kill the old one).</li>
+          <li><b>Dependencies / DAGs</b> ("run B after A succeeds"): this becomes a workflow engine. Name the real tools: Apache Airflow (a scheduler + executor + metadata DB, born at Airbnb), Temporal (durable workflows), Netflix's Maestro. Interviewers are happy if you say "out of scope, but I would add a DAG layer on top of this scheduler".</li>
+        </ul>
+      

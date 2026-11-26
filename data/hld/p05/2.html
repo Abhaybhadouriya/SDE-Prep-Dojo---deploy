@@ -1,0 +1,229 @@
+
+        <h2>The ladder: naive to best</h2>
+        <p>Hello Interview's guide orders the moves like this: stay on one box as long as you can (bigger hardware, the right database), then shard, then handle bursts with queues and load shedding, then batch and aggregate hierarchically. It stresses that scaling writes is not only about adding hardware. We follow the same order.</p>
+
+        <h3>Rung 0 - Bigger box, cheaper writes</h3>
+        <p>Vertical scaling (more CPU, faster NVMe, more RAM) is boring and often correct for an SDE-2 answer at moderate scale. Then make each write cheaper:</p>
+        <ul>
+          <li><b>Drop indexes you do not need.</b> Every secondary index is another write on every insert.</li>
+          <li><b>Write-optimised storage.</b> A B-tree database updates pages in place (random I/O). An <strong><a href="{{BASE}}interview/glossary#lsm-tree">LSM-tree</a></strong> (log-structured merge tree) database such as Cassandra, RocksDB or ScyllaDB turns every write into a sequential append. ByteByteGo's comparison sums it up: B-trees are usually faster for reads, LSM-trees for writes.</li>
+          <li><b>Vertical partitioning.</b> Move unrelated tables to their own databases. Figma did this first: files, organisations and so on got their own databases. Its limit is that the smallest unit is one table, so it does nothing for the one giant table.</li>
+        </ul>
+
+        <p>The LSM write path is worth knowing in detail, because it explains why Cassandra and Bigtable take writes so cheaply. Step through it:</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="LSM write path: commit log, memtable, flush to SSTable, compaction">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="40" width="120" height="54"/>
+            <text class="label" x="80" y="72">write k=v</text>
+            <rect class="zone" x="170" y="20" width="250" height="110"/>
+            <text class="zone-label" x="184" y="40">RAM</text>
+            <rect class="zone db" x="170" y="150" width="610" height="135"/>
+            <text class="zone-label" x="184" y="172">Disk (append only)</text>
+            <g data-step="1">
+              <rect class="box queue" x="190" y="190" width="200" height="44"/>
+              <text class="label" x="290" y="217">commit log (WAL)</text>
+              <path class="arrow" d="M140 80 L200 186"/>
+            </g>
+            <g data-step="2">
+              <rect class="box cache" x="200" y="55" width="200" height="54"/>
+              <text class="label" x="300" y="80">memtable</text>
+              <text class="label small" x="300" y="99">sorted, in memory</text>
+              <path class="arrow" d="M140 67 L194 75"/>
+            </g>
+            <g data-step="3">
+              <rect class="box db" x="440" y="185" width="90" height="40"/>
+              <text class="label small" x="485" y="210">SST 1</text>
+              <rect class="box db" x="540" y="185" width="90" height="40"/>
+              <text class="label small" x="585" y="210">SST 2</text>
+              <rect class="box db" x="640" y="185" width="90" height="40"/>
+              <text class="label small" x="685" y="210">SST 3</text>
+              <path class="arrow" d="M400 90 L480 180"/>
+              <text class="label small" x="520" y="120">flush when full</text>
+            </g>
+            <g data-step="4">
+              <rect class="box db solid" x="490" y="240" width="190" height="36"/>
+              <text class="label white" x="585" y="263">merged SSTable</text>
+              <path class="arrow" d="M485 225 L560 238"/>
+              <path class="arrow" d="M685 225 L620 238"/>
+            </g>
+            <g data-step-only="5">
+              <rect class="box fail" x="440" y="30" width="330" height="60"/>
+              <text class="label bad" x="605" y="55">Cost: compaction rewrites data</text>
+              <text class="label small bad" x="605" y="77">(write amplification), reads check several files</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Log first.</b> The write is appended to a commit log (a write-ahead log) - one sequential write. If the server crashes, replaying the log rebuilds memory. Bigtable uses group commit here: many writes share one log flush.</li>
+            <li><b>Then memory.</b> The write goes into the memtable, a sorted in-memory structure. The client gets its acknowledgement now. No page was read or rewritten on disk.</li>
+            <li><b>Flush.</b> When the memtable reaches a threshold it is frozen and written out as an immutable, sorted file (an SSTable). Bigtable calls this a minor compaction.</li>
+            <li><b>Compact.</b> In the background, several SSTables are merged into one, dropping overwritten and deleted values (merging and major compaction). This keeps the number of files a read must check small.</li>
+            <li><b>The price.</b> Data gets rewritten several times during compaction, and a read may have to check the memtable plus several SSTables (Bloom filters help skip files). LSM trades read cost and background I/O for very cheap writes.</li>
+          </ol>
+        </div>
+
+        <p><b>Breaks when:</b> one machine's disk, CPU or NIC is full, or the data no longer fits. Then you must split ownership.</p>
+
+        <h3>Rung 1 - Shard by a good key</h3>
+        <p>Horizontal sharding gives each machine a subset of the rows. Every write is routed by its <strong>shard key</strong>. ByteByteGo lists four ways to map keys to shards:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Scheme</th><th>How</th><th>Strength</th><th>Weakness</th></tr></thead>
+            <tbody>
+              <tr><td>Range</td><td>Key ranges: A-F, G-M; or by date</td><td>Range scans stay on one shard</td><td>Hot spots: all of today's writes go to the newest range</td></tr>
+              <tr><td>Hash</td><td><code>hash(key) mod N</code></td><td>Even spread</td><td>Range scans hit every shard; changing N moves almost every key</td></tr>
+              <tr><td><a href="{{BASE}}interview/glossary#consistent-hashing">Consistent hashing</a></td><td>Hash ring with virtual nodes (Dynamo, Cassandra)</td><td>Adding a node moves only about 1/N of keys</td><td>Still one owner per key; hot keys stay hot</td></tr>
+              <tr><td>Virtual buckets / directory</td><td>Key &rarr; logical bucket &rarr; physical shard via a lookup table</td><td>Move a bucket without rehashing; flexible</td><td>The directory is a critical service to keep available</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="A router hashes the shard key to one of 480 logical shards mapped onto 32 physical databases">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="100" width="130" height="60"/>
+            <text class="label" x="85" y="126">write</text>
+            <text class="label small" x="85" y="146">workspace=W7</text>
+            <rect class="box svc" x="200" y="100" width="150" height="60"/>
+            <text class="label" x="275" y="126">router</text>
+            <text class="label small" x="275" y="146">hash(W7) % 480</text>
+            <rect class="zone" x="400" y="20" width="380" height="225"/>
+            <text class="zone-label" x="414" y="42">480 logical shards on 32 hosts</text>
+            <rect class="box db" x="420" y="58" width="160" height="50"/>
+            <text class="label" x="500" y="80">host 1</text>
+            <text class="label small" x="500" y="98">shards 0-14</text>
+            <rect class="box db highlight" x="600" y="58" width="160" height="50"/>
+            <text class="label" x="680" y="80">host 2</text>
+            <text class="label small" x="680" y="98">shards 15-29</text>
+            <rect class="box db" x="420" y="128" width="160" height="50"/>
+            <text class="label" x="500" y="150">host 3</text>
+            <text class="label small" x="500" y="168">shards 30-44</text>
+            <rect class="box ghost" x="600" y="128" width="160" height="50"/>
+            <text class="label" x="680" y="158">...</text>
+            <text class="label small" x="590" y="215">move a whole logical shard to rebalance</text>
+            <path class="arrow" d="M150 130 L194 130"/>
+            <path class="arrow" d="M350 120 L594 85"/>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M150 130 L275 130 L600 85"/></circle>
+          </svg>
+          <figcaption>Logical shards decouple "which bucket" from "which machine". Notion uses 480 logical shards (Postgres schemas) on 32 databases, 15 each; 480 has many divisors, so it splits evenly onto 40 or 48 hosts later. Instagram did the same with thousands of logical shards in a few physical Postgres servers.</figcaption>
+        </figure>
+
+        <h4>How to choose the shard key</h4>
+        <ol class="steps">
+          <li><strong>High cardinality.</strong> Many distinct values, so load can spread. <code>country</code> is a bad key; <code>user_id</code> is good.</li>
+          <li><strong>Even load, not just even data.</strong> One merchant with 30% of payments makes <code>merchant_id</code> skewed even though most merchants are tiny.</li>
+          <li><strong>Matches the main access pattern.</strong> Notion picked workspace ID because every block belongs to exactly one workspace and users query one workspace at a time, so most queries never cross shards. Figma groups tables that share a key into "colos" so joins and transactions within one user, file or org stay on one shard.</li>
+          <li><strong>Avoid monotonic keys with range sharding.</strong> A timestamp or auto-increment ID sends every new write to the last shard. Hash it, or prefix it.</li>
+        </ol>
+
+        <div class="callout warn"><p><b>What sharding takes away.</b> Figma's write-up is honest: queries without the shard key become <a href="{{BASE}}interview/glossary#scatter-gather">scatter-gather</a> across every shard; joins only work within a colo on the shard key; atomic cross-shard transactions are not supported, so partial failures must be handled in product logic; global unique IDs and unique indexes need new machinery. Their first table took about nine months to shard. Say this in an interview - it shows you know sharding is a cost, not a free lunch. For cross-shard work, see <a href="{{BASE}}hld/p03">Multi-step Processes (Sagas)</a> and <a href="{{BASE}}hld/d31">Unique ID Generator</a>.</p></div>
+
+        <p><b>Resharding</b> without downtime follows the same recipe at Notion and elsewhere: double-write to old and new (Notion used an audit log plus a catch-up script), backfill history (about three days for them), verify with sampled comparisons and "dark reads" that compare both systems, then switch over with a rollback path ready. YouTube built <a href="https://vitess.io/docs/overview/history/" target="_blank" rel="noopener">Vitess</a> in 2010 to do this routing and resharding for MySQL behind a proxy.</p>
+        <p><b>Breaks when:</b> one key - not one shard - is too hot. Sharding spreads <em>different</em> keys; it does nothing for a single key that gets millions of writes.</p>
+
+        <h3>Rung 2 - Split hot keys</h3>
+        <p>DynamoDB documents its limits plainly: each partition delivers at most 3,000 read units and 1,000 write units per second (one write unit = one 1 KB write). Discord saw the same thing in Cassandra: one very busy channel bucket overloaded a node, and because reads and writes used <a href="{{BASE}}interview/glossary#quorum">quorum</a> (a majority of the replicas, for example 2 of 3, must answer before the request completes), that node's slowness spread to unrelated users. A hot key needs to become several keys.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Writes to one hot key are spread over N suffixed sub-keys on different partitions; reads sum them">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="130" height="50"/><text class="label" x="85" y="60">+1 like</text>
+            <rect class="box client" x="20" y="110" width="130" height="50"/><text class="label" x="85" y="140">+1 like</text>
+            <rect class="box client" x="20" y="190" width="130" height="50"/><text class="label" x="85" y="220">+1 like</text>
+            <rect class="box db" x="330" y="20" width="200" height="44"/><text class="label" x="430" y="47">likes:post9#0</text>
+            <rect class="box db" x="330" y="80" width="200" height="44"/><text class="label" x="430" y="107">likes:post9#1</text>
+            <rect class="box db" x="330" y="140" width="200" height="44"/><text class="label" x="430" y="167">likes:post9#2</text>
+            <rect class="box db" x="330" y="200" width="200" height="44"/><text class="label" x="430" y="227">likes:post9#N-1</text>
+            <rect class="box svc" x="620" y="105" width="160" height="60"/><text class="label" x="700" y="131">read = SUM</text><text class="label small" x="700" y="151">or rollup every 5 s</text>
+            <path class="arrow" d="M150 55 L324 100"/>
+            <path class="arrow" d="M150 135 L324 42"/>
+            <path class="arrow" d="M150 215 L324 222"/>
+            <path class="arrow dashed" d="M530 42 L614 120"/>
+            <path class="arrow dashed" d="M530 102 L614 130"/>
+            <path class="arrow dashed" d="M530 162 L614 140"/>
+            <path class="arrow dashed" d="M530 222 L614 150"/>
+            <text class="label small" x="235" y="262">pick suffix = random(0..N-1)</text>
+            <circle class="packet" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M150 55 L330 100"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" begin="0.7s" repeatCount="indefinite" path="M150 135 L330 42"/></circle>
+            <circle class="packet gold" r="5"><animateMotion dur="2s" begin="1.3s" repeatCount="indefinite" path="M150 215 L330 222"/></circle>
+          </svg>
+          <figcaption>Write sharding a hot key. N sub-keys land on different partitions, so N times the write rate fits. Reads pay: they must fetch and sum all N, or read a rollup that a background job refreshes.</figcaption>
+        </figure>
+
+        <ul>
+          <li><b>Random suffix.</b> AWS's example: append a random 1-200 to a date key (<code>2014-07-09.1</code> ... <code>.200</code>). Writes spread 200 ways; reading the day means 200 queries merged.</li>
+          <li><b>Calculated suffix.</b> Use <code>hash(order_id) % 200</code> instead of random, so a single item can still be found directly while writes stay spread.</li>
+          <li><b>Sharded counters.</b> Firebase's distributed-counter guide does exactly this for counts: a counter is a set of shard documents, each increment goes to a random shard, the total is the sum. Their sample treats one shard as good for about one update per second, so 10 shards gives roughly 10x. Read cost grows with shard count, so add a periodically updated rollup.</li>
+          <li><b>Split all keys or only hot ones?</b> Hello Interview names both. Splitting every key is simple but taxes every read. Splitting only detected hot keys (a "hot list" consulted by writers and readers) is cheaper on average but adds a moving part. Start with all keys for a known-hot key type (like counts on posts), dynamic for unpredictable ones.</li>
+          <li><b>Isolate the noisy tenant.</b> Shopify learned this in February 2016: a Kylie Cosmetics sale overloaded one database shard and took down every other store on that shard too. Big tenants get their own shard; AWS's shuffle sharding limits how many customers share any one failure.</li>
+        </ul>
+
+        <h3>Rung 3 - Queues as shock absorbers</h3>
+        <p>When the problem is a burst, not a steady rate, put a durable queue between the producer and the database. Producers append to the queue at whatever rate they like; consumers drain it at the rate the database can take. Microsoft calls this <em>queue-based load leveling</em>.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="Spiky producers write into Kafka; consumers write batched rows to the database at a steady rate">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="40" width="120" height="44"/><text class="label" x="80" y="67">API pod</text>
+            <rect class="box client" x="20" y="100" width="120" height="44"/><text class="label" x="80" y="127">API pod</text>
+            <rect class="box client" x="20" y="160" width="120" height="44"/><text class="label" x="80" y="187">API pod</text>
+            <rect class="box kafka" x="230" y="70" width="230" height="104"/>
+            <text class="label" x="345" y="100">Kafka topic</text>
+            <text class="label small" x="345" y="122">partitioned by key</text>
+            <text class="label small" x="345" y="142">durable, replayable</text>
+            <rect class="box svc" x="520" y="92" width="110" height="60"/><text class="label" x="575" y="118">consumers</text><text class="label small" x="575" y="138">batch 500</text>
+            <rect class="box db" x="680" y="92" width="100" height="60"/><text class="label" x="730" y="127">DB</text>
+            <path class="arrow" d="M140 62 L224 100"/>
+            <path class="arrow" d="M140 122 L224 122"/>
+            <path class="arrow" d="M140 182 L224 146"/>
+            <path class="arrow" d="M460 122 L514 122"/>
+            <path class="arrow ok thick" d="M630 122 L674 122"/>
+            <text class="label small" x="140" y="225">bursty: 50K/s at 12:00</text>
+            <text class="label small" x="640" y="190">steady: 5K rows/s</text>
+            <circle class="packet" r="5"><animateMotion dur="1s" repeatCount="indefinite" path="M140 62 L240 100"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="0.8s" repeatCount="indefinite" path="M140 122 L240 122"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="1.2s" repeatCount="indefinite" path="M140 182 L240 146"/></circle>
+            <circle class="packet ok" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M630 122 L680 122"/></circle>
+          </svg>
+          <figcaption>A queue converts a spike into a backlog. Small dots arrive fast on the left; one big batched write leaves on the right at the rate the database can take. <a href="{{BASE}}interview/glossary#consumer-lag">Consumer lag</a> is the size of the backlog.</figcaption>
+        </figure>
+
+        <p>Why Kafka handles this so well: it is designed for sequential disk I/O and batching at every stage. In LinkedIn's 2014 benchmark on three ordinary machines (six SATA disks each, 1 Gb Ethernet), three producers wrote about 2 million 100-byte records per second with 3x asynchronous replication; median latency was 2 ms. Synchronous replication roughly halved single-producer throughput (from about 787K to 422K records/s), which is the durability cost made visible. See <a href="{{BASE}}devops/kafka-07">Kafka storage internals</a>.</p>
+        <ul>
+          <li><b>The client must accept "accepted, not done".</b> Return <code>202 Accepted</code> and an ID; the write becomes visible a little later. Fine for clicks and logs, wrong for "did my payment go through?" unless you add a status API (see <a href="{{BASE}}hld/p07">Long-running Tasks</a>).</li>
+          <li><b>A queue does not raise the sustained limit.</b> If producers average more than consumers can write, lag grows forever. A queue buys time for bursts; for steady overload you still need more shards.</li>
+          <li><b>Load shedding</b> is the honest alternative when even the queue would overflow: reject or degrade low-priority writes early. Shopify's first checkout throttle was a leaky bucket at the Nginx/OpenResty edge that sent excess users to a cached queue page instead of a <code>429</code> error (HTTP "429 Too Many Requests", the standard "slow down" reply). Its weakness, found at the next sale, was fairness: waits reached 40 minutes because random retries gave early arrivals no priority.</li>
+        </ul>
+
+        <h3>Rung 4 - Batch and aggregate before you write</h3>
+        <p>Every write has a fixed cost: a network round trip, a lock, a log flush, an index update. Batching pays it once for many records. LinkedIn notes their producer uses group-commit-style batching, and Bigtable uses group commit for its commit log. In Kafka, <code>linger.ms</code> (default changed from 0 to 5 ms in Kafka 4.0) and <code>batch.size</code> control how long a producer waits to fill a batch.</p>
+        <ul>
+          <li><b>Client-side batching:</b> buffer 100 ms or 500 rows, whichever first, then one multi-row insert.</li>
+          <li><b>Aggregate in memory:</b> for counters, do not write 10,000 "+1"s; keep a per-key sum for 5 seconds and write "+10,000" once. This is how <a href="{{BASE}}hld/d21">ad click aggregation</a> and <a href="{{BASE}}hld/d39">like counters</a> survive.</li>
+          <li><b>Hierarchical aggregation:</b> edge servers pre-sum, regional aggregators sum the edges, one writer updates the store. Live reactions on a stream with millions of viewers work this way (<a href="{{BASE}}hld/d44">Live Comments</a>).</li>
+          <li><b>Coalesce overwrites:</b> if a driver's location is written every 4 s but only the latest matters, keep the last value per key in memory and drop the rest.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Hierarchical aggregation: many edge counters roll into regional aggregators and then one store write">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="20" width="130" height="40"/><text class="label small" x="85" y="45">edge: +3,120</text>
+            <rect class="box svc" x="20" y="75" width="130" height="40"/><text class="label small" x="85" y="100">edge: +2,904</text>
+            <rect class="box svc" x="20" y="130" width="130" height="40"/><text class="label small" x="85" y="155">edge: +4,411</text>
+            <rect class="box svc" x="20" y="180" width="130" height="34"/><text class="label small" x="85" y="202">edge: +1,876</text>
+            <rect class="box queue" x="300" y="45" width="170" height="50"/><text class="label small" x="385" y="75">region A: +6,024</text>
+            <rect class="box queue" x="300" y="135" width="170" height="50"/><text class="label small" x="385" y="165">region B: +6,287</text>
+            <rect class="box db" x="610" y="85" width="170" height="60"/><text class="label" x="695" y="111">store</text><text class="label small" x="695" y="131">1 write / 5 s</text>
+            <path class="arrow" d="M150 40 L294 62"/>
+            <path class="arrow" d="M150 95 L294 78"/>
+            <path class="arrow" d="M150 150 L294 155"/>
+            <path class="arrow" d="M150 197 L294 170"/>
+            <path class="arrow" d="M470 70 L604 105"/>
+            <path class="arrow" d="M470 160 L604 125"/>
+          </svg>
+          <figcaption>Hierarchical aggregation turns millions of increments per second into a handful of store writes. The cost is a few seconds of delay and the need for <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> flushes (idempotent = safe to run twice: the second run changes nothing, like setting a register to a value rather than incrementing it; a retried "+6,024" must not be applied twice).</figcaption>
+        </figure>
+
+        <div class="callout danger"><p><b>Batching and buffering lose data on a crash</b> unless the buffer is durable. A count that is a little low after a crash may be fine (views). A lost payment is not. For money, write each event durably (to Kafka with <code>acks=all</code>, where the producer waits until all in-sync replicas have the write, or to a <a href="{{BASE}}interview/glossary#wal">WAL</a>) before aggregating, and make flushes idempotent with an offset or batch ID - see <a href="{{BASE}}devops/kafka-06">Delivery Semantics</a>.</p></div>
+      

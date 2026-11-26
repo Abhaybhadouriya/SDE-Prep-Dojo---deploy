@@ -1,0 +1,158 @@
+
+  <h2>Safe apply: plan review in CI, saved plans and blast radius</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>At small scale, people run <code>terraform apply</code> from their laptops. At scale that breaks: nobody knows who changed what, credentials live on laptops, and two people can apply different branches. The grown-up pattern is <strong>"plan on pull request, apply the reviewed plan on merge"</strong>, run only by CI.</p>
+
+  <div class="stepper" data-stepper>
+    <div class="svg-scroll">
+    <svg viewBox="0 0 800 220" role="img" aria-label="Safe apply pipeline: pull request, plan saved to a file, policy checks, human approval, apply the saved plan, then a post-apply drift check">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="10" y="80" width="110" height="56"/><text class="label small" x="65" y="104">PR opened</text><text class="label small" x="65" y="122">git push</text>
+      <g data-step="2"><rect class="box svc" x="140" y="80" width="110" height="56"/><text class="label small" x="195" y="104">plan -out</text><text class="label small" x="195" y="122">tfplan artifact</text><path class="arrow" d="M120 108 L138 108"/></g>
+      <g data-step="3"><rect class="box warn" x="270" y="80" width="110" height="56"/><text class="label small" x="325" y="104">Checkov / OPA</text><text class="label small" x="325" y="122">policy on plan JSON</text><path class="arrow" d="M250 108 L268 108"/></g>
+      <g data-step="4"><rect class="box warn" x="400" y="80" width="110" height="56"/><text class="label small" x="455" y="104">human review</text><text class="label small" x="455" y="122">approve + merge</text><path class="arrow" d="M380 108 L398 108"/></g>
+      <g data-step="5"><rect class="box ok" x="530" y="80" width="110" height="56"/><text class="label small" x="585" y="104">apply tfplan</text><text class="label small" x="585" y="122">CI role only</text><path class="arrow" d="M510 108 L528 108"/></g>
+      <g data-step="6"><rect class="box db" x="660" y="80" width="130" height="56"/><text class="label small" x="725" y="104">drift check</text><text class="label small" x="725" y="122">plan = no changes</text><path class="arrow" d="M640 108 L658 108"/></g>
+      <g data-step-only="5"><circle class="packet" r="6"><animateMotion dur="1.6s" repeatCount="indefinite" path="M140 160 L585 160 L585 138"/></circle><text class="label small" x="360" y="182">the reviewed file, not a new plan</text></g>
+      <g data-step-only="3"><text class="label small bad" x="325" y="40">e.g. deny: 1 to destroy on aws_db_instance</text></g>
+    </svg>
+    </div>
+    <ol class="stepper-captions">
+      <li>An engineer opens a pull request with the change. Nobody runs <code>apply</code> from a laptop.</li>
+      <li>CI runs <code>terraform plan -out=tfplan</code> with a read-only role and posts the plan text on the PR. The binary plan is kept as an artifact.</li>
+      <li>Policy as code checks the plan (<code>terraform show -json tfplan</code>) with Checkov, OPA/Conftest or Sentinel: no public buckets, no destroying databases, required tags.</li>
+      <li>A human reads the plan, not just the code diff, and approves. Merge.</li>
+      <li>CI assumes the apply role and runs <code>terraform apply tfplan</code>: exactly the plan that was reviewed. If the state moved meanwhile, Terraform refuses the stale plan.</li>
+      <li>After apply, a scheduled plan (<code>-detailed-exitcode</code>) proves there is no drift and alerts if someone changes things by hand later.</li>
+    </ol>
+  </div>
+
+  <h3>Saved plans: apply exactly what was reviewed</h3>
+  <p>Plain <code>terraform apply</code> makes a <em>new</em> plan and applies it. Between your review and the apply, the world may have changed (another merge, drift), so you could apply something nobody saw. A <strong>saved plan</strong> fixes this:</p>
+<pre class="terminal"><code>$ terraform plan -input=false -out=tfplan
+...
+Plan: 2 to add, 1 to change, 0 to destroy.
+
+Saved the plan to: tfplan
+
+To perform exactly these actions, run the following command to apply:
+    terraform apply "tfplan"
+
+$ terraform show -no-color tfplan &gt; plan.txt      # human-readable, for the PR comment
+$ terraform show -json tfplan &gt; plan.json         # machine-readable, for policy checks
+$ terraform apply -input=false tfplan</code></pre>
+  <p>If the state changed after the plan was made (someone else applied), Terraform refuses the saved plan with a "Saved plan is stale" error, which is what you want: re-plan and re-review. Two important cautions:</p>
+  <ul>
+    <li><strong>A saved plan file contains secrets in clear text</strong> (all planned values, including sensitive ones). Store it as a short-lived, encrypted CI artifact, never in git or a public log.</li>
+    <li>A plan is tied to the exact code, provider versions and state it came from. Apply it in the same pipeline, soon after.</li>
+  </ul>
+
+  <h3>Reading a plan like a reviewer</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th>Meaning</th><th>Reviewer reaction</th></tr></thead>
+      <tbody>
+        <tr><td><code>+</code></td><td>create</td><td>Usually safe. Check names, sizes, costs.</td></tr>
+        <tr><td><code>~</code></td><td>update in place</td><td>Check which attribute; some updates still cause a reboot (instance type).</td></tr>
+        <tr><td><code>-/+</code></td><td>destroy, then create (replacement)</td><td><b>Stop and read.</b> "forces replacement" on a database or volume means data loss.</td></tr>
+        <tr><td><code>+/-</code></td><td>create replacement first, then destroy (create_before_destroy)</td><td>Safer, but check for name clashes and double cost briefly.</td></tr>
+        <tr><td><code>-</code></td><td>destroy</td><td><b>Stop and read.</b> Why is it leaving? Renamed? Moved module?</td></tr>
+        <tr><td><code>&lt;=</code></td><td>read (data source)</td><td>No change to infrastructure.</td></tr>
+      </tbody>
+    </table>
+  </div>
+<pre class="terminal"><code>  # aws_db_instance.main must be replaced
+-/+ resource "aws_db_instance" "main" {
+      ~ engine_version = "15.4" -&gt; "16.2"
+      ~ identifier     = "orders-db" -&gt; "orders-db-v2" # forces replacement
+        # (41 unchanged attributes hidden)
+    }
+
+Plan: 1 to add, 0 to change, 1 to destroy.</code></pre>
+  <p>That last line, "1 to destroy" on a database, is exactly what policy checks exist to catch automatically.</p>
+
+  <h3>Guard rails in the code: lifecycle, moved and removed</h3>
+<pre><code class="language-hcl">resource "aws_db_instance" "main" {
+  identifier          = "orders-db"
+  deletion_protection = true          # AWS-side guard: the API refuses DeleteDBInstance
+  # ...
+  lifecycle {
+    prevent_destroy = true            # Terraform-side guard: any plan that destroys this errors out
+    ignore_changes  = [password]      # rotated by Secrets Manager, not by Terraform
+  }
+}
+
+resource "aws_lb_target_group" "web" {
+  name_prefix = "web-"
+  # ...
+  lifecycle {
+    create_before_destroy = true      # new TG exists before the old one is removed
+  }
+}
+
+# a refactor renamed the resource address; tell Terraform it is the SAME object
+moved {
+  from = aws_instance.web
+  to   = module.web.aws_instance.this
+}
+
+# stop managing an object without deleting it (Terraform 1.7+)
+removed {
+  from = aws_s3_bucket.legacy_logs
+  lifecycle {
+    destroy = false
+  }
+}</code></pre>
+<pre class="terminal"><code>$ terraform plan
+...
+Error: Instance cannot be destroyed
+
+  on data.tf line 1:
+   1: resource "aws_db_instance" "main" {
+
+Resource aws_db_instance.main has lifecycle.prevent_destroy set, but the plan
+calls for this resource to be destroyed. To avoid this error and continue with
+the plan, either disable lifecycle.prevent_destroy or reduce the scope of the
+plan using the -target option.</code></pre>
+  <div class="callout warn"><p><b>prevent_destroy has a hole.</b> It only protects while the resource block is in the code. If someone deletes the whole block, the setting goes with it and the next plan happily destroys the database. Pair it with the provider-side flag (<code>deletion_protection</code> on RDS, termination protection on EC2, S3 Object Lock or MFA delete) and a CI policy that blocks deletes of stateful types.</p></div>
+
+  <h3>Targeted applies and forced replacement</h3>
+  <p><code>-target=ADDRESS</code> limits a plan to one resource (plus everything it depends on). The Terraform docs say it is for exceptional cases such as recovering from a mistake, <em>not</em> for routine use, because the rest of the configuration is left un-planned and drift can hide. Terraform even prints a warning that the result may be incomplete.</p>
+<pre><code class="language-bash"># OK: emergency, recreate one broken instance, then immediately run a full plan
+$ terraform apply -replace="aws_instance.web[\"ap-south-1a\"]"
+$ terraform plan        # confirm "No changes" for everything else
+
+# Avoid as a habit: "only apply my bit"
+$ terraform apply -target=module.payments</code></pre>
+  <p><code>-replace=ADDRESS</code> (the modern replacement for <code>terraform taint</code>) forces a destroy/create of one object that is degraded, while still showing the full plan.</p>
+
+  <h3>Blast radius: how much can one apply break?</h3>
+  <p>The <strong>blast radius</strong> of a change is the set of things that can break if it goes wrong. You shrink it in layers:</p>
+  <div class="proscons">
+    <div class="pros"><h5>Shrinks blast radius</h5><ul>
+      <li>Small states split by environment, layer and team</li>
+      <li>Separate AWS accounts per environment (an account is a hard IAM boundary)</li>
+      <li>Least-privilege apply roles per stack; plan roles are read-only</li>
+      <li>Module versions promoted dev, then staging, then prod</li>
+      <li>Policy as code on the plan JSON (OPA/conftest, Sentinel, Checkov): "no deletes of aws_db_instance", "no 0.0.0.0/0 on port 22"</li>
+      <li><code>prevent_destroy</code> + provider deletion protection on stateful resources</li>
+    </ul></div>
+    <div class="cons"><h5>Grows blast radius</h5><ul>
+      <li>One state for the whole company</li>
+      <li>Admin credentials on laptops; anyone can apply prod</li>
+      <li>Unpinned module sources (<code>?ref=main</code>)</li>
+      <li>Applying a fresh plan instead of the reviewed one</li>
+      <li>Habitual <code>-target</code> applies that leave the rest un-planned</li>
+      <li>Big-bang refactors without <code>moved</code> blocks (renames look like destroy + create)</li>
+    </ul></div>
+  </div>
+<pre><code class="language-bash"># a tiny conftest policy check in CI (Rego policy lives in policy/)
+$ terraform show -json tfplan &gt; plan.json
+$ conftest test plan.json -p policy/
+FAIL - plan.json - main - aws_db_instance.main: deleting a database requires the 'allow-db-delete' label
+
+1 test, 0 passed, 0 warnings, 1 failure, 0 exceptions</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is change management for a carrier network, written as code. The PR plan is your <strong>method of procedure</strong> with the exact commands; the reviewer is the change advisory board; the saved plan is "execute exactly the MOP, nothing else"; the stale-plan error is "the device config changed since the MOP was written, re-validate". Splitting state is limiting a change to one PoP at a time. Policy as code is the pre-check script that refuses a config that shuts down a core-facing interface.</p>
+  </div>

@@ -1,0 +1,409 @@
+<h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: core only, one file, <code>g++ -std=c++14 main.cpp</code>.</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>C++ demo OK</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// News feed core in C++14: follow graph, posts with one-vote-per-user, pull vs push generators
+// (Strategy), push fan-out as an Observer, per-user ranking, offset-cursor pagination.
+// Single-threaded demo: this MinGW g++ 6.3 build (win32 thread model) has no std::thread.
+// In a threaded build, guard each store with a mutex and each inbox with its own mutex.
+#include &lt;algorithm&gt;
+#include &lt;cassert&gt;
+#include &lt;cstdio&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;queue&gt;
+#include &lt;set&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: one facade lock, a real std::recursive_mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). Recursive because public methods call each other,
+// just as Java's synchronized is re-entrant. MinGW.org g++ 6.3 (win32 thread model) has no std::mutex and
+// -pthread fails to link there, so the default build uses a no-op Mutex with the same lock()/unlock():
+// the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::recursive_mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+using namespace std;
+
+struct FeedError : runtime_error {
+    explicit FeedError(const string&amp; m) : runtime_error(m) {}
+};
+
+struct Post {
+    string id, author, text;
+    long seq, createdAt;
+    bool deleted = false;
+    map&lt;string, int&gt; votes;                      // user -&gt; +1 / -1
+    int up = 0, down = 0;
+    Post(string i, long s, string a, string t, long c)
+        : id(move(i)), author(move(a)), text(move(t)), seq(s), createdAt(c) {}
+    void vote(const string&amp; user, int dir) {
+        auto it = votes.find(user);
+        if (it != votes.end()) { (it-&gt;second &gt; 0 ? up : down)--; votes.erase(it); }
+        if (dir != 0) { votes[user] = dir; (dir &gt; 0 ? up : down)++; }
+    }
+    int score() const { return up - down; }
+};
+using PostPtr = shared_ptr&lt;Post&gt;;
+
+bool newerThan(const PostPtr&amp; a, const PostPtr&amp; b) {          // newest first
+    if (a-&gt;createdAt != b-&gt;createdAt) return a-&gt;createdAt &gt; b-&gt;createdAt;
+    return a-&gt;seq &gt; b-&gt;seq;
+}
+
+class FollowGraph {
+    map&lt;string, set&lt;string&gt;&gt; following_, followers_;
+public:
+    void follow(const string&amp; a, const string&amp; b) { following_[a].insert(b); followers_[b].insert(a); }
+    void unfollow(const string&amp; a, const string&amp; b) { following_[a].erase(b); followers_[b].erase(a); }
+    set&lt;string&gt; following(const string&amp; a) const {
+        auto it = following_.find(a);
+        return it == following_.end() ? set&lt;string&gt;() : it-&gt;second;
+    }
+    set&lt;string&gt; followers(const string&amp; b) const {
+        auto it = followers_.find(b);
+        return it == followers_.end() ? set&lt;string&gt;() : it-&gt;second;
+    }
+    bool follows(const string&amp; a, const string&amp; b) const {
+        auto it = following_.find(a);
+        return it != following_.end() &amp;&amp; it-&gt;second.count(b) &gt; 0;
+    }
+};
+
+class PostStore {
+    map&lt;string, PostPtr&gt; byId_;
+    map&lt;string, vector&lt;PostPtr&gt;&gt; timelines_;     // per author, oldest first
+public:
+    void add(const PostPtr&amp; p) { byId_[p-&gt;id] = p; timelines_[p-&gt;author].push_back(p); }
+    PostPtr get(const string&amp; id) const {
+        auto it = byId_.find(id);
+        if (it == byId_.end() || it-&gt;second-&gt;deleted) throw FeedError("no such post: " + id);
+        return it-&gt;second;
+    }
+    const vector&lt;PostPtr&gt;&amp; timeline(const string&amp; a) const {
+        static const vector&lt;PostPtr&gt; empty;
+        auto it = timelines_.find(a);
+        return it == timelines_.end() ? empty : it-&gt;second;
+    }
+};
+
+// ---------- Strategy 1: candidates; Observer hooks ----------
+struct FeedGenerator {
+    virtual ~FeedGenerator() {}
+    virtual vector&lt;PostPtr&gt; candidates(const string&amp; user, size_t limit) = 0;
+    virtual void onPost(const PostPtr&amp;) {}
+    virtual void onFollow(const string&amp;, const string&amp;) {}
+};
+
+class PullGenerator : public FeedGenerator {
+    const PostStore&amp; posts_;
+    const FollowGraph&amp; graph_;
+public:
+    PullGenerator(const PostStore&amp; p, const FollowGraph&amp; g) : posts_(p), graph_(g) {}
+    vector&lt;PostPtr&gt; candidates(const string&amp; user, size_t limit) override {
+        typedef pair&lt;const vector&lt;PostPtr&gt;*, size_t&gt; Cur;           // timeline, index
+        auto later = [](const Cur&amp; a, const Cur&amp; b) { return newerThan((*b.first)[b.second], (*a.first)[a.second]); };
+        priority_queue&lt;Cur, vector&lt;Cur&gt;, decltype(later)&gt; heap(later);
+        set&lt;string&gt; sources = graph_.following(user);
+        sources.insert(user);
+        for (const string&amp; a : sources) {
+            const auto&amp; t = posts_.timeline(a);
+            if (!t.empty()) heap.push(Cur(&amp;t, t.size() - 1));
+        }
+        vector&lt;PostPtr&gt; out;
+        while (!heap.empty() &amp;&amp; out.size() &lt; limit) {
+            Cur c = heap.top();
+            heap.pop();
+            const PostPtr&amp; p = (*c.first)[c.second];
+            if (!p-&gt;deleted) out.push_back(p);
+            if (c.second &gt; 0) heap.push(Cur(c.first, c.second - 1));
+        }
+        return out;
+    }
+};
+
+class PushGenerator : public FeedGenerator {
+    const PostStore&amp; posts_;
+    const FollowGraph&amp; graph_;
+    size_t cap_;
+    map&lt;string, deque&lt;PostPtr&gt;&gt; inbox_;
+    void deliver(const string&amp; u, const PostPtr&amp; p) {
+        auto&amp; b = inbox_[u];
+        b.push_front(p);
+        if (b.size() &gt; cap_) b.pop_back();
+    }
+public:
+    PushGenerator(const PostStore&amp; p, const FollowGraph&amp; g, size_t cap) : posts_(p), graph_(g), cap_(cap) {}
+    void onPost(const PostPtr&amp; p) override {
+        deliver(p-&gt;author, p);
+        for (const string&amp; f : graph_.followers(p-&gt;author)) deliver(f, p);
+    }
+    void onFollow(const string&amp; follower, const string&amp; followee) override {
+        auto&amp; b = inbox_[follower];
+        vector&lt;PostPtr&gt; merged(b.begin(), b.end());
+        const auto&amp; t = posts_.timeline(followee);
+        for (size_t i = t.size() &gt; cap_ ? t.size() - cap_ : 0; i &lt; t.size(); ++i)
+            if (find(merged.begin(), merged.end(), t[i]) == merged.end()) merged.push_back(t[i]);
+        sort(merged.begin(), merged.end(), newerThan);
+        if (merged.size() &gt; cap_) merged.resize(cap_);
+        b.assign(merged.begin(), merged.end());
+    }
+    vector&lt;PostPtr&gt; candidates(const string&amp; user, size_t limit) override {
+        vector&lt;PostPtr&gt; out;
+        for (const PostPtr&amp; p : inbox_[user]) {
+            if (out.size() &gt;= limit) break;
+            if (!p-&gt;deleted &amp;&amp; (p-&gt;author == user || graph_.follows(user, p-&gt;author))) out.push_back(p);
+        }
+        return out;
+    }
+};
+
+// ---------- Strategy 2: ranking, chosen per user ----------
+typedef function&lt;bool(const PostPtr&amp;, const PostPtr&amp;)&gt; Order;
+typedef function&lt;Order(const string&amp; viewer, const FollowGraph&amp;)&gt; Ranker;
+
+Ranker recentRanker = [](const string&amp;, const FollowGraph&amp;) { return Order(newerThan); };
+Ranker topRanker = [](const string&amp;, const FollowGraph&amp;) {
+    return Order([](const PostPtr&amp; a, const PostPtr&amp; b) {
+        if (a-&gt;score() != b-&gt;score()) return a-&gt;score() &gt; b-&gt;score();
+        return newerThan(a, b);
+    });
+};
+
+struct FeedPage {
+    vector&lt;PostPtr&gt; items;
+    string nextCursor;                            // empty = no more pages
+};
+
+class SocialNetwork {
+    mutable Mutex mu_;   // the facade lock: every public call holds it
+    set&lt;string&gt; users_;
+    map&lt;string, Ranker&gt; rankerOf_;
+    long seq_ = 0;
+    long now_ = 0;
+    unique_ptr&lt;FeedGenerator&gt; gen_;
+    void mustExist(const string&amp; u) const {
+        if (!users_.count(u)) throw FeedError("no such user: " + u);
+    }
+public:
+    PostStore posts;
+    FollowGraph graph;
+    explicit SocialNetwork(bool push) {
+        if (push) gen_.reset(new PushGenerator(posts, graph, 100));
+        else gen_.reset(new PullGenerator(posts, graph));
+    }
+    void tick() { LockGuard g(mu_); now_ += 60000; }
+    void signup(const string&amp; u) { LockGuard g(mu_);
+        if (!users_.insert(u).second) throw FeedError("user exists: " + u);
+    }
+    void follow(const string&amp; a, const string&amp; b) { LockGuard g(mu_);
+        mustExist(a);
+        mustExist(b);
+        if (a == b) throw FeedError("cannot follow yourself");
+        if (graph.follows(a, b)) return;
+        graph.follow(a, b);
+        gen_-&gt;onFollow(a, b);
+    }
+    void unfollow(const string&amp; a, const string&amp; b) { LockGuard g(mu_); graph.unfollow(a, b); }
+    void setRanking(const string&amp; u, Ranker r) { LockGuard g(mu_); mustExist(u); rankerOf_[u] = r; }
+    PostPtr post(const string&amp; a, const string&amp; text) { LockGuard g(mu_);
+        mustExist(a);
+        ++seq_;
+        char id[16];
+        snprintf(id, sizeof id, "%03ld", seq_);
+        auto p = make_shared&lt;Post&gt;(id, seq_, a, text, now_);
+        posts.add(p);
+        gen_-&gt;onPost(p);                          // Observer hook: push fan-out
+        return p;
+    }
+    void vote(const string&amp; u, const string&amp; pid, int dir) { LockGuard g(mu_); mustExist(u); posts.get(pid)-&gt;vote(u, dir); }
+    void deletePost(const string&amp; u, const string&amp; pid) { LockGuard g(mu_);
+        PostPtr p = posts.get(pid);
+        if (p-&gt;author != u) throw FeedError("only the author can delete " + pid);
+        p-&gt;deleted = true;
+    }
+    FeedPage feed(const string&amp; u, size_t pageSize, const string&amp; cursor) { LockGuard g(mu_);
+        mustExist(u);
+        size_t from = cursor.empty() ? 0 : (size_t)stoul(cursor);
+        vector&lt;PostPtr&gt; ranked = gen_-&gt;candidates(u, 500);
+        auto it = rankerOf_.find(u);
+        Ranker r = it == rankerOf_.end() ? recentRanker : it-&gt;second;
+        stable_sort(ranked.begin(), ranked.end(), r(u, graph));
+        FeedPage page;
+        size_t to = min(ranked.size(), from + pageSize);
+        for (size_t i = from; i &lt; to; ++i) page.items.push_back(ranked[i]);
+        if (to &lt; ranked.size()) page.nextCursor = to_string(to);
+        return page;
+    }
+};
+
+string ids(const FeedPage&amp; p) {
+    string s;
+    for (size_t i = 0; i &lt; p.items.size(); ++i) s += (i ? "," : "") + p.items[i]-&gt;id;
+    return s;
+}
+
+int main() {
+    SocialNetwork pull(false), push(true);
+    const char* names[] = {"ana", "bo", "cy", "dee"};
+    for (SocialNetwork* n : {&amp;pull, &amp;push}) {
+        for (const char* u : names) n-&gt;signup(u);
+        n-&gt;follow("ana", "bo");
+        n-&gt;follow("ana", "cy");
+    }
+    const char* authors[] = {"bo", "cy", "dee", "ana"};
+    for (int i = 0; i &lt; 12; ++i) {
+        for (SocialNetwork* n : {&amp;pull, &amp;push}) { n-&gt;tick(); n-&gt;post(authors[i % 4], "msg " + to_string(i)); }
+    }
+    string a = ids(pull.feed("ana", 50, "")), b = ids(push.feed("ana", 50, ""));
+    cout &lt;&lt; "pull: " &lt;&lt; a &lt;&lt; "\npush: " &lt;&lt; b &lt;&lt; "\n";
+    assert(a == b);
+
+    FeedPage p1 = pull.feed("ana", 4, "");
+    FeedPage p2 = pull.feed("ana", 4, p1.nextCursor);
+    cout &lt;&lt; "page1 " &lt;&lt; ids(p1) &lt;&lt; " next=" &lt;&lt; p1.nextCursor &lt;&lt; "\npage2 " &lt;&lt; ids(p2) &lt;&lt; " next=" &lt;&lt; p2.nextCursor &lt;&lt; "\n";
+
+    pull.vote("bo", "005", +1);
+    pull.vote("cy", "005", +1);
+    pull.vote("cy", "005", +1);                  // same vote twice: still one
+    assert(pull.posts.get("005")-&gt;score() == 2);
+    pull.setRanking("ana", topRanker);
+    cout &lt;&lt; "ana with TOP: " &lt;&lt; ids(pull.feed("ana", 3, "")) &lt;&lt; "\n";
+
+    for (SocialNetwork* n : {&amp;pull, &amp;push}) { n-&gt;unfollow("ana", "cy"); n-&gt;deletePost("bo", "009"); }
+    pull.setRanking("ana", recentRanker);
+    a = ids(pull.feed("ana", 50, ""));
+    b = ids(push.feed("ana", 50, ""));
+    cout &lt;&lt; "after unfollow cy + delete 009: pull " &lt;&lt; a &lt;&lt; " | push " &lt;&lt; b &lt;&lt; "\n";
+    assert(a == b &amp;&amp; a.find("009") == string::npos);
+    push.follow("ana", "dee");
+    cout &lt;&lt; "push after follow dee (backfill): " &lt;&lt; ids(push.feed("ana", 5, "")) &lt;&lt; "\n";
+
+    try { pull.follow("ana", "ana"); assert(false); } catch (const FeedError&amp; e) { cout &lt;&lt; "error ok: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    try { pull.deletePost("ana", "001"); assert(false); } catch (const FeedError&amp; e) { cout &lt;&lt; "error ok: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    cout &lt;&lt; "C++ demo OK\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it is the core only: no console, no per-user ranking switch beyond one TOP ranker, and no thread test. It prints 10 lines against Java's 72 (15 named checks) and ends with "C++ demo OK". Pull and push, pagination, unfollow, delete and backfill are all there.</p></div>
+
+  <h3 id="run">Run it</h3>
+<pre><code class="language-bash">cd lld-code/lld-case-news-feed/java   &amp;&amp; javac -d out *.java &amp;&amp; java -cp out Main
+cd ../python                           &amp;&amp; python main.py &amp;&amp; python -m unittest -v test_feed
+cd ../cpp                              &amp;&amp; g++ -std=c++14 -Wall -o feed main.cpp &amp;&amp; ./feed</code></pre>
+  <p>Java output (Python prints the same feed lines):</p>
+<pre class="terminal"><code>== 1. Flipkart console: post, follow, reply, vote, shownewsfeed ==
+&gt; signup~lucius
+  signed up lucius
+&gt; signup~albus
+  signed up albus
+&gt; signup~tom
+  signed up tom
+&gt; login~tom
+  (feed is empty)
+&gt; post~I will be the greatest wizard
+  posted 001
+&gt; post~call me Voldemort
+  posted 002
+&gt; login~albus
+  id: 002 (0 up, 0 down, 0 comments) tom: call me Voldemort [2m ago]
+  id: 001 (0 up, 0 down, 0 comments) tom: I will be the greatest wizard [4m ago]
+&gt; post~Lemon drops for everyone
+  posted 003
+&gt; login~lucius
+  id: 003 (0 up, 0 down, 0 comments) albus: Lemon drops for everyone [2m ago]
+  id: 002 (0 up, 0 down, 0 comments) tom: call me Voldemort [6m ago]
+  id: 001 (0 up, 0 down, 0 comments) tom: I will be the greatest wizard [8m ago]
+&gt; follow~tom
+  following tom
+&gt; upvote~001
+  upvoted 001
+&gt; reply~001~so modest
+  comment c1
+&gt; login~albus
+  id: 001 (1 up, 0 down, 1 comments) tom: I will be the greatest wizard [16m ago]
+  id: 003 (0 up, 0 down, 0 comments) albus: Lemon drops for everyone [10m ago]
+  id: 002 (0 up, 0 down, 0 comments) tom: call me Voldemort [14m ago]
+&gt; downvote~002
+  downvoted 002
+&gt; shownewsfeed
+  id: 001 (1 up, 0 down, 1 comments) tom: I will be the greatest wizard [20m ago]
+  id: 003 (0 up, 0 down, 0 comments) albus: Lemon drops for everyone [14m ago]
+  id: 002 (0 up, 1 down, 0 comments) tom: call me Voldemort [18m ago]
+&gt; login~lucius
+  id: 001 (1 up, 0 down, 1 comments) tom: I will be the greatest wizard [22m ago]
+  id: 002 (0 up, 1 down, 0 comments) tom: call me Voldemort [20m ago]
+  id: 003 (0 up, 0 down, 0 comments) albus: Lemon drops for everyone [16m ago]
+&gt; shownewsfeed
+  id: 001 (1 up, 0 down, 1 comments) tom: I will be the greatest wizard [24m ago]
+  id: 002 (0 up, 1 down, 0 comments) tom: call me Voldemort [22m ago]
+  id: 003 (0 up, 0 down, 0 comments) albus: Lemon drops for everyone [18m ago]
+&gt; follow~lucius
+  error: cannot follow yourself
+&gt; fly~away
+  unknown command: fly
+== 2. pull vs push give the same feed ==
+  pull: 012,010,009,008,006,005,004,002,001
+  push: 012,010,009,008,006,005,004,002,001
+== 3. pagination with a cursor ==
+  page1 012,010,009,008 next=4
+  page2 006,005,004,002 next=8
+  page3 001 next=null
+== 4. per-user ranking (Uber follow-up) ==
+  ana with TOP ranking: 005,012,010
+== 5. unfollow and delete ==
+  pull: 012,008,005,004,001
+  push: 012,008,005,004,001
+  push after follow dee (backfill): 012,011,008,007,005
+== 6. errors ==
+  error ok: cannot follow yourself
+  error ok: no such user: zed
+  error ok: only the author can delete 001
+  error ok: bad cursor: x
+  error ok: user exists: ana
+== 7. 8 threads: 400 users vote twice on one post, 400 posts ==
+  upvotes=400 downvotes=0 u7 inbox=401
+ALL 15 CHECKS PASSED</code></pre>
+  <p>Python tests:</p>
+<pre class="terminal"><code>test_ago (test_feed.FeedTest.test_ago) ... ok
+test_comment_thread_counts (test_feed.FeedTest.test_comment_thread_counts) ... ok
+test_concurrent_votes_and_fanout (test_feed.FeedTest.test_concurrent_votes_and_fanout) ... ok
+test_console (test_feed.FeedTest.test_console) ... ok
+test_engagement_ranking (test_feed.FeedTest.test_engagement_ranking) ... ok
+test_errors (test_feed.FeedTest.test_errors) ... ok
+test_pagination_walks_everything_once (test_feed.FeedTest.test_pagination_walks_everything_once) ... ok
+test_pull_merges_followees_newest_first (test_feed.FeedTest.test_pull_merges_followees_newest_first) ... ok
+test_push_inbox_cap_and_lazy_unfollow (test_feed.FeedTest.test_push_inbox_cap_and_lazy_unfollow) ... ok
+test_same_timestamp_uses_sequence (test_feed.FeedTest.test_same_timestamp_uses_sequence) ... ok
+test_votes_are_one_per_user (test_feed.FeedTest.test_votes_are_one_per_user) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.035s
+
+OK</code></pre>
+  <p>C++ output:</p>
+<pre class="terminal"><code>pull: 012,010,009,008,006,005,004,002,001
+push: 012,010,009,008,006,005,004,002,001
+page1 012,010,009,008 next=4
+page2 006,005,004,002 next=8
+ana with TOP: 005,012,010
+after unfollow cy + delete 009: pull 012,008,005,004,001 | push 012,008,005,004,001
+push after follow dee (backfill): 012,011,008,007,005
+error ok: cannot follow yourself
+error ok: only the author can delete 001
+C++ demo OK</code></pre>

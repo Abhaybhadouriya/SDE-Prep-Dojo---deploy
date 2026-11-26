@@ -1,0 +1,66 @@
+
+        <h2>Event time, watermarks and late data</h2>
+        <p><strong>Processing time</strong> is the clock of the machine running the operator. It is simple and fast, but results change if the job lags or restarts. <strong>Event time</strong> is the timestamp inside the event, set where it happened (the phone, the ad server). Results are deterministic and replayable, but events arrive <em>out of order</em>: a phone in a tunnel uploads 3-minute-old clicks. So when is the 00:00-00:05 window complete?</p>
+        <p>A <strong>watermark</strong> is Flink's answer. <code>Watermark(t)</code> is a marker that flows with the data and says "event time has reached t; expect no more events with timestamp &lt;= t". The usual generator is <em>bounded out-of-orderness</em>: watermark = largest timestamp seen minus a fixed delay (say 30 s). When the watermark passes a window's end, the window fires. An operator with several inputs uses the <em>minimum</em> watermark of its inputs, so one idle Kafka partition can stall everything. That is why Flink lets you mark idle sources.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Out-of-order events arrive, the watermark advances, the window fires, and a late event goes to a side output">
+            
+            <path class="arrow" d="M40 200 L770 200"/>
+            <text class="label small" x="400" y="225">event time (minutes)</text>
+            <text class="label small" x="60" y="218">0</text><text class="label small" x="300" y="218">5</text><text class="label small" x="540" y="218">10</text>
+            <rect class="zone" x="60" y="60" width="240" height="130"/>
+            <text class="zone-label" x="72" y="80">window 0-5</text>
+            <rect class="zone" x="300" y="60" width="240" height="130"/>
+            <text class="zone-label" x="312" y="80">window 5-10</text>
+
+            <g data-step="1">
+              <circle class="packet" r="9" cx="116" cy="150"/><text class="label small" x="116" y="128">1:10</text>
+              <circle class="packet" r="9" cx="268" cy="150"/><text class="label small" x="268" y="128">4:20</text>
+            </g>
+            <g data-step="2">
+              <circle class="packet alt" r="9" cx="204" cy="150"/><text class="label small" x="204" y="128">3:00</text>
+              <text class="label small kafka" x="190" y="104">out of order, still counted</text>
+            </g>
+            <g data-step-only="2">
+              <path class="arrow kafka thick none" d="M244 50 L244 200"/><text class="label kafka" x="420" y="45">watermark 3:50 (max 4:20 - 30 s)</text>
+            </g>
+            <g data-step="3">
+              <circle class="packet" r="9" cx="340" cy="150"/><text class="label small" x="340" y="128">5:50</text>
+              <path class="arrow ok thick none" d="M316 50 L316 200"/><text class="label ok" x="470" y="45">watermark 5:20 passed 5:00</text>
+              <rect class="box svc solid" x="90" y="240" width="190" height="44"/><text class="label white" x="185" y="262">FIRE: count = 3</text>
+            </g>
+            <g data-step="4">
+              <circle class="packet bad" r="9" cx="156" cy="172"/><text class="label bad" x="156" y="192">2:00</text>
+              <rect class="box fail" x="330" y="240" width="300" height="44"/><text class="label bad" x="480" y="262">too late: side output / correction</text>
+              <path class="arrow bad" d="M166 178 L325 255"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Events arrive</b> carrying their own timestamps: first 1:10, then 4:20. The delay is 30 s, so the watermark is "largest timestamp seen minus 30 s".</li>
+            <li><b>An out-of-order event.</b> Next, an event stamped 3:00 arrives. The watermark is 4:20 - 30 s = 3:50. That is still before 5:00, the end of window 0-5, so the window is open and the 3:00 event is counted.</li>
+            <li><b>Window fires.</b> Now 5:50 arrives. The watermark jumps to 5:50 - 30 s = 5:20, which is past 5:00, so window 0-5 fires and emits count = 3 (1:10, 3:00 and 4:20). The 5:50 event goes into window 5-10. Rule: an event stamped before 5:00 is counted only if it arrives before any event stamped 5:30 or later has been seen. Pick the delay from how late your events usually are.</li>
+            <li><b>Late event.</b> An event stamped 2:00 arrives after the window fired. By default (allowed lateness 0) Flink drops it. You can set <code>allowedLateness</code> to keep the window state longer and re-fire with a corrected result, or send late events to a <em>side output</em> for a later batch correction.</li>
+          </ol>
+        </div>
+        <div class="callout note"><p><b>You might confuse this with...</b> <em>event time</em> (when it happened, stamped at the source), <em>ingestion time</em> (when Kafka or Flink first saw it) and <em>processing time</em> (the operator's clock right now). Only event time gives the same answer when you replay the data. Also, <em>allowed lateness</em> is not the watermark delay: the delay decides when a window first fires; allowed lateness decides how long after that the window can still be corrected.</p></div>
+        <p>The delay is a trade-off you must say out loud in an interview: a longer delay means more complete results but later answers. Uber's surge pricing simply ignores late messages, while a billing pipeline must not drop them, so it uses side outputs plus a nightly batch reconciliation.</p>
+
+<pre><code class="language-java">// Flink (Java): clicks per ad per minute, on event time, tolerating 30 s of disorder
+WatermarkStrategy&lt;Click&gt; wm = WatermarkStrategy
+    .&lt;Click&gt;forBoundedOutOfOrderness(Duration.ofSeconds(30))
+    .withTimestampAssigner((c, ts) -&gt; c.eventTimeMillis)
+    .withIdleness(Duration.ofMinutes(1));          // do not let an idle partition stall time
+
+OutputTag&lt;Click&gt; late = new OutputTag&lt;Click&gt;("late-clicks") {};
+
+SingleOutputStreamOperator&lt;AdCount&gt; counts = env
+    .fromSource(kafkaSource, wm, "clicks")
+    .keyBy(c -&gt; c.adId)
+    .window(TumblingEventTimeWindows.of(Duration.ofMinutes(1)))
+    .allowedLateness(Duration.ofMinutes(2))
+    .sideOutputLateData(late)
+    .aggregate(new CountAgg());
+
+counts.getSideOutput(late).sinkTo(lateClicksSink);   // reconcile later in batch</code></pre>
+      

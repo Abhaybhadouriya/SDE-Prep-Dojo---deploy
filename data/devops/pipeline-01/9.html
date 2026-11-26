@@ -1,0 +1,43 @@
+
+        <h2>Delivery guarantees, hop by hop</h2>
+        <p>"What guarantee does the pipeline give?" has no single answer. It is a chain, and you should state it per hop. This table is the most important thing on the page for an interview.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Hop</th><th>Guarantee</th><th>How</th></tr></thead>
+            <tbody>
+              <tr><td>client to order-api</td><td>At-least-once if the client retries</td><td>A resend with the same <code>order_id</code> is harmless, because the sink upserts on it</td></tr>
+              <tr><td>order-api to Kafka</td><td>No loss, no duplicates from producer retries</td><td>Idempotent producer, <code>acks=all</code>, min ISR 2</td></tr>
+              <tr><td>orders.created to enricher to enriched/retry/dlq</td><td>Exactly-once</td><td>Kafka transactions: outputs and input offsets commit atomically; readers use <code>read_committed</code></td></tr>
+              <tr><td>orders.enriched to Postgres</td><td>Effectively-once</td><td>At-least-once delivery + <code>INSERT ... ON CONFLICT (order_id) DO UPDATE</code>; offsets committed only after the DB commit</td></tr>
+              <tr><td>orders.enriched to analytics</td><td>At-most-once for open windows (offsets committed while state is only in memory; a crash loses them); duplicates from upstream re-drives are counted twice</td><td>In-memory windows; a real system checkpoints state together with offsets (Kafka Streams or Flink state stores)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>The sink's trick in one SQL statement (from <a href="{{BASE}}data/files/pipeline/code/services/postgres-sink/sink.py"><code>sink.py</code></a>):</p>
+<pre><code class="language-sql">INSERT INTO orders (order_id, customer_id, total_cents, currency, items, created_at,
+                    kafka_partition, kafka_offset)
+VALUES (...)
+ON CONFLICT (order_id) DO UPDATE SET
+    total_cents = EXCLUDED.total_cents,
+    items       = EXCLUDED.items,
+    kafka_partition = EXCLUDED.kafka_partition,
+    kafka_offset    = EXCLUDED.kafka_offset,
+    updated_at  = now()
+WHERE orders.kafka_offset &lt;= EXCLUDED.kafka_offset</code></pre>
+        <p>If the sink crashes after the database commit but before the offset commit, it will read the same records again. The upsert just rewrites the same row. The <code>WHERE</code> clause adds one more guard: an older copy of a record never overwrites a newer one.</p>
+
+        <h3>Backpressure: who slows down whom</h3>
+        <p>Backpressure means a slow part of the system pushes back on the fast part instead of being overwhelmed. In ShopStream it happens at two places:</p>
+        <ul>
+          <li><b>Between Kafka and consumers: lag.</b> Consumers pull at their own speed. If the sink is slow, records wait on disk. Nothing is dropped; the gap between the newest offset and the sink's committed offset grows. That gap is <b><a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a></b>, and Prometheus alerts on it (<code>EnricherLagHigh</code> fires when the enricher group is more than 1000 records behind for 2 minutes).</li>
+          <li><b>Between clients and the API: 503.</b> The producer buffers records in memory before sending. If brokers are down, that buffer fills and <code>produce()</code> raises <code>BufferError</code>. The API turns that into HTTP <code>503 "producer queue full, retry later"</code> with <code>Retry-After: 1</code>. If the broker does not acknowledge within 10 s (<code>ACK_TIMEOUT_S</code>) the API returns <code>504</code>, honestly saying the order "may still be delivered".</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Consumer lag is queue depth on an egress interface: if it grows steadily, the drain rate is lower than the fill rate. The 503 is TCP flow control at the edge: when the send buffer is full, tell the sender to back off rather than accept bytes you cannot hold. Where it breaks: a NIC queue is microseconds deep and drops on overflow; a Kafka partition can hold days of backlog on disk, so lag is a slow-burning problem you watch on a graph, not a drop counter.</p>
+        </div>
+
+        <h3>The ordering caveat</h3>
+        <p>On the happy path, a customer's orders stay in order (same key, same partition, one owner). But a retried order takes a detour through <code>orders.retry</code> and comes back later, so a newer order from the same customer can overtake it. That is the trade-off of non-blocking retries. If a domain needs strict per-key order (for example account balance updates), you instead <b>park the key</b>: stop processing that customer's later records until the retry succeeds, while other customers keep flowing.</p>
+      

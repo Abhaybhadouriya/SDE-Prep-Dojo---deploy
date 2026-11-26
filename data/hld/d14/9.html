@@ -1,0 +1,121 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: scope</strong> Movies or concerts? Pick seats or best-available? Max seats per booking? Hold length? Say: no double booking (CP for seats), browsing AP.</li>
+          <li><strong>5-10 min: numbers</strong> Normal load is small (about 12 bookings/s, GB-size inventory). Hot on-sale: 1M requests/s for 50k seats. Conclude: shape demand with a waiting room; one SQL primary per shard is enough.</li>
+          <li><strong>10-15 min: API + data</strong> Hold, book, webhook, seatmap. <code>show_seats</code> with PK (show_id, seat_id) and the status column.</li>
+          <li><strong>15-25 min: diagram</strong> The stepper: edge, catalog, seat map from cache, hold in DB, pay, confirm via webhook, Kafka fan-out, sweeper.</li>
+          <li><strong>25-40 min: deep dives</strong> Lead with the race and the conditional UPDATE. Then the payment-after-expiry race, then the waiting room.</li>
+          <li><strong>40-45 min: wrap up</strong> Failures per box; metrics: hold success rate, hold-to-booking conversion, payment latency, queue length and admission rate, expired-hold count, double-booking alarms (should be zero, checked by a reconciliation query).</li>
+        </ol>
+        <div class="grid-2">
+          <div class="panel"><h4>An SDE-1 answer sounds like</h4><p>"Seats per show live in a SQL table. To hold, I update the status from AVAILABLE to HELD with a 10-minute expiry, only if it is still available, and check the row count. After payment succeeds, I mark it BOOKED. A job frees expired holds. Search and seat maps are cached." Correct and safe.</p></div>
+          <div class="panel"><h4>An SDE-2 answer adds</h4><p>"All-or-nothing multi-seat holds in one transaction; lazy expiry inside the WHERE clause so a late sweeper cannot block sales; idempotent webhooks with a unique hold_id; auto-refund if payment lands after expiry; outbox to Kafka for tickets and seat-map updates; and for on-sales a waiting room with signed admission tokens, best-available allocation and pre-scaling, because the database cannot absorb a million requests a second." Numbers, races, failure handling.</p></div>
+        </div>
+        <div class="callout interview"><p><b>60-second answer</b> (say it out loud): "Browsing and seat maps are read-heavy and may be a few seconds stale, so they come from caches. Taking a seat is a tiny strongly consistent write: one row per seat per show in Postgres, and a hold is a single conditional UPDATE from AVAILABLE to HELD with a 10-minute expiry, checked by row count, all seats in one transaction. Expired holds count as free inside the same WHERE clause, so a slow sweeper never blocks sales. After the PSP's signed webhook, we flip HELD to BOOKED only if we still hold it, otherwise auto-refund. An outbox sends events to Kafka for tickets, emails and seat-map updates. For a hot on-sale, a waiting room admits users at the rate the database can handle."</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> read-then-write in application code; locking the whole show row (serialises every seat); holds with no expiry; trusting the seat map cache for the decision; using Redis as the only record of who owns a seat; charging before holding; ignoring webhook retries; "just autoscale" for the concert; forgetting per-user limits and bots; not saying what the user sees when they lose a race.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Amazon,Flipkart">
+          <summary>How do you guarantee two users never book the same seat?</summary>
+          <div class="answer">
+            <p>Make the check and the write one atomic database operation on the seat row: <code>UPDATE show_seats SET status='HELD', ... WHERE show_id=? AND seat_id=? AND status='AVAILABLE'</code>, then check that the number of updated rows equals the number of seats requested. The row lock serialises concurrent updates on the same seat; the loser re-checks the WHERE clause, matches 0 rows, and gets a 409. For multiple seats, do it in one transaction and roll back if the count is short. Confirmation is another conditional update from HELD (by this hold) to BOOKED.</p>
+            <div class="approach"><h5>How to answer</h5><p>Describe the race first (read, check, write), then the fix (conditional update), then the multi-seat detail. Mention alternatives in one line each.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not SELECT FOR UPDATE? (It works; it holds locks longer and needs a fixed lock order to avoid deadlocks.)</li><li>What isolation level do you need? (READ COMMITTED is enough for this single-statement pattern in Postgres.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Uber,Atlassian">
+          <summary>How do holds expire, and what if the expiry job is down?</summary>
+          <div class="answer">
+            <p>Each held seat has <code>held_until</code>. The hold query treats an expired hold as free (<code>OR (status='HELD' AND held_until + interval '2 minutes' &lt; now())</code>), so correctness does not depend on any background job. A sweeper still runs every few seconds to reset expired rows and publish "seat released" events, which keeps the seat map green and the counts right. If the sweeper is down, sales continue; only the seat map looks fuller than reality for a while.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Lazy for correctness, active for freshness." Then say what the user sees in each failure.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Could you use Redis key expiry instead? (Yes, as a pre-filter; keyspace notifications are not guaranteed delivery, so don't rely on them alone.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Microsoft,Flipkart">
+          <summary>The payment succeeds one minute after the hold expired, and someone else took the seat. What now?</summary>
+          <div class="answer">
+            <p>The confirm UPDATE (<code>WHERE hold_id=? AND status='HELD'</code>) changes 0 rows, so we never confirm. The booking moves to FAILED_SEAT_LOST and we trigger an automatic refund through the PSP with an idempotent refund key, then notify the user, ideally offering nearby seats. To make this rare: a short grace window on confirm, extending holds while a payment is known to be in progress, and showing a countdown. The rule is "never confirm a seat you do not own; refund instead".</p>
+            <div class="approach"><h5>How to answer</h5><p>State the invariant, then the compensation (refund), then the tricks that reduce how often it happens.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you make the refund safe to retry?</li><li>What if the webhook never arrives? (Reconciliation job polls the PSP.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Microsoft,Amazon,Google">
+          <summary>A Taylor Swift on-sale: 2 million users, 50,000 seats. Walk me through it.</summary>
+          <div class="answer">
+            <p>Do not try to serve 2 million users at the booking tier. Put a virtual waiting room at the CDN edge: users arriving before the start get random positions, later arrivals queue behind, and an admission controller lets in a rate the hold path can handle, issuing signed short-lived tokens. Reduce demand before it reaches us: pre-registration, presale codes, CAPTCHA, per-account limits. Inside, use best-available allocation by section to cut conflicts, a pushed seat map, and pre-scaled pods. Stop the queue and tell people as soon as inventory is gone.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from the ratio (1M req/s vs 50k seats), say "shape demand, don't scale the DB", then walk the funnel from outside in.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you choose the admission rate?</li><li>How do you stop one person sharing an admission token with friends?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Uber">
+          <summary>Would you use a Redis distributed lock for seats?</summary>
+          <div class="answer">
+            <p>Only as an optimisation, never as the guarantee. <code>SET seat:{show}:{seat} hold NX EX 600</code> is fast and expires on its own, so it can reject obvious losers before they reach the database. But a lock in Redis can be lost on failover, and a client that pauses past its lease can still write later. Kleppmann's critique of Redlock points out that safe locks need fencing tokens checked by the resource. Our resource is the database, so the conditional update in the database is the real guard.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Efficiency lock vs correctness lock" is the distinction to name.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is a fencing token?</li><li>How would you hold 4 seats atomically in Redis? (Lua script.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Flipkart">
+          <summary>How do you keep the seat map fresh for 100,000 people looking at it?</summary>
+          <div class="answer">
+            <p>Serve it from Redis (a bitmap or hash per show, a few KB), never from the database per request. Update it from seat events published after each hold, release and booking. For normal shows, clients poll every few seconds with caching headers; for hot shows, push deltas over SSE/WebSocket through a fan-out tier. Accept a few seconds of staleness, because the hold call is the real check and returns "just taken" if the map was wrong.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "hint vs truth" early, then the cache, then push vs poll.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many WebSocket connections per server? What happens on reconnect storms?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Amazon,Walmart,Flipkart">
+          <summary>Where does Kafka belong in this design, and where does it not?</summary>
+          <div class="answer">
+            <p>Not in the synchronous hold decision, because the user waits for the answer and the database already serialises it. Kafka belongs after the decision: an outbox publishes <code>booking.events</code> keyed by <code>show_id</code>, and independent consumer groups generate tickets, send notifications, update the seat-map cache, and feed analytics and fraud detection. That keeps slow side effects off the booking path and lets each consumer retry independently. The one exception is an extreme hot show, where you could serialise all holds for that show through one partition and an in-memory allocator.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the line between "decide" (sync, DB) and "react" (async, Kafka), and mention the outbox.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do consumers avoid sending two tickets? (Idempotency on booking_id.)</li><li>Why key by show_id and not booking_id?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>How do you enforce "max 6 tickets per person per event" under concurrency?</summary>
+          <div class="answer">
+            <p>Two concurrent holds from the same user could each see "4 so far" and both succeed. Make the limit part of the same transaction: keep a row per (user, event) with a counter, and change it with an upsert in the same transaction as the seat hold (a plain UPDATE would match 0 rows on the user's first hold and look like "limit exceeded"):</p>
+<pre><code class="language-sql">INSERT INTO user_event_limits (user_id, event_id, count)
+VALUES (:user, :event, :n)
+ON CONFLICT (user_id, event_id) DO UPDATE
+   SET count = user_event_limits.count + :n
+ WHERE user_event_limits.count + :n &lt;= 6;
+-- 1 row affected: allowed.  0 rows: over the limit, ROLLBACK the hold.</code></pre>
+            <p>(For a first hold, check <code>:n &lt;= 6</code> in the app before the insert.) Release the count when holds expire. Back it with identity checks (verified phone, payment instrument) since one person can own many accounts.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the race, then reuse the same conditional-update trick. Mention that accounts are not people.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about resale and scalping?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Amazon,Microsoft">
+          <summary>How would you shard this system for many countries and huge events?</summary>
+          <div class="answer">
+            <p>Shard by <code>show_id</code> (or event for stadiums): every hold, booking and seat event touches exactly one show, so there are no cross-shard transactions. Place each shard in the region nearest the venue, because the people buying tickets for a Mumbai show are mostly in India. Search and catalog are global, read-mostly and replicated. User data (bookings history) can be sharded by user and populated asynchronously from booking events. A directory service maps show to shard so a hot event can get a dedicated shard.</p>
+            <div class="approach"><h5>How to answer</h5><p>Pick the key from the transaction boundary ("what does one booking touch?"), then talk about placement and hot events.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does "my bookings" across all shards work? (A per-user read model built from events.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the show sold out, but the hall was 20% empty</h4>
+          <div class="situation"><p>After a big Friday release, the cinema reports many empty seats in "sold out" shows. Customers complained they could not book.</p></div>
+          <div class="bad"><p>Weak answer: "Probably a bug in the front end; I would add more logging."</p></div>
+          <div class="good"><p>Strong answer: compare BOOKED vs HELD counts at show time. If many seats were HELD and never paid, holds were too long, the sweeper or the lazy check was broken, or bots hoarded holds. Check payment latency during the peak (holds expiring while users waited on the PSP). Fixes: confirm the lazy expiry clause exists, cap active holds per user, shorten TTL, alert on "held seats older than TTL + 1 min".</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What dashboard would have caught this live?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: two customers have tickets for the same seat</h4>
+          <div class="situation"><p>A support ticket: two people arrived with valid QR codes for seat F7 in the same show.</p></div>
+          <div class="bad"><p>Weak answer: "Our UPDATE prevents that, so it must be fraud."</p></div>
+          <div class="good"><p>Strong answer: assume our invariant was broken until proven otherwise. Look for a code path that bypasses the conditional update (admin tool, offline box-office sync, a retry that confirms without checking hold_id), a failover to an async replica that lost a write, or cache-based confirmation. Add a DB constraint so it cannot happen again (for example a unique ticket per (show_id, seat_id)), and a nightly reconciliation query that alarms on duplicates.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you sync the cinema's offline box office with the online inventory?</li></ul></div>
+        </div>
+      

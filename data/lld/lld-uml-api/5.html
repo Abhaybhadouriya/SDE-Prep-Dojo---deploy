@@ -1,0 +1,48 @@
+
+  <h2>Idempotency: safe to call twice</h2>
+  <p>An operation is <b>idempotent</b> if doing it twice has the same effect as doing it once. <code>balance()</code> is idempotent for free. <code>setPrice(100)</code> is too. <code>transfer(200)</code> is not: run it twice and Asha loses 400. Yet callers <i>will</i> call twice: the network times out after the server did the work, the user double-taps "Pay", a queue redelivers a message.</p>
+  <p>The standard fix is an <b>idempotency key</b>: the client makes a unique id per logical operation and sends it with every retry. The server remembers key to result.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 840 330" role="img" aria-label="Sequence: client sends transfer with key k-001, server debits and stores receipt, response is lost; client retries with k-001, server finds key and returns the same receipt without a second debit">
+      <rect class="box client" x="60" y="14" width="140" height="40"/><text class="label" x="130" y="34">Client</text>
+      <rect class="box svc" x="350" y="14" width="160" height="40"/><text class="label" x="430" y="34">WalletService</text>
+      <rect class="box queue" x="640" y="14" width="160" height="40"/><text class="label" x="720" y="34">Key store</text>
+      <path class="line" d="M130 54 L130 320 M430 54 L430 320 M720 54 L720 320" stroke-dasharray="4 4"/>
+      <path class="arrow" d="M130 86 L426 86"/><text class="label small" x="280" y="76">transfer(k-001, W1, W2, 200)</text>
+      <path class="arrow" d="M430 116 L716 116"/><text class="label small" x="575" y="106">k-001 seen? no</text>
+      <text class="label small left" x="442" y="142">debit W1, credit W2</text>
+      <path class="arrow" d="M430 166 L716 166"/><text class="label small" x="575" y="156">save k-001 = receipt T3</text>
+      <path class="arrow dashed bad" d="M426 192 L240 192"/><text class="label small bad" x="200" y="192">lost</text>
+      <text class="label small" x="280" y="214">timeout, so the client retries</text>
+      <path class="arrow" d="M130 244 L426 244"/><text class="label small" x="280" y="234">transfer(k-001, W1, W2, 200)</text>
+      <path class="arrow" d="M430 270 L716 270"/><text class="label small" x="575" y="260">k-001 seen? yes</text>
+      <path class="arrow dashed ok" d="M426 304 L134 304"/><text class="label small ok" x="280" y="294">receipt T3 (no second debit)</text>
+    </svg>
+    <figcaption>The retry returns the stored receipt. Same key with a <i>different</i> body is a client bug and gets an IdempotencyConflict error.</figcaption>
+  </figure>
+  <p>This is exactly how real payment APIs behave. Stripe's API reference says it stores the status code and body of the first request made with a key, compares the parameters of later requests with the same key and errors if they differ, and may prune keys once they are at least 24 hours old (<a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe: idempotent requests</a>). Razorpay documents idempotency in its <a href="https://razorpay.com/docs/api/understand/#idempotency" target="_blank" rel="noopener">API basics</a> as well.</p>
+<pre><code class="language-java">// lld-code/lld-uml-api/WalletApi.java (compiled and run)
+public synchronized TransferReceipt transfer(TransferRequest r) {
+    requireText(r.idempotencyKey(), "idempotencyKey");
+    requirePositive(r.amount());
+    if (r.fromWallet().equals(r.toWallet())) throw new InvalidRequestException("cannot transfer to the same wallet");
+    TransferRequest earlier = seenRequests.get(r.idempotencyKey());
+    if (earlier != null) {
+        if (!earlier.equals(r)) throw new IdempotencyConflictException("key reused with a different request");
+        return receipts.get(r.idempotencyKey());          // replay, no side effects
+    }
+    Wallet from = find(r.fromWallet()), to = find(r.toWallet());
+    if (from.balance.lessThan(r.amount()))
+        throw new InsufficientFundsException(from.id + " has " + from.balance + ", needs " + r.amount());
+    from.balance = from.balance.minus(r.amount());
+    to.balance   = to.balance.plus(r.amount());
+    TransferReceipt receipt = new TransferReceipt("T" + (nextId++), from.id, to.id, r.amount(), from.balance);
+    seenRequests.put(r.idempotencyKey(), r);
+    receipts.put(r.idempotencyKey(), receipt);
+    return receipt;
+}</code></pre>
+  <div class="callout interview"><p><b>A design choice to say out loud:</b> this version stores only successes, so a transfer that failed with "insufficient funds" can be retried with the same key after a top-up. Stripe's v1 API instead replays the saved first response (including errors) once execution has begun. Either is defensible; what matters is that you picked one and can say why.</p></div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>TCP solved this decades ago: sequence numbers are idempotency keys. A retransmitted segment with a sequence number the receiver already acknowledged is dropped and re-ACKed, not delivered twice to the application. The idempotency store is the receiver's "what have I already seen" window, and its 24-hour retention is the equivalent of the window size.</p>
+  </div>

@@ -1,0 +1,125 @@
+
+        <h2>What -p 8080:80 really does (packet by packet)</h2>
+        <div class="callout interview"><p><b>Must know.</b> This is the canonical home of the "-p at packet level" answer on this site; the <a href="#story">VRF bridge</a> at the top of this page is the one the other pages point back to.</p></div>
+        <p>Now the part you asked for most. We run <code>docker run -d --name web -p 8080:80 nginx:1.30</code> and a laptop at <code>192.168.1.50</code> opens <code>http://192.168.1.10:8080</code>. Step through the journey. (To run the <code>iptables</code> and <code>conntrack</code> commands below on Windows or macOS, use WSL 2 Ubuntu with Docker Engine; see <a href="{{BASE}}devops/docker-index#lab-setup">Lab setup</a>.)</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 820 340" role="img" aria-label="Inbound packet path: host eth0, nat PREROUTING DNAT, routing, FORWARD, docker0, veth, container eth0, and the reply un-NAT via conntrack">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="20" width="140" height="60"/>
+            <text class="label" x="80" y="45">laptop</text>
+            <text class="label small" x="80" y="65">192.168.1.50</text>
+
+            <g data-step="1">
+              <path class="arrow" d="M150 50 L213 50"/>
+              <rect class="box client" x="220" y="20" width="140" height="60"/>
+              <text class="label" x="290" y="45">host eth0</text>
+              <text class="label small" x="290" y="65">dst 192.168.1.10:8080</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M360 50 L423 50"/>
+              <rect class="box queue" x="430" y="15" width="190" height="70"/>
+              <text class="label" x="525" y="40">nat PREROUTING</text>
+              <text class="label small" x="525" y="58">jump DOCKER chain: DNAT</text>
+              <text class="label small" x="525" y="76">dst becomes 172.17.0.2:80</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M620 50 L673 50"/>
+              <rect class="box svc" x="680" y="15" width="130" height="70"/>
+              <text class="label" x="745" y="40">routing</text>
+              <text class="label small" x="745" y="58">172.17/16 is on</text>
+              <text class="label small" x="745" y="76">docker0</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M745 85 L745 133"/>
+              <rect class="box queue" x="600" y="140" width="210" height="70"/>
+              <text class="label" x="705" y="165">filter FORWARD</text>
+              <text class="label small" x="705" y="183">DOCKER-USER first (yours)</text>
+              <text class="label small" x="705" y="201">then Docker's accept rules</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow" d="M600 175 L533 175"/>
+              <rect class="box svc" x="390" y="145" width="140" height="60"/>
+              <text class="label" x="460" y="170">docker0</text>
+              <text class="label small" x="460" y="190">bridge, MAC lookup</text>
+              <path class="arrow" d="M390 175 L333 175"/>
+              <rect class="box cache" x="210" y="150" width="120" height="50"/>
+              <text class="label small" x="270" y="180">veth3a1b2c4</text>
+            </g>
+            <g data-step="6">
+              <rect class="zone k8s" x="10" y="120" width="180" height="110"/>
+              <text class="zone-label" x="20" y="140">netns: web</text>
+              <path class="arrow" d="M210 175 L193 175"/>
+              <rect class="box docker solid" x="25" y="150" width="150" height="60"/>
+              <text class="label white" x="100" y="175">nginx on :80</text>
+              <text class="label white" x="100" y="195" style="font-size:13px">eth0 172.17.0.2</text>
+            </g>
+            <g data-step="7">
+              <rect class="box ghost" x="10" y="250" width="800" height="76"/>
+              <text class="label" x="410" y="276">Reply: 172.17.0.2:80 to 192.168.1.50 leaves via docker0 and is routed to eth0</text>
+              <text class="label small" x="410" y="300">conntrack remembers the DNAT, so the source is rewritten back to 192.168.1.10:8080</text>
+              <text class="label small" x="410" y="318">The laptop only ever sees the host's address.</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Arrives.</b> The TCP SYN reaches the host's <code>eth0</code> with destination <code>192.168.1.10:8080</code>. Nothing on the host needs to listen on 8080 for this to work (but see docker-proxy below).</li>
+            <li><b>DNAT.</b> In the <code>nat</code> table, <code>PREROUTING</code> jumps to Docker's <code>DOCKER</code> chain, which has a rule: TCP port 8080 &rarr; <code>172.17.0.2:80</code>. The kernel rewrites the destination and creates a <b>conntrack</b> entry.</li>
+            <li><b>Route.</b> Because the destination is now <code>172.17.0.2</code>, the routing table says "connected via docker0". This is forwarding, not local delivery, so the INPUT chain is never involved.</li>
+            <li><b>Filter.</b> The packet goes through the <code>filter FORWARD</code> chain. Docker sends it to <code>DOCKER-USER</code> first (the place for <i>your</i> rules), then to its own chains that accept traffic to published ports and isolate networks from each other.</li>
+            <li><b>Switch.</b> The bridge looks up the container's MAC in its forwarding table and sends the frame out of the veth port for <code>web</code>.</li>
+            <li><b>Delivered.</b> The frame pops out of the other end of the veth pair as <code>eth0</code> inside the container. nginx, listening on <code>0.0.0.0:80</code>, accepts the connection. It sees the real client IP <code>192.168.1.50</code>.</li>
+            <li><b>Reply.</b> The response is routed back to the host side. Conntrack recognises the flow and reverses the NAT, so the laptop sees replies from <code>192.168.1.10:8080</code>. Outbound connections started by the container use the separate <code>MASQUERADE</code> rule.</li>
+          </ol>
+        </div>
+
+        <h3>See the rules yourself</h3>
+<pre class="terminal"><code>$ sudo iptables -t nat -S DOCKER
+-N DOCKER
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.17.0.2:80
+
+$ sudo iptables -t nat -S POSTROUTING
+-P POSTROUTING ACCEPT
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+
+$ sudo conntrack -L -p tcp --dport 8080
+tcp  6 431999 ESTABLISHED src=192.168.1.50 dst=192.168.1.10 sport=53122 dport=8080 src=172.17.0.2 dst=192.168.1.50 sport=80 dport=53122 [ASSURED] mark=0 use=1
+
+$ ps -eo pid,args | grep [d]ocker-proxy
+ 4301 /usr/bin/docker-proxy -proto tcp -host-ip 0.0.0.0 -host-port 8080 -container-ip 172.17.0.2 -container-port 80</code></pre>
+        <p class="muted">Exact rule text varies by Docker version and by whether your host uses iptables-legacy, iptables-nft or (experimental in Engine 29) native nftables. The shape is always the same: DNAT in, MASQUERADE out.</p>
+
+        <ul>
+          <li><b>The DNAT rule</b> (<code>! -i docker0</code> means "not coming from the bridge itself") is the fast path. It is all kernel work, no extra process touches the bytes.</li>
+          <li><b>MASQUERADE</b> rewrites the source of anything leaving <code>172.17.0.0/16</code> through another interface. That is how containers reach the internet.</li>
+          <li><b>The conntrack line</b> shows both directions of the flow: original tuple and the reply tuple after DNAT. If you have debugged NAT on a firewall, this is identical.</li>
+          <li><b>docker-proxy</b> is a small user-space process per published port. It handles cases that the DNAT rule does not catch, mainly connections to <code>localhost:8080</code> from the host itself (locally generated packets do not pass PREROUTING). It also holds the port open so nothing else on the host can bind it. You can disable it with <code>"userland-proxy": false</code>, and Docker then uses hairpin NAT rules instead.</li>
+        </ul>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is a textbook <b>port-forward on a CPE router</b>: DNAT on the WAN side, connected route to the LAN, stateful firewall in FORWARD, PAT/masquerade for egress. The only Docker-specific bits are the chain names. If you can debug a NAT box with <code>conntrack -L</code> and <code>tcpdump</code> on both sides, you can debug Docker networking. <i>Where it breaks:</i> Docker rewrites these chains whenever containers start and stop, so hand-made rules in Docker's own chains get wiped. Your rules belong in <code>DOCKER-USER</code>.</p>
+        </div>
+
+        <div class="callout danger"><p><b>Security trap: "-p is public".</b> <code>-p 8080:80</code> binds <code>0.0.0.0</code> and <code>[::]</code>, so the port is open on every interface of the host. Docker's own docs call this insecure by default. For something only you should reach (a database on a dev box), bind to loopback: <code>-p 127.0.0.1:5432:5432</code>. And note that <b>ufw / firewalld rules do not protect published ports</b>: the DNAT happens in PREROUTING and the packet is forwarded, so it never hits the INPUT chain that ufw filters. Filter in <code>DOCKER-USER</code> instead:</p>
+<pre><code class="language-bash"># allow only the office subnet to reach published container ports arriving on eth0
+sudo iptables -I DOCKER-USER -i eth0 ! -s 10.20.0.0/16 -j DROP
+
+# match the ORIGINAL published host port, not --dport (see the note below)
+sudo iptables -I DOCKER-USER -i eth0 -p tcp -m conntrack --ctorigdstport 8080 --ctdir ORIGINAL ! -s 10.20.0.0/16 -j DROP</code></pre>
+        <p><b>Interview follow-up:</b> packets reach <code>DOCKER-USER</code> <i>after</i> DNAT, so to match the original host port use <code>-m conntrack --ctorigdstport 8080</code> (and <code>--ctorigdst</code> for the host IP), not <code>--dport 8080</code>. By the time the packet is in FORWARD its destination is already <code>container-IP:80</code>, so a <code>--dport 8080</code> rule never matches. Source-based rules like the first one work either way, because DNAT does not change the source.</p></div>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Syntax</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td><code>-p 8080:80</code></td><td>Host port 8080 on all interfaces &rarr; container port 80 (TCP)</td></tr>
+              <tr><td><code>-p 127.0.0.1:8080:80</code></td><td>Only reachable from the host itself (on Docker Engine 28 and newer; see the note below the table)</td></tr>
+              <tr><td><code>-p 5353:53/udp</code></td><td>UDP instead of TCP</td></tr>
+              <tr><td><code>-p 80</code></td><td>Container port 80 &rarr; a random free host port (see <code>docker port web</code>)</td></tr>
+              <tr><td><code>-P</code></td><td>Publish every <code>EXPOSE</code>d port to random host ports</td></tr>
+              <tr><td><code>EXPOSE 80</code> in a Dockerfile</td><td>Documentation only. Publishes nothing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout note"><p><b>What changed in Docker Engine 28 (2025):</b> before it, a machine on the same LAN could add a route to <code>172.17.0.0/16</code> via your Docker host and reach container ports directly, even ports published only on <code>127.0.0.1</code> or not published at all, because the host simply forwarded those packets. Engine 28 adds rules in the iptables <b>raw</b> table (PREROUTING) that drop packets addressed to a container's IP unless they arrive from that container's own bridge, so unpublished ports really are private and loopback-published ports are not reachable from neighbours (28.0.1 closed a remaining gap). The escape hatch <code>DOCKER_INSECURE_NO_IPTABLES_RAW=1</code> turns this protection off; do not set it. Source: <a href="https://www.docker.com/blog/docker-engine-28-hardening-container-networking-by-default/" target="_blank" rel="noopener">Docker blog: Engine v28 hardening container networking</a> and the <a href="https://docs.docker.com/engine/release-notes/28/" target="_blank" rel="noopener">Engine 28 release notes</a>.</p></div>
+      

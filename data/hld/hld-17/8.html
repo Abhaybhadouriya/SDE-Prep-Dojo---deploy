@@ -1,0 +1,27 @@
+
+        <h2>Token-based rate limits and fair scheduling</h2>
+        <p>Request counts lie in LLM systems. One request with a 100,000-token document costs thousands of times more GPU work than "hi". So providers limit several dimensions at once. OpenAI's docs list requests per minute (RPM), requests per day (RPD), tokens per minute (TPM), tokens per day (TPD) and images per minute, and whichever limit is hit first applies.</p>
+        <h3>The counting problem</h3>
+        <p>You know the input tokens when the request arrives, but the output tokens only when it finishes. OpenAI's docs say the limit is computed from the maximum of <code>max_tokens</code> and an estimate from the request's length, which is why a large <code>max_tokens</code> eats your budget even if the answer is short. The common design is <b>reserve, then reconcile</b>:</p>
+<pre><code class="language-python"># Token bucket per (tenant, model) in Redis; run as one atomic Lua script in production.
+def admit(tenant, prompt_tokens, max_tokens):
+    estimate = prompt_tokens + max_tokens          # worst case
+    if not bucket.try_take(tenant, estimate):      # refills at TPM / 60 per second
+        return reject(429, retry_after=bucket.seconds_until(tenant, estimate))
+    return Reservation(tenant, estimate)
+
+def on_finish(res, prompt_tokens, output_tokens):
+    actual = prompt_tokens + output_tokens
+    bucket.give_back(res.tenant, res.estimate - actual)   # refund the unused part</code></pre>
+        <ul>
+          <li><strong>Tell clients where they stand.</strong> OpenAI returns headers such as <code>x-ratelimit-remaining-tokens</code> and <code>x-ratelimit-reset-tokens</code>, plus <code>Retry-After</code> on a 429.</li>
+          <li><strong>Clients back off with jitter.</strong> OpenAI's guidance: treat <code>Retry-After</code> as a minimum, otherwise exponential backoff with jitter (their examples start at 1 s and cap at 60 s), and remember failed attempts still count toward per-minute limits.</li>
+          <li><strong>Limit concurrency too.</strong> A token bucket controls rate, but GPU memory is about <em>concurrent</em> streams. Cap in-flight requests per tenant so one customer cannot fill every KV slot.</li>
+          <li><strong>Tiers and priority.</strong> Paid traffic goes to a higher-priority queue or a reserved pool; free traffic gets a smaller model or waits. Batch jobs (embedding a whole corpus) run in a separate low-priority lane that fills idle GPU time.</li>
+          <li><strong>Load shedding.</strong> When the queue wait would exceed the TTFT target, reject early with 429 or 503 instead of letting requests time out after using GPU time. See <a href="{{BASE}}hld/hld-11">resilience patterns</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is QoS on a router. TPM is a token-bucket policer measured in bytes, not packets; the concurrency cap is a queue-depth limit; paid vs free tiers are priority queues with weighted fair queuing; reserve-then-refund is like admission control for a reserved-bandwidth flow. Counting requests instead of tokens is like policing by packets per second while someone sends jumbo frames.</p>
+        </div>
+      

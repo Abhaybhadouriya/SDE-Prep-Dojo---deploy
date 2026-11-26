@@ -1,0 +1,121 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: clarify.</strong> Scoring rule, ties, windows, one board or many, top 10 + my rank + around me. Write the list.</li>
+          <li><strong>5-10 min: estimate.</strong> 5M DAU, 2,500 peak writes/s, 650 MB raw. Conclude out loud: "one Redis node fits; sharding is a follow-up".</li>
+          <li><strong>10-15 min: API + data.</strong> Internal POST from the game server with match_id; three GETs; score log in SQL, live board in a sorted set.</li>
+          <li><strong>15-25 min: draw it.</strong> Game server -&gt; (Kafka) -&gt; leaderboard service -&gt; Redis; client -&gt; API -&gt; Redis. Name the commands.</li>
+          <li><strong>25-40 min: deep dives.</strong> Pick two before being asked: idempotent updates and ties/windows. Then sharding when they say "100x".</li>
+          <li><strong>40-45 min: wrap-up.</strong> Failures (Redis loss -&gt; rebuild), monitoring (<a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a>, board age, Redis memory), what you would do next.</li>
+        </ol>
+        <div class="callout interview"><p><b>SDE-1 vs SDE-2.</b> An SDE-1 answer that reaches "Redis sorted set, ZINCRBY, ZREVRANGE, ZREVRANK, scores from the server only" with clean estimates is a pass. An SDE-2 answer drives the conversation into idempotency, ties, the "Redis is not the source of truth" point and a reasoned sharding plan without being prompted.</p></div>
+        <div class="callout warn"><p><b>Common mistakes:</b> letting the client post its own score; <code>ORDER BY score</code> on every request; saying "Redis Cluster shards it automatically" (one sorted set = one key = one slot); forgetting retries double-count; ignoring ties; using processing time for the month boundary; treating Redis as the only copy of the data.</p></div>
+
+        <h3>60-second answer</h3>
+        <div class="callout tip"><p>"Scores come only from the game server, which publishes each match result to Kafka keyed by user - its only write; a consumer copies the events into a durable score database, so there is no dual write. A leaderboard consumer applies it to a Redis sorted set per tournament with a Lua script that first checks the match ID, so retries never double count. Top 10 is ZREVRANGE 0 9, my rank is ZREVRANK, around-me is a range around my rank - all O(log N). At 5 million daily users that is 2,500 writes a second and under a couple of GB, so one Redis primary with a replica is enough. Redis is a rebuildable view: if it is lost I replay the log. At 100x I keep an exact sorted set for the top players and give everyone else a percentile from a histogram, or hash-partition by user and scatter-gather."</p></div>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Amazon,Microsoft">
+          <summary>Why not store scores in MySQL and use ORDER BY?</summary>
+          <div class="answer">
+            <p>Top 10 with an index on score is fine. The problem is "my rank": it is a count of everyone above me, and with millions of rows and thousands of updates per second, every update rewrites the index and every rank query scans a large part of it. A sorted set keeps the order incrementally, so rank is O(log N). I still keep MySQL as the durable score log and for history.</p>
+            <div class="approach"><h5>How to answer</h5><p>Agree that SQL works for top 10, then name the exact query that does not scale (rank), then give the replacement. Do not trash SQL - it stays as the source of truth.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the board is only updated weekly? (Then a weekly SQL batch with <code>RANK() OVER (ORDER BY score DESC)</code> written to a cache table is fine; real time is what forces the sorted set.)</li><li>How would you get the rank in SQL anyway? (<code>SELECT COUNT(*) + 1 FROM scores WHERE board = ? AND score &gt; ?</code> with an index on (board, score) - correct, but it walks every index entry above you.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Google">
+          <summary>How does a Redis sorted set give a rank in O(log N)?</summary>
+          <div class="answer">
+            <p>It is a skip list plus a hash table. The skip list is a sorted linked list with randomised express lanes; each forward link stores its span (how many nodes it jumps). To find a member, Redis looks up its score in the hash table, walks the skip list from the top lane down, and adds up the spans - the total is the position. Expected O(log N) levels are visited. Small sets use a compact listpack instead.</p>
+            <div class="approach"><h5>How to answer</h5><p>Two structures, one job each. Mention "span" - it is the detail that shows you know why rank is cheap, not just lookup.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why a skip list instead of a balanced tree? (Same O(log N) on average, but simpler code, no rotations, easy range walks along the bottom lane, and span counts make rank cheap.)</li><li>What is the worst case? (O(N) if the coin flips are extremely unlucky and the lanes give no shortcuts; with random levels that is astronomically unlikely, so expected O(log N) is what matters.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Walmart">
+          <summary>The consumer retries and a player gets double points. How do you prevent it?</summary>
+          <div class="answer">
+            <p>Make the update idempotent. Every score event carries a unique match_id. A Lua script runs atomically in Redis: SADD the match_id to a seen-set; only if it was new, ZINCRBY. Commit the Kafka offset after the script returns. A replay or redelivery then becomes a no-op. Alternatives: a per-match <code>SET NX EX</code> key, or write absolute totals with ZADD computed from the score DB.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the failure precisely (crash between update and offset commit = at-least-once), then the fix (idempotency key + atomic check-and-update).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you use Kafka <a href="{{BASE}}interview/glossary#eos">exactly-once</a> instead? (No. Kafka EOS covers Kafka-to-Kafka only: read, process, write to another topic and commit offsets in one transaction. Redis is outside that transaction, so you still need the match_id check.)</li><li>How long must you remember match IDs? (At least as long as a duplicate can arrive. For retries a day is plenty; if you may replay the whole month to rebuild, keep them for the month plus a margin, or make the rebuild write absolute totals.)</li><li>What about Redis Cluster and two keys in one script? (Both keys must hash to one slot: use a hash tag such as <code>lb:{2026-11}</code> and <code>seen:{2026-11}</code>, otherwise Redis returns a CROSSSLOT error.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon">
+          <summary>Two players have the same score. Who ranks higher?</summary>
+          <div class="answer">
+            <p>Ask the product rule. "Same score, same rank": compute rank as ZCOUNT of strictly higher scores, plus one. "Earlier achiever first": encode the score as points x 2<sup>22</sup> + (month_end - achieved_at), keeping the total under 2<sup>53</sup> because Redis scores are doubles. Then the sorted order is unique, and updates go through a Lua script that recomputes the packed score instead of ZINCRBY.</p>
+            <div class="approach"><h5>How to answer</h5><p>Ask first, then give both encodings. Mentioning the 2<sup>53</sup> double precision limit is a strong signal.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does Redis do by default with equal scores? (Orders by member name - reverse order for ZREV* commands.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Meta">
+          <summary>Scale it to 500 million daily players.</summary>
+          <div class="answer">
+            <p>That is about 65 GB raw and 250k updates/s, more than one node. One sorted set is one key, so I split the board myself. Option A: range partition by score - top 10 is on the highest shard, rank = local rank + sizes of higher shards, but players move between shards and the low range is crowded. Option B: hash by user - even load, top 10 by merging each shard's top 10, rank by summing ZCOUNT over shards in parallel. Best in practice: an exact sorted set only for the top N (e.g. 10,000 entries above a cut-off) and a histogram-based percentile for everyone else, because nobody needs to know they are exactly 81-millionth.</p>
+            <div class="approach"><h5>How to answer</h5><p>Recompute the numbers first, state why "turn on cluster" does not work, compare two partitionings in a table, then propose the product-aware hybrid.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does a player enter the exact top-N set? (Keep the current cut-off score; when an update pushes a player above it, ZADD them and ZREMRANGEBYRANK the lowest member to keep the set at N; everyone else only updates the histogram.)</li><li>How accurate is the histogram? (As fine as its buckets: with one bucket per score point the count above you is exact; with wider buckets you are off by at most one bucket's population, which is fine for "top 12%".)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Flipkart">
+          <summary>How do you support daily, weekly and monthly boards at once?</summary>
+          <div class="answer">
+            <p>One key per window (<code>lb:2026-11-23</code>, <code>lb:2026-W47</code>, <code>lb:2026-11</code>). The consumer's Lua script increments all windows that the match's <i>end time</i> falls into, atomically. Short windows get EXPIRE. At window close a job snapshots the top N and final ranks to the history DB. A rolling "last 7 days" is a periodic ZUNIONSTORE of 7 daily keys, never computed per request.</p>
+            <div class="approach"><h5>How to answer</h5><p>Keys are cheap - say "a window is a key". Then mention <a href="{{BASE}}interview/glossary#event-time">event time</a> vs processing time for the boundary.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A match ends at 23:59:59 and is processed at 00:00:02 - which month? (Event time: the match end time decides, so it counts in the old month; keep the old board open for a short grace period before finalising.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Do you need Kafka between the game server and the leaderboard?</summary>
+          <div class="answer">
+            <p>Not for the leaderboard alone - at 2,500 writes/s the game server could call the service directly. Kafka earns its place when several consumers want the same score events (analytics, achievements, anti-cheat, notifications), when you want to absorb end-of-tournament spikes, and when you want replay to rebuild Redis. Keyed by user_id, it also keeps one player's events in order.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you can justify (or skip) a component. "It depends on who else consumes the events" is the real answer.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What partition key and how many partitions? (user_id, so one player's events stay in order; enough partitions for peak consumers with headroom - for example 12-24 at 2,500 events/s, since partitions are hard to reduce later.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Walmart">
+          <summary>Redis loses its data. What happens and how do you recover?</summary>
+          <div class="answer">
+            <p>First the replica is promoted (seconds); a few acknowledged updates may be missing because replication is asynchronous. Replay recent Kafka events from a known offset - the idempotency check makes it safe. If both copies are gone, rebuild the board from the score DB (sum points per user for the month) or replay the topic from the start of the month, then switch the read path back. Meanwhile reads serve the last cached top 10 with an "asOf" time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "Redis is a view, the log is the truth" in the first sentence; then the three tiers of recovery.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long does a full rebuild take, and how would you speed it up? (Measure it; it grows with the number of match rows. Speed it up by summing per user in the DB first and loading totals with pipelined ZADD, and by snapshotting the board periodically so you only replay the tail.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Microsoft">
+          <summary>Design a friends-only leaderboard.</summary>
+          <div class="answer">
+            <p>Friends lists are small (hundreds). Fetch friend IDs from the social graph service, ZMSCORE them from the global board in one call, sort in the app, cache the result for a few seconds per user. No per-user sorted set needed. Only if lists are huge (followers) do I precompute per-user boards for heavy users.</p>
+            <div class="approach"><h5>How to answer</h5><p>Notice the small N and pick the simple solution - over-engineering is a red flag.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A celebrity has 10 million followers who all want the board. (Do not compute it per follower: compute that board once, cache it for a few seconds and serve everyone from the cache or a CDN; identical reads make it a hot-key caching problem.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>How do you stop cheating?</summary>
+          <div class="answer">
+            <p>Clients never write scores; the game server computes them from the match it hosted, and the scoring API is internal and authenticated. On top, an anti-cheat consumer on the same Kafka topic flags impossible rates (e.g. more wins per hour than matches can take), and flagged users are removed with ZREM and audited from the score log.</p>
+            <div class="approach"><h5>How to answer</h5><p>Architecture first (trust boundary), detection second.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you undo a cheater's points across all windows? (ZREM the user from every window key they touched, mark their matches void in the score log, let a rebuild job recompute the affected boards from the log, and keep an audit record.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the tournament final, and the board freezes</h4>
+          <div class="situation"><p>During the last hour of the monthly tournament players say their wins do not show up. The API is healthy and returns a top 10. Kafka consumer lag for <code>leaderboard-svc</code> is climbing.</p></div>
+          <div class="bad"><p>Weak answer: "Restart the leaderboard service."</p></div>
+          <div class="good"><p>Strong answer: reads are fine, so the write path is behind. Check lag per partition: if all partitions lag, the consumers are too slow - scale consumers up to the partition count and batch increments with Redis pipelining. If one partition lags, look for a <a href="{{BASE}}interview/glossary#hot-partition">hot key</a> or a poison message stuck in retries (move it to a dead-letter topic). Check Redis CPU and slow log - a ZUNIONSTORE job or a big ZRANGE may be blocking the single thread. Meanwhile show "updated N seconds ago" and delay the official result until lag is zero.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you declare the winner fairly if processing is delayed? (Use event time; close the board only after lag = 0.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: a player's points doubled overnight</h4>
+          <div class="situation"><p>Support reports dozens of players with exactly twice their expected points after a deployment at 02:00.</p></div>
+          <div class="bad"><p>Weak answer: "Subtract the points manually."</p></div>
+          <div class="good"><p>Strong answer: a deployment restarted consumers; offsets had not been committed for a batch, so events were redelivered and the update path is not idempotent (maybe the new version skipped the Lua dedup). Fix the code path, then rebuild affected boards from the score DB (the source of truth) rather than patching by hand. Add a test that replays the same event twice, and a metric for "duplicate match_id seen".</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why commit offsets after, not before, the update? (Commit first and crash, and the event is lost forever; update first and crash, and it is redelivered - which the match_id check makes harmless.)</li></ul></div>
+        </div>
+      

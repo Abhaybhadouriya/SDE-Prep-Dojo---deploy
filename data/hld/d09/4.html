@@ -1,0 +1,37 @@
+
+        <h2>Data model</h2>
+        <p>Two places hold the truth for different moments. During the sale, Redis holds the <b>live counter</b> (fast, atomic). Kafka holds the <b>record of every reservation</b> (durable, replayable). The SQL database holds <b>reservations and orders</b> as the long-term source of truth, written at a pace it can handle.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Key / table</th><th>Store</th><th>Holds</th><th>Notes</th></tr></thead>
+            <tbody>
+              <tr><td><code>sale:{bbd26:b3}:stock</code></td><td>Redis</td><td>units left in bucket 3</td><td>Stock split into N buckets. The hash tag <code>{bbd26:b3}</code> puts each bucket's keys in one slot, and different buckets on different shards. (A Redis Cluster splits keys into 16,384 <b>slots</b> spread over shards; a <b>hash tag</b> is the part in braces, and only that part is hashed to pick the slot. More with the script in deep dive 2.)</td></tr>
+              <tr><td><code>sale:{bbd26:b3}:buyers</code></td><td>Redis set</td><td>user ids that won in bucket 3</td><td>Lives in the same slot as the stock, so one Lua script can check and decrement both.</td></tr>
+              <tr><td><code>sale:bbd26:soldout</code></td><td>Redis + edge config</td><td>flag</td><td>Pushed to the CDN and waiting room so they answer "sold out" without calling the backend.</td></tr>
+              <tr><td><code>sale:bbd26:expiries</code></td><td>Redis sorted set</td><td>reservationId scored by payBy</td><td>The expiry worker pops due items and returns their stock.</td></tr>
+              <tr><td><code>sale-reservations</code></td><td>Kafka topic</td><td>one event per reservation</td><td>Keyed by reservationId. The durable log that the order writer drains.</td></tr>
+              <tr><td><code>sale_reservations</code></td><td>SQL</td><td>reservation, user, status, pay_by</td><td><code>UNIQUE (sale_id, user_id)</code> is the last-line defence for "one per user".</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">CREATE TABLE sale_reservations (
+  reservation_id BIGINT PRIMARY KEY,
+  sale_id        TEXT   NOT NULL,
+  user_id        BIGINT NOT NULL,
+  bucket         INT    NOT NULL,
+  status         TEXT   NOT NULL,         -- HELD, PAID, EXPIRED, CANCELLED
+  pay_by         TIMESTAMPTZ NOT NULL,
+  order_id       BIGINT,
+  UNIQUE (sale_id, user_id)               -- one per user, enforced by the database too
+);
+
+-- the sale's ground truth after the dust settles
+SELECT status, count(*) FROM sale_reservations WHERE sale_id = 'bbd26' GROUP BY status;</code></pre>
+<pre class="terminal"><code> status  | count
+---------+-------
+ PAID    |  9412
+ HELD    |   211
+ EXPIRED |   377
+(3 rows)</code></pre>
+        <p>(An example result.) Reconciliation checks the invariant: <b>PAID + HELD must never be more than total stock</b>, and Redis's remaining stock should equal total minus PAID minus HELD. Here 9,412 + 211 = 9,623, so 377 units came back from expired reservations and can go to a second wave or the waitlist.</p>
+      

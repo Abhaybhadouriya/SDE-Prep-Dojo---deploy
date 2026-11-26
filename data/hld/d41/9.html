@@ -1,0 +1,126 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5:</strong> Clarify: is it a wallet that holds money, or UPI-style orchestration? Same currency only? P2P or merchant? State the invariant.</li>
+          <li><strong>5-10:</strong> Estimate. Derive TPS, show that one DB is not enough, and conclude that sharding leads to cross-shard transactions.</li>
+          <li><strong>10-20:</strong> API with an idempotency key and integer amounts. The double-entry schema.</li>
+          <li><strong>20-35:</strong> Same-shard transaction, then cross-shard saga (debit first), idempotency layers, the in-transit clearing account.</li>
+          <li><strong>35-45:</strong> Event sourcing for audit, reconciliation, hot accounts, failure modes.</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Every transfer is a journal entry whose postings sum to zero; on one shard it is a single transaction that debits only if <code>balance &gt;= amt</code>, and the client's idempotency key plus a UNIQUE constraint stop a retry from paying twice."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"Across shards a persisted saga debits first through an in-transit clearing account, ledger events leave through an outbox to Kafka, hot merchants get sub-accounts, and daily reconciliation against bank files proves the clearing accounts return to zero."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout danger"><p><b>Common mistakes:</b> a single <code>balance</code> column with no postings (no audit trail); floating-point money; Redis as the source of truth; crediting before debiting; checking idempotency on a replica; calling the bank inside a DB transaction; "we use 2PC" without its cost; forgetting reconciliation.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>What is a double-entry ledger, and why not just keep a balance column?</summary>
+          <div class="answer">
+            <p>Every money movement is a journal entry with postings that sum to zero, for example A -100 and B +100. Balances are derived from postings, and you may cache them. A single mutable balance column loses history. You cannot say why it changed or what it was last week, and a bug silently creates or destroys money. With double-entry, the sum of all postings is always zero, so any imbalance is detectable. Corrections are new entries, so you keep a full audit trail.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the invariant, a 2-line example, and then the three benefits: audit, detectability, reproducibility. Mention Square's Books, or Modern Treasury's advice to compute balances from transactions rather than mutate them.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you get a balance fast if it is a SUM? (A cached balance + version in the same tx.)</li><li>How do you fix a wrong entry? (A reversing entry.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>Design a ledger for cross-service transactions (order, payment, refund, payout).</summary>
+          <div class="answer">
+            <p>One central ledger service with an API that accepts only balanced journal entries. Each service posts its own facts: an order creates a receivable, a payment capture moves money from PSP clearing to the merchant's pending balance, and a refund and a payout move it out. Use typed accounts (user, merchant, clearing, fees, PSP). An idempotency key per business event makes posts retry-safe. Events go out through an outbox to Kafka. Clearing accounts should return to zero when a flow completes, so a non-zero clearing balance flags a broken flow. This is the core idea of Stripe's Ledger.</p>
+            <div class="approach"><h5>How to answer</h5><p>Model the money flow as a state machine of accounts. Draw one flow end to end, then show how you detect a missing step.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Services publish out of order. How does the ledger cope?</li><li>How do you shard it?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Transfer between accounts on different shards: walk me through it, including crashes.</summary>
+          <div class="answer">
+            <p>Use an orchestrated saga. Persist the transfer as STARTED. Step 1 is a local tx on A's shard: debit A if <code>balance &gt;= amt</code>, write a posting to an in-transit clearing account, and record step 1 done. Step 2 is a local tx on B's shard: credit B from in-transit. The orchestrator stores progress after each step, and each step is idempotent on (transferId, step). On a crash, it resumes from the stored state. If step 2 fails permanently, the compensation credits A back. Debit first, because a credit that happens first could be spent before a failing debit.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the 2 boxes and the failure arrow. Compare briefly with 2PC (locks, a coordinator SPOF) and TC/C (parallel, but the out-of-order cancel needs handling).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does the user see in between?</li><li>Could you avoid cross-shard transfers by co-locating accounts?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>The client times out and retries a payment. How do you guarantee one debit?</summary>
+          <div class="answer">
+            <p>Layered idempotency. The client reuses the same Idempotency-Key. The server inserts the key with a lease (IN_PROGRESS) on the primary, so a concurrent duplicate gets 409, and a completed one returns the stored response. The ledger has a UNIQUE constraint on the journal entry's idempotency key as the last guard. Downstream bank or PSP calls carry a derived key. Retries use exponential backoff with jitter.</p>
+            <div class="approach"><h5>How to answer</h5><p>"Exactly-once effect = <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a> delivery + idempotent processing." Then name the layers.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The same key arrives with a different amount?</li><li>How long do you keep keys?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>How would you reach 1 million transfers per second?</summary>
+          <div class="answer">
+            <p>At ~1,000 TPS per SQL node, 1M transfers = 2M operations = 2,000 nodes, so raise per-node throughput. ByteByteGo's path: event sourcing with a single-threaded deterministic state machine per partition, commands and events in local append-only files (sequential I/O, mmap), state in RocksDB, and periodic snapshots. Replicate the event log with Raft for durability. Partition accounts across many Raft groups, and use a saga for cross-partition transfers. Push results back through a reverse proxy instead of making the client poll.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the node maths first. That is what justifies the more exotic design.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What must be replicated: commands, events or state? (Events. Commands may not deterministically produce the same events.)</li><li>How do you take a midnight snapshot for finance?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart">
+          <summary>Design a Razorpay-like payment gateway. Where does the ledger sit?</summary>
+          <div class="answer">
+            <p>The gateway exposes create-order and capture APIs to merchants. It routes to acquirers or UPI, handles webhooks, and settles to merchants on T+1. The ledger records every state: authorised (a hold), captured (PSP clearing to merchant pending), fees (merchant to platform revenue), settled (merchant pending to bank payout), refunds and chargebacks. The settlement amount is just the merchant's pending balance, which is a single read, as in Square's design. Daily reconciliation matches acquirer settlement files to ledger entries.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate the orchestration (talking to the networks) from the accounting (the ledger). Show one payment's journal entries.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you handle a chargeback 60 days later?</li><li>How do you route between acquirers?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Flipkart,Amazon">
+          <summary>One merchant receives 5,000 payments per second. What breaks and how do you fix it?</summary>
+          <div class="answer">
+            <p>The merchant's account row becomes a hot lock. Every credit serialises on it. Fixes: split it into N sub-accounts and credit a random one (the balance is the sum); skip the balance check for credits, because they cannot overdraw; batch credits into one posting per interval; or update the cached balance asynchronously while appending postings. Payouts sweep the sub-accounts.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name it as the hot-key problem, then give the sharded-counter style fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you read a consistent balance across sub-accounts?</li><li>What about a hot debit account, such as a payroll run?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Flipkart,Walmart">
+          <summary>Explain how a UPI payment flows. What does the app's backend own?</summary>
+          <div class="answer">
+            <p>The payer app sends a request through its PSP bank to the NPCI switch. NPCI resolves the payee VPA through the payee's PSP, has the payer's bank verify the PIN and debit, then has the payee's bank credit, and notifies both sides. The app holds no balance. Its backend owns the user, VPA and device binding, a ledger of payment intents and outcomes, status polling for pending cases, reversals and daily reconciliation.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw 5 boxes. Stress the "unknown outcome" state and reconciliation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the debit succeeds but the credit times out?</li><li>How do you scale for a festival-day peak?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Walmart">
+          <summary>Our books say Rs 10 crore settled, but the bank file says Rs 9.99 crore. How do you design reconciliation?</summary>
+          <div class="answer">
+            <p>Ingest the bank and PSP files, normalise them (formats, ids, time zones), and match records by reference id and amount. Classify the unmatched ones as temporary breaks (cut-off timing, re-checked with the next file), missing on our side, missing on their side, or amount mismatches. Raise alerts and tickets with the money at stake. Run it in batch (Spark) for end-of-day and in a stream (Flink) for near-real-time. Model in-flight money as clearing accounts that must reach zero.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "reconciliation always exists, even with exactly-once code", then walk through the classification.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid alert fatigue?</li><li>Who can post adjusting entries, and how is that audited?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Why event sourcing for a wallet, and what are its costs?</summary>
+          <div class="answer">
+            <p>It gives you reproducibility: replay the events to get the balance at any time, and verify new code by replaying history and comparing. The event log is the audit trail, and CQRS lets you build many read models. The costs are eventual consistency on read models, schema evolution of events, replay time (mitigated by snapshots), a deterministic state machine that needs discipline, and more operational complexity than a plain SQL ledger.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tie it to the auditor's three questions. Then be honest about the costs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is a double-entry SQL ledger already "event sourced"? (Mostly yes, because postings are immutable events.)</li><li>How do you delete data for privacy rules?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "money disappeared"</h4>
+          <div class="situation"><p>A user's wallet shows Rs 500 less, but the friend never got it. The logs show that the orchestrator pod was OOM-killed at 14:02.</p></div>
+          <div class="bad"><p>Weak answer: "Manually add Rs 500 to the user."</p></div>
+          <div class="good"><p>Strong answer: the debit committed (step 1) and the pod died before the credit. The saga row is stuck in DEBITED. A recovery worker should scan for sagas that are not terminal and older than T, and resume them: the credit is idempotent on (transferId, 2). Alert on the age of stuck sagas. The in-transit clearing account shows exactly Rs 500 outstanding, so finance can see it too. Never fix it by editing the balance. If you must intervene, post an adjusting journal entry with an audit reason.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you prevent two recovery workers from resuming the same saga?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: Diwali sale, payments up 4x</h4>
+          <div class="situation"><p>A big-sale day pushes payments to 4x normal. Two large merchants get most of the traffic, and the ledger p99 latency jumps from 40 ms to 2 s.</p></div>
+          <div class="bad"><p>Weak answer: "Scale the pods." The pods are not the bottleneck.</p></div>
+          <div class="good"><p>Strong answer: check lock waits on the merchant account rows. Enable sub-account crediting for the hot merchants (pre-provisioned before the sale), batch credit postings, move statement reads to the CQRS read model, rate-limit retries with jitter, and pre-split the hot shards. After the event, compare the clearing-account totals to prove that nothing was lost.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metrics would you have on the dashboard before the sale?</li></ul></div>
+        </div>
+      

@@ -1,0 +1,131 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (self-reported interview posts):</p>
+          <ul>
+            <li>Amazon SDE2 L5, India, 2026-02, 40-minute HLD: online auction system; requirements, entities, data model, API design, scale-out and design choices (the same loop's LLD was a coffee machine with requirements added as follow-ups). <a href="https://leetcode.com/discuss/post/7599188/" target="_blank" rel="noopener">post</a></li>
+            <li>Meta E5, 2025-07, full loop system design: design an auction system. <a href="https://leetcode.com/discuss/post/6991906/" target="_blank" rel="noopener">post</a></li>
+            <li>Razorpay SDE-2, 2024-11, selected: bidders and sellers sign up (one user cannot be both), sellers list products and view their listings, bidders search with Elasticsearch and place bids; concurrency and conflict resolution so the system stays consistent. <a href="https://leetcode.com/discuss/post/6044408/" target="_blank" rel="noopener">post</a></li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> List, search, bid, live price, close, settle. Ask about proxy bids, soft close, reserve, roles. Write "bids CP, browse AP".</li>
+          <li><strong>5-10 min: estimation</strong> Total bids are small; one hot auction is the problem (about 1K bids per second, 100K watchers).</li>
+          <li><strong>10-18 min: entities, data model, APIs</strong> Auction row with denormalised price, leader and version; append-only bids; the bid API's responses.</li>
+          <li><strong>18-28 min: architecture</strong> Auction service, Bid service, DB sharded by auction, outbox to Kafka, Elasticsearch, Redis pub/sub to SSE gateways, closer, settlement.</li>
+          <li><strong>28-40 min: deep dives</strong> Conditional update vs queue serialisation; proxy bids and ties; end time and soft close; fan-out.</li>
+          <li><strong>40-45 min: wrap up</strong> CAP choice, failure modes, metrics (bid latency p99, rejection reasons, auctions past end still LIVE, push lag).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Sellers create auctions through an Auction service; changes flow by CDC into Elasticsearch for search. The bid path is the core: the auction row holds current price, leader, the leader's secret maximum, ends_at and a version, sharded by auction id. A bid is one conditional update: status live, now before ends_at by the database clock, amount at least price plus increment; it bumps the version, extends ends_at in the soft-close window, and appends the bid with seq equal to the version, all in one transaction. Losers get TOO_LOW with the next minimum. For a single auction with thousands of bids a second, I move its bids onto a Kafka partition with one consumer. Accepted bids go through an outbox to Kafka, then Redis pub/sub to SSE gateways, versioned so clients refetch on gaps. A closer closes auctions with a conditional update when ends_at passes; settlement charges the winner idempotently and falls back to a second-chance offer."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: entities and tables, the bid API, a transaction or lock so two bids cannot both win, a scheduled job that closes auctions, polling for the live price, search with Elasticsearch. SDE-2 adds: the single-statement conditional update and why read-then-write fails, queue-per-auction serialisation for hot items, proxy bidding and tie rules, enforcing the end in the bid check with one clock, soft close inside the same update, versioned push with coalescing, idempotent settlement and the CP-vs-AP split.</p></div>
+
+        <h3>Follow-up questions</h3>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Razorpay,Amazon">
+          <summary>Two bidders bid at the same millisecond. How do you resolve the conflict?</summary>
+          <div class="answer">
+            <p>Make the check and the write one atomic operation on the auction row: <code>UPDATE ... WHERE current_price + inc &lt;= :amount AND status='LIVE' AND now() &lt; ends_at</code>. The database serialises the two updates on the row; the first commits and bumps the version; the second re-evaluates the condition against the new price and either succeeds (if still high enough) or returns 0 rows and is rejected with the new minimum. The version becomes the bid's sequence number, so there is one total order; equal maximums are won by the earlier sequence.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the lost-update race first, then the conditional update, then "and if this one auction is very hot, a Kafka partition per auction".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not a distributed lock? (Expiry under pauses lets two writers in; a conditional write inside the data store has no such gap.)</li><li>How does DynamoDB do it? (ConditionExpression; ConditionalCheckFailedException on failure.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Razorpay,Meta">
+          <summary>Consistency or availability for bids? What about the rest?</summary>
+          <div class="answer">
+            <p>Bids: consistency. One leader per auction shard; if it is unavailable, reject bids for that auction briefly instead of accepting them somewhere that could diverge. Reads (item pages, search, live price): availability with bounded staleness, served from replicas, caches and the search index. The bid response itself always reflects the authoritative row.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the split explicitly and give the user-facing behaviour for each during a failure.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Multi-region? (Home each auction in one region; bids from elsewhere route there; reads are local.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>A celebrity auction gets thousands of bids per second in its final minute. What changes?</summary>
+          <div class="answer">
+            <p>The conditional update still gives correct answers but many bids lose and retry against one row. Move that auction's bids to a Kafka partition keyed by auction id with a single consumer that holds the current state in memory and writes results in order; the API returns 202 and the client gets the result over the stream or by polling the bid id. Alternatively a Redis Lua check-and-set with durable write-behind. Also coalesce price pushes to a few per second.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know the cost: asynchronous result and more components, worth it only for hot auctions. You can route only flagged hot auctions this way.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the consumer crashes? (Another takes the partition, rebuilds state from the DB, resumes from the committed offset; processing is idempotent by bid id.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>How do you close auctions exactly at the end time?</summary>
+          <div class="answer">
+            <p>Two parts. Correctness: the bid's conditional update includes <code>now() &lt; ends_at</code> using the database clock, so no bid is accepted late regardless of the closer. Announcement: a closer polls the partial index on <code>ends_at</code> for live auctions every second (SKIP LOCKED across instances) or fires delayed messages per auction, re-reads <code>ends_at</code> (it may have moved), and runs <code>LIVE -&gt; CLOSED</code> conditionally, then emits auction.closed for settlement and notifications.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "who wins" (decided by the bid check) from "when we announce" (closer). That shows real understanding.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>50K auctions end at 20:00 Sunday. (Shard the closer; each shard closes its slice in parallel.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Meta">
+          <summary>How do you stop sniping?</summary>
+          <div class="answer">
+            <p>Offer proxy bidding so honest bidders can set a maximum in advance, and optionally a soft close: a bid in the last N seconds sets <code>ends_at = max(ends_at, now() + N)</code> inside the same conditional update, and every price event carries the new end time. Cap the number of extensions if needed. eBay itself keeps a fixed end and relies on automatic bidding; many other auction sites use soft close.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give both mechanisms and the one-line SQL change.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does the closer need to know? (It re-reads ends_at before closing and reschedules.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Walk me through the entities, data model and why you chose SQL or NoSQL.</summary>
+          <div class="answer">
+            <p>User (with role), Item, Auction (prices, times, status, denormalised current price, leader, leader max, bid count, version), Bid (append-only, seq per auction, idempotency key), Watch, Settlement. SQL fits: relational data, transactions spanning the auction row and the bid insert, unique constraints. Shard by auction id so the hot transaction stays on one shard. DynamoDB also works: auction item plus bid items in one partition key with conditional writes and a transaction; then search and "my bids" need secondary indexes or Elasticsearch.</p>
+            <div class="approach"><h5>How to answer</h5><p>Derive the store from the bid transaction, not from habit.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you show "my active bids"? (Secondary index by bidder, or an event-built read model.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Razorpay">
+          <summary>How does search with Elasticsearch stay in sync with live prices?</summary>
+          <div class="answer">
+            <p>The database is the source of truth; CDC or an outbox publishes auction changes to Kafka; an indexer updates the Elasticsearch document (price, bid count, ends_at, status). It is near real time and eventually consistent; the item page reads the database or cache. For price changes on hot auctions, batch index updates (at most one per auction per few seconds) to avoid hammering the index.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "never dual-write from the bid path" and why (partial failures).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Sort by "ending soon"? (Index ends_at; filter status LIVE.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Meta">
+          <summary>How do watchers see the new price in real time?</summary>
+          <div class="answer">
+            <p>SSE or WebSocket from browser to a gateway; gateway pods subscribe to <code>auction:{id}</code> in Redis while they have watchers; the publisher sends versioned events from the outbox stream. Clients drop events with an older version and refetch on gaps or reconnects (Redis pub/sub is at-most-once). Coalesce to a few updates per second per hot auction. Fall back to polling every few seconds.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw publisher, Redis, two gateway pods, clients. Mention versions.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why SSE over WebSocket? (Updates are one-way; bids go over normal POST.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Razorpay,Amazon">
+          <summary>The winner does not pay. What happens?</summary>
+          <div class="answer">
+            <p>Settlement creates the order and payment request with a deadline and an idempotency key. On expiry, mark the settlement EXPIRED, record a strike against the bidder, and offer the item to the next-highest distinct bidder at their bid (second chance) or relist. Every step is a state transition with a compensating action, run as a saga.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the settlement state machine and reuse the payment service.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Auto-charge at close? (Possible with a saved method and consent; still idempotent by auction id.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: two people were told they won</h4>
+          <div class="situation">A customer complaint: both bidders received "You are the highest bidder" in the last second, and the final price is the lower bid.</div>
+          <div class="bad">Weak answer: "Add a cache so reads are faster."</div>
+          <div class="good">Strong answer: classic lost update. The bid service read the price, checked in application code, then wrote unconditionally. Fix with the conditional update (check inside the write) and return "leading" only from the row the update returned. Repair data from the bid log (append-only, sequenced), contact both bidders, and add a test that fires concurrent bids at one auction.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>How would you detect it in production? (Invariant check: final price equals the maximum accepted bid; alert if not.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: bids accepted after the end</h4>
+          <div class="situation">An auction ended at 20:00:00 but a bid timestamped 20:00:02 won.</div>
+          <div class="bad">Weak answer: "Run the closer more often."</div>
+          <div class="good">Strong answer: the bid path trusted the closer (checked status only) or used app-server clocks. Put <code>now() &lt; ends_at</code> in the conditional update with the database clock; then the closer's speed no longer matters for correctness.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>What about network latency for a bid sent at 19:59:59.9? (Server receipt time is the rule; say so in the terms.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Read-then-write bid logic, or computing the high bid with <code>SELECT max(amount)</code> on every bid.</li>
+          <li>Relying on the closer job to stop late bids.</li>
+          <li>Using client timestamps for ordering or ties.</li>
+          <li>Writing to Elasticsearch directly from the bid transaction (dual write).</li>
+          <li>Treating total bid throughput as the scale problem and ignoring the single hot auction.</li>
+          <li>Forgetting reserve price, settlement and non-payment.</li>
+          <li>Saying "eventual consistency everywhere".</li>
+        </ul>
+      

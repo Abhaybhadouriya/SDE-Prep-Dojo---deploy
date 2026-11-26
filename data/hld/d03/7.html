@@ -1,0 +1,57 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <p>This design is a textbook Kafka use case, so this section is bigger than usual.</p>
+        <ul>
+          <li><b>Kafka</b> is the backbone. It <b>decouples</b> fast intake (202 in milliseconds) from slow delivery (seconds, retries), <b>absorbs bursts</b> (a campaign can enqueue faster than providers accept), <b>keeps order per user</b> (key = <code>user_id</code>, so "order placed" is not shown after "order delivered"), and allows <b>replay</b> after a bug thanks to retention. Each channel is a separate <a href="{{BASE}}devops/kafka-04">consumer group</a>, so push and email progress independently. Producers use <code>acks=all</code> with <code>enable.idempotence=true</code> (both defaults in Kafka 4.x clients) and topics use replication factor 3 with <code>min.insync.replicas=2</code> (see <a href="{{BASE}}devops/kafka-05">replication</a>).</li>
+          <li><b>Kubernetes</b> runs every box as a Deployment: API, router and one worker Deployment per channel and priority. Scale workers on <b>consumer lag</b> (messages waiting), not CPU, because workers mostly wait on the network. <a href="https://keda.sh/docs/latest/scalers/apache-kafka/" target="_blank" rel="noopener">KEDA's Kafka scaler</a> does exactly that. Keep a high <code>minReplicaCount</code> for the <code>.high</code> pools so OTP workers are never cold. Provider credentials (APNs keys, SMS API keys) are <a href="{{BASE}}devops/k8s-07">Secrets</a>.</li>
+          <li><b>Docker:</b> each service is an image; a <a href="{{BASE}}devops/docker-07">Compose</a> file with Kafka (KRaft, single node), Redis and fake providers is how you test the whole flow on a laptop, the same way the <a href="{{BASE}}devops/pipeline-02">ShopStream pipeline</a> is built locally.</li>
+        </ul>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Create topics">
+<pre><code class="language-bash"># Kafka 4.x (KRaft). Inside the apache/kafka:4.4.0 container: export PATH=$PATH:/opt/kafka/bin
+B=localhost:9092
+kafka-topics.sh --bootstrap-server $B --create --topic notif.requests --partitions 48 --replication-factor 3 --config min.insync.replicas=2
+kafka-topics.sh --bootstrap-server $B --create --topic push.high      --partitions 24 --replication-factor 3 --config min.insync.replicas=2
+kafka-topics.sh --bootstrap-server $B --create --topic push.low       --partitions 96 --replication-factor 3 --config min.insync.replicas=2
+kafka-topics.sh --bootstrap-server $B --create --topic push.retry.1m  --partitions 12 --replication-factor 3
+kafka-topics.sh --bootstrap-server $B --create --topic push.dlq       --partitions 6  --replication-factor 3 --config retention.ms=1209600000</code></pre>
+<pre class="terminal"><code>WARNING: Due to limitations in metric names, topics with a period (&#39;.&#39;) or underscore (&#39;_&#39;) could collide. To avoid issues it is best to use either, but not both.
+Created topic notif.requests.
+WARNING: Due to limitations in metric names, topics with a period (&#39;.&#39;) or underscore (&#39;_&#39;) could collide. To avoid issues it is best to use either, but not both.
+Created topic push.high.
+WARNING: Due to limitations in metric names, topics with a period (&#39;.&#39;) or underscore (&#39;_&#39;) could collide. To avoid issues it is best to use either, but not both.
+Created topic push.low.
+WARNING: Due to limitations in metric names, topics with a period (&#39;.&#39;) or underscore (&#39;_&#39;) could collide. To avoid issues it is best to use either, but not both.
+Created topic push.retry.1m.
+WARNING: Due to limitations in metric names, topics with a period (&#39;.&#39;) or underscore (&#39;_&#39;) could collide. To avoid issues it is best to use either, but not both.
+Created topic push.dlq.</code></pre>
+            <p>(On a one-broker laptop, use <code>--replication-factor 1</code> and drop <code>min.insync.replicas</code>.) The DLQ keeps 14 days (1,209,600,000 ms) so humans have time to look. Kafka prints the metric-name warning for every topic containing a period or underscore; it is harmless as long as you never mix the two styles (we use only periods).</p>
+          </div>
+          <div class="tab-panel" data-title="Watch lag">
+<pre><code class="language-bash">kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group push-low-workers</code></pre>
+<pre class="terminal"><code>GROUP             TOPIC     PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG     CONSUMER-ID   HOST         CLIENT-ID
+push-low-workers  push.low  0          1820431         1904112         83681   worker-7f...  /10.1.4.22   worker-7
+push-low-workers  push.low  1          1817002         1903980         86978   worker-2c...  /10.1.4.31   worker-2
+...</code></pre>
+            <p>Illustrative output (the column layout is what the tool prints; the numbers are examples). During a campaign, <code>push.low</code> lag grows into the millions and that is fine. Lag on <code>push.high</code> should stay near zero; alert if it does not.</p>
+          </div>
+          <div class="tab-panel" data-title="KEDA autoscaling">
+<pre><code class="language-yaml">apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: push-low-workers
+spec:
+  scaleTargetRef:
+    name: push-low-workers          # the worker Deployment
+  minReplicaCount: 2
+  maxReplicaCount: 96               # no point going above the partition count
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka:9092
+      consumerGroup: push-low-workers
+      topic: push.low
+      lagThreshold: "5000"          # target lag per replica</code></pre>
+          </div>
+        </div>
+      

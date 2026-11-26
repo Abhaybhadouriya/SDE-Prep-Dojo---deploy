@@ -1,0 +1,78 @@
+
+        <h2>Data model</h2>
+        <p>One database cannot be good at everything, so we pick a store per access pattern. This is the one-sentence rule to say: <b>"Transactions go to SQL, search goes to a search index, hot moving data goes to memory, and history goes to a log."</b></p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Four stores: SQL for orders, search index for restaurants, Redis for rider locations, Kafka for event history">
+            <rect class="box db" x="20" y="40" width="175" height="110"/>
+            <text class="label" x="107" y="66">PostgreSQL / MySQL</text>
+            <text class="label small" x="107" y="92">orders, order_items</text>
+            <text class="label small" x="107" y="112">payments, restaurants</text>
+            <text class="label small" x="107" y="132">menus (source of truth)</text>
+            <rect class="box svc" x="215" y="40" width="175" height="110"/>
+            <text class="label" x="302" y="66">Elasticsearch</text>
+            <text class="label small" x="302" y="92">restaurant docs</text>
+            <text class="label small" x="302" y="112">geo_point + H3 cells</text>
+            <text class="label small" x="302" y="132">cuisine, rating, tags</text>
+            <rect class="box cache" x="410" y="40" width="175" height="110"/>
+            <text class="label" x="497" y="66">Redis</text>
+            <text class="label small" x="497" y="92">rider latest location</text>
+            <text class="label small" x="497" y="112">rider status (FREE/BUSY)</text>
+            <text class="label small" x="497" y="132">menu + cart cache</text>
+            <rect class="box kafka" x="605" y="40" width="175" height="110"/>
+            <text class="label" x="692" y="66">Kafka</text>
+            <text class="label small" x="692" y="92">order-events</text>
+            <text class="label small" x="692" y="112">rider-locations</text>
+            <text class="label small" x="692" y="132">dispatch-decisions</text>
+            <text class="label small" x="107" y="180">strong, ACID</text>
+            <text class="label small" x="302" y="180">fast filters, eventual</text>
+            <text class="label small" x="497" y="180">sub-ms, lossy OK</text>
+            <text class="label small" x="692" y="180">replayable history</text>
+            <path class="arrow dashed" d="M107 200 L107 240 L692 240 L692 200"/>
+            <text class="label small" x="400" y="262">changes in SQL flow to Kafka (outbox / CDC), then to the search index and caches</text>
+            <circle class="packet alt" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M107 200 L107 240 L692 240 L692 200"/></circle>
+          </svg>
+          <figcaption>Pick a store per access pattern. SQL is the truth, and everything else is a fast, rebuildable view fed from it.</figcaption>
+        </figure>
+<pre><code class="language-sql">-- Orders: the money and the promise. Shard by order_id (hash) when one primary is not enough.
+CREATE TABLE orders (
+  order_id        BIGINT PRIMARY KEY,          -- Snowflake-style id, time sortable
+  idempotency_key UUID   NOT NULL UNIQUE,      -- one row per checkout attempt, ever
+  customer_id     BIGINT NOT NULL,
+  restaurant_id   BIGINT NOT NULL,
+  rider_id        BIGINT,                      -- NULL until assigned
+  city_id         INT    NOT NULL,
+  status          TEXT   NOT NULL,             -- PLACED, CONFIRMED, ACCEPTED, ...
+  total_paise     BIGINT NOT NULL,             -- integer money, never float
+  prep_minutes    INT,
+  promised_eta    TIMESTAMPTZ,
+  version         INT    NOT NULL DEFAULT 0,   -- optimistic concurrency
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX ON orders (customer_id, created_at DESC);   -- "my orders"
+CREATE INDEX ON orders (restaurant_id, status);          -- restaurant tablet queue
+
+-- Every state change is also appended here (audit + debugging "where did my order go?")
+CREATE TABLE order_events (
+  order_id BIGINT, seq INT, from_status TEXT, to_status TEXT, actor TEXT, at TIMESTAMPTZ,
+  PRIMARY KEY (order_id, seq)
+);
+
+-- Outbox: written in the SAME transaction as the order change, relayed to Kafka
+CREATE TABLE outbox (
+  id BIGSERIAL PRIMARY KEY, aggregate_id BIGINT, event_type TEXT, payload JSONB, created_at TIMESTAMPTZ DEFAULT now()
+);</code></pre>
+        <div class="callout note"><p><b>New word - outbox:</b> events are written into this table inside the <i>same</i> transaction as the order, so the event and the order can never disagree (both saved or neither). A small relay process (or a CDC tool reading the database log) then copies new rows to Kafka. The full story is in deep dive 4 below; for now, read "outbox row" as "an event waiting to be published".</p></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Key</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Orders, payments</td><td>SQL (sharded later)</td><td><code>order_id</code></td><td>Transactions, unique idempotency key, conditional status updates.</td></tr>
+              <tr><td>Restaurants, menus (truth)</td><td>SQL</td><td><code>restaurant_id</code></td><td>Changed by partners, needs validation. Small data.</td></tr>
+              <tr><td>Restaurant search</td><td>Elasticsearch</td><td>doc per restaurant</td><td>Geo filter + text + facets in one query.</td></tr>
+              <tr><td>Rider live location</td><td>Redis GEO per city</td><td><code>riders:{city}</code></td><td>62k writes/s, only the latest value matters, expire stale riders.</td></tr>
+              <tr><td>Rider status</td><td>Redis hash</td><td><code>rider:{id}</code></td><td>Atomic compare-and-set on FREE -&gt; OFFERED -&gt; BUSY.</td></tr>
+              <tr><td>Location history, events</td><td>Kafka, then object storage</td><td><code>riderId</code> / <code>orderId</code></td><td>Replay, ML features for ETA, analytics.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      

@@ -1,0 +1,829 @@
+<h3>Python</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="tracker.py">
+<pre><code class="language-python">"""Task Tracker (Jira / Trello / To-do): the same design as the Java version.
+
+Board = issues + sprints + audit log, guarded by one lock. Workflow = a transition table.
+Guards = small rule objects checked before a move. Filters = composable specs (&amp;, |, ~).
+"""
+from __future__ import annotations
+
+import itertools
+import threading
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Optional
+
+
+class IssueType(Enum):
+    STORY = 1
+    TASK = 2
+    BUG = 3
+    SUBTASK = 4
+
+
+class Priority(Enum):
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    CRITICAL = 4
+
+
+class Field(Enum):
+    TITLE = 1
+    DESCRIPTION = 2
+    PRIORITY = 3
+
+
+class SprintState(Enum):
+    PLANNED = 1
+    ACTIVE = 2
+    CLOSED = 3
+
+
+class TrackerError(Exception):
+    pass
+
+
+class TransitionDenied(TrackerError):
+    pass
+
+
+class StaleUpdate(TrackerError):
+    pass
+
+
+class Workflow:
+    """States plus allowed moves, configurable per board."""
+
+    def __init__(self, name: str, initial: str):
+        self.name, self.initial = name, initial
+        self._next: dict[str, list[str]] = {initial: []}
+        self._done: set[str] = set()
+
+    def allow(self, src: str, *dst: str) -&gt; "Workflow":
+        self._next.setdefault(src, []).extend(dst)
+        for d in dst:
+            self._next.setdefault(d, [])
+        return self
+
+    def done(self, *states: str) -&gt; "Workflow":
+        self._done.update(states)
+        return self
+
+    def allows(self, src: str, dst: str) -&gt; bool:
+        return dst in self._next.get(src, [])
+
+    def is_done(self, state: str) -&gt; bool:
+        return state in self._done
+
+    def states(self) -&gt; list[str]:
+        return list(self._next)
+
+    @staticmethod
+    def todo() -&gt; "Workflow":
+        return Workflow("To-do", "TODO").allow("TODO", "DONE").allow("DONE", "TODO").done("DONE")
+
+    @staticmethod
+    def scrum() -&gt; "Workflow":
+        return (Workflow("Scrum", "TODO")
+                .allow("TODO", "IN_PROGRESS")
+                .allow("IN_PROGRESS", "IN_REVIEW", "TODO")
+                .allow("IN_REVIEW", "DONE", "IN_PROGRESS")
+                .allow("DONE", "TODO")
+                .done("DONE"))
+
+
+@dataclass
+class Issue:
+    key: str
+    type: IssueType
+    title: str
+    priority: Priority
+    status: str
+    reporter: str
+    created_at: int
+    description: str = ""
+    assignee: Optional[str] = None
+    parent: Optional[str] = None
+    sprint: Optional[str] = None
+    labels: set = field(default_factory=set)
+    subtasks: list = field(default_factory=list)
+    version: int = 1
+    updated_at: int = 0
+
+    def view(self, done: bool) -&gt; "IssueView":
+        return IssueView(self.key, self.type, self.title, self.description, self.status, done, self.priority,
+                         self.assignee, tuple(sorted(self.labels)), self.parent, tuple(self.subtasks),
+                         self.sprint, self.version)
+
+
+@dataclass(frozen=True)
+class IssueView:
+    """An immutable copy handed to readers and filters."""
+    key: str
+    type: IssueType
+    title: str
+    description: str
+    status: str
+    done: bool
+    priority: Priority
+    assignee: Optional[str]
+    labels: tuple
+    parent: Optional[str]
+    subtasks: tuple
+    sprint: Optional[str]
+    version: int
+
+    @property
+    def number(self) -&gt; int:
+        return int(self.key.split("-", 1)[1])
+
+    def line(self) -&gt; str:
+        return f"{self.key} [{self.priority.name}] {self.title} ({self.assignee or 'unassigned'})"
+
+
+@dataclass(frozen=True)
+class Event:
+    seq: int
+    at: int
+    actor: str
+    issue: str
+    action: str
+    src: str
+    dst: str
+
+    def __str__(self) -&gt; str:
+        detail = self.dst if self.src == "-" else f"{self.src} -&gt; {self.dst}"
+        return f"#{self.seq:&lt;2} t={self.at:02d} {self.actor:&lt;6} {self.issue:&lt;6} {self.action:&lt;14} {detail}"
+
+
+@dataclass
+class Sprint:
+    id: str
+    name: str
+    state: SprintState = SprintState.PLANNED
+    issues: list = field(default_factory=list)   # top-level only; subtasks follow the parent
+
+
+# ---------------------------------------------------------------- guards (Strategy)
+
+Guard = Callable[[Issue, str, "Board"], Optional[str]]
+
+
+def needs_assignee(state: str) -&gt; Guard:
+    def check(i: Issue, to: str, b: "Board") -&gt; Optional[str]:
+        return f"{i.key} needs an assignee before {state}" if to == state and i.assignee is None else None
+    return check
+
+
+def subtasks_done() -&gt; Guard:
+    def check(i: Issue, to: str, b: "Board") -&gt; Optional[str]:
+        if not b.workflow.is_done(to):
+            return None
+        for k in i.subtasks:
+            if not b.workflow.is_done(b.issues[k].status):
+                return f"{i.key} has an open subtask {k}"
+        return None
+    return check
+
+
+# ---------------------------------------------------------------- filters (Specification)
+
+class Spec:
+    def __init__(self, fn: Callable[[IssueView], bool]):
+        self.fn = fn
+
+    def __call__(self, v: IssueView) -&gt; bool:
+        return self.fn(v)
+
+    def __and__(self, other: "Spec") -&gt; "Spec":
+        return Spec(lambda v: self(v) and other(v))
+
+    def __or__(self, other: "Spec") -&gt; "Spec":
+        return Spec(lambda v: self(v) or other(v))
+
+    def __invert__(self) -&gt; "Spec":
+        return Spec(lambda v: not self(v))
+
+
+class Filters:
+    open = staticmethod(lambda: Spec(lambda v: not v.done))
+    status = staticmethod(lambda s: Spec(lambda v: v.status == s))
+    assignee = staticmethod(lambda u: Spec(lambda v: v.assignee == u))
+    unassigned = staticmethod(lambda: Spec(lambda v: v.assignee is None))
+    priority_at_least = staticmethod(lambda p: Spec(lambda v: v.priority.value &gt;= p.value))
+    label = staticmethod(lambda l: Spec(lambda v: l in v.labels))
+    type = staticmethod(lambda t: Spec(lambda v: v.type == t))
+    in_sprint = staticmethod(lambda s: Spec(lambda v: v.sprint == s))
+    backlog = staticmethod(lambda: Spec(lambda v: v.sprint is None))
+
+    @staticmethod
+    def text(q: str) -&gt; Spec:
+        q = q.lower()
+        return Spec(lambda v: q in v.title.lower() or q in v.description.lower())
+
+
+def by_priority(v: IssueView):
+    return (-v.priority.value, v.number)
+
+
+# ---------------------------------------------------------------- board + service
+
+class Board:
+    def __init__(self, key: str, name: str, workflow: Workflow):
+        self.key, self.name, self.workflow = key, name, workflow
+        self.members: list[str] = []
+        self.guards: list[Guard] = []
+        self.issues: dict[str, Issue] = {}
+        self.sprints: dict[str, Sprint] = {}
+        self.log: list[Event] = []
+        self.next_number = 1
+        self.lock = threading.RLock()
+
+
+class TaskTracker:
+    def __init__(self, clock: Callable[[], int]):
+        self._clock = clock
+        self._users: dict[str, str] = {}
+        self._boards: dict[str, Board] = {}
+        self._sprint_board: dict[str, str] = {}
+        self._listeners: list[Callable[[Event], None]] = []
+        self._seq = itertools.count(1)
+        self._sprint_ids = itertools.count(1)
+        self._ids_lock = threading.Lock()
+
+    # ---- setup
+    def add_listener(self, fn: Callable[[Event], None]) -&gt; None:
+        self._listeners.append(fn)
+
+    def add_user(self, uid: str, name: str) -&gt; None:
+        if uid in self._users:
+            raise TrackerError(f"user {uid} exists")
+        self._users[uid] = name
+
+    def create_board(self, key: str, name: str, wf: Workflow, owner: str) -&gt; None:
+        self._user(owner)
+        if key in self._boards:
+            raise TrackerError(f"board {key} exists")
+        b = Board(key, name, wf)
+        b.members.append(owner)
+        self._boards[key] = b
+
+    def add_member(self, board_key: str, actor: str, uid: str) -&gt; None:
+        self._user(uid)
+        self._write(self._board(board_key), actor,
+                    lambda b, out: None if uid in b.members else b.members.append(uid))
+
+    def add_guard(self, board_key: str, guard: Guard) -&gt; None:
+        b = self._board(board_key)
+        with b.lock:
+            b.guards.append(guard)
+
+    # ---- issues
+    def create_issue(self, board_key: str, actor: str, itype: IssueType, title: str, p: Priority) -&gt; str:
+        if itype == IssueType.SUBTASK:
+            raise TrackerError("use add_subtask for subtasks")
+        return self._write(self._board(board_key), actor,
+                           lambda b, out: self._new_issue(b, out, actor, itype, title, p, None))
+
+    def add_subtask(self, parent_key: str, actor: str, title: str) -&gt; str:
+        def body(b: Board, out: list) -&gt; str:
+            parent = self._issue(b, parent_key)
+            if parent.type == IssueType.SUBTASK:
+                raise TrackerError("a subtask cannot have subtasks")
+            key = self._new_issue(b, out, actor, IssueType.SUBTASK, title, parent.priority, parent)
+            parent.subtasks.append(key)
+            self._touch(parent)
+            self._log(b, out, actor, parent_key, "SUBTASK_ADDED", None, key)
+            return key
+        return self._write(self._board_of(parent_key), actor, body)
+
+    def assign(self, key: str, actor: str, assignee: Optional[str]) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            if assignee is not None and assignee not in b.members:
+                raise TrackerError(f"{assignee} is not a member of {b.key}")
+            i = self._issue(b, key)
+            if i.assignee == assignee:
+                return
+            self._log(b, out, actor, key, "ASSIGNED", i.assignee, assignee)
+            i.assignee = assignee
+            self._touch(i)
+        self._write(self._board_of(key), actor, body)
+
+    def edit(self, key: str, actor: str, f: Field, value: str, expected_version: int = -1) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            i = self._issue(b, key)
+            if expected_version &gt;= 0 and expected_version != i.version:
+                raise StaleUpdate(f"{key} changed since you loaded it "
+                                  f"(you have v{expected_version}, current is v{i.version})")
+            if f == Field.TITLE:
+                old, i.title = i.title, value
+            elif f == Field.DESCRIPTION:
+                old, i.description = i.description, value
+            else:
+                if value not in Priority.__members__:
+                    raise TrackerError(f"unknown priority {value}")
+                old, i.priority = i.priority.name, Priority[value]
+            self._touch(i)
+            self._log(b, out, actor, key, "EDIT_" + f.name, old, value)
+        self._write(self._board_of(key), actor, body)
+
+    def add_label(self, key: str, actor: str, label: str) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            i = self._issue(b, key)
+            if label not in i.labels:
+                i.labels.add(label)
+                self._touch(i)
+                self._log(b, out, actor, key, "LABEL_ADDED", None, label)
+        self._write(self._board_of(key), actor, body)
+
+    def move(self, key: str, actor: str, to: str) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            i = self._issue(b, key)
+            if i.status == to:
+                return
+            if not b.workflow.allows(i.status, to):
+                raise TransitionDenied(f"{key}: {i.status} -&gt; {to} is not in the {b.workflow.name} workflow")
+            for g in b.guards:
+                why = g(i, to, b)
+                if why:
+                    raise TransitionDenied(why)
+            self._log(b, out, actor, key, "MOVED", i.status, to)
+            i.status = to
+            self._touch(i)
+        self._write(self._board_of(key), actor, body)
+
+    def remove(self, key: str, actor: str) -&gt; list[str]:
+        def body(b: Board, out: list) -&gt; list[str]:
+            i = self._issue(b, key)
+            gone = list(i.subtasks) + [key]
+            if i.parent is not None:
+                p = b.issues[i.parent]
+                p.subtasks.remove(key)
+                self._touch(p)
+            if i.sprint is not None and key in b.sprints[i.sprint].issues:
+                b.sprints[i.sprint].issues.remove(key)
+            for k in gone:
+                del b.issues[k]
+                self._log(b, out, actor, k, "REMOVED", None, "deleted")
+            return gone
+        return self._write(self._board_of(key), actor, body)
+
+    # ---- sprints
+    def create_sprint(self, board_key: str, actor: str, name: str) -&gt; str:
+        def body(b: Board, out: list) -&gt; str:
+            with self._ids_lock:
+                sid = f"S{next(self._sprint_ids)}"
+            b.sprints[sid] = Sprint(sid, name)
+            self._sprint_board[sid] = b.key
+            return sid
+        return self._write(self._board(board_key), actor, body)
+
+    def add_to_sprint(self, sid: str, actor: str, key: str) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            s = b.sprints[sid]
+            if s.state == SprintState.CLOSED:
+                raise TrackerError(f"{s.name} is closed")
+            i = self._issue(b, key)
+            if i.type == IssueType.SUBTASK:
+                raise TrackerError(f"subtasks follow their parent {i.parent}")
+            if i.sprint == sid:
+                return
+            if i.sprint is not None:
+                b.sprints[i.sprint].issues.remove(key)
+            s.issues.append(key)
+            self._set_sprint(b, out, actor, i, sid)
+        self._write(self._board_of_sprint(sid), actor, body)
+
+    def start_sprint(self, sid: str, actor: str) -&gt; None:
+        def body(b: Board, out: list) -&gt; None:
+            s = b.sprints[sid]
+            if s.state != SprintState.PLANNED:
+                raise TrackerError(f"{s.name} is {s.state.name}")
+            for other in b.sprints.values():
+                if other.state == SprintState.ACTIVE:
+                    raise TrackerError(f"{other.name} is already active on {b.key}")
+            s.state = SprintState.ACTIVE
+        self._write(self._board_of_sprint(sid), actor, body)
+
+    def complete_sprint(self, sid: str, actor: str) -&gt; list[str]:
+        def body(b: Board, out: list) -&gt; list[str]:
+            s = b.sprints[sid]
+            if s.state != SprintState.ACTIVE:
+                raise TrackerError(f"{s.name} is not active")
+            carried = [k for k in s.issues if not b.workflow.is_done(b.issues[k].status)]
+            for k in carried:
+                self._set_sprint(b, out, actor, b.issues[k], None)
+                s.issues.remove(k)
+            s.state = SprintState.CLOSED
+            return carried
+        return self._write(self._board_of_sprint(sid), actor, body)
+
+    # ---- reads (copies)
+    def get(self, key: str) -&gt; IssueView:
+        b = self._board_of(key)
+        with b.lock:
+            i = self._issue(b, key)
+            return i.view(b.workflow.is_done(i.status))
+
+    def search(self, board_key: str, spec: Spec) -&gt; list[IssueView]:
+        return sorted((v for v in self._snapshot(self._board(board_key)) if spec(v)), key=by_priority)
+
+    def history(self, key: str) -&gt; list[Event]:
+        b = self._board_of(key)
+        with b.lock:
+            return [e for e in b.log if e.issue == key]
+
+    def activity_of(self, uid: str) -&gt; list[Event]:
+        out = []
+        for b in list(self._boards.values()):
+            with b.lock:
+                out += [e for e in b.log if e.actor == uid]
+        return sorted(out, key=lambda e: e.seq)
+
+    def sprint_state(self, sid: str) -&gt; SprintState:
+        b = self._board_of_sprint(sid)
+        with b.lock:
+            return b.sprints[sid].state
+
+    def log_size(self, board_key: str) -&gt; int:
+        b = self._board(board_key)
+        with b.lock:
+            return len(b.log)
+
+    def render(self, board_key: str) -&gt; str:
+        b = self._board(board_key)
+        views = self._snapshot(b)
+        with b.lock:
+            active = next((s.name for s in b.sprints.values() if s.state == SprintState.ACTIVE), "none")
+        lines = [f"{b.key} {b.name} [{b.workflow.name}]  active sprint: {active}"]
+        for st in b.workflow.states():
+            col = sorted((v for v in views if v.status == st), key=by_priority)
+            if not col:
+                lines.append(f"  {st:&lt;11} | -")
+            for n, v in enumerate(col):
+                lines.append(f"  {st if n == 0 else '':&lt;11} | {v.line()}")
+        return "\n".join(lines) + "\n"
+
+    # ---- internals
+    def _write(self, b: Board, actor: str, body):
+        out: list[Event] = []
+        with b.lock:
+            if actor not in b.members:
+                raise TrackerError(f"{actor} is not a member of {b.key}")
+            result = body(b, out)
+        for e in out:                      # listeners run after the lock is released
+            for fn in self._listeners:
+                fn(e)
+        return result
+
+    def _new_issue(self, b: Board, out: list, actor: str, itype: IssueType, title: str,
+                   p: Priority, parent: Optional[Issue]) -&gt; str:
+        if not title or not title.strip():
+            raise TrackerError("title is required")
+        key = f"{b.key}-{b.next_number}"
+        b.next_number += 1
+        now = self._clock()
+        i = Issue(key, itype, title, p, b.workflow.initial, actor, now, updated_at=now)
+        if parent is not None:
+            i.parent, i.sprint = parent.key, parent.sprint
+        b.issues[key] = i
+        self._log(b, out, actor, key, "CREATED", None, f"{itype.name} '{title}'")
+        return key
+
+    def _set_sprint(self, b: Board, out: list, actor: str, i: Issue, sid: Optional[str]) -&gt; None:
+        src = "backlog" if i.sprint is None else b.sprints[i.sprint].name
+        dst = "backlog" if sid is None else b.sprints[sid].name
+        i.sprint = sid
+        self._touch(i)
+        self._log(b, out, actor, i.key, "SPRINT", src, dst)
+        for k in i.subtasks:
+            b.issues[k].sprint = sid
+            self._touch(b.issues[k])
+
+    def _log(self, b: Board, out: list, actor: str, key: str, action: str,
+             src: Optional[str], dst: Optional[str]) -&gt; None:
+        with self._ids_lock:
+            seq = next(self._seq)
+        e = Event(seq, self._clock(), actor, key, action, src or "-", dst or "-")
+        b.log.append(e)
+        out.append(e)
+
+    def _touch(self, i: Issue) -&gt; None:
+        i.version += 1
+        i.updated_at = self._clock()
+
+    def _snapshot(self, b: Board) -&gt; list[IssueView]:
+        with b.lock:
+            return [i.view(b.workflow.is_done(i.status)) for i in b.issues.values()]
+
+    def _user(self, uid: str) -&gt; str:
+        if uid not in self._users:
+            raise TrackerError(f"no user {uid}")
+        return self._users[uid]
+
+    def _board(self, key: str) -&gt; Board:
+        if key not in self._boards:
+            raise TrackerError(f"no board {key}")
+        return self._boards[key]
+
+    def _board_of(self, issue_key: str) -&gt; Board:
+        if "-" not in issue_key:
+            raise TrackerError(f"bad issue key {issue_key}")
+        return self._board(issue_key.split("-", 1)[0])
+
+    def _board_of_sprint(self, sid: str) -&gt; Board:
+        if sid not in self._sprint_board:
+            raise TrackerError(f"no sprint {sid}")
+        return self._board(self._sprint_board[sid])
+
+    @staticmethod
+    def _issue(b: Board, key: str) -&gt; Issue:
+        if key not in b.issues:
+            raise TrackerError(f"no issue {key}")
+        return b.issues[key]
+
+
+def counter_clock() -&gt; Callable[[], int]:
+    """A fake clock: 1, 2, 3, ... so output and tests are deterministic."""
+    c = itertools.count(1)
+    lock = threading.Lock()
+
+    def tick() -&gt; int:
+        with lock:
+            return next(c)
+    return tick</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver: the same story as Java's Main.demo(). Run: python main.py ; tests: python -m unittest"""
+from tracker import (Field, Filters, IssueType, Priority, TaskTracker, TrackerError, Workflow,
+                     counter_clock, needs_assignee, subtasks_done)
+
+
+def try_it(label, fn):
+    try:
+        fn()
+        print(f"  ok      {label}")
+    except TrackerError as e:
+        print(f"  refused {label}: {e}")
+
+
+def show(title, rows):
+    print(f"  {title}:")
+    if not rows:
+        print("    (none)")
+    for v in rows:
+        print(f"    {v.line()} {v.status}")
+
+
+def demo():
+    tt = TaskTracker(counter_clock())
+    tt.add_listener(lambda e: print(f"  [notify] {e.dst}: you were assigned {e.issue}")
+                    if e.action == "ASSIGNED" and e.dst != "-" else None)
+    for u in ("alice", "bob", "carol", "dave"):
+        tt.add_user(u, u)
+    tt.create_board("PAY", "Payments", Workflow.scrum(), "alice")
+    tt.add_member("PAY", "alice", "bob")
+    tt.add_member("PAY", "alice", "carol")
+    tt.add_guard("PAY", needs_assignee("IN_PROGRESS"))
+    tt.add_guard("PAY", subtasks_done())
+
+    print("== 1. Create issues and subtasks, assign")
+    story = tt.create_issue("PAY", "alice", IssueType.STORY, "UPI refund flow", Priority.HIGH)
+    bug = tt.create_issue("PAY", "alice", IssueType.BUG, "Double debit on retry", Priority.CRITICAL)
+    task = tt.create_issue("PAY", "bob", IssueType.TASK, "Write on-call runbook", Priority.LOW)
+    api = tt.add_subtask(story, "alice", "Refund API")
+    db = tt.add_subtask(story, "alice", "Refund table migration")
+    tt.assign(bug, "alice", "bob")
+    tt.assign(story, "alice", "carol")
+    tt.assign(api, "carol", "carol")
+    tt.add_label(story, "alice", "upi")
+    tt.add_label(bug, "alice", "upi")
+    try_it(f"assign {task} to dave", lambda: tt.assign(task, "alice", "dave"))
+    try_it("dave creates an issue", lambda: tt.create_issue("PAY", "dave", IssueType.TASK, "x", Priority.LOW))
+
+    print("\n== 2. Sprint planning")
+    s1 = tt.create_sprint("PAY", "alice", "Sprint 1")
+    tt.add_to_sprint(s1, "alice", story)
+    tt.add_to_sprint(s1, "alice", bug)
+    tt.start_sprint(s1, "alice")
+    try_it(f"add subtask {db} to the sprint", lambda: tt.add_to_sprint(s1, "alice", db))
+    s2 = tt.create_sprint("PAY", "alice", "Sprint 2")
+    try_it("start Sprint 2 while Sprint 1 is active", lambda: tt.start_sprint(s2, "alice"))
+
+    print("\n== 3. Workflow moves")
+    try_it(f"{task} TODO -&gt; IN_PROGRESS", lambda: tt.move(task, "bob", "IN_PROGRESS"))
+    try_it(f"{task} TODO -&gt; DONE", lambda: tt.move(task, "bob", "DONE"))
+    for key, who in ((bug, "bob"), (story, "carol"), (api, "carol")):
+        for st in ("IN_PROGRESS", "IN_REVIEW", "DONE"):
+            try_it(f"{key} -&gt; {st}", lambda: tt.move(key, who, st))
+
+    print("\n== 4. Two people edit the same issue")
+    v = tt.get(task).version
+    try_it(f"alice renames {task} (she loaded v{v})",
+           lambda: tt.edit(task, "alice", Field.TITLE, "Write payments on-call runbook", v))
+    try_it(f"bob sets priority HIGH (he also loaded v{v})",
+           lambda: tt.edit(task, "bob", Field.PRIORITY, "HIGH", v))
+
+    print("\n== 5. Filters")
+    show("open and HIGH or above", tt.search("PAY", Filters.open() &amp; Filters.priority_at_least(Priority.HIGH)))
+    show("label upi and not done", tt.search("PAY", Filters.label("upi") &amp; Filters.open()))
+    show("unassigned or LOW", tt.search("PAY", Filters.unassigned() | ~Filters.priority_at_least(Priority.MEDIUM)))
+    show("text 'refund' in the active sprint", tt.search("PAY", Filters.text("refund") &amp; Filters.in_sprint(s1)))
+
+    print("\n== 6. Board view")
+    print(tt.render("PAY"), end="")
+
+    print("\n== 7. Close the sprint, remove a task")
+    print(f"  carried over to the backlog: [{', '.join(tt.complete_sprint(s1, 'alice'))}]")
+    backlog = tt.search("PAY", Filters.backlog() &amp; ~Filters.type(IssueType.SUBTASK))
+    print(f"  backlog now: [{', '.join(v.key for v in backlog)}]")
+    print(f"  removed: [{', '.join(tt.remove(task, 'bob'))}]")
+
+    print(f"\n== 8. Audit history of {bug}")
+    for e in tt.history(bug):
+        print(f"  {e}")
+
+    print("\n== 9. Everything carol did")
+    for e in tt.activity_of("carol"):
+        print(f"  {e}")
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_tracker.py">
+<pre><code class="language-python">import threading
+import unittest
+
+from tracker import (Field, Filters, IssueType, Priority, SprintState, StaleUpdate, TaskTracker,
+                     TrackerError, TransitionDenied, Workflow, counter_clock, needs_assignee, subtasks_done)
+
+
+def board(wf: Workflow) -&gt; TaskTracker:
+    tt = TaskTracker(counter_clock())
+    for u in ("a", "b", "x"):
+        tt.add_user(u, u)
+    tt.create_board("T", "Test", wf, "a")
+    tt.add_member("T", "a", "b")
+    return tt
+
+
+def walk(tt, key, actor):
+    for st in ("IN_PROGRESS", "IN_REVIEW", "DONE"):
+        tt.move(key, actor, st)
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.tt = board(Workflow.scrum())
+        self.tt.add_guard("T", needs_assignee("IN_PROGRESS"))
+        self.tt.add_guard("T", subtasks_done())
+
+    def test_table_and_assignee_guard(self):
+        k = self.tt.create_issue("T", "a", IssueType.TASK, "t1", Priority.MEDIUM)
+        with self.assertRaises(TransitionDenied):
+            self.tt.move(k, "a", "DONE")
+        with self.assertRaises(TransitionDenied):
+            self.tt.move(k, "a", "IN_PROGRESS")
+        self.tt.assign(k, "a", "b")
+        self.tt.move(k, "b", "IN_PROGRESS")
+        self.assertEqual(self.tt.get(k).status, "IN_PROGRESS")
+
+    def test_parent_waits_for_subtasks(self):
+        p = self.tt.create_issue("T", "a", IssueType.STORY, "parent", Priority.HIGH)
+        c = self.tt.add_subtask(p, "a", "child")
+        with self.assertRaises(TrackerError):
+            self.tt.add_subtask(c, "a", "grandchild")
+        self.tt.assign(p, "a", "a")
+        self.tt.move(p, "a", "IN_PROGRESS")
+        self.tt.move(p, "a", "IN_REVIEW")
+        with self.assertRaises(TransitionDenied):
+            self.tt.move(p, "a", "DONE")
+        self.tt.assign(c, "a", "a")
+        walk(self.tt, c, "a")
+        self.tt.move(p, "a", "DONE")
+        self.assertTrue(self.tt.get(p).done)
+
+    def test_membership_and_bad_input(self):
+        k = self.tt.create_issue("T", "a", IssueType.TASK, "t", Priority.LOW)
+        for fn in (lambda: self.tt.create_issue("T", "x", IssueType.TASK, "t", Priority.LOW),
+                   lambda: self.tt.assign(k, "a", "x"),
+                   lambda: self.tt.move("T-99", "a", "DONE"),
+                   lambda: self.tt.create_issue("T", "a", IssueType.TASK, " ", Priority.LOW),
+                   lambda: self.tt.edit(k, "a", Field.PRIORITY, "URGENT")):
+            with self.assertRaises(TrackerError):
+                fn()
+
+    def test_stale_edit_is_refused(self):
+        k = self.tt.create_issue("T", "a", IssueType.TASK, "t", Priority.LOW)
+        v = self.tt.get(k).version
+        self.tt.edit(k, "a", Field.TITLE, "renamed", v)
+        self.assertEqual(self.tt.get(k).version, v + 1)
+        with self.assertRaises(StaleUpdate):
+            self.tt.edit(k, "b", Field.TITLE, "lost update", v)
+        self.assertEqual(self.tt.get(k).title, "renamed")
+
+
+class SprintTests(unittest.TestCase):
+    def test_sprint_lifecycle(self):
+        tt = board(Workflow.scrum())
+        a1 = tt.create_issue("T", "a", IssueType.STORY, "s", Priority.HIGH)
+        a2 = tt.add_subtask(a1, "a", "sub")
+        a3 = tt.create_issue("T", "a", IssueType.TASK, "quick", Priority.LOW)
+        s1, s2 = tt.create_sprint("T", "a", "S1"), tt.create_sprint("T", "a", "S2")
+        tt.add_to_sprint(s1, "a", a1)
+        tt.add_to_sprint(s1, "a", a3)
+        self.assertEqual(tt.get(a2).sprint, s1)
+        tt.start_sprint(s1, "a")
+        with self.assertRaises(TrackerError):
+            tt.start_sprint(s2, "a")
+        walk(tt, a3, "a")
+        self.assertEqual(tt.complete_sprint(s1, "a"), [a1])
+        self.assertIsNone(tt.get(a1).sprint)
+        self.assertIsNone(tt.get(a2).sprint)
+        self.assertEqual(tt.get(a3).sprint, s1)
+        self.assertEqual(tt.sprint_state(s1), SprintState.CLOSED)
+        with self.assertRaises(TrackerError):
+            tt.add_to_sprint(s1, "a", a1)
+
+
+class RemoveFilterAuditTests(unittest.TestCase):
+    def test_remove_cascades_and_history_survives(self):
+        tt = board(Workflow.scrum())
+        r1 = tt.create_issue("T", "a", IssueType.STORY, "r", Priority.LOW)
+        r2 = tt.add_subtask(r1, "a", "r-sub")
+        r3 = tt.add_subtask(r1, "a", "r-sub2")
+        tt.remove(r3, "a")
+        self.assertEqual(tt.get(r1).subtasks, (r2,))
+        self.assertEqual(tt.remove(r1, "b"), [r2, r1])
+        with self.assertRaises(TrackerError):
+            tt.get(r1)
+        h = tt.history(r1)
+        self.assertEqual((h[0].action, h[-1].action), ("CREATED", "REMOVED"))
+
+    def test_filters_compose_and_sort(self):
+        tt = board(Workflow.todo())
+        f1 = tt.create_issue("T", "a", IssueType.TASK, "Buy milk", Priority.LOW)
+        f2 = tt.create_issue("T", "a", IssueType.TASK, "Pay rent", Priority.CRITICAL)
+        f3 = tt.create_issue("T", "a", IssueType.TASK, "Pay electricity", Priority.CRITICAL)
+        tt.add_label(f1, "a", "home")
+        tt.move(f2, "a", "DONE")
+        keys = lambda rows: [v.key for v in rows]
+        self.assertEqual(keys(tt.search("T", Filters.text("pay") &amp; Filters.open())), [f3])
+        self.assertEqual(keys(tt.search("T", Filters.label("home") | Filters.priority_at_least(Priority.HIGH))),
+                         [f2, f3, f1])
+        self.assertEqual(len(tt.search("T", ~Filters.open())), 1)
+        tt.move(f2, "a", "TODO")
+        self.assertFalse(tt.get(f2).done)
+        h = tt.history(f2)
+        self.assertEqual(len(h), 3)
+        self.assertEqual((h[1].dst, h[2].src), ("DONE", "DONE"))
+        self.assertTrue(all(h[i].seq &gt; h[i - 1].seq for i in range(1, len(h))))
+
+    def test_refused_write_notifies_nobody(self):
+        tt = board(Workflow.scrum())
+        seen = []
+        tt.add_listener(lambda e: seen.append(e.action))
+        k = tt.create_issue("T", "a", IssueType.TASK, "l", Priority.LOW)
+        with self.assertRaises(TransitionDenied):
+            tt.move(k, "a", "DONE")
+        self.assertEqual(seen, ["CREATED"])
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def test_parallel_creates_get_unique_keys(self):
+        tt = board(Workflow.todo())
+        keys, keys_lock = [], threading.Lock()
+
+        def worker(actor):
+            mine = []
+            for n in range(250):
+                k = tt.create_issue("T", actor, IssueType.TASK, f"job {n}", Priority.MEDIUM)
+                tt.move(k, actor, "DONE")
+                mine.append(k)
+            with keys_lock:
+                keys.extend(mine)
+
+        threads = [threading.Thread(target=worker, args=("a" if t % 2 == 0 else "b",)) for t in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(set(keys)), 2000)
+        self.assertEqual(tt.search("T", Filters.open()), [])
+        self.assertEqual(tt.log_size("T"), 4000)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+  </div>
+  <p><code>python main.py</code> prints exactly the Java demo output (without the final check count). <code>python -m unittest</code>:</p>
+<pre class="terminal"><code>.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.028s
+
+OK</code></pre>
+  

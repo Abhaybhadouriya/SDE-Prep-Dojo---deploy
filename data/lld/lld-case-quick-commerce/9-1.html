@@ -1,0 +1,310 @@
+<h3>C++14</h3>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>ALL 11 CHECKS PASSED</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Quick-commerce order + inventory (Zepto style) - C++14.
+// Windows (MinGW g++ 6.3):  g++ -std=c++14 -Wall -O2 main.cpp -o qc &amp;&amp; ./qc
+// Linux (real locks + race): g++ -std=c++14 -Wall -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o qc &amp;&amp; ./qc
+// MinGW.org g++ 6.3 uses the win32 thread model: it has no std::mutex/std::thread and -pthread fails to
+// link. Without HAVE_STD_MUTEX, Mutex below is a no-op with the same lock()/unlock() interface, so the
+// SAME locking code compiles both ways; only the Linux build runs the 20-thread race.
+#include &lt;algorithm&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdlib&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#ifdef HAVE_STD_MUTEX
+#include &lt;thread&gt;
+typedef std::mutex Mutex;
+typedef std::recursive_mutex RecursiveMutex;           // the order lock is re-taken by expire()
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+typedef Mutex RecursiveMutex;
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+using std::map; using std::string; using std::vector;
+typedef map&lt;string, int&gt; Lines;                         // sku -&gt; qty; std::map iterates in sorted order
+
+struct QcError : std::runtime_error { explicit QcError(const string&amp; m) : std::runtime_error(m) {} };
+
+// One SKU in one store. Invariant: 0 &lt;= reserved &lt;= onHand. Fields guarded by mu.
+struct StockItem {
+    Mutex mu; int onHand = 0, reserved = 0;
+    int available() { LockGuard g(mu); return onHand - reserved; }
+    void restock(int q) { LockGuard g(mu); onHand += q; }
+};
+
+class DarkStore {
+public:
+    const string id; const double x, y;
+    DarkStore(string i, double px, double py) : id(std::move(i)), x(px), y(py) {}
+    StockItem&amp; item(const string&amp; sku) {                // the map itself has its own lock (like ConcurrentHashMap)
+        LockGuard g(mapMu_);
+        std::unique_ptr&lt;StockItem&gt;&amp; p = stock_[sku];
+        if (!p) p.reset(new StockItem());
+        return *p;
+    }
+    double distanceTo(double cx, double cy) const { return std::hypot(x - cx, y - cy); }
+    bool hasAll(const Lines&amp; l) {                       // a hint only; reserveAll re-checks under the locks
+        for (const auto&amp; kv : l) if (item(kv.first).available() &lt; kv.second) return false;
+        return true;
+    }
+    bool reserveAll(const Lines&amp; l) {
+        vector&lt;StockItem*&gt; items = lockSorted(l);
+        bool ok = true;
+        for (const auto&amp; kv : l) if (item(kv.first).onHand - item(kv.first).reserved &lt; kv.second) ok = false;
+        if (ok) for (const auto&amp; kv : l) item(kv.first).reserved += kv.second;
+        unlock(items);
+        return ok;
+    }
+    void releaseAll(const Lines&amp; l) {
+        vector&lt;StockItem*&gt; items = lockSorted(l);
+        for (const auto&amp; kv : l) item(kv.first).reserved -= kv.second;
+        unlock(items);
+    }
+    void commitAll(const Lines&amp; l) {
+        vector&lt;StockItem*&gt; items = lockSorted(l);
+        for (const auto&amp; kv : l) { StockItem&amp; s = item(kv.first); s.reserved -= kv.second; s.onHand -= kv.second; }
+        unlock(items);
+    }
+private:
+    Mutex mapMu_;
+    map&lt;string, std::unique_ptr&lt;StockItem&gt;&gt; stock_;
+    // One global order (SKU name, which is std::map order) means two baskets never deadlock.
+    vector&lt;StockItem*&gt; lockSorted(const Lines&amp; l) {
+        vector&lt;StockItem*&gt; items;
+        for (const auto&amp; kv : l) items.push_back(&amp;item(kv.first));
+        for (StockItem* s : items) s-&gt;mu.lock();
+        return items;
+    }
+    static void unlock(vector&lt;StockItem*&gt;&amp; items) { for (auto it = items.rbegin(); it != items.rend(); ++it) (*it)-&gt;mu.unlock(); }
+};
+
+enum class St { CREATED, CONFIRMED, PACKED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED, EXPIRED };
+const char* name(St s) {
+    static const char* n[] = {"CREATED", "CONFIRMED", "PACKED", "OUT_FOR_DELIVERY", "DELIVERED", "CANCELLED", "EXPIRED"};
+    return n[static_cast&lt;int&gt;(s)];
+}
+bool canMove(St a, St b) {
+    switch (a) {
+        case St::CREATED:          return b == St::CONFIRMED || b == St::CANCELLED || b == St::EXPIRED;
+        case St::CONFIRMED:        return b == St::PACKED || b == St::CANCELLED;
+        case St::PACKED:           return b == St::OUT_FOR_DELIVERY || b == St::CANCELLED;
+        case St::OUT_FOR_DELIVERY: return b == St::DELIVERED;
+        default:                   return false;
+    }
+}
+
+struct Order {
+    string id, customer; DarkStore* store; Lines lines; int total; long long expiresAt;
+    St status = St::CREATED;
+    RecursiveMutex mu;                                  // per-order lock: state change + its side effect
+    Order(string i, string c, DarkStore* s, Lines l, int t, long long e)
+        : id(std::move(i)), customer(std::move(c)), store(s), lines(std::move(l)), total(t), expiresAt(e) {}
+    St moveTo(St n) {                                   // caller holds mu
+        if (!canMove(status, n)) throw QcError("order " + id + ": " + name(status) + " -&gt; " + name(n) + " not allowed");
+        St old = status; status = n; return old;
+    }
+};
+typedef std::lock_guard&lt;RecursiveMutex&gt; OrderGuard;
+
+class QuickCommerce {
+public:
+    QuickCommerce(double maxKm, long long holdMs) : maxKm_(maxKm), holdMs_(holdMs) {}
+    void addProduct(const string&amp; sku, int price) { LockGuard g(regMu_); price_[sku] = price; }
+    void addStore(const string&amp; id, double x, double y) { LockGuard g(regMu_); stores_.emplace_back(new DarkStore(id, x, y)); }
+    void restock(const string&amp; sid, const string&amp; sku, int q) {
+        { LockGuard g(regMu_); if (!price_.count(sku) || q &lt;= 0) throw QcError("bad restock"); }
+        store(sid).item(sku).restock(q);
+    }
+    void advance(long long ms) { LockGuard g(regMu_); now_ += ms; }
+
+    Order&amp; createOrder(const string&amp; cust, double cx, double cy, const Lines&amp; lines) {
+        if (lines.empty()) throw QcError("empty basket");
+        int total = 0;
+        vector&lt;DarkStore*&gt; cand;
+        long long now;
+        {
+            LockGuard g(regMu_);
+            for (const auto&amp; kv : lines) {
+                if (!price_.count(kv.first) || kv.second &lt;= 0) throw QcError("bad line " + kv.first);
+                total += price_[kv.first] * kv.second;
+            }
+            for (auto&amp; s : stores_) cand.push_back(s.get());
+            now = now_;
+        }
+        for (;;) {
+            DarkStore* best = nullptr;                 // Strategy: nearest store with the full basket in range
+            for (DarkStore* s : cand)
+                if (s-&gt;distanceTo(cx, cy) &lt;= maxKm_ &amp;&amp; s-&gt;hasAll(lines) &amp;&amp;
+                    (!best || s-&gt;distanceTo(cx, cy) &lt; best-&gt;distanceTo(cx, cy))) best = s;
+            if (!best) throw QcError("out of stock nearby");
+            if (best-&gt;reserveAll(lines)) {             // the real check, under the SKU locks
+                LockGuard g(regMu_);
+                string id = "q" + std::to_string(++seq_);
+                orders_[id].reset(new Order(id, cust, best, lines, total, now + holdMs_));
+                return *orders_[id];
+            }
+            cand.erase(std::find(cand.begin(), cand.end(), best));   // stock moved: try the next store
+        }
+    }
+    // Acts only while CREATED. A duplicate or late webhook changes nothing: a failure that arrives
+    // after success must not release stock that was already committed.
+    St onPayment(const string&amp; oid, bool ok) {
+        Order&amp; o = order(oid);
+        OrderGuard g(o.mu);                            // lock order: order, then SKUs
+        if (o.status == St::CREATED &amp;&amp; now() &gt; o.expiresAt) expire(o);
+        if (o.status != St::CREATED) {                 // duplicate or out-of-order webhook
+            if (ok &amp;&amp; (o.status == St::EXPIRED || o.status == St::CANCELLED))
+                throw QcError("order " + oid + " is " + name(o.status) + ": refund the payment");
+            return o.status;
+        }
+        if (ok) { o.moveTo(St::CONFIRMED); o.store-&gt;commitAll(o.lines); }
+        else    { o.moveTo(St::CANCELLED); o.store-&gt;releaseAll(o.lines); }
+        return o.status;
+    }
+    void pack(const string&amp; oid) { Order&amp; o = order(oid); OrderGuard g(o.mu); o.moveTo(St::PACKED); }
+    void dispatch(const string&amp; oid) { Order&amp; o = order(oid); OrderGuard g(o.mu); o.moveTo(St::OUT_FOR_DELIVERY); }
+    void cancel(const string&amp; oid) {
+        Order&amp; o = order(oid);
+        OrderGuard g(o.mu);                            // state change and side effect in one critical section
+        St old = o.moveTo(St::CANCELLED);
+        if (old == St::CREATED) o.store-&gt;releaseAll(o.lines);
+        else if (old == St::CONFIRMED || old == St::PACKED)
+            for (const auto&amp; kv : o.lines) o.store-&gt;item(kv.first).restock(kv.second);
+    }
+    int sweepExpired() {
+        vector&lt;Order*&gt; snap;
+        { LockGuard g(regMu_); for (auto&amp; kv : orders_) snap.push_back(kv.second.get()); }
+        int n = 0;
+        for (Order* o : snap) if (expireIfDue(*o)) ++n;
+        return n;
+    }
+    Order&amp; order(const string&amp; id) {
+        LockGuard g(regMu_);
+        auto it = orders_.find(id); if (it == orders_.end()) throw QcError("unknown order " + id); return *it-&gt;second;
+    }
+    DarkStore&amp; store(const string&amp; id) {
+        LockGuard g(regMu_);
+        for (auto&amp; s : stores_) if (s-&gt;id == id) return *s;
+        throw QcError("unknown store " + id);
+    }
+private:
+    double maxKm_; long long holdMs_, now_ = 0; int seq_ = 0;
+    Mutex regMu_;                                      // guards the registries, the clock and seq_
+    map&lt;string, int&gt; price_;
+    vector&lt;std::unique_ptr&lt;DarkStore&gt;&gt; stores_;
+    map&lt;string, std::unique_ptr&lt;Order&gt;&gt; orders_;
+    long long now() { LockGuard g(regMu_); return now_; }
+    bool expireIfDue(Order&amp; o) {
+        OrderGuard g(o.mu);
+        return o.status == St::CREATED &amp;&amp; now() &gt; o.expiresAt &amp;&amp; expire(o);
+    }
+    bool expire(Order&amp; o) {                            // caller holds o.mu
+        if (!canMove(o.status, St::EXPIRED)) return false;
+        o.moveTo(St::EXPIRED);
+        o.store-&gt;releaseAll(o.lines);
+        return true;
+    }
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); } ++checks; }
+template &lt;class F&gt; static void expectFail(F f) {
+    try { f(); check(false, "should fail"); } catch (const QcError&amp; e) { std::cout &lt;&lt; "rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; ++checks; }
+}
+
+int main() {
+    QuickCommerce qc(3.0, 5 * 60000);
+    qc.addProduct("milk", 60); qc.addProduct("bread", 40); qc.addProduct("eggs", 50);
+    qc.addStore("DS-near", 0.5, 0.5); qc.addStore("DS-far", 2.0, 1.5);
+    qc.restock("DS-near", "milk", 2); qc.restock("DS-near", "bread", 10);
+    qc.restock("DS-far", "milk", 10); qc.restock("DS-far", "bread", 10); qc.restock("DS-far", "eggs", 10);
+
+    Order&amp; q1 = qc.createOrder("asha", 0, 0, {{"milk", 2}, {"bread", 1}});
+    StockItem&amp; milk = q1.store-&gt;item("milk");
+    std::cout &lt;&lt; "CREATE " &lt;&lt; q1.id &lt;&lt; " at " &lt;&lt; q1.store-&gt;id &lt;&lt; " total=" &lt;&lt; q1.total
+              &lt;&lt; " milk onHand=" &lt;&lt; milk.onHand &lt;&lt; " reserved=" &lt;&lt; milk.reserved &lt;&lt; "\n";
+    check(q1.store-&gt;id == "DS-near" &amp;&amp; q1.total == 160 &amp;&amp; milk.available() == 0, "reserved at nearest");
+    Order&amp; q2 = qc.createOrder("ravi", 0, 0, {{"milk", 1}, {"eggs", 1}});
+    std::cout &lt;&lt; "CREATE " &lt;&lt; q2.id &lt;&lt; " at " &lt;&lt; q2.store-&gt;id &lt;&lt; "\n";
+    check(q2.store-&gt;id == "DS-far", "fallback store");
+    expectFail([&amp;] { qc.createOrder("far-away", 9, 9, {{"milk", 1}}); });
+    expectFail([&amp;] { qc.createOrder("asha", 0, 0, {{"caviar", 1}}); });
+    qc.onPayment(q1.id, true);
+    check(qc.onPayment(q1.id, true) == St::CONFIRMED &amp;&amp; milk.onHand == 0 &amp;&amp; milk.reserved == 0, "deduct once");
+    check(qc.onPayment(q1.id, false) == St::CONFIRMED &amp;&amp; milk.onHand == 0 &amp;&amp; milk.reserved == 0,
+          "late failure webhook after success leaves counters unchanged");
+    std::cout &lt;&lt; "LATE failure webhook for " &lt;&lt; q1.id &lt;&lt; " -&gt; " &lt;&lt; name(q1.status) &lt;&lt; "\n";
+    qc.onPayment(q2.id, false);
+    check(q2.store-&gt;item("eggs").available() == 10, "failed payment releases");
+    qc.pack(q1.id);
+    qc.cancel(q1.id);
+    check(milk.available() == 2, "cancel after pack puts milk back on the shelf");
+    std::cout &lt;&lt; "CANCEL " &lt;&lt; q1.id &lt;&lt; " after packing -&gt; milk available=" &lt;&lt; milk.available() &lt;&lt; "\n";
+    Order&amp; q3 = qc.createOrder("meera", 0, 0, {{"bread", 4}});
+    qc.advance(6 * 60000);
+    check(qc.sweepExpired() == 1 &amp;&amp; q3.status == St::EXPIRED, "expired");
+    std::cout &lt;&lt; "after 6 min: " &lt;&lt; q3.id &lt;&lt; "=" &lt;&lt; name(q3.status) &lt;&lt; " bread available="
+              &lt;&lt; q3.store-&gt;item("bread").available() &lt;&lt; "\n";
+    expectFail([&amp;] { qc.onPayment(q3.id, true); });
+#ifdef HAVE_STD_MUTEX
+    {   // 20 shoppers, 5 milk; half the baskets list bread first (std::map sorts them anyway)
+        QuickCommerce race(5, 60000);
+        race.addProduct("milk", 60); race.addProduct("bread", 40);
+        race.addStore("DS-race", 0, 0);
+        race.restock("DS-race", "milk", 5); race.restock("DS-race", "bread", 100);
+        Mutex wonMu; int won = 0;
+        vector&lt;std::thread&gt; ts;
+        for (int i = 0; i &lt; 20; ++i)
+            ts.emplace_back([&amp;, i] {
+                try { race.createOrder("u" + std::to_string(i), 0, 0, {{"milk", 1}, {"bread", 1}}); LockGuard g(wonMu); ++won; }
+                catch (const QcError&amp;) {}
+            });
+        for (auto&amp; t : ts) t.join();
+        StockItem&amp; m = race.store("DS-race").item("milk");
+        std::cout &lt;&lt; "RACE 20 threads: orders=" &lt;&lt; won &lt;&lt; " milk reserved=" &lt;&lt; m.reserved &lt;&lt; "\n";
+        check(won == 5 &amp;&amp; m.available() == 0 &amp;&amp; m.reserved == 5, "never oversold");
+    }
+#endif
+    std::cout &lt;&lt; "ALL " &lt;&lt; checks &lt;&lt; " CHECKS PASSED\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it runs fewer scenarios: 10 of Java's 16 checks on MinGW (11 in the Linux <code>-DHAVE_STD_MUTEX</code> build, measured). It skips the 20-thread mixed-order basket race, the two-hold sweep and the success-then-failure counter check; the late-failure webhook itself is shown. Same transition table and lock order.</p></div>
+
+  <p>Demo output (<code>javac -d out Main.java &amp;&amp; java -cp out Main</code>):</p>
+<pre class="terminal"><code>CREATE q1 milk x2 bread x1 (customer at 0,0)
+  -&gt; q1 at DS-near total=160 status=CREATED
+  milk@DS-near onHand=2 reserved=2 available=0
+CREATE q2 milk x1 eggs x1 -&gt; near store has neither now
+  -&gt; q2 at DS-far
+rejected: out of stock nearby for {milk=1}
+PAY q1 ok (twice: duplicate webhook)
+  milk@DS-near onHand=0 reserved=0 available=0
+LATE failure webhook for paid q1 -&gt; ignored
+  milk@DS-near onHand=0 reserved=0 available=0
+PAY q2 failed -&gt; stock released
+CANCEL q1 after packing -&gt; back on the shelf
+TIMEOUT: q3 holds bread, clock +6 min, then sweep
+rejected: order q3 is EXPIRED: refund the payment
+RACE 20 shoppers, 5 milk left in DS-race; half the baskets list bread first
+  orders=5  milk@DS-race onHand=5 reserved=5 available=0
+  after 3 paid + 2 expired: milk@DS-race onHand=2 reserved=0 available=2
+ALL 16 CHECKS PASSED</code></pre>
+  <p>Python tests (<code>python -m unittest</code>):</p>
+<pre class="terminal"><code>...........
+----------------------------------------------------------------------
+Ran 11 tests in 0.011s
+
+OK</code></pre>

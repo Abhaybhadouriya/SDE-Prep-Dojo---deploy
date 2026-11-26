@@ -1,0 +1,108 @@
+
+        <h2>Interview questions about the pipeline</h2>
+        <p>These are the questions people report getting when they put a Kafka pipeline on their resume or design one in an HLD round. Company tags mean "commonly reported at", not "always asked at".</p>
+
+        <details class="qa" data-level="2" data-topic="pipeline" data-company="Amazon,Flipkart,Walmart">
+          <summary>What would you monitor in a Kafka pipeline?</summary>
+          <div class="answer">
+            <p>Five things. Consumer lag per group and per partition, ideally converted to time, because it tells me whether each stage keeps up. Throughput in and out per topic, so I can tell "more traffic" from "slower consumer". Error outcomes: retry rate, DLQ growth, producer publish errors. Broker and replication health: under-replicated partitions, offline partitions, exactly one active controller. And the user-facing view: API success rate and end-to-end latency from event creation to the sink. I alert on symptoms with durations (lag growing for 2 minutes, any under-replicated partition for 1 minute, DLQ growing) and use the rest for diagnosis.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give a short, ordered list from user-facing to internal, and separate "what pages me" from "what I look at when debugging".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How is lag computed? (Log end offset minus committed offset, per partition per group.)</li><li>How would you measure end-to-end latency? (Event timestamp at the source, a histogram of now minus that at the sink.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="pipeline" data-company="Amazon,Microsoft,Flipkart">
+          <summary>Consumer lag is growing. Walk me through your investigation.</summary>
+          <div class="answer">
+            <p>First, is it real and how bad: lag per group in time versus retention, and is it still growing. Then I find the cause. Did input throughput rise, for example a sale? Then scale consumers up to the partition count, which we do automatically on lag. Is the consumer erroring or restarting? Logs and restart counts: a poison record, a crash loop, a fenced transactional producer. Is the group rebalancing repeatedly? Processing longer than <code>max.poll.interval.ms</code>, or probes killing pods. Is one partition far above the rest? A hot key, which scaling will not fix. Is a downstream dependency slow? Then the database or API is the bottleneck and lag is just Kafka buffering for it. I fix the cause, let lag drain, and if lag approached retention I check whether anything was deleted unread.</p>
+            <div class="approach"><h5>How to answer</h5><p>Structure beats speed: severity, then a short decision tree, then the fix, then "how do we make sure it does not happen again" (autoscaling, alerts, load tests).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>You added consumers and lag did not go down. Why? (Hot partition, more consumers than partitions, or a downstream bottleneck.)</li><li>What happens if lag exceeds retention? (Records are deleted before they are read: data loss.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="kafka" data-company="Google,Amazon,Walmart">
+          <summary>A broker dies. What happens to producers and consumers, and can data be lost?</summary>
+          <div class="answer">
+            <p>The KRaft controller notices the broker stopped heartbeating, shrinks the ISR of every partition it hosted and elects new leaders from the remaining in-sync replicas. Clients get errors on the old leader, refresh metadata and continue with the new one, usually within seconds. With replication factor 3, <code>min.insync.replicas=2</code> and <code>acks=all</code>, every acknowledged write is on at least two brokers, so nothing acknowledged is lost and writes continue with two replicas. If a second broker fails, the ISR drops below 2 and acks=all producers get NOT_ENOUGH_REPLICAS: the system refuses writes rather than risk loss. Data can be lost if you use acks=1 (the leader acked, then died before followers copied), or if unclean leader election is enabled and an out-of-sync replica becomes leader. When the broker returns it truncates to the high watermark, catches up and rejoins the ISR; a preferred leader election rebalances leadership.</p>
+            <div class="approach"><h5>How to answer</h5><p>Sequence of events naming the component (controller), then the durability math (RF, min ISR, acks), then the two ways to lose data, then recovery.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why RF 3 and min ISR 2 rather than min ISR 3? (Min ISR 3 means any single broker failure stops writes.)</li><li>What is the high watermark? (The highest offset replicated to all ISR members; consumers only read up to it.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="pipeline" data-company="Uber,Amazon,Flipkart">
+          <summary>You found a bug in a consumer that has been writing wrong results for 3 hours. How do you recover?</summary>
+          <div class="answer">
+            <p>Kafka keeps the input, so I can replay. Fix and deploy the consumer. Stop the group (offsets can only be reset with no active members), reset its offsets to a time before the bug with <code>kafka-consumer-groups --reset-offsets --to-datetime</code>, dry run first, then execute and start the consumer. It reprocesses the 3 hours. This is safe only if the sink is idempotent, for example an upsert on a business key, so corrected rows overwrite wrong ones instead of being added. If the output topic was consumed by others, I may need to publish corrections or have downstream consumers reprocess too. Replay reads cold data from disk, so I throttle it or run it off-peak.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the property that makes it possible (retention), the exact tool, the safety condition (idempotent sink), and the side effects (downstream consumers, broker load).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the data is older than retention? (Then you need an archive: tiered storage, or a copy in a data lake.)</li><li>How would you replay without stopping the live consumer? (A new consumer group writing to a shadow table, then swap.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Microsoft,Google">
+          <summary>What causes rebalance storms and how do you prevent them?</summary>
+          <div class="answer">
+            <p>A rebalance happens whenever group membership or subscriptions change. Storms come from members repeatedly leaving: processing a batch takes longer than <code>max.poll.interval.ms</code> so the member is kicked out and rejoins; heartbeats missed because of long GC pauses or CPU starvation; liveness probes restarting pods; autoscalers flapping; or rolling deploys that restart many pods quickly. Prevention: keep the poll loop fast (smaller batches, move retries to a <a href="{{BASE}}interview/glossary#retry-topic">retry topic</a>, pause partitions instead of sleeping), use the cooperative-sticky assignor or the new KIP-848 consumer protocol (<code>group.protocol=consumer</code>) so only moved partitions pause, static membership with <code>group.instance.id</code> for quick restarts, graceful shutdown so members leave cleanly, slow scale-down, and PDBs to limit evictions.</p>
+            <div class="approach"><h5>How to answer</h5><p>Two lists: causes, then fixes, matched to each other. Mention that eager rebalances stop the whole group, while cooperative ones only move what must move.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does KIP-848 change? (The broker computes assignments and reconciles members one by one; no global sync barrier.)</li><li>What would switching ShopStream take? (Set <code>group.protocol=consumer</code> and remove <code>partition.assignment.strategy</code> and <code>session.timeout.ms</code> from <code>consumer_config()</code>: with the new protocol the client may not set them. Assignment moves to the broker (<code>group.consumer.assignors</code>) and the session timeout becomes a broker/group setting (<code>group.consumer.session.timeout.ms</code>, default 45 s). It also needs a librdkafka version with GA KIP-848 support.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="pipeline" data-company="Amazon,Walmart,Flipkart">
+          <summary>How do you know your pipeline does not lose or duplicate orders?</summary>
+          <div class="answer">
+            <p>By design and by checking. By design: idempotent producer with acks=all and min ISR 2, so no loss or producer duplicates into Kafka; a transactional read-process-write in the enricher; offsets committed only after the database commit; an upsert on <code>order_id</code> at the sink; every failure routed to a retry topic or DLQ instead of dropped. By checking: reconciliation. Count accepted orders at the API per minute and compare with rows in the database for the same event-time minute, plus the DLQ count. Any gap that persists beyond expected lag is an alert. And chaos drills: kill brokers and consumers under load, then reconcile.</p>
+            <div class="approach"><h5>How to answer</h5><p>Interviewers love the second half. Most candidates only describe the guarantees; describing how you would <em>verify</em> them is a senior signal.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the API crashed after the Kafka ack but before answering the client? (The client retries; the same order_id upserts once, if the client supplies the id.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="pipeline" data-company="Google,Microsoft,Uber">
+          <summary>What is backpressure in this pipeline, and who slows down whom?</summary>
+          <div class="answer">
+            <p>Backpressure is a slow stage pushing back on faster stages instead of being overwhelmed. Between consumers and Kafka it is natural: consumers pull, so a slow sink just reads slower and lag grows; Kafka is the buffer, bounded by retention. The sink in our project does exactly this when Postgres is down: it keeps its batch, retries, and does not commit. At the producer side the buffer is the client's in-memory queue: when brokers are slow, librdkafka's queue fills, <code>produce()</code> raises <code>BufferError</code>, and the order-api returns 503 with Retry-After, which pushes back on the callers. So the chain is: DB slows sink, lag absorbs it; brokers slow, producer queue fills, API sheds load to clients.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define it, then walk each boundary and name what absorbs or rejects the pressure there. A TCP flow-control analogy works well.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is pull better than push for consumers? (The consumer controls its rate; the broker does not need per-consumer flow control.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="pipeline" data-company="Amazon,Microsoft,Google">
+          <summary>Design question: how would you make this pipeline multi-region?</summary>
+          <div class="answer">
+            <p>First I ask what the requirement is: disaster recovery (survive a region loss with some RPO) or active-active (serve writes in both). For DR, the common pattern is active-passive: the primary cluster serves everything and MirrorMaker 2 replicates topics and translates consumer offsets to a standby cluster in another region; on failover consumers start from translated offsets, accepting a few seconds of duplicates, which our idempotent sink absorbs. Replication is asynchronous, so the RPO is the replication lag, which I monitor like <a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a>. For active-active, each region writes to its own local topics with a region prefix so MirrorMaker does not loop, and consumers read both local and mirrored topics; that requires the business logic to tolerate events from two places, for example orders owned by the region where they were placed. Within one region, the cheaper step is three availability zones with rack awareness, which is what our Strimzi setup simulates.</p>
+            <div class="approach"><h5>How to answer</h5><p>Clarify RPO/RTO and active-passive vs active-active before drawing. Name the tool, the lag it introduces, and how duplicates are handled.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not stretch one Kafka cluster across regions? (Synchronous replication across high-RTT links makes every acks=all write slow.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: Big Billion Day, lag climbing, autoscaler at max</h4>
+          <div class="situation"><p>During a flash sale, enricher lag climbs past 200,000. KEDA has already scaled to 6 replicas, the maximum. CPU on the enricher pods is modest. Customers see "order placed", but confirmation emails (driven by <code>orders.enriched</code>) arrive 10 minutes late.</p></div>
+          <div class="bad"><p>Weak answer: "Raise maxReplicaCount to 20." (A seventh to twentieth consumer would be idle; there are only 6 partitions.)</p></div>
+          <div class="good"><p>Strong answer: Six replicas for six partitions means we are at the parallelism ceiling, and modest CPU says the enricher is waiting on something, probably the catalog lookup in Postgres. Short term: cache prices in memory (they barely change during a sale), raise batch size so transactions are amortised, and check the catalog DB's latency. Check lag per partition for a hot key. Medium term: more partitions for future events (planned before the sale, since adding partitions remaps keys), or concurrent processing inside each consumer while keeping per-key order. The API is unaffected because Kafka absorbs the burst; I would communicate that emails are delayed, not lost, and watch lag in time versus the 7-day retention, which is nowhere near.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you pick the partition count before the sale? (Target throughput divided by measured per-partition consumer throughput, plus headroom.)</li><li>Would share groups help? (Yes for unordered work: many consumers per partition, at the cost of per-key ordering.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: under-replicated partitions alert at 3 a.m.</h4>
+          <div class="situation"><p>The <code>UnderReplicatedPartitions</code> alert fires and stays firing. Orders are still being accepted. The on-call engineer asks whether to wake anyone up.</p></div>
+          <div class="bad"><p>Weak answer: "Orders work, so it can wait until morning."</p></div>
+          <div class="good"><p>Strong answer: Writes work because the ISR is still at 2, but we have lost our safety margin: one more broker problem and acks=all writes stop. So it is urgent, not an outage. I check which broker the under-replicated partitions have in common (the <code>--under-replicated-partitions</code> output lists replicas and ISR). If a broker is down, I restart it or let the orchestrator replace it and watch it catch up. If it is up but falling behind, I look at its disk, network and request-handler saturation. Once the ISR is full again I confirm with the same command, then do a preferred leader election, and write up why it happened.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the difference between under-replicated and offline partitions? (Offline = no leader at all = outage for that partition.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: after a deploy, the DLQ fills with "missing field items"</h4>
+          <div class="situation"><p>Ten minutes after the mobile team shipped a new app version, the DLQ alert fires. Thousands of records, all with the same error header, all from new app versions.</p></div>
+          <div class="bad"><p>Weak answer: "Make the enricher accept orders without items."</p></div>
+          <div class="good"><p>Strong answer: One error type in a burst right after a deploy points at the deploy. The DLQ did its job: good orders keep flowing and the bad ones are kept with their origin. I would get the producer fixed or rolled back first (stop the bleeding), then look at a sample: maybe the field was renamed. Once fixed, I write a small transform that maps the old shape to the new, and redrive the DLQ records to <code>orders.created</code>; the idempotent sink protects against duplicates. Then prevent it: a <a href="{{BASE}}interview/glossary#schema-registry">schema registry</a> with compatibility checks in the producer's CI would have rejected the change before it shipped.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What compatibility mode would you use? (BACKWARD, the Schema Registry default: consumers on the new schema can read data written with the old one. You may delete fields and add optional fields with defaults, but not add a required field. Upgrade consumers first. Use FULL if producers and consumers deploy independently.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the sink lag graph is a saw-tooth</h4>
+          <div class="situation"><p>postgres-sink lag rises for about 5 minutes, drops to zero, rises again. Logs show the members joining and leaving the group every few minutes.</p></div>
+          <div class="bad"><p>Weak answer: "Add more sink replicas."</p></div>
+          <div class="good"><p>Strong answer: A regular saw-tooth with join/leave lines is a rebalance loop. Five minutes matches the default <code>max.poll.interval.ms</code> (300,000 ms): a batch takes longer than that, maybe because of a slow query or a lock, so the member is removed, rejoins, re-reads the same batch, and repeats. Fix: find the slow write, reduce the batch size so each poll returns faster, and alert on rebalance rate. Adding replicas would make it worse: more members, more rebalances.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you confirm? (Consumer logs for "revoked" lines and the time between polls; DB slow-query log.)</li></ul></div>
+        </div>
+      

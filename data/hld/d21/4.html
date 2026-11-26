@@ -1,0 +1,72 @@
+
+        <h2>Data model</h2>
+        <h3>Raw click event (in Kafka, then object storage)</h3>
+<pre><code class="language-json">{
+  "click_id": "imp-991",            // = impression_id, the idempotency key
+  "ad_id": "ad-42",
+  "campaign_id": "cmp-7",
+  "advertiser_id": "adv-3",
+  "user_hash": "u_8f2c...",         // hashed, never raw PII
+  "event_time": "2026-11-23T10:02:13.481Z",   // when the user clicked (event time)
+  "received_time": "2026-11-23T10:02:13.530Z",
+  "country": "IN",
+  "device": "android",
+  "ip_hash": "ip_51aa..."
+}</code></pre>
+        <h3>Aggregates (in an OLAP store)</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Table</th><th>Primary key</th><th>Columns</th><th>Kept</th></tr></thead>
+            <tbody>
+              <tr><td><code>clicks_by_minute</code></td><td>(ad_id, window_start, country, device)</td><td>clicks, unique_users_sketch, is_final</td><td>30 days</td></tr>
+              <tr><td><code>clicks_by_hour</code></td><td>(ad_id, hour, country, device)</td><td>clicks, unique_users_sketch</td><td>2 years</td></tr>
+              <tr><td><code>clicks_by_day</code></td><td>(advertiser_id, campaign_id, ad_id, day)</td><td>clicks, spend</td><td>forever</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>Why an OLAP store</b> (Apache Pinot, Apache Druid, or ClickHouse) and not Postgres or Cassandra? Queries are "sum clicks for these ads over this time range, grouped by country" - scans and aggregations over many rows, with time filters. Columnar OLAP stores are built exactly for that and ingest from Kafka directly. Postgres would struggle with the write rate and the scan sizes; Cassandra is great for key lookups but weak at ad-hoc group-bys. The raw events go to object storage as Parquet/Iceberg for audit and the nightly batch job.</p>
+        <div class="callout note"><p><b>Jargon check.</b> <b>OLAP</b> (online analytical processing) = a database built for big sums and group-bys over many rows, not for single-row updates. <b>Columnar</b> = it stores each column together on disk, so "sum clicks" reads only the clicks column and skips the rest. <b>Parquet</b> = a columnar <i>file format</i> (a file you can drop in S3). <b>Iceberg</b> = a table layer over many Parquet files in S3 that adds upserts, snapshots and schema changes, so the files behave like one table. <b>unique_users_sketch</b> = a <b><a href="{{BASE}}interview/glossary#hyperloglog">HyperLogLog</a></b>: a ~12 KB structure that estimates "how many distinct users" within about 1%, and two sketches can be merged (minute sketches add up to an hour sketch) - exact distinct counts would need to store every user ID.</p>
+          <p><b>More words you will meet below.</b> <b>HMAC</b> = a keyed hash: only someone holding our secret key can produce a valid signature, so only we can mint click tokens. <b>302</b> = the HTTP "Found" redirect status; the browser follows the <code>Location</code> header to the advertiser. <b>TTL</b> (time to live) = how long a stored item is kept before it is deleted automatically. <b>Keyed state</b> = memory a Flink operator keeps per key (per ad, per click ID), saved in checkpoints. <b>RocksDB</b> = an embedded on-disk key-value store that Flink uses to hold large state on local SSD instead of the JVM heap. <b>Task slot</b> = one unit of parallel work inside a Flink worker (like one core's worth of a pipeline). <b>Savepoint</b> = a checkpoint you trigger by hand before an upgrade, so the new version resumes from it. <b>Spark</b> = a batch engine that crunches big files in parallel. <b>MirrorMaker 2</b> = a tool that copies topics from one Kafka cluster to another (cross-region). <b>Chandy-Lamport</b> = the classic algorithm for taking a consistent snapshot of a distributed system by sending marker messages along every channel.</p></div>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Row store keeps each row together; column store keeps each column together so a sum reads one column">
+            <rect class="zone" x="10" y="10" width="380" height="230"/><text class="zone-label" x="22" y="32">Row store (Postgres)</text>
+            <rect class="box svc" x="30" y="50" width="340" height="36"/><text class="label small mono" x="200" y="73">ad-42 | 10:02 | IN | android | 1251</text>
+            <rect class="box svc" x="30" y="94" width="340" height="36"/><text class="label small mono" x="200" y="117">ad-42 | 10:03 | IN | ios | 830</text>
+            <rect class="box svc" x="30" y="138" width="340" height="36"/><text class="label small mono" x="200" y="161">ad-7 | 10:02 | US | web | 77</text>
+            <text class="label small" x="200" y="200">SUM(clicks) must read every whole row</text>
+            <text class="label bad" x="200" y="222">great for "update one row"</text>
+            <rect class="zone" x="410" y="10" width="380" height="230"/><text class="zone-label" x="422" y="32">Column store (OLAP)</text>
+            <rect class="box ghost" x="430" y="50" width="60" height="124"/><text class="label small" x="460" y="116">ad_id</text>
+            <rect class="box ghost" x="496" y="50" width="60" height="124"/><text class="label small" x="526" y="116">time</text>
+            <rect class="box ghost" x="562" y="50" width="60" height="124"/><text class="label small" x="592" y="116">country</text>
+            <rect class="box ghost" x="628" y="50" width="60" height="124"/><text class="label small" x="658" y="116">device</text>
+            <rect class="box active" x="694" y="50" width="76" height="124"/><text class="label small mono" x="732" y="80">1251</text><text class="label small mono" x="732" y="116">830</text><text class="label small mono" x="732" y="152">77</text>
+            <text class="label small" x="600" y="200">SUM(clicks) reads only the green column</text>
+            <text class="label ok" x="600" y="222">compresses well, scans fast</text>
+          </svg>
+          <figcaption>Same three rows, two layouts. A dashboard query touches 1-2 columns out of many, so storing columns together means reading far less disk. That is why analytics uses OLAP column stores.</figcaption>
+        </figure>
+        <p>The aggregate row's primary key matters: if the stream job writes <code>(ad-42, 10:02, IN, android) = 1251</code> twice, an <b><a href="{{BASE}}interview/glossary#upsert">upsert</a></b> (overwrite by key) leaves 1251, while an <b>increment</b> would give 2502. Choosing "write the full value by key" instead of "add to a counter" is one of the most important decisions on this page.</p>
+        <div class="callout note"><p><b>You might confuse this with...</b></p><ul>
+          <li><b>Upsert vs increment:</b> upsert = "set row K to 1251" (repeat it and nothing changes); increment = "add 1251 to row K" (repeat it and you double). Same SQL keyword family, opposite behaviour on retry.</li>
+          <li><b>Event time vs processing time:</b> event time = when the user tapped (stamped on the phone); processing time = when Flink saw it. Billing and replays need event time.</li>
+          <li><b>Dedup vs <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> sink:</b> dedup removes duplicate <i>input</i> clicks; an idempotent sink makes duplicate <i>output</i> writes harmless. You need both.</li>
+        </ul></div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Upsert by key is idempotent; increment is not">
+            <rect class="zone" x="10" y="10" width="380" height="200"/><text class="zone-label" x="22" y="32">UPSERT (idempotent)</text>
+            <rect class="box svc" x="20" y="50" width="185" height="44"/><text class="label small" x="112" y="72">write (ad-42,10:02)=1251</text>
+            <rect class="box svc" x="30" y="110" width="160" height="44"/><text class="label small" x="110" y="132">retry: same write</text>
+            <rect class="box active" x="230" y="80" width="140" height="56"/><text class="label ok" x="300" y="102">row = 1251</text><text class="label small" x="300" y="122">correct</text>
+            <path class="arrow" d="M205 72 L222 100"/><path class="arrow" d="M190 132 L222 116"/>
+            <rect class="zone" x="410" y="10" width="380" height="200"/><text class="zone-label" x="422" y="32">INCREMENT (not idempotent)</text>
+            <rect class="box svc" x="430" y="50" width="160" height="44"/><text class="label small" x="510" y="72">add +1251</text>
+            <rect class="box svc" x="430" y="110" width="160" height="44"/><text class="label small" x="510" y="132">retry: add +1251</text>
+            <rect class="box fail" x="620" y="80" width="165" height="56"/><text class="label bad" x="702" y="102">row = 2502</text><text class="label small" x="702" y="122">advertiser overbilled</text>
+            <path class="arrow" d="M590 72 L622 100"/><path class="arrow" d="M590 132 L622 116"/>
+            <text class="label small" x="400" y="190">retries happen after every crash - design so a retry is harmless</text>
+          </svg>
+          <figcaption>Writing the whole window value under a fixed key makes retries harmless. Adding deltas double-counts on every retry.</figcaption>
+        </figure>
+      

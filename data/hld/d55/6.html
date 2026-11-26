@@ -1,0 +1,94 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Leases are timers, and timers lie: fencing tokens</h3>
+        <p>A lock that never expires is useless: if the holder crashes, nobody can ever get it. So every distributed lock is really a <b>lease</b>: "yours until time T unless you renew". The trouble is that the holder can be paused for longer than the lease without knowing. Kleppmann lists GC pauses (reportedly several minutes in bad cases), page faults, CPU starvation, a stray SIGSTOP, and network delay: in one GitHub incident packets were delayed about 90 seconds. Checking "do I still hold the lease?" right before writing does not help, because the pause can hit between the check and the write.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Timeline: client 1 gets token 33, pauses, lease expires, client 2 gets token 34 and writes; client 1 wakes and its write with 33 is rejected">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="10" y="60">client 1</text><text class="label left" x="10" y="140">client 2</text><text class="label left" x="10" y="220">storage</text>
+            <path class="arrow none" d="M100 55 L780 55"/><path class="arrow none" d="M100 135 L780 135"/><path class="arrow none" d="M100 215 L780 215"/>
+            <rect class="box k" x="110" y="40" width="70" height="30"/><text class="label small" x="145" y="60">tok 33</text>
+            <rect class="box fail" x="190" y="40" width="330" height="30"/><text class="label small" x="355" y="60">stop-the-world GC pause</text>
+            <text class="label small bad" x="300" y="95">lease expires here</text><path class="arrow bad dashed" d="M300 75 L300 200"/>
+            <rect class="box k" x="330" y="120" width="70" height="30"/><text class="label small" x="365" y="140">tok 34</text>
+            <path class="arrow ok" d="M400 150 L440 205"/><text class="label ok" x="470" y="190">write 34 ok</text>
+            <path class="arrow bad" d="M530 70 L590 205"/><text class="label bad" x="660" y="190">write 33: reject</text>
+            <text class="label small" x="520" y="240">storage keeps max token = 34</text>
+          </svg>
+          <figcaption>Kleppmann's example, redrawn. The lock service did its job; the bug is on the resource side unless it checks tokens.</figcaption>
+        </figure>
+        <p><b>The fix: fencing tokens.</b> Every grant carries a number that strictly increases. The <b>resource</b> (database, file server, storage API) stores the highest token it has seen and rejects lower ones. In ZooKeeper use the <b>czxid</b> (creation zxid: the transaction id that created the lock-holder's sequential znode) or that znode's sequence number, both of which only grow. Do <i>not</i> use the znode's data version: each acquirer creates a brand-new znode whose version starts again at 0, so it does not increase across holders and cannot fence. In etcd, the key's revision (etcd's docs explicitly equate revision with a fencing token and Chubby's sequencer); in Chubby, the sequencer holds lock name, mode and lock generation number, and servers call <code>CheckSequencer()</code>.</p>
+        <p>For resources that cannot check tokens, Chubby has a weaker defence: <b>lock-delay</b>. If a holder vanishes without releasing, the server refuses to give the lock to anyone else for a period the client chooses, bounded at one minute. It does not fix long pauses, but it absorbs everyday message delays and restarts.</p>
+        <div class="callout warn"><p><b>Honest limit:</b> etcd's own docs say its lock API cannot give mutual exclusion over an external resource by itself; the resource must validate versions. AWS's leader-election article says the same in other words: an election can briefly yield zero or two leaders, so the downstream system must stop the old one from interfering. A lock service <i>plus</i> a fencing check is the safe unit.</p></div>
+
+        <h3>2. Sessions, KeepAlives, jeopardy and the grace period</h3>
+        <p>Two Chubby words first. <b>Jeopardy</b> is the state a client enters when its own copy of the session lease runs out and it cannot reach a master: it is not dead yet, but it must stop trusting its cache. The <b>grace period</b> is how long it keeps trying (45 s by default) before it gives up and declares the session expired. Locks are tied to sessions, not to TCP connections. Chubby's flow is worth memorising because it shows how to survive leader failover without dropping everyone's locks:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Session lease timeline with local lease timeout, jeopardy, grace period of 45 seconds, and new master taking over">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M30 120 L780 120"/><text class="label small" x="760" y="145">time</text>
+            <rect class="box k" x="40" y="66" width="230" height="48"/><text class="label small" x="155" y="86">session lease</text><text class="label small" x="155" y="104">(12 s default)</text>
+            <rect class="box hot" x="270" y="66" width="250" height="48"/><text class="label small" x="395" y="86">jeopardy: cache off,</text><text class="label small" x="395" y="104">retry for up to 45 s grace</text>
+            <rect class="box active" x="520" y="66" width="250" height="48"/><text class="label small" x="645" y="86">safe: new master</text><text class="label small" x="645" y="104">accepted the KeepAlive</text>
+            <path class="arrow bad" d="M200 40 L200 62"/><text class="label bad" x="200" y="32">old master dies</text>
+            <path class="arrow ok" d="M520 40 L520 62"/><text class="label ok" x="520" y="32">new master elected</text>
+            <text class="label small left" x="40" y="170">1. Client's local lease runs out: it disables its cache, sends a "jeopardy" event to the app.</text>
+            <text class="label small left" x="40" y="195">2. It keeps trying to find a master for the grace period (45 s default).</text>
+            <text class="label small left" x="40" y="220">3. New master accepts the KeepAlive: session, locks and handles survive. If not: session expired.</text>
+          </svg>
+          <figcaption>Chubby's numbers: 12 s default lease extension (raised to about 60 s under heavy load), 45 s grace period. Most measured outages were 15 s or less, so the grace period hides them.</figcaption>
+        </figure>
+        <ul>
+          <li>The <b>client's</b> view of the lease is conservative: it assumes the lease ends earlier than the server thinks (it accounts for reply flight time and clock rate drift). Leases use elapsed time on each machine, not synchronized wall clocks.</li>
+          <li>The new master, on takeover, picks a new epoch number (so old-epoch messages are rejected), rebuilds sessions and locks from the replicated database, extends every session lease to the maximum the old master might have granted, and only then accepts lock operations.</li>
+          <li>ZooKeeper's equivalent: session timeout between 2x and 20x the server's <code>tickTime</code>; ephemeral znodes vanish when the session expires.</li>
+          <li>AWS's advice: check remaining lease time often (especially before side effects) and do not renew leases from a careless background thread that keeps renewing while the real work is stuck.</li>
+        </ul>
+
+        <h3>3. Queues instead of stampedes: the ZooKeeper lock recipe</h3>
+        <p>A naive lock lets every waiter watch the one lock node. When it is released, all N waiters wake and race: the <b>herd effect</b>. ZooKeeper's recipe forms a fair queue instead:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 240" role="img" aria-label="ZooKeeper lock recipe: sequential ephemeral znodes, each client watches only its predecessor">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box plain" x="300" y="20" width="200" height="40"/><text class="label mono" x="400" y="45">/locks/invoice</text>
+            <rect class="box active" x="40" y="120" width="160" height="50"/><text class="label small mono" x="120" y="142">guid1-lock-0031</text><text class="label small ok" x="120" y="160">lowest: holds lock</text>
+            <rect class="box db" x="230" y="120" width="160" height="50"/><text class="label small mono" x="310" y="142">guid2-lock-0032</text><text class="label small" x="310" y="160">watches 0031</text>
+            <rect class="box db" x="420" y="120" width="160" height="50"/><text class="label small mono" x="500" y="142">guid3-lock-0033</text><text class="label small" x="500" y="160">watches 0032</text>
+            <rect class="box db" x="610" y="120" width="160" height="50"/><text class="label small mono" x="690" y="142">guid4-lock-0034</text><text class="label small" x="690" y="160">watches 0033</text>
+            <path class="arrow" d="M400 60 L120 115"/><path class="arrow" d="M400 60 L310 115"/><path class="arrow" d="M400 60 L500 115"/><path class="arrow" d="M400 60 L690 115"/>
+            <path class="arrow dashed" d="M230 185 C 200 210, 160 210, 130 175"/><path class="arrow dashed" d="M420 185 C 390 210, 350 210, 320 175"/><path class="arrow dashed" d="M610 185 C 580 210, 540 210, 510 175"/>
+            <text class="label small" x="400" y="230">delete 0031 wakes only guid2: one waiter per release, no herd</text>
+          </svg>
+          <figcaption>Each waiter creates an EPHEMERAL|SEQUENTIAL child and watches only its predecessor. If a holder dies, its ephemeral node disappears with its session.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>Create</strong> <code>/locks/invoice/&lt;guid&gt;-lock-</code> as ephemeral + sequential. ZooKeeper appends the counter.</li>
+          <li><strong>List children</strong> (no watch). If mine is the lowest, I hold the lock.</li>
+          <li><strong>Else watch my predecessor only</strong> with <code>exists()</code>. When it is deleted, go to step 2 (the predecessor may have died, not released, so re-check).</li>
+          <li><strong>Release</strong> = delete my node.</li>
+        </ol>
+        <p>Why the <b>GUID</b> in the name? A create can succeed on the server, then the server crashes before the reply. The session is still valid, so the node exists, but the client does not know its name. On retry it lists children and looks for its GUID rather than creating a second entry. That is the idempotent-acquire requirement from the API section. Shared (read/write) locks use <code>read-</code> and <code>write-</code> prefixes: a reader waits only for lower write nodes.</p>
+
+        <h3>4. Leader failover and split brain inside the service</h3>
+        <ul>
+          <li><b>Majority quorum</b>: 5 replicas, majority 3. Two sides of a partition can never both have 3, so at most one side elects a leader. That is why sizes are odd: 4 replicas still need 3 votes but only tolerate 1 failure, same as 3 replicas.</li>
+          <li><b>Master lease</b>: followers promise not to vote for another leader for a few seconds. The old leader stops serving reads when its own (conservative) lease timer ends, before anyone else can be elected.</li>
+          <li><b>Epoch / term numbers</b>: every leader has a higher term; messages from an older term are ignored. Same idea as the fencing token, one level down.</li>
+          <li><b>Real numbers</b>: Chubby's snapshot cell showed a 14 s failover; two elections took 6 s and 4 s, outliers 30 s. Across 700 cell-days they counted 61 outages, 52 under 30 s. etcd's FAQ recommends election timeout at least 5x the heartbeat interval and warns that slow disk fsync can cost the leader its leadership.</li>
+        </ul>
+
+        <h3>5. Scaling: coarse locks, proxies, partitioning</h3>
+        <p>Chubby chose <b>coarse-grained</b> locks on purpose: held for hours or days (e.g. "I am the Bigtable master"), so the acquire rate is tiny and a short service outage barely matters. For <b>fine-grained</b> locks (per order, per seat, per locker slot) at thousands per second, Chubby's advice is: use the coarse lock to elect owners of <i>lock groups</i>, and let those application servers manage fine locks in memory with a simple monotonically increasing counter. That is exactly sharded ownership.</p>
+        <ul>
+          <li><b>Proxies</b>: a proxy holds one session to the cell on behalf of thousands of clients and answers their KeepAlives itself. Chubby notes a proxy serving N clients cuts KeepAlive traffic by N.</li>
+          <li><b>Longer leases under load</b>: fewer KeepAlives per second at the cost of slower detection of dead clients.</li>
+          <li><b>Client caching with invalidation</b>: reads hit the local cache; the leader sends invalidations (on KeepAlive replies) before a write completes. Chubby found negative caching (caching "file does not exist") significant too.</li>
+          <li><b>Partition the namespace</b>: hash directories to different cells. Reads and writes per cell drop by N, but KeepAlives do not, because a client usually touches many partitions.</li>
+          <li><b>One cell per datacenter</b> plus a global cell for rare global decisions; cross-region consensus adds 10-100 ms per write, so keep hot locks local.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Proxies merging KeepAlives is like BFD or LACP aggregation: instead of every flow running its own liveness probe, one session per link carries liveness for everything behind it. And "coarse lock elects owners of lock groups" is how a control plane hands out ownership of hardware tables to line cards, which then manage individual entries locally.</p>
+        </div>
+      

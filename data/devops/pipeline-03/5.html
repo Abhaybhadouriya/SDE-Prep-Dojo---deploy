@@ -1,0 +1,120 @@
+
+        <h2>Exactly-once inside Kafka: the transaction loop</h2>
+        <p>The enricher reads a record and writes a record. Two things must happen: the output must be written, and the input offset must be committed. If you do them one after the other, a crash in between gives you either a lost record (offset committed, output missing) or a duplicate (output written, offset not committed, so you read it again).</p>
+        <p>Kafka <b>transactions</b> make both happen together. The trick is that a consumer offset commit is <em>itself</em> just a write to an internal topic, <code>__consumer_offsets</code>. So a transaction can include the output records and the offset write, and commit them as one unit.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 340" role="img" aria-label="Enricher transaction: consume a batch, begin, produce outputs that are not yet visible, add offsets, commit so both become visible, or abort and rewind after a crash">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="30" width="200" height="60"/>
+            <text class="label" x="120" y="52">orders.created</text>
+            <text class="label small" x="120" y="74">batch: offsets 100-104</text>
+            <rect class="box svc" x="320" y="30" width="200" height="60"/>
+            <text class="label" x="420" y="52">enricher</text>
+            <text class="label small" x="420" y="74">transactional.id = pod name</text>
+            <rect class="box k8s" x="620" y="30" width="220" height="70"/>
+            <text class="label" x="730" y="50">txn coordinator</text>
+            <text class="label small" x="730" y="70">a broker</text>
+            <text class="label small" x="730" y="86">log: __transaction_state</text>
+
+            <g data-step="1"><path class="arrow" d="M220 60 L315 60"/><text class="label small" x="268" y="105">consume()</text></g>
+            <g data-step="2"><path class="arrow" d="M520 60 L615 60"/><text class="label small" x="568" y="105">begin</text></g>
+            <g data-step="3">
+              <rect class="box kafka ghost" x="320" y="160" width="200" height="50"/>
+              <text class="label" x="420" y="178">orders.enriched</text>
+              <text class="label small" x="420" y="197">5 records, uncommitted</text>
+              <path class="arrow dashed" d="M420 90 L420 155"/>
+            </g>
+            <g data-step="4">
+              <rect class="box queue ghost" x="20" y="160" width="200" height="50"/>
+              <text class="label" x="120" y="178">__consumer_offsets</text>
+              <text class="label small" x="120" y="197">enricher: next = 105</text>
+              <path class="arrow dashed" d="M320 120 L200 156"/>
+            </g>
+            <g data-step-only="5">
+              <rect class="box solid kafka" x="320" y="230" width="200" height="40"/>
+              <text class="label white" x="420" y="250">COMMIT marker</text>
+              <rect class="box solid queue" x="20" y="230" width="200" height="40"/>
+              <text class="label white" x="120" y="250">COMMIT marker</text>
+              <path class="arrow ok" d="M730 100 L525 245"/>
+              <path class="arrow ok" d="M730 100 L225 245"/>
+              <text class="label ok" x="430" y="305">Outputs AND offsets visible together</text>
+            </g>
+            <g data-step-only="6">
+              <rect class="box fail" x="320" y="230" width="200" height="40"/>
+              <text class="label bad" x="420" y="250">ABORT marker</text>
+              <rect class="box fail" x="20" y="230" width="200" height="40"/>
+              <text class="label bad" x="120" y="250">offsets not moved</text>
+              <text class="label bad" x="430" y="305">Crash: nothing visible, re-read 100-104</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Consume a batch.</b> <code>consumer.consume(num_messages=200, timeout=1.0)</code> returns up to 200 records, here offsets 100 to 104.</li>
+            <li><b>Begin.</b> <code>producer.begin_transaction()</code>. The first write tells the transaction coordinator (the <a href="{{BASE}}interview/glossary#broker">broker</a> that owns this <code>transactional.id</code>'s partition of <code>__transaction_state</code>) which partitions are in the transaction.</li>
+            <li><b>Produce outputs.</b> Each record goes to enriched, retry or dlq. They are really written to the logs, but <code>read_committed</code> consumers cannot read past them yet.</li>
+            <li><b>Add the offsets.</b> <code>send_offsets_to_transaction(consumer.position(...), group_metadata)</code> puts "enricher has done up to 104" into the same transaction.</li>
+            <li><b>Commit.</b> The coordinator writes a COMMIT marker into every partition involved. Now the outputs and the offset become visible at the same moment.</li>
+            <li><b>Or crash.</b> If the enricher dies or hits an error before commit, the transaction is aborted (by the code, or by the coordinator after <code>transaction.timeout.ms</code>). Readers skip the aborted records, the offset never moved, and the batch is read again.</li>
+          </ol>
+        </div>
+
+        <p>Here is the real loop, trimmed only of the per-record routing you saw above:</p>
+<pre><code class="language-python"># services/enricher/enricher.py (excerpt)
+    producer = Producer({
+        **idempotent_producer_config(),
+        # Stable id per instance. A restarted instance with the same id "fences"
+        # its zombie predecessor (broker bumps the producer epoch).
+        "transactional.id": os.getenv("TRANSACTIONAL_ID", f"enricher-{HOSTNAME}"),
+        "transaction.timeout.ms": 60000,
+    })
+    producer.init_transactions(30)
+    ...
+    while stop.running:
+        msgs = consumer.consume(num_messages=BATCH_SIZE, timeout=1.0)
+        if not msgs:
+            continue
+        producer.begin_transaction()
+        try:
+            for m in msgs:
+                ...                       # enrich -&gt; produce to enriched / retry / dlq
+            # Commit the INPUT offsets as part of the same transaction.
+            # (The real code commits only what it finished if the batch ran
+            #  past BATCH_BUDGET_S, and seeks back to re-read the rest.)
+            producer.send_offsets_to_transaction(
+                consumer.position(consumer.assignment()),
+                consumer.consumer_group_metadata(), 30)
+            producer.commit_transaction(30)
+        except KafkaException as exc:
+            err = exc.args[0]
+            TXN_ABORTS.inc()
+            if err.txn_requires_abort():
+                producer.abort_transaction(30)
+                rewind(consumer)
+            elif err.retriable():
+                producer.abort_transaction(30)
+                rewind(consumer)
+            else:
+                # Fatal (e.g. we were fenced by a newer instance). Exit; k8s restarts us.
+                raise</code></pre>
+        <p>Three details are easy to miss:</p>
+        <ul>
+          <li><b><code>rewind()</code> after abort.</b> Aborting the transaction does not move the consumer back. The consumer's in-memory position is already past the batch. So the code seeks every assigned partition back to its last <em>committed</em> offset and reads the batch again. Forget this and an aborted batch is silently skipped.</li>
+          <li><b><code>consumer_group_metadata()</code>.</b> This passes the group's generation to the broker. If a rebalance happened and this instance no longer owns the partitions, the commit is rejected instead of corrupting offsets.</li>
+          <li><b>The batch has a time budget.</b> One transaction covers a whole batch of up to 200 records. If one batch takes longer than <code>transaction.timeout.ms</code> (60 s), the coordinator aborts it and the batch is re-read in a loop; past <code>max.poll.interval.ms</code> (5 min) the group also kicks the consumer out. So batch time must stay well below both. The enricher stops a batch after <code>BATCH_BUDGET_S</code> (20 s), commits what it finished and re-reads the rest, and its catalog lookup has a small <b>circuit breaker</b>: after the database fails once, it fails fast for <code>DB_COOLDOWN_S</code> (5 s) instead of spending a 3-second connect timeout on every record.</li>
+          <li><b>The transactional producer is also idempotent.</b> <code>idempotent_producer_config()</code> sets <code>enable.idempotence</code>, <code>acks=all</code> and infinite retries, so the broker de-duplicates producer retries using a producer id and per-partition sequence numbers.</li>
+        </ul>
+
+        <h3>Zombies and fencing</h3>
+        <p>A <b><a href="{{BASE}}interview/glossary#zombie">zombie</a></b> is an old instance that everyone thinks is dead but is still running: for example a pod that froze in a long GC pause or lost its network, was replaced, and then woke up. If both the old and new instance commit transactions for the same partitions, you get duplicates.</p>
+        <p>The fix is a <b>stable <code>transactional.id</code></b>. When the new instance calls <code>init_transactions()</code>, the coordinator bumps the <b>epoch</b> (a generation number) for that id and aborts anything the old epoch left open. When the zombie wakes and tries to commit with the old epoch, the broker rejects it with a fatal <code>ProducerFenced</code> error, and the enricher code exits. On Kubernetes the pod name is injected as <code>HOSTNAME</code>, so <code>transactional.id = enricher-&lt;pod name&gt;</code>. Kafka 4.0 brokers support transaction protocol v2 (KIP-890): clients that also speak it bump the epoch on every transaction, closing older "hanging transaction" holes. The server-side check that a partition was really added to the transaction protects all clients, old ones included.</p>
+        <div class="callout warn"><p><b>Gotcha from the project's troubleshooting table:</b> "a fatal <code>ProducerFenced</code> means two instances had the same <code>transactional.id</code>." If you hard-code the id, every replica fences every other one and the group crash-loops.</p></div>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The transaction coordinator is a two-phase-commit arbiter, and the epoch is a generation number like a VRRP or Raft term: whoever holds the newest number is the only one allowed to write. The COMMIT marker is a control record written into each data log, similar to a barrier token in a pipeline. Where it breaks: classic 2PC can block if the coordinator dies; Kafka's coordinator state is itself a replicated log, so another broker takes over and finishes or aborts the transaction.</p>
+        </div>
+
+        <h3>Where exactly-once stops</h3>
+        <p>Kafka EOS covers <b>read from Kafka, process, write to Kafka</b>. It does not cover anything outside Kafka: a database write, an email, a payment API call. If the enricher sent an email inside the loop and then aborted, the email is already sent, and the retry sends it again. Outside Kafka, you need a different tool: idempotent writes. That is the next section.</p>
+        <p>For the theory of delivery guarantees in general, see <a href="{{BASE}}hld/hld-10">Distributed Transactions &amp; Events</a>.</p>
+      

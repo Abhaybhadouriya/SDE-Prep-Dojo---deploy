@@ -1,0 +1,87 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Two entry gates, one free spot. Both gates run "find a free spot, then mark it taken". If the find and the mark are two separate steps, both gates can find the same spot before either marks it. This is the <b>check-then-act</b> race, and it is the number one concurrency topic in LLD rounds (it appeared in 9 of the interview reports we collected, from parking to seats to drivers).</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Check-then-act race on a parking spot and the atomic fix">
+      <rect class="box client" x="20" y="20" width="140" height="44"/><text class="label small" x="90" y="42">Gate A thread</text>
+      <rect class="box client" x="20" y="200" width="140" height="44"/><text class="label small" x="90" y="222">Gate B thread</text>
+      <rect class="box db" x="330" y="110" width="140" height="64"/><text class="label" x="400" y="134">L1-2</text><text class="label small" x="400" y="156">free</text>
+      <g data-step="1"><path class="arrow" d="M160 50 L324 120"/><text class="label small left" x="200" y="50">1. isFree(L1-2)? yes</text></g>
+      <g data-step="2"><path class="arrow" d="M160 215 L324 165"/><text class="label small left" x="180" y="250">2. isFree(L1-2)? yes</text></g>
+      <g data-step-only="3">
+        <rect class="box ring fail" x="330" y="110" width="140" height="64"/>
+        <text class="label bad" x="640" y="120">3. both mark it taken:</text>
+        <text class="label bad" x="640" y="145">two cars, one spot</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="520" y="190" width="260" height="90"/>
+        <text class="label small" x="650" y="212">Fix: one atomic step</text>
+        <text class="label mono" x="650" y="236">spot = freeSet.pollFirst()</text>
+        <text class="label small" x="650" y="262">A gets L1-2, B gets the next one</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Gate A checks the spot: it is free.</li>
+      <li>Before A writes anything, gate B checks the same spot: still free.</li>
+      <li>Both write "taken". Two tickets point at one spot. No exception, no log line: the bug only shows up as an angry customer.</li>
+      <li>The fix is to make "find and take" a single atomic operation. Our level stores free spots in a <code>ConcurrentSkipListSet</code>, and <code>pollFirst()</code> removes and returns the nearest free spot in one step.</li>
+    </ol>
+  </div>
+  <h3>Every shared thing and how it is protected</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Race</th><th>Protection in our code</th></tr></thead>
+      <tbody>
+        <tr><td>Free spots of a size on a level</td><td>Two gates take the same spot</td><td><code>ConcurrentSkipListSet.pollFirst()</code> (Java), per-level <code>Lock</code> around heap pop (Python)</td></tr>
+        <tr><td>Plate to ticket map</td><td>The same car enters twice through two gates</td><td><code>putIfAbsent</code>: only the first claim wins; undone with <code>remove(key, value)</code> if no spot</td></tr>
+        <tr><td>Active tickets</td><td>One ticket used at two exits</td><td><code>remove(id, ticket)</code> returns true for exactly one caller</td></tr>
+        <tr><td>Strategy fields</td><td>Admin switches pricing while gates run</td><td><code>volatile</code> fields; each strategy is immutable, so swapping the reference is safe</td></tr>
+        <tr><td>Listener list</td><td>A listener added during a notify loop</td><td><code>CopyOnWriteArrayList</code> (reads are lock-free; adds are rare)</td></tr>
+        <tr><td>Ticket id counter</td><td>Two tickets with the same id</td><td><code>AtomicLong.incrementAndGet()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The demo proves it: 8 threads park 200 cars into 50 spots, and the result is exactly 50 tickets on 50 distinct spots; then every ticket is presented twice at the exits and exactly 50 exits succeed.</p>
+  <h3>Three ways to lock, and which to say</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Approach</th><th>How</th><th>Good</th><th>Bad</th></tr></thead>
+      <tbody>
+        <tr><td>One big lock</td><td><code>synchronized park()</code> and <code>unpark()</code></td><td>Obviously correct; fine for a demo</td><td>All gates wait for each other, even on different levels</td></tr>
+        <tr><td>Lock per level (or per size per level)</td><td><code>ReentrantLock</code> in each Level; strategy calls <code>tryTake</code> under it</td><td>Gates on different levels run in parallel</td><td>Need lock ordering if one operation touches two levels (it does not here)</td></tr>
+        <tr><td>Lock-free collections (ours)</td><td>Concurrent sorted set + concurrent maps with atomic methods</td><td>No lock code to get wrong; scales with gates</td><td>Each single step is atomic, but a multi-step invariant still needs care (we claim the plate first, and undo it on failure)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><b>The database version (Microsoft's follow-up).</b> If spots live in a table, the same choice appears as pessimistic versus optimistic locking:</p>
+<pre><code class="language-sql">-- Pessimistic: lock the row you are about to take; other gates skip locked rows instead of waiting
+BEGIN;
+SELECT id FROM spot
+ WHERE level = 1 AND size = 'MEDIUM' AND vehicle IS NULL
+ ORDER BY number LIMIT 1
+ FOR UPDATE SKIP LOCKED;
+UPDATE spot SET vehicle = 'KA01AB1234' WHERE id = :id;
+COMMIT;
+
+-- Optimistic: no lock; the write succeeds only if nobody changed the row since you read it
+UPDATE spot SET vehicle = 'KA01AB1234', version = version + 1
+ WHERE id = :id AND version = :seenVersion AND vehicle IS NULL;
+-- 0 rows updated means you lost the race: pick another spot and retry</code></pre>
+  <p>Say when to use which: pessimistic when contention is high (a nearly full lot at 9 a.m.: optimistic would retry a lot), optimistic when conflicts are rare (a big, mostly empty lot). <code>SKIP LOCKED</code> is the trick that keeps <a href="{{BASE}}interview/glossary#pessimistic-locking">pessimistic locking</a> from turning gates into a queue. More in <a href="{{BASE}}lld/lld-conc-locks">Locks for LLD</a> and <a href="{{BASE}}lld/lld-conc-booking">Booking concurrency</a>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Taking a spot is the kernel's bitmap allocator: <code>find_first_zero_bit()</code> followed by <code>test_and_set_bit()</code>, retried if the atomic set loses, is how IDs and IRQ vectors are handed out without a global lock. <code>pollFirst()</code> on a concurrent set gives the same "find and claim in one atomic step" guarantee. The optimistic SQL update is a <code>cmpxchg</code> loop on a version number; the pessimistic one is a <code>spin_lock</code> on the row.</p>
+  </div>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReentrantLock</code> = <code>pthread_mutex_t</code> of the recursive kind (the owning thread may lock it again), with <code>tryLock</code> like <code>mutex_trylock</code>.</li>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>CopyOnWriteArrayList</code> = an RCU-style list: readers walk a snapshot with no lock, writers copy the array and publish it; good for read-mostly listener sets.</li>
+      <li><code>ConcurrentSkipListSet</code> / <code>Map</code> = a sorted, lock-free set; <code>pollFirst()</code> removes the smallest element in one atomic step.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

@@ -1,0 +1,169 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. The URL frontier: priority and politeness at the same time</h3>
+        <p>A single FIFO queue fails in two ways. Links on a page usually point to the same site, so the head of the queue fills with one host and politeness forces you to wait, which stalls everything (head-of-line blocking). And FIFO ignores importance: a news home page and a 10-year-old forum post get equal treatment. The classic fix comes from the Mercator crawler (Heydon and Najork, 1999) and is taught in the Stanford IR book: split the frontier into two layers.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 340" role="img" aria-label="Mercator frontier: prioritizer feeds front queues by priority, a router moves URLs into one back queue per host, a heap of next allowed times picks which back queue a fetcher reads">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="140" width="120" height="56"/>
+            <text class="label" x="80" y="164">Prioritizer</text>
+            <text class="label small" x="80" y="184">score URL</text>
+            <rect class="zone kafka" x="170" y="20" width="200" height="300"/>
+            <text class="zone-label" x="182" y="42">Front queues (priority)</text>
+            <rect class="box kafka" x="190" y="60" width="160" height="40"/><text class="label" x="270" y="85">F1 high</text>
+            <rect class="box kafka" x="190" y="120" width="160" height="40"/><text class="label" x="270" y="145">F2 medium</text>
+            <rect class="box kafka" x="190" y="180" width="160" height="40"/><text class="label" x="270" y="205">F3 low</text>
+            <text class="label small" x="270" y="250">biased pick:</text>
+            <text class="label small" x="270" y="270">high more often</text>
+            <rect class="zone k8s" x="420" y="20" width="200" height="300"/>
+            <text class="zone-label" x="432" y="42">Back queues (1 per host)</text>
+            <rect class="box queue" x="440" y="60" width="160" height="40"/><text class="label" x="520" y="85">news.example</text>
+            <rect class="box queue" x="440" y="120" width="160" height="40"/><text class="label" x="520" y="145">shop.example</text>
+            <rect class="box queue" x="440" y="180" width="160" height="40"/><text class="label" x="520" y="205">blog.example</text>
+            <rect class="box queue" x="440" y="240" width="160" height="40"/><text class="label" x="520" y="265">wiki.example</text>
+            <rect class="box cache" x="650" y="60" width="130" height="100"/>
+            <text class="label" x="715" y="88">Heap</text>
+            <text class="label small" x="715" y="110">host by</text>
+            <text class="label small" x="715" y="130">next_allowed_at</text>
+            <rect class="box svc" x="650" y="220" width="130" height="60"/>
+            <text class="label" x="715" y="246">Fetcher</text>
+            <text class="label small" x="715" y="266">threads</text>
+            <path class="arrow" d="M140 168 L184 80"/><path class="arrow" d="M140 168 L184 140"/><path class="arrow" d="M140 168 L184 200"/>
+            <path class="arrow" d="M350 140 L434 140"/>
+            <path class="arrow" d="M715 160 L715 214"/>
+            <path class="arrow dashed" d="M650 250 L606 205"/>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M140 168 L190 80 L350 80 L440 140 L600 140 L650 250"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="4s" begin="2s" repeatCount="indefinite" path="M140 168 L190 200 L350 200 L440 200 L600 200 L650 250"/></circle>
+          </svg>
+          <figcaption>Front queues decide <i>what is important</i>; back queues decide <i>when a host may be hit again</i>. A fetcher asks the heap for the host whose wait time is over, takes one URL from that host's back queue, and after the fetch puts the host back in the heap with <code>next_allowed_at = now + delay</code>.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Front queues</b> (say 10 to 100): the prioritizer scores each URL (page importance such as PageRank or in-link count, how often it changes, whether it is a seed or sitemap URL) and puts it in the matching queue. A biased random pick reads high queues more often, so low-priority pages still move forward (no starvation).</li>
+          <li><b>Back queues</b>: each back queue holds URLs from one host only. The Mercator rule of thumb is about three times as many back queues as fetcher threads, so a fetcher always finds a host that is ready.</li>
+          <li><b>The heap</b>: one entry per back queue, keyed by the earliest time that host may be contacted. Delay can be fixed (1 s), taken from robots.txt <code>Crawl-delay</code>, or adaptive: Mercator waited about 10 times the duration of the last fetch, so slow (struggling) servers automatically get fewer requests.</li>
+          <li><b>Spill to disk</b>: the frontier can hold billions of URLs, far more than RAM. Keep the head of each queue in memory and the tail on local disk (RocksDB or plain append-only files), just like a router buffering in DRAM behind SRAM.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Front queues are strict-ish priority classes; back queues are per-flow queues; the heap is a calendar queue / timer wheel that tells the scheduler which flow's shaper has tokens again. Adaptive delay is AIMD congestion control in spirit: when the far end slows down, you back off. <i>Where this breaks:</i> a shaper smooths bits; a crawler's unit is whole requests, and the far end's "capacity" is unknown, so the delay is a guess you keep adjusting from response times and HTTP 429/503 codes.</p>
+        </div>
+
+        <h3>2. Distributing the crawl: shard by host</h3>
+        <p>With 10-20 fetcher machines, who owns which URLs? The key insight: <b>partition by host name, not by URL</b>. If every URL of <code>shop.example</code> goes to one shard, then politeness, robots.txt caching and the host's DNS entry are all local to one machine, and no cross-machine lock is needed to enforce "one connection per host".</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Links are routed to frontier shards by hash of host, so each host lives on exactly one shard">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="90" width="170" height="80"/>
+            <text class="label" x="105" y="122">New links</text>
+            <text class="label small" x="105" y="146">from all parsers</text>
+            <rect class="box cache" x="260" y="90" width="170" height="80"/>
+            <text class="label" x="345" y="122">Router</text>
+            <text class="label small" x="345" y="146">hash(host) mod S</text>
+            <rect class="box queue" x="520" y="20" width="250" height="56"/>
+            <text class="label" x="645" y="44">Shard 0</text>
+            <text class="label small" x="645" y="64">news.example, a.org ...</text>
+            <rect class="box queue" x="520" y="102" width="250" height="56"/>
+            <text class="label" x="645" y="126">Shard 1</text>
+            <text class="label small" x="645" y="146">shop.example, b.net ...</text>
+            <rect class="box queue" x="520" y="184" width="250" height="56"/>
+            <text class="label" x="645" y="208">Shard 2</text>
+            <text class="label small" x="645" y="228">blog.example, c.io ...</text>
+            <path class="arrow" d="M190 130 L254 130"/>
+            <path class="arrow" d="M430 120 L514 50"/><path class="arrow" d="M430 130 L514 130"/><path class="arrow" d="M430 140 L514 210"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M190 130 L430 130 L520 50"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M190 130 L430 130 L520 130"/></circle>
+            <circle class="packet gold" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M190 130 L430 130 L520 210"/></circle>
+          </svg>
+          <figcaption>Same host, same shard, every time. In practice you would use consistent hashing or a fixed number of virtual partitions so that adding a shard moves only a small slice of hosts.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is ECMP flow hashing. A 5-tuple hash pins a flow to one path so packets stay in order and per-flow state lives in one place; here a host-name hash pins a website to one shard so its politeness state lives in one place. And like resilient ECMP hashing, you want consistent hashing so a shard joining or leaving does not reshuffle every host. <i>Where this breaks:</i> a few giant hosts (one huge site with hundreds of millions of pages) make that shard hot, so very large sites get their own dedicated shard or a per-host budget.</p>
+        </div>
+        <p>Sharding by host has one subtlety: hosts that share one IP address (shared hosting, CDNs). Politeness really protects the <i>server</i>, so serious crawlers also rate-limit per IP or per IP range, not only per host name.</p>
+
+        <h3>3. Dedup: URLs with a Bloom filter, content with fingerprints</h3>
+        <p><b>URL dedup.</b> Before enqueueing, ask "have I ever seen this normalised URL?" A hash set of 10 billion 16-byte hashes is about 160 GB; a <b>Bloom filter</b> answers the same question in about 12 GB at 1% error (from the estimate). A Bloom filter is a big bit array plus k hash functions: to add a URL, set k bits; to check, see whether all k bits are set. It can say "maybe seen" for a URL it never saw (a false positive), but it never says "not seen" for a URL it did see. For a crawler, a false positive means we skip a page we should have fetched, 1 time in 100. That is an acceptable loss; fetching every page twice is not.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Bloom filter: a URL is hashed by three functions which set three bits in a bit array; a check reads the same three bits">
+            <text class="label left" x="20" y="34">add("shop.example/tv")</text>
+            <text class="label left" x="20" y="200">check("blog.example/x")</text>
+            <g>
+              <rect class="cell" x="140" y="90" width="40" height="40"/><rect class="cell filled" x="180" y="90" width="40" height="40"/><rect class="cell" x="220" y="90" width="40" height="40"/><rect class="cell" x="260" y="90" width="40" height="40"/><rect class="cell filled" x="300" y="90" width="40" height="40"/><rect class="cell" x="340" y="90" width="40" height="40"/><rect class="cell filled" x="380" y="90" width="40" height="40"/><rect class="cell" x="420" y="90" width="40" height="40"/><rect class="cell filled" x="460" y="90" width="40" height="40"/><rect class="cell" x="500" y="90" width="40" height="40"/><rect class="cell" x="540" y="90" width="40" height="40"/><rect class="cell filled" x="580" y="90" width="40" height="40"/><rect class="cell" x="620" y="90" width="40" height="40"/>
+            </g>
+            <text class="label small" x="200" y="148">1</text><text class="label small" x="320" y="148">1</text><text class="label small" x="400" y="148">1</text><text class="label small" x="480" y="148">1</text><text class="label small" x="600" y="148">1</text>
+            <path class="arrow ok" d="M200 42 L200 84"/><path class="arrow ok" d="M200 42 L320 84"/><path class="arrow ok" d="M200 42 L480 84"/>
+            <path class="arrow accent" d="M200 188 L400 136"/><path class="arrow accent" d="M200 188 L600 136"/><path class="arrow accent" d="M200 188 L540 136"/>
+            <text class="label left" x="660" y="100">h1,h2,h3</text>
+            <text class="label small left" x="660" y="200">bit 540 is 0</text>
+            <text class="label small left" x="660" y="218">=&gt; surely new</text>
+          </svg>
+          <figcaption>Adding a URL sets k bits (green). Checking another URL reads its k bits: if any bit is 0, the URL is definitely new. If all are 1, it is "probably seen" (could be a false positive). Bits are never cleared, so a plain Bloom filter cannot delete; use a counting Bloom filter or rebuild periodically.</figcaption>
+        </figure>
+        <p>The Bloom filter is a fast first gate, not the truth. The URL table stays the source of truth: on "maybe seen", some designs do a second lookup in the URL table for high-priority URLs to recover from false positives. Shard the filter by host hash, the same as the frontier, so each frontier shard owns its own filter in RAM and snapshots it to disk regularly (losing it means a burst of duplicate fetches, not a correctness bug).</p>
+        <p><b>Content dedup.</b> Different URLs often serve the same page: <code>http</code> vs <code>https</code>, <code>www</code> vs no <code>www</code>, session IDs, mirrors, print versions. Two levels:</p>
+        <ul>
+          <li><b>Exact duplicates</b>: a SHA-256 of the body. If it is already in the content table, store a pointer and do not re-parse.</li>
+          <li><b>Near duplicates</b>: pages that differ only in an ad or a timestamp. <b>SimHash</b> builds a 64-bit fingerprint where similar documents get fingerprints that differ in only a few bits. Google's 2007 paper on near-duplicate detection for crawling (Manku, Jain and Das Sarma) used 64-bit SimHash fingerprints and treated pages within a Hamming distance of 3 bits as near-duplicates. MinHash with locality-sensitive hashing is the other well-known option.</li>
+        </ul>
+        <p>URL normalisation is the cheapest dedup of all. Here is a tiny, runnable version:</p>
+<pre><code class="language-python">import hashlib
+from urllib.parse import urlsplit, urlunsplit
+
+def normalise(url: str) -&gt; str | None:
+    s = urlsplit(url.strip())
+    if not s.hostname:                       # mailto:, relative links: not crawlable as-is
+        return None
+    host = s.hostname.lower()
+    default = {"http": 80, "https": 443}.get(s.scheme.lower())
+    netloc = host if s.port in (None, default) else f"{host}:{s.port}"   # http://h:443 keeps :443
+    path = s.path or "/"
+    return urlunsplit((s.scheme.lower(), netloc, path, s.query, ""))  # drop #fragment
+
+for u in ["HTTP://Example.COM:80/a/b#top", "http://example.com/a/b"]:
+    n = normalise(u)
+    print(n, hashlib.sha256(n.encode()).hexdigest()[:16])</code></pre>
+<pre class="terminal"><code>$ python normalise.py
+http://example.com/a/b 649028aa54628de9
+http://example.com/a/b 649028aa54628de9</code></pre>
+
+        <h3>4. robots.txt, DNS and the hidden bottlenecks</h3>
+        <p><b>robots.txt rules from RFC 9309</b> (worth quoting precisely in an interview): a crawler must be able to parse at least 500 KiB of robots.txt; it should not use a cached copy for more than 24 hours; if robots.txt returns a 4xx "unavailable" status the crawler may crawl freely; and if it is "unreachable" (5xx or network error) the crawler must assume the whole site is disallowed. When several rules match, the most specific (longest) match wins, and Allow wins a tie. So cache robots.txt per host for up to a day, refresh it in the background, and fail closed on server errors.</p>
+<pre><code class="language-python">from urllib import robotparser
+
+rules = """
+User-agent: *
+Disallow: /cart/
+Disallow: /search
+Allow: /search/help
+Crawl-delay: 2
+""".splitlines()
+
+rp = robotparser.RobotFileParser()
+rp.parse(rules)
+for path in ["/products/42", "/cart/checkout", "/search?q=tv", "/search/help"]:
+    print(path, rp.can_fetch("DojoBot", "https://shop.example" + path))
+print("crawl-delay:", rp.crawl_delay("DojoBot"))</code></pre>
+<pre class="terminal"><code>$ python robots_demo.py
+/products/42 True
+/cart/checkout False
+/search?q=tv False
+/search/help False
+crawl-delay: 2</code></pre>
+        <div class="callout warn"><p><b>Gotcha we hit while writing this page.</b> Look at the last line: Python's built-in <code>urllib.robotparser</code> says <code>/search/help</code> is blocked. Under RFC 9309 the longer <code>Allow: /search/help</code> rule should win, so it should be allowed. The standard-library parser applies the first matching rule in file order instead. Also, if you call <code>rp.read()</code> on a site that answers your default User-Agent with 403, the parser marks the whole site disallowed. Production crawlers use an RFC-compliant parser (Google open-sourced its C++ robots.txt parser) and test it against tricky files.</p></div>
+        <p><b>DNS is the classic hidden bottleneck.</b> Every new host needs a lookup; standard resolver calls are often blocking, and public resolvers rate-limit you. At about 1,000 fetches per second across many distinct hosts, uncached DNS can easily cost more time than the fetch. Fixes: a local caching resolver on every fetcher node (respecting TTLs), asynchronous DNS in the fetcher, and pre-resolving the next hosts in the back queues while their politeness timers run down. The Mercator team reported building their own multi-threaded DNS resolver for this reason.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The DNS cache is the ARP cache of the crawler: without it, every "packet" waits for a resolution round trip. Pre-resolving hosts while they wait in the heap is like ARP-ing for a next hop before the first packet arrives. <i>Where this breaks:</i> DNS TTLs and CDNs mean the IP behind a host can change often, so you cache by TTL, not forever.</p>
+        </div>
+
+        <h3>5. Crawler traps, freshness and JavaScript</h3>
+        <ul>
+          <li><b>Traps</b>: infinite calendars, session IDs in every URL, endless filter combinations on shop pages (<code>?color=red&amp;size=m&amp;sort=price...</code>), and symbolic-link loops like <code>/a/b/a/b/a/b</code>. Defences: maximum URL length; maximum depth from a seed; a per-host page budget per crawl cycle; strip known session and tracking parameters; detect repeating path segments; and watch for hosts whose "new URL" rate is far above their "new content" rate (lots of new URLs, same SimHash) and demote them.</li>
+          <li><b>Freshness / recrawl</b>: every fetched URL gets a <code>next_fetch</code> time. A simple adaptive rule: if the content hash changed since last time, halve the interval (down to a floor); if not, double it (up to a cap). Use conditional GET (<code>If-Modified-Since</code>, <code>If-None-Match</code> with the ETag) so unchanged pages come back as a cheap <code>304 Not Modified</code>. Sitemaps with <code>lastmod</code> tell you what changed without guessing.</li>
+          <li><b>Crawl budget</b>: Google's documentation describes crawl budget as a mix of the crawl rate a site can handle and how much Google wants to crawl it (popularity, staleness). Same idea: capacity limit times demand.</li>
+          <li><b>JavaScript-heavy pages</b>: many modern pages render their content with JavaScript. Running a headless browser (Chromium) costs far more CPU and memory than a plain HTTP fetch, so do it as a second pass: fetch HTML first, and send only pages that look empty or important to a separate rendering pool.</li>
+        </ul>
+        <div class="callout interview"><p>A strong closing line for the deep dives: "The frontier is the product. Everything else - fetchers, parsers, storage - is stateless and scales horizontally. The frontier holds the state: priority, politeness timers and seen-sets, so I shard it by host and make it durable."</p></div>
+      

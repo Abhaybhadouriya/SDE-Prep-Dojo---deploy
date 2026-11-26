@@ -1,0 +1,67 @@
+
+        <h2>Data model</h2>
+        <p>Use a relational database (PostgreSQL or MySQL) for everything about seats, holds, bookings and payments: we need transactions, conditional updates and unique constraints. Use Elasticsearch (or similar) for search, and Redis for caches. Static layouts (venue, screen, seat grid) change rarely; the per-show seat status changes constantly.</p>
+<pre><code class="language-sql">CREATE TABLE shows (
+  show_id     BIGINT PRIMARY KEY,
+  event_id    BIGINT NOT NULL,
+  screen_id   BIGINT NOT NULL,
+  starts_at   TIMESTAMPTZ NOT NULL,
+  on_sale_at  TIMESTAMPTZ NOT NULL
+);
+
+-- One row per seat per show: the inventory. This is the table that matters.
+CREATE TABLE show_seats (
+  show_id     BIGINT      NOT NULL,
+  seat_id     VARCHAR(8)  NOT NULL,          -- 'F7'
+  price_tier  SMALLINT    NOT NULL,
+  status      VARCHAR(10) NOT NULL DEFAULT 'AVAILABLE',   -- AVAILABLE | HELD | BOOKED
+  hold_id     UUID,
+  held_until  TIMESTAMPTZ,
+  booking_id  BIGINT,
+  version     INT         NOT NULL DEFAULT 0,
+  PRIMARY KEY (show_id, seat_id)               -- seat ownership is per (show, seat)
+);
+CREATE INDEX ON show_seats (hold_id);
+CREATE INDEX ON show_seats (held_until) WHERE status = 'HELD';   -- for the sweeper
+
+CREATE TABLE bookings (
+  booking_id      BIGINT PRIMARY KEY,
+  user_id         BIGINT NOT NULL,
+  show_id         BIGINT NOT NULL,
+  hold_id         UUID   NOT NULL UNIQUE,     -- one booking per hold, even on retries
+  status          VARCHAR(16) NOT NULL,       -- PAYMENT_PENDING | CONFIRMED | FAILED | REFUNDED
+  amount_paise    BIGINT NOT NULL,            -- integer money
+  idempotency_key VARCHAR(64) NOT NULL UNIQUE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+        <ul>
+          <li><b>Why one row per seat per show?</b> It turns "is F7 free?" into a single-row question with a primary key, which databases answer and lock very cheaply. It also makes the hold one conditional UPDATE.</li>
+          <li><b>Sharding:</b> shard (or partition) everything by <code>show_id</code>. A booking only ever touches one show, so it never needs a cross-shard transaction. At movie scale one primary is enough; at Ticketmaster scale you shard by event or show.</li>
+          <li><b>Seat map cache:</b> a Redis bitmap or small hash per show (<code>seatmap:{show_id}</code>), updated by events when status changes, read by thousands of browsers. A 50,000-seat stadium needs about 6 KB per status bitmap (50,000 bits, one per seat).</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 220" role="img" aria-label="Seat state machine: available, held, booked, with expiry back to available">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="40" y="80" width="170" height="60"/>
+            <text class="label" x="125" y="104">AVAILABLE</text>
+            <text class="label small" x="125" y="124">anyone may hold</text>
+            <rect class="box queue" x="345" y="80" width="170" height="60"/>
+            <text class="label" x="430" y="104">HELD</text>
+            <text class="label small" x="430" y="124">hold_id, held_until</text>
+            <rect class="box db solid" x="650" y="80" width="170" height="60"/>
+            <text class="label white" x="735" y="104">BOOKED</text>
+            <text class="label white" x="735" y="124">booking_id</text>
+            <path class="arrow" d="M210 100 L338 100"/>
+            <text class="label small" x="275" y="88">hold (conditional)</text>
+            <path class="arrow ok" d="M515 100 L643 100"/>
+            <text class="label small" x="580" y="88">payment ok</text>
+            <path class="arrow bad dashed" d="M400 140 C 360 200, 200 200, 140 145"/>
+            <text class="label small bad" x="270" y="200">TTL expired / cancelled / payment failed</text>
+            <path class="arrow dashed" d="M735 80 C 700 20, 200 20, 150 75"/>
+            <text class="label small" x="440" y="30">refund / cancel (policy)</text>
+            <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M210 100 L345 100 L515 100 L650 100"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="5s" begin="2.5s" repeatCount="indefinite" path="M400 140 C 360 200, 200 200, 140 145"/></circle>
+          </svg>
+          <figcaption>Three states. Every arrow is a single conditional UPDATE whose WHERE clause names the state it expects to leave. If the row is no longer in that state, the update changes 0 rows and the caller knows it lost.</figcaption>
+        </figure>
+      

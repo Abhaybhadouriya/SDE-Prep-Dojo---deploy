@@ -1,0 +1,118 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Partition by document or by term?</h3>
+        <p>This is the classic question. Real large-scale systems (Google's 2003 cluster paper, Twitter's Earlybird, Elasticsearch) use <b>document partitioning</b>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Document partitioning versus term partitioning">
+            <rect class="zone db" x="20" y="20" width="370" height="220"/>
+            <text class="zone-label" x="35" y="42">By document (hash post_id)</text>
+            <rect class="box db" x="40" y="60" width="330" height="40"/>
+            <text class="label small" x="205" y="80">shard A: full index of posts 1, 4, 7 ...</text>
+            <rect class="box db" x="40" y="110" width="330" height="40"/>
+            <text class="label small" x="205" y="130">shard B: full index of posts 2, 5, 8 ...</text>
+            <rect class="box db" x="40" y="160" width="330" height="40"/>
+            <text class="label small" x="205" y="180">shard C: full index of posts 3, 6, 9 ...</text>
+            <text class="label small" x="205" y="222">query hits ALL shards; each does AND locally</text>
+
+            <rect class="zone kafka" x="410" y="20" width="370" height="220"/>
+            <text class="zone-label" x="425" y="42">By term (hash word)</text>
+            <rect class="box kafka" x="430" y="60" width="330" height="40"/>
+            <text class="label small" x="595" y="80">shard X: "world", "chai" (all posts)</text>
+            <rect class="box kafka" x="430" y="110" width="330" height="40"/>
+            <text class="label small" x="595" y="130">shard Y: "cup", "news" (all posts)</text>
+            <rect class="box kafka hot" x="430" y="160" width="330" height="40"/>
+            <text class="label small" x="595" y="180">shard Z: "the" (HOT, huge list)</text>
+            <text class="label small" x="595" y="222">query hits few shards; AND needs network join</text>
+          </svg>
+          <figcaption>Document partitioning: every shard is a mini search engine. Term partitioning: each shard owns some words for all posts.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>Document-partitioned</th><th>Term-partitioned</th></tr></thead>
+            <tbody>
+              <tr><td>Write of one post</td><td>1 shard</td><td>~20 shards (one per term)</td></tr>
+              <tr><td>Query fan-out</td><td>All shards (scatter-gather)</td><td>Only shards owning the query terms</td></tr>
+              <tr><td>Multi-word AND</td><td>Local per shard - cheap</td><td>Ship long posting lists across the network to intersect</td></tr>
+              <tr><td>Hot terms</td><td>Spread evenly over shards</td><td>One shard melts ("the", "worldcup")</td></tr>
+              <tr><td>Tail latency</td><td>Slowest shard decides; fix with replicas + hedged requests</td><td>Fewer shards per query</td></tr>
+              <tr><td>Used by</td><td>Google (2003 paper), Twitter Earlybird, Elasticsearch</td><td>Simple Redis-keyword designs; some research systems</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Document partitioning is like <b>RSS (receive-side scaling)</b> hashing flows to CPU cores: each core owns whole flows and needs no cross-core locking. Scatter-gather then is a <b>multicast and collect</b>, and your p99 is set by the slowest responder - the same reason one slow line card hurts a whole ECMP group. Replicas per shard play the role of redundant paths.</p>
+        </div>
+        <p>Google's 2003 paper describes exactly this: index shards each hold a <b>randomly chosen subset of documents</b>, every shard has a pool of replica machines behind a load balancer, and because shards do not talk to each other the speedup is nearly linear. Elasticsearch suggests keeping shards between <b>10 and 50 GB</b> and under 200 million documents.</p>
+
+        <h3>2. Real-time indexing: one writer, many readers, no locks</h3>
+        <p>Twitter's Earlybird paper (2012) and the 2020 follow-up give a very concrete design:</p>
+        <ul>
+          <li>Each server holds several <b>segments</b> (12 in 2012, each up to 2<sup>23</sup> = ~8.4M tweets). Only <b>one segment is active</b> (being written); the others are frozen and converted into a compact read-only form (about 55% smaller).</li>
+          <li><b>Document ids encode time</b>. In 2020, Twitter packed a 31-bit id as 27 bits of millisecond timestamp + a 4-bit counter, so ids sort by creation time even when tweets arrive out of order. Searching from the newest id lets a query <b>stop early</b> after the first N hits.</li>
+          <li>Posting lists moved from a prepend-only <b>unrolled linked list</b> (needs strictly ordered input) to a <b>skip list</b> with a 1:5 level ratio, so late-arriving tweets can be inserted in place.</li>
+          <li>A single writer per segment publishes new entries by an atomic pointer update; reader threads (one per core) never take a lock.</li>
+          <li>Result: indexing latency dropped from about <b>15 seconds to about 1 second</b>, while serving hundreds of thousands of QPS.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Index segment lifecycle: active segment fills, then freezes, then is optimised">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="80" width="130" height="60"/>
+            <text class="label" x="85" y="102">Kafka</text>
+            <text class="label small" x="85" y="124">new posts</text>
+            <rect class="box hot" x="200" y="70" width="170" height="80"/>
+            <text class="label" x="285" y="96">Active segment</text>
+            <text class="label small" x="285" y="118">1 writer, N readers</text>
+            <text class="label small" x="285" y="136">uncompressed</text>
+            <rect class="box db" x="420" y="70" width="160" height="80"/>
+            <text class="label" x="500" y="96">Frozen</text>
+            <text class="label small" x="500" y="118">full (~8.4M posts)</text>
+            <text class="label small" x="500" y="136">read-only</text>
+            <rect class="box db solid" x="630" y="70" width="150" height="80"/>
+            <text class="label white" x="705" y="100">Optimised</text>
+            <text class="label white" x="705" y="124">~55% smaller</text>
+            <path class="arrow kafka" d="M150 110 L193 110"/>
+            <path class="arrow" d="M370 110 L413 110"/>
+            <path class="arrow" d="M580 110 L623 110"/>
+            <text class="label small" x="500" y="185">background rewrite, then swap; old copy dropped</text>
+            <text class="label small" x="285" y="185">newest ids first, stop early</text>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M60 110 L200 110 L360 110"/></circle>
+          </svg>
+          <figcaption>Earlybird-style segment lifecycle (numbers from the 2012 paper). Only one segment per server is ever being written.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>That single-writer, lock-free-reader trick with an atomic pointer publish is <b>RCU</b> (read-copy-update) from the Linux kernel. Readers see either the old or the new head, never a torn one. Frozen read-only segments are like making a page read-only after it is built.</p>
+        </div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> An inverted index sharded by document (post_id), scatter-gather across shards, and Kafka feeding an append-only real-time index are the interview-sufficient core. Deep dives 3-5 (likes via milestones and re-rank, phrase queries, hot queries and tiers) are what an SDE-2 answer adds.</p></div>
+
+        <h3>3. Sorting by likes without 100K index writes per second</h3>
+        <p>If every like rewrote the popularity score in every term's sorted set (a post has ~20 terms), 100K likes/s would become 2M index writes/s. Options:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Approach</th><th>Index writes</th><th>Downside</th></tr></thead>
+            <tbody>
+              <tr><td>Update on every like</td><td>likes x terms</td><td>Melts on viral posts</td></tr>
+              <tr><td>Batch per 30 s window</td><td>One per post per window</td><td>Helps viral posts; a post with 1 like/minute still writes 1,440 times a day</td></tr>
+              <tr><td><b>Milestones + re-rank</b></td><td>~log10(likes): 1,000 likes = 4 writes (at 1, 10, 100, 1,000); powers of 2 would be ~10</td><td>Index order is approximate; fix it at query time</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>With milestones, the index stores an <code>approxLikes</code> field. At query time take the top <b>2N</b> candidates by approximate score, fetch exact counts from the counter service, re-sort, return the top N. This <b>retrieve-then-rerank</b> pattern is the same as in recommendation systems (see <a href="{{BASE}}hld/d48">Recommendation System</a>). The exact counts themselves come from a <a href="{{BASE}}hld/d39">sharded counter</a>.</p>
+
+        <h3>4. Multi-word and phrase queries</h3>
+        <ul>
+          <li><b>AND</b> = intersect posting lists. Sorted lists intersect like a merge; skip pointers let you jump ahead in the longer list (Twitter keeps a "search finger" so the next jump is O(log d), not O(log n)). Always start from the <b>shortest</b> list.</li>
+          <li><b>Phrases</b> ("world cup" as adjacent words) need <b>positions</b> stored in postings, or index <b>bigrams</b> (word pairs) for popular pairs only - indexing all bigrams can grow keys from ~10M to over 100M.</li>
+        </ul>
+
+        <h3>5. Hot queries, caching and cold data</h3>
+        <ul>
+          <li><b>Cache</b> normalised query results in Redis and at the CDN with a TTL under the freshness target (for example 30 s). During a final, "world cup" might be a large share of all traffic - cache it, and use <b>request coalescing</b> so a cache miss triggers one backend query, not thousands (see <a href="{{BASE}}hld/p04">Pattern: Scaling Reads</a>).</li>
+          <li><b>Time tiers</b>: recent tier in RAM, older tiers on SSD, built in batch. Twitter's 2014 full index held about <b>half a trillion</b> tweets with &lt; 100 ms average latency, sharded in two dimensions: <b>time tiers x hash partitions</b>, so the cluster grows by adding new tiers instead of reshuffling old ones.</li>
+          <li><b>Rarely searched terms</b> can be moved to blob storage and loaded on demand.</li>
+          <li><b>Deletes</b>: do not rewrite posting lists. Keep a per-segment "deleted ids" bitmap, filter at query time, and purge when segments are rebuilt or merged.</li>
+        </ul>
+      

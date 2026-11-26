@@ -1,0 +1,47 @@
+
+  <h2>In the database: row locks, conditional updates, unique constraints</h2>
+  <p>An in-memory lock only protects one process. The moment you run two app servers behind a load balancer, two JVMs have two separate lock maps, and the race is back. In a real system the <b>database row</b> is the shared thing, so the database must make check + act atomic. Four tools, from most to least common:</p>
+  <h3>1. Conditional update (atomic check-and-act in one statement)</h3>
+<pre><code class="language-sql">UPDATE show_seat
+   SET status = 'HELD', user_id = :user, hold_until = now() + interval '5 minutes'
+ WHERE show_id = :show AND seat_id = :seat
+   AND (status = 'FREE' OR (status = 'HELD' AND hold_until &lt; now()));
+-- 1 row changed: you got it.  0 rows: someone else did. No read-then-write gap.</code></pre>
+  <h3>2. Optimistic version column</h3>
+<pre><code class="language-sql">-- read
+SELECT status, version FROM show_seat WHERE show_id = :show AND seat_id = :seat;   -- FREE, 41
+-- write only if unchanged
+UPDATE show_seat SET status = 'BOOKED', user_id = :user, version = version + 1
+ WHERE show_id = :show AND seat_id = :seat AND version = 41;
+-- 0 rows -&gt; conflict -&gt; re-read and decide</code></pre>
+  <p>ORMs do this for you: a JPA entity with a <code>@Version</code> field adds the version check to every update and throws <code>OptimisticLockException</code> on conflict.</p>
+  <h3>3. Pessimistic row lock: SELECT ... FOR UPDATE</h3>
+<pre><code class="language-sql">BEGIN;
+SELECT seat_id, status FROM show_seat
+ WHERE show_id = :show AND seat_id IN ('A1','A2','A3')
+ ORDER BY seat_id                -- consistent order: avoids deadlocks between transactions
+ FOR UPDATE NOWAIT;              -- or SKIP LOCKED to grab any free ones, or plain FOR UPDATE to wait
+-- application checks all three are FREE
+UPDATE show_seat SET status = 'HELD', user_id = :user, hold_until = now() + interval '5 minutes'
+ WHERE show_id = :show AND seat_id IN ('A1','A2','A3');
+COMMIT;                          -- row locks are released here</code></pre>
+  <ul>
+    <li><code>FOR UPDATE</code> locks the selected rows until the transaction ends; other <code>FOR UPDATE</code>s and writes on those rows wait. Plain reads still proceed (MVCC).</li>
+    <li><code>NOWAIT</code> fails immediately instead of waiting; <code>SKIP LOCKED</code> silently skips rows someone else locked, which is perfect for "give me any 2 free seats in row F" or job queues. Both exist in PostgreSQL and MySQL 8.</li>
+    <li>Keep the transaction short: <b>never call the payment gateway while holding the row lock</b>. Hold the seat (commit), pay, then confirm in a second short transaction.</li>
+  </ul>
+  <h3>4. Unique constraint: the safety net</h3>
+  <p>A <code>UNIQUE (show_id, seat_id)</code> on the bookings table means that even if all your application logic is wrong, the database refuses the second row. Use it in addition to one of the above, not instead of them, because the error arrives late (after payment, if you are careless).</p>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th></th><th>In-memory lock / CAS</th><th>Database guard</th><th>Distributed lock (Redis, ZooKeeper)</th></tr></thead>
+      <tbody>
+        <tr><td>Protects</td><td>One process only</td><td>Every server sharing the DB</td><td>Every server sharing the lock service</td></tr>
+        <tr><td>Survives restart</td><td>No (holds lost)</td><td>Yes</td><td>Depends (TTL keys expire)</td></tr>
+        <tr><td>Cost per booking</td><td>Nanoseconds</td><td>One round trip</td><td>One or more round trips</td></tr>
+        <tr><td>Use when</td><td>Machine-coding round; single-instance service; in front of the DB as a fast filter</td><td>Default for real bookings: source of truth</td><td>The resource is not in one DB row (calls to an external partner, a cron that must run once)</td></tr>
+        <tr><td>Trap</td><td>Two app servers = two lock maps</td><td>Long transactions, lock order</td><td>Lock expires while you still work: use fencing tokens</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>For distributed locks in depth (Redis <code>SET key value NX PX ttl</code>, leases, fencing tokens) see <a href="{{BASE}}hld/d55">Distributed Lock Service</a>; for the full booking system see <a href="{{BASE}}hld/d14">Ticket Booking (BookMyShow)</a> and <a href="{{BASE}}hld/d40">Hotel Reservation</a>.</p>

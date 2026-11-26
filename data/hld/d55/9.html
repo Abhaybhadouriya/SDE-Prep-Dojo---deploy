@@ -1,0 +1,123 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: clarify.</strong> Coarse (leader election) or fine (per item)? How many clients, how often? Must it be correct or just efficient? Single region or global?</li>
+          <li><strong>5-10: estimate.</strong> Show heartbeats dominate; state fits in RAM; write rate is low.</li>
+          <li><strong>10-15: API.</strong> Sessions, acquire/release, tokens, watches.</li>
+          <li><strong>15-25: core design.</strong> 5-replica consensus cell, leader with master lease, replicated log, in-memory tree, client library.</li>
+          <li><strong>25-38: deep dives.</strong> Fencing tokens (always), session/grace period across failover, herd-free waiting, partitions and quorum.</li>
+          <li><strong>38-45: scale and ops.</strong> Proxies, partitioning, per-DC cells; metrics (session count, KeepAlive rate, fsync p99, election count) and alternatives (DB conditional writes, Kafka partition ownership).</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "A cell of five replicas runs Raft or Paxos, so it survives two failures. An elected leader holds a master lease and serves every read and write, so grants are linearizable. State is a small tree of nodes, kept in memory, backed by a replicated log and snapshots. Clients open a session and send KeepAlives; locks belong to the session, and ephemeral nodes vanish when it dies. Every grant carries a fencing token that only grows, and the protected resource rejects anything older, because a lease alone cannot stop a paused holder. Waiters watch only their predecessor, so a release wakes one client, not a herd. On leader failover, clients go into jeopardy and wait a grace period, so most sessions survive. It is built for coarse locks held for minutes; fine-grained locks belong in the database with conditional writes."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: what a lock is for, lease + renew, why a TTL alone is not safe (GC pause), fencing tokens, a consensus cluster of 3 or 5, the herd-free waiting recipe. SDE-2 adds: sessions vs connections, jeopardy and the grace period across failover, master leases and the new master's epoch, the czxid / revision as the token, Redlock's assumptions and Kleppmann's critique, proxies and partitioning for scale.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a lease vs a lock.</b> A lock says "only one holder"; a lease says "only one holder <i>until this time</i>, unless renewed". Every lock in a distributed system is really a lease, because a holder can die silently. Also do not confuse a <b>lock service</b> (Chubby, ZooKeeper, etcd: consensus, correctness) with a <b>Redis lock</b> (fast, single primary, good for efficiency, not for correctness).</p></div>
+        <h3>Common mistakes</h3>
+        <div class="callout warn"><p><b>Common mistakes:</b> "just use Redis SETNX with a TTL" and stopping there; claiming a TTL prevents two holders; no fencing token; even-sized clusters; forgetting that the lock holder can pause; designing for 1M locks/s on a consensus leader; no plan for session survival across failover.</p></div>
+        <div class="video" data-yt="v7x75aN9liM" data-title="Distributed Locks | System design basics" data-channel="Tech Dummies - Narendra Lakshmana Gowda" data-mins="20"></div>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Microsoft,Uber">
+          <summary>Design a distributed lock service.</summary>
+          <div class="answer">
+            <p>Clarify coarse vs fine locks and correctness needs. Core: a cell of 5 replicas across zones running Raft/Paxos; an elected leader holds a master lease and serves all reads and writes. State is a small tree of nodes (locks, small files) in RAM, built from a replicated log and snapshots. Clients open sessions kept alive by KeepAlives; locks and ephemeral nodes die with the session. Every grant returns a monotonically increasing fencing token (the lock's generation) that resources must check. Waiters queue as sequential entries and watch only their predecessor. For scale, proxies merge KeepAlives, clients cache with invalidations, and the namespace can be split across cells.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with "this is CP" and the estimate showing heartbeats dominate. Draw the cell, then the acquire stepper, then spend real time on fencing and failover. Name Chubby, ZooKeeper and etcd as prior art.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to locks during leader failover?</li><li>How would a resource that cannot check tokens be protected?</li><li>How do you support read-write locks?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>Why not just use Redis SET NX with a TTL?</summary>
+          <div class="answer">
+            <p>For efficiency locks it is fine: <code>SET res token NX PX 30000</code> to acquire and a compare-and-delete (Lua script, or <code>DELEX ... IFEQ</code> in Redis 8.4+) to release so you never delete someone else's lock. For correctness it fails in two ways: Redis replication is asynchronous, so a failover can lose the key and grant the lock twice; and the random value is not monotonic, so it cannot be a fencing token. Redlock adds 5 masters but relies on timing assumptions (bounded pauses, delays and clock drift) and Redis TTLs use wall-clock time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Do not trash Redis. Split the answer: efficiency (Redis is great) vs correctness (consensus + fencing, or a transactional DB).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Walk through the Redis failover race.</li><li>Could you add fencing to Redis? (An INCR counter - but its durability depends on the same async replication.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Microsoft">
+          <summary>What is a fencing token and who checks it?</summary>
+          <div class="answer">
+            <p>A number issued with every lock grant that strictly increases (lock generation, the czxid or sequence number of the ZooKeeper lock znode, etcd revision). The protected resource, not the lock service, stores the highest token it has accepted and rejects requests with a lower one. This turns "two clients think they hold the lock" from data corruption into a rejected write. Chubby calls it a sequencer and offers <code>CheckSequencer()</code> for servers that prefer to ask.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tell the GC-pause story with 33 and 34. Then say the resource needs an atomic "check token and write" (conditional update), otherwise the check itself races.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the resource is a third-party API you cannot change? (Lock-delay, idempotency keys, or route all writes through one proxy that checks tokens.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Google">
+          <summary>How do you choose the lease / session timeout?</summary>
+          <div class="answer">
+            <p>Short leases detect dead holders fast but cost more heartbeats and risk false expiry on a brief network blip or GC pause. Long leases are cheap but keep a lock stuck after a crash. Chubby used 12 s by default, raised toward 60 s under load, plus a 45 s grace period so leader failover does not expire sessions. Rule of thumb: lease several times longer than the worst normal pause and the heartbeat interval; for etcd elections the docs suggest election timeout at least 5x the heartbeat interval.</p>
+            <div class="approach"><h5>How to answer</h5><p>Frame it as detection time vs false positives vs load, and tie it to your earlier KeepAlive estimate (doubling the lease halves KeepAlive QPS).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Should the client renew from a background thread? (Careful: AWS warns it can keep renewing while the work is stuck.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Google,Microsoft">
+          <summary>1,000 workers wait for the same lock. What happens when it is released?</summary>
+          <div class="answer">
+            <p>With a single watched key, all 1,000 wake and race: a herd that spikes the leader. Instead each waiter creates a sequential ephemeral entry and watches only its immediate predecessor (ZooKeeper's recipe), so each release wakes exactly one waiter and the queue is FIFO-fair. In etcd the lock helper similarly waits on the key with the next-lower revision.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the herd effect, draw the chain of watches, and mention the GUID-in-name trick for retries.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the predecessor crashes rather than releases?</li><li>How do shared (read) locks change the rule?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google">
+          <summary>The leader crashes right after committing a grant but before replying. What does the client see?</summary>
+          <div class="answer">
+            <p>The grant is committed (on a majority), so the new leader has it. The client's request times out; its library retries Acquire on the new leader with the same session and request ID (or GUID). Because acquire is idempotent per session, the new leader returns the existing grant and its token instead of queueing a second entry. The session survives thanks to the grace period, and the new leader extended all session leases on takeover.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "committed" from "acknowledged". Show idempotency and session continuity as the two tools.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>And if the entry was not committed? (Then it is lost; the retry creates it fresh.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Google,Microsoft">
+          <summary>How would you serve 500,000 clients?</summary>
+          <div class="answer">
+            <p>Estimate first: 500k sessions / 12 s = ~42k KeepAlives/s on one leader, which is the bottleneck. Options: proxies that hold one session each for thousands of clients; longer leases; client caches with invalidations so reads rarely reach the leader; one cell per datacenter; partition the namespace across cells. Keep writes rare by keeping locks coarse.</p>
+            <div class="approach"><h5>How to answer</h5><p>Always attack the KeepAlive path first, then reads, then writes. Quote Chubby: 90,000 clients on one master caused overload; proxies fixed it.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What do proxies cost? (One more hop on writes and first reads; a proxy failure affects all its clients.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>In Amazon Locker, how would you lock a locker slot while a package is assigned?</summary>
+          <div class="answer">
+            <p>Do not put every slot through a global lock service; that is fine-grained and high-rate. Use a conditional write in the slot table (status AVAILABLE to RESERVED with a version check and a reservation TTL), which is atomic in one row and needs no separate lock. If you need a coordinator per locker bank, elect one owner per bank with a coarse lease (lock service) and let it allocate slots in memory with a fencing token on writes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you know when not to use a distributed lock: lock and data in the same DB means a transaction is the best lock.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you release slots when the courier never arrives? (TTL plus a sweeper job.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Microsoft,Google">
+          <summary>Why 5 replicas and not 4 or 6? Where do you place them?</summary>
+          <div class="answer">
+            <p>Majority of n is floor(n/2)+1. 3 tolerates 1 failure, 5 tolerates 2, 4 still tolerates only 1 (needs 3 votes) and 6 only 2, so even sizes add cost with no benefit. More than 7 slows every write (etcd's FAQ advises against it). Place replicas in different racks and zones, e.g. 2+2+1 across three zones, so losing a zone leaves 3.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the formula and the fault-tolerance table, then placement.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about two zones only? (A 3+2 split loses quorum if the 3-zone fails; add a tie-breaker in a third site.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>When should you avoid a distributed lock entirely?</summary>
+          <div class="answer">
+            <p>When the data has a natural owner or a database can do it atomically: optimistic concurrency (version column, compare-and-set), unique constraints, conditional writes, single-writer partitions (Kafka key partitioning), or idempotent operations that make duplicates harmless. Amazon's builders' library lists Step Functions, idempotent APIs and optimistic locking as preferred alternatives to leader election.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give one example per alternative from designs you know (booking, wallet, job scheduler).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Optimistic vs pessimistic under high contention?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: two job runners both sent the payout batch</h4>
+          <div class="situation"><p>A scheduler uses a Redis lock with a 30 s TTL. Last night the payout job ran twice and some vendors were paid twice.</p></div>
+          <div class="bad"><p>Weak answer: "Increase the TTL to 5 minutes."</p></div>
+          <div class="good"><p>Strong answer: the first runner probably paused or ran longer than the TTL, or Redis failed over and lost the key. A longer TTL only shrinks the window. Fix the correctness path: make payouts idempotent (payout ID per vendor per day with a unique constraint in the ledger), and move leadership to a consensus-backed lease with a fencing token that the payout service checks. Keep Redis only as a cheap "do not start duplicate work" hint.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect this in monitoring before vendors complain?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: every leader election causes a five-minute brownout</h4>
+          <div class="situation"><p>Whenever the lock cell's leader changes, dependent services see errors for minutes, though the election itself takes seconds.</p></div>
+          <div class="bad"><p>Weak answer: "Make elections faster."</p></div>
+          <div class="good"><p>Strong answer: clients are probably losing sessions and stampeding. Check whether the grace period is shorter than failover plus reconnect time; whether clients reconnect without jitter; whether caches are cold so reads all hit the new leader. Fix with a longer grace period, jittered backoff, proxies, and having the new leader extend leases before accepting work, as Chubby does.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which metrics prove the fix? (Session expirations per failover, KeepAlive QPS spike, p99 acquire latency.)</li></ul></div>
+        </div>
+      

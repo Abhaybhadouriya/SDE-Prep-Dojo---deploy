@@ -1,0 +1,58 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>What can go wrong if two shells share the tree without a lock? Two <code>mkdir /a</code> calls both see "no child a" and both insert: one directory silently replaces the other with its subtree. Two <code>append</code>s to one <code>StringBuilder</code> corrupt it. A <code>find</code> walking a <code>TreeMap</code> while <code>rm</code> changes it throws <code>ConcurrentModificationException</code>. Every one is a check-then-act race.</p>
+  <p>Step through the race this section is about, then the fix the code uses:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 310" role="img" aria-label="Two mkdir calls race on the same name; the write lock makes the second one see the first">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="42">Thread A</text>
+      <rect class="box client" x="20" y="210" width="150" height="44"/><text class="label small" x="95" y="232">Thread B</text>
+      <rect class="box db" x="300" y="110" width="210" height="70"/><text class="label" x="405" y="136">/home children</text><text class="label small" x="405" y="160">no 'a' yet</text>
+      <g data-step="1"><path class="arrow" d="M170 50 L294 120"/><text class="label small left" x="196" y="56">1. child 'a'? none</text></g>
+      <g data-step="2"><path class="arrow" d="M170 225 L294 170"/><text class="label small left" x="186" y="268">2. child 'a'? still none</text></g>
+      <g data-step-only="3">
+        <rect class="box ring fail" x="300" y="110" width="210" height="70"/>
+        <text class="label bad" x="650" y="120">3. both insert 'a':</text>
+        <text class="label small bad" x="650" y="145">one Directory replaces</text>
+        <text class="label small bad" x="650" y="170">the other and its files</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="510" y="196" width="280" height="118"/>
+        <text class="label small" x="650" y="216">Fix: write lock around walk + insert</text>
+        <text class="label mono" x="650" y="238">writeLock().lock()</text>
+        <text class="label mono" x="650" y="260">check child, insert child</text>
+        <text class="label mono" x="650" y="282">unlock - B then sees 'a'</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Shell A runs <code>mkdir /home/a</code> and looks up the child: there is none.</li>
+      <li>Shell B runs the same command and also finds no child named <code>a</code>.</li>
+      <li>Both insert. The second <code>put</code> silently replaces the first directory, and anything A already created inside it is gone.</li>
+      <li>The fix: every mutating command takes the tree's write lock for the lookup and the insert together, so B waits and then gets "already exists". Reads (ls, cat, find) share the read lock. The demo's 8 threads x 400 appends end with exactly 3,200 bytes.</li>
+    </ol>
+  </div>
+  <h3>Level 1: one read-write lock on the tree (what the code does)</h3>
+  <p><code>ls</code>, <code>cat</code>, <code>du</code>, <code>find</code> and wildcard resolution take the <b>read</b> lock; <code>mkdir</code>, <code>write</code>, <code>rm</code> take the <b>write</b> lock. Readers run in parallel; a writer runs alone. The demo's 8 threads x 400 appends end with exactly 3,200 bytes, so no write was lost. It is correct, simple, and impossible to deadlock because there is only one lock. Its cost: one writer anywhere blocks every reader everywhere. Details of the lock itself are in <a href="{{BASE}}lld/lld-conc-locks">locks and synchronisation</a>.</p>
+  <h3>Level 2: finer locks (the follow-up answer)</h3>
+  <ul>
+    <li><b>A lock per directory.</b> <code>mkdir /a/b/c</code> only needs <code>c</code>'s parent. Walk down taking each directory's read lock (or no lock with a stable snapshot), then take the parent's write lock for the insert. Two <code>mkdir</code>s in different folders no longer block each other.</li>
+    <li><b>Lock ordering for two-directory operations.</b> <code>mv /a/x /b/x</code> touches two parents. Always lock them in one global order (for example ancestor first, then by node id) or two opposite moves deadlock. Linux does this in <code>lock_rename()</code>, with a file-system-wide rename mutex to stop a directory being moved into its own subtree.</li>
+    <li><b>Lock-free reads.</b> Readers walk without locks while writers publish changes by swapping in new child maps (copy-on-write). That is the idea behind RCU path walk in the kernel and behind <code>ConcurrentHashMap</code> lookups in Java.</li>
+    <li><b>Per-file content lock.</b> Two appends to different files should not wait for each other: give each <code>FileNode</code> its own lock (or a <code>synchronized</code> block) for content, separate from the tree structure lock.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The kernel's answer is the same ladder. Each directory inode has <code>i_rwsem</code> (taken exclusive for create and unlink in that directory, shared for lookup on many file systems). The dentry hash is read under RCU and a <code>rename_lock</code> seqlock, so a lookup that raced with a rename simply retries. And a shell that sits in a removed directory keeps it alive through a dentry reference count (<code>dget</code>/<code>dput</code>): the directory is unhashed but not freed, and <code>/proc/self/cwd</code> shows it as "(deleted)". Our Java code takes the simpler route and moves the shell to <code>/</code>; the C++ version keeps the removed directory alive through its <code>shared_ptr</code>, exactly like a dentry refcount, before falling back.</p>
+  </div>
+  <h3>What about the Shell?</h3>
+  <p>A <code>Shell</code> is not thread-safe and does not need to be: one session is driven by one thread, like one process's cwd. If the interviewer wants a session shared across threads, make <code>cwd</code> <code>volatile</code> (it is a single reference swap) and keep all tree work inside <code>FileSystem</code>.</p>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>ReentrantReadWriteLock</code></td><td><code>struct rw_semaphore</code>: <code>readLock()</code> is <code>down_read()</code>, <code>writeLock()</code> is <code>down_write()</code>.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

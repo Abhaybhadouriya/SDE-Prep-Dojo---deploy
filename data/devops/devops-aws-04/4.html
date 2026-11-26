@@ -1,0 +1,119 @@
+
+  <h2>Karpenter: just-in-time nodes, NodePools and consolidation</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+  <p>The Cluster Autoscaler grows an existing Auto Scaling group when pods are Pending; it can only add more of the shapes you pre-defined, one ASG per shape. <strong>Karpenter</strong> (open source, started by AWS, now a Kubernetes SIG Autoscaling project) skips node groups. It watches for unschedulable pods, reads their requests, node selectors, affinities, tolerations and topology spread, picks instance types that fit from everything the NodePool allows, and calls the EC2 Fleet API directly. Click through one scale-out:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 340" role="img" aria-label="Karpenter sees pending pods, batches them, chooses instance types, launches via EC2 Fleet, the node joins and pods bind; later consolidation removes an underused node">
+      <rect class="box k8s" x="20" y="30" width="150" height="70"/>
+      <text class="label" x="95" y="58">5 pods Pending</text>
+      <text class="label small" x="95" y="80">req 1 CPU, 2Gi each</text>
+      <g data-step="2">
+        <rect class="box svc" x="230" y="30" width="170" height="70"/>
+        <text class="label" x="315" y="58">Karpenter</text>
+        <text class="label small" x="315" y="80">batch + simulate</text>
+        <path class="arrow" d="M170 65 L225 65"/>
+      </g>
+      <g data-step="3">
+        <rect class="box cache" x="460" y="20" width="320" height="90"/>
+        <text class="label small" x="620" y="44">NodePool allows: c/m/r, gen &gt; 5,</text>
+        <text class="label small" x="620" y="66">amd64 + arm64, spot + on-demand</text>
+        <text class="label small ok" x="620" y="90">fits: m7g.2xlarge, c7g.2xlarge, m6i.2xlarge ...</text>
+        <path class="arrow" d="M400 65 L455 65"/>
+      </g>
+      <g data-step="4">
+        <rect class="box warn" x="460" y="150" width="320" height="60"/>
+        <text class="label small" x="620" y="175">EC2 CreateFleet (spot,</text>
+        <text class="label small" x="620" y="196">price-capacity-optimized)</text>
+        <path class="arrow" d="M620 110 L620 145"/>
+      </g>
+      <g data-step="5">
+        <rect class="box k8s solid" x="230" y="150" width="170" height="60"/>
+        <text class="label white" x="315" y="185">new node m7g.2xl</text>
+        <path class="arrow k8s" d="M460 180 L405 180"/>
+        <path class="arrow ok" d="M95 100 L280 145"/>
+        <text class="label small left" x="30" y="140">scheduler binds pods</text>
+        <circle class="packet k8s" r="6"><animateMotion dur="1.6s" repeatCount="indefinite" path="M95 100 L280 145"/></circle>
+      </g>
+      <g data-step="6">
+        <rect class="box ghost" x="20" y="250" width="150" height="60"/>
+        <text class="label small" x="95" y="276">node A 20% used</text>
+        <text class="label small" x="95" y="296">2 small pods</text>
+        <rect class="box k8s" x="230" y="250" width="170" height="60"/>
+        <text class="label small" x="315" y="285">node B has room</text>
+        <path class="arrow dashed" d="M170 280 L225 280"/>
+        <rect class="box fail" x="460" y="250" width="320" height="60"/>
+        <text class="label small" x="620" y="276">consolidation: cordon + drain A,</text>
+        <text class="label small" x="620" y="296">pods move to B, terminate A</text>
+        <path class="arrow bad" d="M400 280 L455 280"/>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li><b>Pending.</b> The HPA scaled a Deployment from 10 to 15 replicas. kube-scheduler finds no node with 1 CPU / 2 Gi of unrequested capacity and marks 5 pods <code>Unschedulable</code>.</li>
+      <li><b>Batch.</b> Karpenter watches those pods. It waits a short batching window (seconds) so it can plan for the whole burst at once instead of one node per pod, then simulates scheduling with the same constraints the scheduler uses.</li>
+      <li><b>Choose.</b> It intersects the pods' needs with the NodePool's <code>requirements</code> (instance category, generation, arch, capacity type, zones) and ranks instance types that fit all 5 pods on as few nodes as possible.</li>
+      <li><b>Launch.</b> It creates a <code>NodeClaim</code> and calls EC2 <code>CreateFleet</code> with a list of acceptable instance types. For Spot it uses the price-capacity-optimized strategy: the deepest, least-likely-to-be-interrupted pools, then the cheapest of those. No ASG involved.</li>
+      <li><b>Join and bind.</b> The instance boots the AMI from the <code>EC2NodeClass</code>, the kubelet registers the node, and kube-scheduler binds the pending pods to it. Typically about a minute from Pending to Running, dominated by instance boot and image pull.</li>
+      <li><b>Consolidate (later).</b> Load drops. Karpenter keeps simulating: "could these pods fit on the other nodes, or on one cheaper node?" If yes, it cordons and drains the extra node (respecting <a href="{{BASE}}interview/glossary#pdb">PodDisruptionBudgets</a> and disruption budgets) and terminates it.</li>
+    </ol>
+  </div>
+  <p>Karpenter is configured with two kinds of objects. A <b>NodePool</b> (<code>karpenter.sh/v1</code>) says <i>what kinds of nodes</i> pods may get and how nodes may be disrupted. An <b>EC2NodeClass</b> (<code>karpenter.k8s.aws/v1</code>) says <i>how to launch</i> them on AWS: AMI, IAM role, subnets, security groups, disks.</p>
+  <pre><code class="language-yaml">apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+spec:
+  role: KarpenterNodeRole-dojo           # instance profile role for nodes
+  amiSelectorTerms:
+    - alias: al2023@latest               # pin a tested version (al2023@vYYYYMMDD) in prod
+  subnetSelectorTerms:
+    - tags: { karpenter.sh/discovery: dojo }   # the private subnets, one per AZ
+  securityGroupSelectorTerms:
+    - tags: { karpenter.sh/discovery: dojo }
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: general
+spec:
+  template:
+    spec:
+      nodeClassRef: { group: karpenter.k8s.aws, kind: EC2NodeClass, name: default }
+      expireAfter: 720h                  # recycle nodes every 30 days (fresh AMI)
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["5"]
+  limits:
+    cpu: "400"                           # hard ceiling for this pool
+    memory: 1600Gi
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+    budgets:
+      - nodes: "10%"                     # never disrupt more than 10% of nodes at once
+      - nodes: "0"                       # and nothing during business hours (UTC cron)
+        schedule: "0 3 * * mon-fri"
+        duration: 12h
+        reasons: ["Underutilized"]</code></pre>
+  <p>Key behaviours to know:</p>
+  <ul>
+    <li><b>Consolidation policy.</b> <code>WhenEmptyOrUnderutilized</code> (the default) deletes or replaces any node when that lowers cost; <code>WhenEmpty</code> only removes nodes with no workload pods. <code>consolidateAfter</code> is how long a node must be stable before it is a candidate.</li>
+    <li><b>Disruption budgets</b> rate-limit voluntary disruption (consolidation, drift, emptiness). With none set, the default is 10% of nodes. The most restrictive matching budget wins.</li>
+    <li><b>Drift.</b> Change the AMI alias, subnets or requirements and existing nodes become "drifted" and are replaced gradually - this is how you roll out a new AMI.</li>
+    <li><b>Expiry.</b> <code>expireAfter</code> (default 720h) forces node replacement, a simple way to keep AMIs fresh.</li>
+    <li><b>Opt-out per pod.</b> The annotation <code>karpenter.sh/do-not-disrupt: "true"</code> protects a long batch job's node from voluntary disruption.</li>
+    <li><b>Do not run Karpenter on nodes it manages.</b> Put its controller on a small managed node group or on Fargate.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Consolidation is memory compaction for a cluster. The kernel migrates movable pages to free up whole contiguous blocks it can return; Karpenter migrates movable pods (evicts them, the ReplicaSet recreates them elsewhere) to free up whole nodes it can return to EC2. Just as unmovable pages block compaction, pods with <code>do-not-disrupt</code>, a PDB at its limit, or local storage block consolidation. And the disruption budget is your rate limiter - like bounding how much CPU <code>kcompactd</code> may burn.</p>
+  </div>

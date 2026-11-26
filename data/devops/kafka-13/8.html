@@ -1,0 +1,92 @@
+
+        <h2>Production scenario drills</h2>
+        <p>Interviewers love "it is 3 am and this happens". The weak answer jumps to a fix. The strong answer gathers facts, forms a hypothesis, fixes the root cause, and prevents a repeat. More drills across all tracks: <a href="{{BASE}}interview/scenarios">Production Scenario Drills</a> and <a href="{{BASE}}devops/pipeline-05">Pipeline failure drills</a>.</p>
+
+        <div class="scenario">
+          <h4>Scenario: lag explodes during the big sale</h4>
+          <div class="situation"><p>It is the first hour of a Big Billion Days-style sale. The <code>order.events</code> topic has 12 partitions. The inventory consumer group's lag went from near zero to 2 million records in 20 minutes and is still growing. Customers see "order processing" for a long time.</p></div>
+          <div class="bad"><p>Weak answer: "Add more consumers." (If there are already 12, more consumers will sit idle.)</p></div>
+          <div class="good"><p>Strong answer: "First, is lag growing on all partitions or one? One means a hot key or a stuck consumer; all means we are throughput-bound. Then where is the time going: the consumer's CPU, GC pauses, or the downstream database? If the DB is the bottleneck, more consumers make it worse; I would batch writes (for example 500 rows per statement) and check for lock contention. If the consumers are CPU-bound and below 12 instances, scale to 12. Beyond that, process with a keyed thread pool inside each consumer to keep per-order order. Meanwhile, make sure retention is far longer than the lag in time so we lose nothing, and shed non-critical work, like pausing the analytics group if it shares the DB. Afterwards: load-test at sale scale, size partitions for the peak, and alert on lag growth rate."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not add partitions right now? (Key remapping breaks per-order ordering mid-sale; new partitions only help new records.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: the rebalance storm</h4>
+          <div class="situation"><p>A consumer group rebalances every few minutes. Throughput collapses and duplicates appear downstream. Logs show members leaving the group with a message about the poll interval.</p></div>
+          <div class="bad"><p>Weak answer: "Increase <code>session.timeout.ms</code>."</p></div>
+          <div class="good"><p>Strong answer: "Leaving because of the poll interval means a member did not call <code>poll()</code> within <code>max.poll.interval.ms</code> (5 minutes by default): one batch of up to 500 records took too long. Heartbeats come from a background thread, so the session timeout is not the problem. I would measure per-record time, then lower <code>max.poll.records</code> so a batch fits comfortably, speed up the slow call (often an external API without a timeout), and only then consider raising the interval. I would move to the cooperative assignor or the KIP-848 protocol so rebalances move fewer partitions, commit in the revoke callback to cut duplicates, and check pods are not being restarted by a failing liveness probe."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if one record legitimately takes 10 minutes? (Pause the partition and process asynchronously, or use a share group or a job queue.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: a whole day of data was reprocessed</h4>
+          <div class="situation"><p>A reporting consumer that had been switched off for 10 days was turned back on. It reprocessed everything still in the topic and customers received duplicate statement emails.</p></div>
+          <div class="bad"><p>Weak answer: "Kafka has a bug with offsets."</p></div>
+          <div class="good"><p>Strong answer: "Committed offsets for an empty group expire after <code>offsets.retention.minutes</code>, 7 days by default. After 10 days the group had no offsets, so <code>auto.offset.reset</code> decided the start; it was <code>earliest</code>, so it read all retained data. Immediate fix: stop the consumer, set offsets to the right point with <code>--reset-offsets --to-datetime</code>, restart. Real fix: the email step must be idempotent (record a sent-statement ID per customer and period). Prevention: alert when a group has been empty for days, and runbooks that check offsets before restarting old consumers."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would <code>latest</code> have been safer? (It would have skipped 10 days of data silently, a different bug.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: broker disk at 95% at 3 am</h4>
+          <div class="situation"><p>An alert fires: one broker's data disk is 95% full and growing. The other brokers are at 60%.</p></div>
+          <div class="bad"><p>Weak answer: "Delete some old log files on that broker."</p></div>
+          <div class="good"><p>Strong answer: "Never delete segment files by hand; it can corrupt partitions. First, why only this broker? Probably skew: it hosts more or bigger partitions, or a hot partition. Short term, buy time safely: lower <code>retention.ms</code> or <code>retention.bytes</code> on the biggest topics through <code>kafka-configs.sh</code> (and confirm with owners), or expand the volume if the cloud allows. Then move partitions off it with <code>kafka-reassign-partitions.sh</code> or Cruise Control, with a replication throttle so the move does not hurt clients. Afterwards: alert at 70-75% to have hours, not minutes; balance partitions by size; consider tiered storage for long-retention topics. If the disk fills completely, that log directory goes offline; with a single log dir (the common case) the broker shuts down entirely, its leaderships move to other brokers, and its partitions go under-replicated cluster-wide."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why throttle reassignment? (Copying data competes with live replication and client traffic.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: producers time out only from Kubernetes</h4>
+          <div class="situation"><p>A new service in Kubernetes can connect to the Kafka bootstrap address, but every <code>send()</code> times out. The same code works on a laptop inside the cluster's VPN.</p></div>
+          <div class="bad"><p>Weak answer: "Increase <code>request.timeout.ms</code>."</p></div>
+          <div class="good"><p>Strong answer: "The bootstrap call only fetches metadata. The client then connects directly to each partition leader using the broker's <b>advertised listener</b> address. If brokers advertise an address that is not routable from the pod network, such as an internal hostname or a private IP the pod cannot reach, bootstrap works but produce requests never reach the leader. I would check the metadata the client receives (the broker hostnames in debug logs) and test connectivity to each one from inside a pod. Fix: a listener per network (internal and external) with the right advertised addresses, which Strimzi sets up for you. Also rule out NetworkPolicies, TLS or SASL mismatches, and <code>NotEnoughReplicas</code>."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why can't you just put all brokers behind one load balancer? (The client must reach the specific leader broker for each partition.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: one poison pill stops a partition</h4>
+          <div class="situation"><p>Lag on partition 4 of <code>payments</code> has been rising for an hour; the other partitions are fine. The consumer logs show the same deserialisation exception again and again at one offset.</p></div>
+          <div class="bad"><p>Weak answer: "Restart the consumer."</p></div>
+          <div class="good"><p>Strong answer: "One record cannot be deserialised, the consumer throws, does not commit, re-reads it forever. A restart repeats that. Immediate: catch deserialisation errors (an error-handling deserialiser), send the raw bytes plus topic, partition, offset and error to a DLQ, commit past it, and alert. If the code cannot be changed quickly, I would carefully reset that group's offset on partition 4 to one past the bad record and record the skipped offset. Root cause: usually a producer that wrote an incompatible schema, so enforce compatibility in the Schema Registry. For payments, someone must look at the DLQ record and reconcile manually."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you replay DLQ records once fixed? (A re-drive tool publishes them back to the main or first retry topic.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: customers charged twice after a deploy</h4>
+          <div class="situation"><p>After a routine deploy of the payment consumer, a few dozen customers were charged twice. Nothing was wrong with Kafka.</p></div>
+          <div class="bad"><p>Weak answer: "Turn on exactly-once in Kafka."</p></div>
+          <div class="good"><p>Strong answer: "A deploy restarts consumers. Records processed after the last commit are delivered again after the rebalance, which is normal at-least-once behaviour, so the bug is that the charge step was not idempotent. Fix: every charge carries an idempotency key derived from the payment ID, sent to the provider and stored with a unique constraint before the call. Commit offsets on partition revocation and on graceful shutdown (SIGTERM handling) to shrink the duplicate window, and use static membership to avoid needless rebalances. Then refund the affected customers via reconciliation against the ledger, and add a duplicate-charge alert. Kafka transactions would not have helped, because the charge is outside Kafka."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the idempotency key, exactly? (A deterministic ID per business operation, not a random one per attempt.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: NotEnoughReplicas after a zone outage</h4>
+          <div class="situation"><p>One availability zone goes down. Some producers start failing with <code>NotEnoughReplicasException</code>; others are fine.</p></div>
+          <div class="bad"><p>Weak answer: "Set <code>min.insync.replicas=1</code> so writes work again."</p></div>
+          <div class="good"><p>Strong answer: "With RF 3 and min ISR 2, losing one zone should leave two replicas per partition, so writes should continue. Partitions that fail must have had two replicas in the lost zone, which means rack awareness was not set (<code>broker.rack</code>), or a reassignment ignored it. Short term, the system is doing the right thing: refusing writes it cannot make durable. Lowering min ISR trades possible data loss for availability; that is a business decision, per topic, not a reflex. Fix: set <code>broker.rack</code> from the zone, reassign so every partition spans three zones, and add a check that alerts on any partition with two replicas in one zone."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does the producer do while it gets this error? (Retries until <code>delivery.timeout.ms</code>, 2 minutes, then fails the send; the app must handle that.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: one seller melts one partition</h4>
+          <div class="situation"><p>A marketplace keys <code>listing.updates</code> by seller ID. During a sale, one very large seller pushes millions of price updates. One partition's consumer is hours behind; the rest are idle.</p></div>
+          <div class="bad"><p>Weak answer: "Add partitions."</p></div>
+          <div class="good"><p>Strong answer: "All of that seller's records hash to one partition, so more partitions do not spread them. Do we really need order per seller, or only per listing? If per listing, change the key to listing ID: the load spreads naturally and order is still correct where it matters. If per-seller order matters, salt the key for known heavy sellers (<code>sellerId#0..15</code>) and merge downstream, or route whales to a dedicated topic with its own consumers. Also coalesce: if only the latest price matters, the consumer can drop superseded updates for the same listing in a batch, and a compacted topic fits that data."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you have caught this before the sale? (Per-partition bytes-in and key-distribution checks in load tests.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: under-replicated partitions after every rolling restart</h4>
+          <div class="situation"><p>During broker upgrades, the team restarts brokers one after another. Each time, alerts for under-replicated partitions fire, and once a partition went offline.</p></div>
+          <div class="bad"><p>Weak answer: "Silence the alert during maintenance."</p></div>
+          <div class="good"><p>Strong answer: "A restarted broker needs time to catch up before it rejoins the ISR. If the next broker is restarted before that, some partitions lose two replicas and drop below min ISR, or go offline. The rule: restart one broker, wait until under-replicated partitions return to zero (and the broker leads its preferred partitions again), then the next. Strimzi's rolling update does this check for you; on VMs, script it. Also check controlled shutdown is enabled so leadership moves off a broker before it stops, and that a PodDisruptionBudget stops Kubernetes node drains from taking two brokers at once."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why did one partition go offline, not just under-replicated? (All its ISR members were down at the same moment.)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: "we lost events, but Kafka says acks=all"</h4>
+          <div class="situation"><p>An audit shows a few thousand events missing from a topic. Producers use <code>acks=all</code>. Nobody remembers an outage.</p></div>
+          <div class="bad"><p>Weak answer: "Kafka is not reliable; switch to a database."</p></div>
+          <div class="good"><p>Strong answer: "I would check five places. (1) Topic config: is min ISR 1 or RF 1? Then acks=all could mean only the leader. (2) Was unclean leader election enabled during a broker failure? (3) Producer code: does it check the send callback or future? A <code>send()</code> that fails after <code>delivery.timeout.ms</code> is lost if nobody looks. (4) Did <code>buffer.memory</code> fill up and the app drop records on <code>TimeoutException</code>? (5) Retention: were the events deleted before the audit consumer read them? Then I compare producer-side counts with topic offsets to see on which side the gap is. The fix follows the cause; usually it is the producer callback."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How would you prove end-to-end completeness continuously? (Per-producer sequence or counts in headers, compared by an audit consumer.)</li></ul></div>
+        </div>
+      

@@ -1,0 +1,30 @@
+
+        <h2>Trade-offs, bottlenecks and failure modes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Decision</th><th>Option A</th><th>Option B</th><th>Pick</th></tr></thead>
+            <tbody>
+              <tr><td>Find due jobs</td><td>DB polling</td><td>Timer wheel / Redis ZSET</td><td>DB as truth + in-memory wheel for the next minute</td></tr>
+              <tr><td>Hand-off</td><td>Kafka</td><td>SQS / RabbitMQ</td><td>Kafka for throughput, replay and spikes; SQS if you want zero ops and per-message visibility timeouts out of the box</td></tr>
+              <tr><td>Worker model</td><td>Push (scheduler calls worker)</td><td>Pull (worker reads queue)</td><td>Pull: workers control their own load, which is natural <a href="{{BASE}}interview/glossary#backpressure">backpressure</a></td></tr>
+              <tr><td>Delivery</td><td>At-most-once</td><td>At-least-once + idempotency</td><td>At-least-once; at-most-once only for "nice to have" jobs (metrics pings)</td></tr>
+              <tr><td>Execution unit</td><td>Thread in a long-lived worker</td><td>A pod per run</td><td>Threads for short jobs (ms-s); pods for heavy, isolated jobs (minutes, needs its own image)</td></tr>
+              <tr><td>Build vs buy</td><td>Own scheduler</td><td>Airflow / Temporal / EventBridge Scheduler</td><td>Say you would buy unless scale, cost or multi-tenancy forces a build</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>What if this box fails?</h3>
+        <ul>
+          <li><b>Job API down:</b> no new jobs, but existing jobs still run. Stateless pods, so Kubernetes restarts them; run 3+ replicas across zones.</li>
+          <li><b>A DB shard primary down:</b> that shard's jobs pause until a replica is promoted (seconds). Other 63 shards are fine. When it comes back, the scheduler catches up because due rows are still due (<code>next_run_at &lt;= now()</code>). Decide per job: run late ("catch up") or skip missed runs (<code>startingDeadlineSeconds</code>-style).</li>
+          <li><b>Scheduler leader dies:</b> its etcd lease expires, another pod takes the shard and reloads the next-minute window. A few seconds of delay, no loss.</li>
+          <li><b>Kafka broker dies:</b> with RF=3, <code>min.insync.replicas=2</code>, <code>acks=all</code>, a new leader takes over and nothing acknowledged is lost. Publishing retries briefly. See <a href="{{BASE}}devops/kafka-05">replication</a>.</li>
+          <li><b>Workers die:</b> leases expire, the reaper re-queues; uncommitted Kafka messages are redelivered.</li>
+          <li><b>Target service down:</b> retries with back-off and jitter, then DLQ. Add a per-target <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a> (stop calling a failing dependency for a while, then test it with a few calls - like route dampening for a flapping route) so 50,000 runs do not hammer a dead service.</li>
+          <li><b>Clock skew:</b> never compare times from two machines. The DB's <code>now()</code> decides "due" and lease expiry; workers only use durations.</li>
+        </ul>
+        <div class="proscons">
+          <div class="pros"><h5>Strengths of this design</h5><ul><li>Correctness comes from DB constraints and fencing, not from perfect leader election</li><li>Spikes become lag, not outages</li><li>Every piece scales out independently</li></ul></div>
+          <div class="cons"><h5>Costs</h5><ul><li>Many moving parts (DB, etcd, Kafka, workers)</li><li>Job owners must write idempotent jobs</li><li>Sub-second precision needs the in-memory wheel</li></ul></div>
+        </div>
+      

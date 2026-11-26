@@ -1,0 +1,99 @@
+
+  <h2>Spot for stateless pools</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p><strong>Spot Instances</strong> are spare EC2 capacity. AWS says they can save up to 90% against On-Demand prices. The catch: when EC2 needs the capacity back, it <em>interrupts</em> your instance with a two-minute warning. So Spot is perfect for work that can be killed and restarted somewhere else: stateless web pods behind a load balancer, CI runners, batch jobs, Kafka consumers that can rebalance, and big-data workers. It is a bad fit for a single database primary or anything that cannot lose a node with two minutes' notice.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Spot interruption handling: notice, cordon and drain, replacement node, pods rescheduled">
+      <rect class="box warn" x="30" y="40" width="200" height="110"/>
+      <text class="label" x="130" y="66">Spot node A</text>
+      <text class="label small" x="130" y="90">pods: web-1, web-2</text>
+      <rect class="box ok" x="300" y="40" width="200" height="110"/>
+      <text class="label" x="400" y="66">Node B (Spot, other pool)</text>
+      <text class="label small" x="400" y="90">pods: web-3</text>
+      <rect class="box svc" x="580" y="40" width="190" height="110"/>
+      <text class="label" x="675" y="66">Load balancer</text>
+      <text class="label small" x="675" y="90">targets: ready pods</text>
+      <g data-step="1">
+        <rect class="box queue" x="30" y="200" width="200" height="70"/>
+        <text class="label small" x="130" y="226">EventBridge / IMDS:</text>
+        <text class="label small" x="130" y="248">interruption in 2 min</text>
+        <path class="arrow bad" d="M130 200 L130 156"/>
+      </g>
+      <g data-step="2">
+        <text class="label small bad" x="130" y="118">tainted + cordoned</text>
+        <text class="label small" x="130" y="138">no new pods land here</text>
+      </g>
+      <g data-step="3">
+        <rect class="box ok" x="300" y="200" width="200" height="70"/>
+        <text class="label small" x="400" y="226">Node C launched</text>
+        <text class="label small" x="400" y="248">(different instance type)</text>
+      </g>
+      <g data-step="4">
+        <path class="arrow" d="M230 95 L294 95"/>
+        <path class="arrow" d="M230 130 L300 230"/>
+        <text class="label small" x="400" y="118">web-1 moves here</text>
+        <text class="label small" x="400" y="190">web-2 moves to C</text>
+      </g>
+      <g data-step="5">
+        <path class="arrow ok" d="M500 95 L574 95"/>
+        <text class="label small ok" x="675" y="118">old targets drained,</text>
+        <text class="label small ok" x="675" y="138">new ones healthy</text>
+        <text class="label small bad" x="130" y="176">node A reclaimed</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>EC2 emits the interruption notice two minutes ahead, as an EventBridge event and in instance metadata at <code>spot/instance-action</code>.</li>
+      <li>The node is tainted and cordoned so the scheduler stops placing pods on it.</li>
+      <li>A replacement node starts in parallel, ideally from a different instance type or AZ so it is not in the same reclaimed pool.</li>
+      <li>Pods are drained: graceful termination runs, PodDisruptionBudgets keep enough replicas up, pods reschedule.</li>
+      <li>The load balancer deregisters old targets after connection draining. Then EC2 reclaims node A. Users saw nothing.</li>
+    </ol>
+  </div>
+  <p>You can see the notice yourself from inside the instance. Before any interruption the path returns HTTP 404; when one is scheduled it returns JSON (the AWS docs recommend checking about every 5 seconds):</p>
+  <pre class="terminal"><code>$ TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/spot/instance-action
+404
+# ... later, when EC2 decides to reclaim the instance:
+$ curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+    http://169.254.169.254/latest/meta-data/spot/instance-action
+{"action": "terminate", "time": "2026-11-23T08:22:00Z"}</code></pre>
+  <h3>Rules for using Spot well</h3>
+  <ul>
+    <li><strong>Diversify.</strong> Allow many instance types and sizes across all AZs. Each type in each AZ is a separate capacity pool; ten pools rarely all run dry at once. Use the <code>price-capacity-optimized</code> allocation strategy in Auto Scaling groups.</li>
+    <li><strong>Keep a floor on On-Demand.</strong> Run the minimum needed to survive with zero Spot (often covered by a Savings Plan) and burst on Spot.</li>
+    <li><strong>Make shutdown graceful.</strong> Handle SIGTERM, set <code>terminationGracePeriodSeconds</code> well under 120 seconds, and set PodDisruptionBudgets.</li>
+    <li><strong>Do not set a low max price.</strong> AWS notes that a maximum price makes interruptions more frequent; the default (capped at On-Demand) is usually right.</li>
+  </ul>
+  <p>With <strong>Karpenter</strong> on EKS, a NodePool can allow both capacity types; Karpenter prefers Spot when it is allowed and falls back to On-Demand. With an SQS interruption queue configured, it handles the two-minute warning by tainting, draining and replacing the node in parallel:</p>
+  <pre><code class="language-yaml">apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: web-stateless
+spec:
+  template:
+    spec:
+      requirements:
+      - key: karpenter.sh/capacity-type
+        operator: In
+        values: ["spot", "on-demand"]
+      - key: karpenter.k8s.aws/instance-category
+        operator: In
+        values: ["c", "m", "r"]          # many families = many Spot pools
+      - key: kubernetes.io/arch
+        operator: In
+        values: ["amd64", "arm64"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized   # repack and remove half-empty nodes
+    consolidateAfter: 5m
+    budgets:
+    - nodes: "10%"                                   # never disrupt more than 10% of nodes at once</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Spot is a best-effort QoS class, like traffic marked CS1 (scavenger) that a router drops first under congestion. The two-minute notice is a graceful-restart timer: you get a short window to move state before the adjacency goes down. Diversifying across instance types and AZs is ECMP across independent links - one link failing (one pool reclaimed) only removes a slice of capacity.</p>
+  </div>

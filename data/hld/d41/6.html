@@ -1,0 +1,125 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Cross-shard transfers: 2PC vs TC/C vs saga</h3>
+        <p>Accounts A and C live on different databases. ByteByteGo walks through three ways to make "A -1, C +1" atomic:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>2PC (XA)</th><th>TC/C (Try-Confirm/Cancel)</th><th>Saga (orchestrated)</th></tr></thead>
+            <tbody>
+              <tr><td>Who does it</td><td>The database (prepare, then commit)</td><td>The application, in 2 phases</td><td>The application: a sequence of local transactions</td></tr>
+              <tr><td>After phase 1</td><td>Local transactions <em>not</em> committed, locks held</td><td>Each local transaction already committed (Try)</td><td>Each step committed as it runs</td></tr>
+              <tr><td>On failure</td><td>Abort all</td><td>Cancel = a new transaction that reverses Try</td><td>Compensating transactions in reverse order</td></tr>
+              <tr><td>Parallel steps</td><td>Yes</td><td>Yes</td><td>No (linear)</td></tr>
+              <tr><td>Main pain</td><td>Long-held locks, coordinator is a SPOF, needs XA support</td><td>Out-of-order Cancel before Try, and you must store the phase status</td><td>Intermediate states are visible, and you write N compensations</td></tr>
+              <tr><td>Use when</td><td>Rarely at wallet scale</td><td>Latency-sensitive, many participants</td><td>The default in microservices, and the current trend</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Saga: debit A, credit C, on failure compensate A">
+            <rect class="box svc" x="20" y="40" width="160" height="56"/>
+            <text class="label" x="100" y="65">1. Debit A -1</text>
+            <text class="label small" x="100" y="85">shard 1, local tx</text>
+            <rect class="box svc" x="320" y="40" width="160" height="56"/>
+            <text class="label" x="400" y="65">2. Credit C +1</text>
+            <text class="label small" x="400" y="85">shard 3, local tx</text>
+            <rect class="box highlight" x="620" y="40" width="160" height="56"/>
+            <text class="label" x="700" y="72">COMPLETED</text>
+            <path class="arrow ok" d="M180 68 L312 68"/>
+            <path class="arrow ok" d="M480 68 L612 68"/>
+            <rect class="box fail" x="320" y="160" width="160" height="56"/>
+            <text class="label bad" x="400" y="185">credit fails</text>
+            <text class="label small" x="400" y="205">(account closed)</text>
+            <rect class="box queue" x="20" y="160" width="160" height="56"/>
+            <text class="label" x="100" y="185">Compensate</text>
+            <text class="label small" x="100" y="205">refund A +1</text>
+            <path class="arrow bad" d="M400 96 L400 152"/>
+            <path class="arrow" d="M320 188 L188 188"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M100 68 L400 68 L700 68"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M400 96 L400 188 L100 188"/></circle>
+          </svg>
+          <figcaption>Saga, happy path (top) and failure path (bottom). The orchestrator persists each step, so it can resume after a crash. Every step and compensation is idempotent.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Order matters.</b> ByteByteGo shows that only "debit first, credit later" is valid. If you credit first and the debit then fails, C may already have spent the money, and you cannot take it back.</li>
+          <li><b>Store the phase status.</b> For TC/C, keep a phase table (transaction id, the Try status per participant, the second-phase decision, an out-of-order flag) in the database of the debited account. Then a restarted coordinator knows where it stopped.</li>
+          <li><b>Out-of-order Cancel.</b> A Cancel can arrive at C before C's Try (network delay). C records "cancelled before try", and a later Try must fail.</li>
+          <li><b>The in-flight state is visible.</b> Between step 1 and step 2, the money is in neither account. Model it explicitly as a <em>clearing</em> or "in-transit" account, so that the books still balance at every instant.</li>
+        </ul>
+        <p>Patterns in depth: <a href="{{BASE}}hld/hld-10">distributed transactions</a>, <a href="{{BASE}}hld/p03">multi-step processes</a>.</p>
+
+        <h3>2. Idempotency end to end</h3>
+        <ol class="steps">
+          <li><strong>Client key.</strong> The app generates a UUID per user intent and reuses it on every retry. Stripe popularised the <code>Idempotency-Key</code> header, paired with exponential backoff with jitter on retries.</li>
+          <li><strong>Server lease.</strong> Insert the key with status IN_PROGRESS and a lease expiry. A concurrent duplicate sees IN_PROGRESS and gets 409 / "retry later". Airbnb's Orpheus uses a row lock and a lease longer than the RPC timeout.</li>
+          <li><strong>Unique constraint in the ledger.</strong> <code>journal_entry.idempotency_key UNIQUE</code>. Even if every layer above fails, the database refuses a second journal entry for the same intent.</li>
+          <li><strong>Downstream keys.</strong> Pass a derived key to the bank or the PSP, so it deduplicates too.</li>
+          <li><strong>Store the response.</strong> Retries get the same answer, including a "failed: insufficient funds" answer.</li>
+        </ol>
+        <div class="callout danger"><p><b>Replica lag causes double spends.</b> If you check "has this key been processed?" on a read replica, a retry that arrives a few seconds after the first success can miss it and execute again. Airbnb documents this exact failure. Keep idempotency reads on the primary.</p></div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> The double-entry invariant, the same-shard ACID transaction with <code>balance &gt;= amt</code>, a debit-first saga across shards, and idempotency at every layer are the interview-sufficient core. Deep dives 3-6 (event sourcing and Raft, hot accounts, reconciliation, UPI internals) are what an SDE-2 or fintech-team answer adds.</p></div>
+
+        <h3>3. Event sourcing, CQRS and reproducibility</h3>
+        <p>Auditors ask: "What was this balance at 23:59 on 31 March? Prove it. Prove the new code computes the same thing." ByteByteGo's answer is <b>event sourcing</b>:</p>
+        <ul>
+          <li><b>Command</b>: an intent ("transfer 1 from A to C"). It can be invalid.</li>
+          <li><b>Event</b>: a validated fact ("transferred 1 from A to C"). It is immutable, in past tense, and must be applied.</li>
+          <li><b>State</b>: the balances map, derived by applying events.</li>
+          <li><b>State machine</b>: validates commands into events and applies events to state. It must be deterministic, so no random numbers and no I/O.</li>
+        </ul>
+        <p>Replay the events from the start, or from a <b>snapshot</b>, and you get exactly the same balances. With <b>CQRS</b> (Command Query Responsibility Segregation: writes go to the event log, reads come from separate views built from it), read-only state machines build other views (statements, a balance at time T, fraud features) from the same event stream. For speed, ByteByteGo moves the command and event logs to local append-only files (mmap) and the state into RocksDB, which is an LSM tree and therefore write-optimised. It then replicates the event log with <b>Raft</b>: with 5 nodes, the system keeps working while 3 are up. Accounts are partitioned across Raft groups, and cross-group transfers use a saga on top.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A deterministic state machine replicated by a consensus log is exactly how a <b>redundant control plane</b> stays in sync. The active and standby route processors apply the same ordered update stream, so they reach the same RIB. Raft's "majority of 5" rule is the same quorum logic as split-brain protection in a cluster of line cards.</p>
+        </div>
+
+        <h3>4. Hot accounts</h3>
+        <p>A big merchant receives thousands of payments a second into <em>one</em> account row. Every credit takes that row's lock, so the account becomes the bottleneck.</p>
+        <ul>
+          <li><b>Split into sub-accounts:</b> <code>merchant_42#0..#63</code>. Credits go to a random sub-account, and the balance is the sum. Debits (payouts) are rare and can sweep the sub-accounts.</li>
+          <li><b>Credit-only fast path.</b> Credits cannot overdraw, so you can append postings without the <code>balance &gt;= amt</code> check, batch them, and update the cached balance asynchronously.</li>
+          <li><b>Pre-aggregate.</b> Write one journal entry per N payments per second (a "batch posting"), with the details kept in the line items. This is the same idea as <a href="{{BASE}}hld/d39">sharded counters</a>.</li>
+        </ul>
+
+        <h3>5. Reconciliation: the safety net</h3>
+        <p>Even with exactly-once code, the outside world disagrees sometimes: a bank's file is late, a timestamp falls on the other side of midnight, or a partner sends a malformed report. Reconciliation compares our ledger with bank settlement files and PSP reports every day, or as a stream.</p>
+        <ul>
+          <li><b>Normalise</b> the formats first (dates, amounts, ids).</li>
+          <li><b>Cut-off breaks:</b> a record at 23:59:55 here and 00:00:30 at the bank shows as a mismatch. Mark it a <em>temporary break</em> and re-check against tomorrow's file (ByteByteGo).</li>
+          <li><b>Clearing accounts should be zero.</b> Stripe's Ledger models each flow as money moving through accounts. In steady state, "clearing" accounts must be empty, so a single missing or wrong event shows up as a non-zero clearing balance. Stripe reports 5 billion events a day, with 99.99% of dollar volume fully ingested and verified within four days.</li>
+          <li><b>Scale:</b> batch jobs (Spark/Hadoop) for end-of-day, and Flink for near-real-time.</li>
+        </ul>
+
+        <h3>6. How UPI actually moves money</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="UPI flow: payer app, PSP bank, NPCI switch, payer bank debit, payee bank credit">
+            <rect class="box client" x="10" y="30" width="130" height="56"/>
+            <text class="label" x="75" y="55">Payer app</text>
+            <text class="label small" x="75" y="75">PhonePe, etc.</text>
+            <rect class="box svc" x="190" y="30" width="130" height="56"/>
+            <text class="label" x="255" y="55">PSP bank</text>
+            <text class="label small" x="255" y="75">app's bank</text>
+            <rect class="box queue" x="370" y="80" width="150" height="80"/>
+            <text class="label" x="445" y="112">NPCI UPI</text>
+            <text class="label small" x="445" y="134">switch</text>
+            <rect class="box db" x="590" y="20" width="190" height="56"/>
+            <text class="label" x="685" y="45">Payer's bank</text>
+            <text class="label small" x="685" y="65">debit + PIN check</text>
+            <rect class="box db" x="590" y="170" width="190" height="56"/>
+            <text class="label" x="685" y="195">Payee's bank</text>
+            <text class="label small" x="685" y="215">credit</text>
+            <path class="arrow" d="M140 58 L182 58"/>
+            <path class="arrow" d="M320 70 L370 100"/>
+            <path class="arrow" d="M520 100 L582 55"/>
+            <path class="arrow" d="M520 140 L582 195"/>
+            <text class="label small" x="560" y="122">resolve VPA</text>
+            <circle class="packet gold" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M75 58 L255 58 L445 120 L685 48 L445 120 L685 198"/></circle>
+            <text class="label small" x="200" y="192">The app never holds the money.</text>
+            <text class="label small" x="200" y="212">Banks settle net positions later.</text>
+          </svg>
+          <figcaption>UPI direct payment, after the ByteByteGo UPI explainer: NPCI resolves the VPA, debits the payer's bank, credits the payee's bank, and notifies the apps through their banks.</figcaption>
+        </figure>
+        <p>For your design, this means that a UPI-based app is a <b>payment orchestrator + ledger of intents</b>, not a balance holder. Its hard problems are: timeouts with an unknown outcome (the "deemed" or pending state), status-check APIs, polling, and reversals, plus daily reconciliation with the banks. Treat every outbound call as "may have happened": store the intent first, call, and then record the response (the pre-RPC / RPC / post-RPC split).</p>
+      

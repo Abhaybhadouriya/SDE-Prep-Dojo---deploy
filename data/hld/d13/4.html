@@ -1,0 +1,75 @@
+
+        <h2>Data model</h2>
+        <p>There are two kinds of data, and they want very different stores.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Size and shape</th><th>Store</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Video bytes (original, renditions, segments, thumbnails)</td><td>PBs per day, immutable, big objects</td><td>Blob / object storage (S3, GCS, Azure Blob, or in-house)</td><td>Cheap per GB, very durable, scales horizontally, serves byte ranges. See <a href="{{BASE}}hld/d36">S3-like Object Storage</a>.</td></tr>
+              <tr><td>Video metadata (title, owner, status, durations)</td><td>Billions of small rows, read on every watch</td><td>Sharded SQL (MySQL with Vitess at YouTube) plus a cache</td><td>Needs transactions for status changes and simple secondary indexes. Size is small; QPS is high.</td></tr>
+              <tr><td>Upload sessions and processing jobs</td><td>Short-lived, write-heavy state</td><td>SQL table or a workflow engine's store</td><td>Must be exact: which parts arrived, which tasks finished.</td></tr>
+              <tr><td>View counts, watch events</td><td>Huge event stream</td><td>Kafka, then a stream aggregator, then a counter store</td><td>Counts can be approximate and late. Never increment a SQL row per view.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">-- Sharded by video_id (Vitess keyspace "videos"); channel lookups use a secondary index table
+CREATE TABLE videos (
+  video_id      VARCHAR(16) PRIMARY KEY,      -- random, so writes spread over shards
+  channel_id    BIGINT       NOT NULL,
+  title         VARCHAR(200) NOT NULL,
+  visibility    ENUM('PUBLIC','UNLISTED','PRIVATE') NOT NULL,
+  status        ENUM('UPLOADING','UPLOADED','PROCESSING','READY','FAILED','BLOCKED') NOT NULL,
+  duration_ms   INT,
+  source_key    VARCHAR(512),                 -- raw/v_9Kx2/source.mp4
+  manifest_key  VARCHAR(512),                 -- hls/v_9Kx2/master.m3u8
+  created_at    TIMESTAMP NOT NULL,
+  version       INT NOT NULL DEFAULT 0        -- optimistic locking for status changes
+);
+
+CREATE TABLE renditions (
+  video_id   VARCHAR(16),
+  profile    VARCHAR(16),        -- 'h264_720p', 'vp9_1080p'
+  status     ENUM('PENDING','RUNNING','DONE','FAILED'),
+  bytes      BIGINT,
+  PRIMARY KEY (video_id, profile)   -- same shard as the video: no cross-shard join
+);
+
+CREATE TABLE segment_tasks (
+  video_id   VARCHAR(16),
+  profile    VARCHAR(16),
+  seg_no     INT,
+  attempt    INT DEFAULT 0,
+  status     ENUM('PENDING','RUNNING','DONE','FAILED'),
+  output_key VARCHAR(512),
+  PRIMARY KEY (video_id, profile, seg_no)   -- the natural idempotency key of a task
+);</code></pre>
+        <p><b>Blob key layout</b> matters too. Use <code>raw/{video_id}/source</code>, <code>out/{video_id}/{profile}/seg_00042.m4s</code> and <code>out/{video_id}/master.m3u8</code>. Putting the random <code>video_id</code> first spreads load across the storage system's internal partitions. A key that starts with a date would put all of today's writes in one hot range.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 210" role="img" aria-label="Video status state machine">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="70" width="130" height="50"/>
+            <text class="label small" x="75" y="100">UPLOADING</text>
+            <rect class="box db" x="185" y="70" width="130" height="50"/>
+            <text class="label small" x="250" y="100">UPLOADED</text>
+            <rect class="box queue" x="360" y="70" width="140" height="50"/>
+            <text class="label small" x="430" y="100">PROCESSING</text>
+            <rect class="box svc" x="545" y="70" width="120" height="50"/>
+            <text class="label small" x="605" y="100">READY</text>
+            <rect class="box fail" x="545" y="150" width="120" height="44"/>
+            <text class="label small" x="605" y="177">FAILED</text>
+            <rect class="box fail" x="710" y="70" width="140" height="50"/>
+            <text class="label small" x="780" y="100">BLOCKED</text>
+            <path class="arrow" d="M140 95 L178 95"/>
+            <path class="arrow" d="M315 95 L353 95"/>
+            <path class="arrow ok" d="M500 95 L538 95"/>
+            <path class="arrow bad" d="M470 120 L545 165"/>
+            <path class="arrow bad" d="M665 95 L703 95"/>
+            <path class="arrow dashed" d="M545 172 C 450 200, 430 160, 430 125"/>
+            <text class="label small" x="160" y="60">complete</text>
+            <text class="label small" x="335" y="60">event</text>
+            <text class="label small" x="420" y="190">retry</text>
+            <text class="label small" x="690" y="60">policy</text>
+          </svg>
+          <figcaption>The video's status is a small state machine stored in the metadata row. Each move is a conditional update (<code>WHERE status = 'PROCESSING' AND version = 7</code>), so two workers can never both move it.</figcaption>
+        </figure>
+      

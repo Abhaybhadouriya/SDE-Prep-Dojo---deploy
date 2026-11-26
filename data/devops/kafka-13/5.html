@@ -1,0 +1,139 @@
+
+        <h2>Level 4 questions: internals, performance and operations</h2>
+        <p>SDE-2 territory. You do not need every detail, but you must be able to go one level below the obvious answer. Background: <a href="{{BASE}}devops/kafka-07">Storage Internals</a>, <a href="{{BASE}}devops/kafka-08">KRaft</a>, <a href="{{BASE}}devops/kafka-11">Operations &amp; Tuning</a>.</p>
+
+        <details class="qa" data-level="4" data-topic="kafka,performance" data-company="Typical,Walmart">
+          <summary>Why is Kafka fast? Go deeper than "it uses the disk sequentially".</summary>
+          <div class="answer">
+            <p>Five things stack up. (1) <b>Sequential appends</b> to a log, so the disk never seeks on the write path, and readers mostly read recent, sequential data. (2) The <b>OS page cache</b> instead of a JVM cache: no double buffering, no garbage collection pressure, and the cache survives a broker restart. (3) <b>Zero-copy</b>: for plaintext connections the broker calls <code>sendfile</code>, so data moves from page cache to the socket inside the kernel. (4) <b>Batching and compression end to end</b>: the producer compresses a batch, the broker stores it as is, and the consumer decompresses it, so the broker does little CPU work per message. (5) <b>Partitioning</b> spreads load across brokers and disks, and the broker keeps almost no per-message state because consumers track their own offsets. Caveats: TLS breaks zero-copy, and consumers reading old data that is not in cache cause disk reads that can evict hot pages for tail readers.</p>
+            <div class="approach"><h5>How to answer</h5><p>Number the reasons, add one caveat. With your kernel background, name <code>sendfile(2)</code> and the page cache confidently; it will land.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Does Kafka fsync every write? (No by default; durability comes from replication.)</li><li>How does tiered storage change the cold-read problem? (Old reads come from object storage, not the hot disk.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,storage" data-company="Typical">
+          <summary>How does Kafka store a partition on disk, and how does it find offset N?</summary>
+          <div class="answer">
+            <p>A partition is a directory like <code>orders-3/</code> containing <b>segments</b>. Each segment has a <code>.log</code> file with the record batches, a sparse <code>.index</code> mapping some offsets to byte positions, and a <code>.timeindex</code> mapping timestamps to offsets. Each file is named by the segment's <b>base offset</b>, the first offset it contains. Only the newest, <b>active</b> segment is written; a segment rolls when it reaches <code>segment.bytes</code> (1 GiB) or <code>segment.ms</code>. To find offset N, the broker picks the segment whose base offset is the largest one not above N (a binary search over the segment list), binary-searches the sparse index for the nearest entry below N, then scans forward a little in the log file. Retention deletes whole closed segments.</p>
+            <div class="approach"><h5>How to answer</h5><p>Directory, segment files, file naming, the lookup in two binary searches plus a short scan. Draw the file names.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why a sparse index? (Small enough to memory-map; a short scan is cheap.)</li><li>How is "replay from a timestamp" served? (The time index.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,durability" data-company="Typical,Amazon">
+          <summary>Can Kafka lose acknowledged data? List the ways.</summary>
+          <div class="answer">
+            <p>Producer side: <code>acks=0</code> or <code>acks=1</code> with a leader crash before followers fetch; replication factor 1 with a dead disk; <code>acks=all</code> with <code>min.insync.replicas=1</code> after the ISR has shrunk to the leader; <b>unclean leader election</b> enabled, so a stale replica becomes leader and the newer records are truncated away; and producers that never check the send callback, so failed sends are silently dropped. Consumer side: auto-commit before processing finishes, then a crash; and retention deleting data a slow consumer has not read. Operations: deleting a topic, or resetting offsets past data. A correlated failure of all replicas (all in one zone, power loss before page cache flush) is also possible, which is why replicas go in different zones.</p>
+            <div class="approach"><h5>How to answer</h5><p>Group by producer, broker, consumer, operations. For each, the fix in a few words. This shows a structured mind.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which of these did you personally see? (Have one story ready, even from a lab.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,replication,kraft" data-company="Typical,Microsoft">
+          <summary>A broker dies. Walk through what happens, step by step.</summary>
+          <div class="answer">
+            <p>1) The broker stops heartbeating to the active <b>KRaft controller</b>; after the broker session timeout, the controller fences it. 2) For every partition where it was leader, the controller picks a new leader from the remaining ISR (or, with ELR, from eligible replicas), bumps the <b>leader epoch</b>, and writes these changes to the metadata log. 3) Other brokers replicate the metadata log and start acting as leaders or followers. 4) Producers and consumers get errors such as <code>NOT_LEADER_OR_FOLLOWER</code>, refresh metadata and retry against the new leaders; with idempotence the retries do not create duplicates. 5) Those partitions now have one replica fewer, so <b>under-replicated partition</b> alerts fire; if the ISR drops below min ISR, acks=all writes fail. 6) When the broker returns or is replaced, it truncates to the leader epoch boundary, catches up from the leaders and rejoins the ISR. Partitions it led do not move back automatically unless preferred-leader election runs (it does by default periodically).</p>
+            <div class="approach"><h5>How to answer</h5><p>Number the steps and name the actor at each one (controller, brokers, clients). The learner input asked "never make me guess which process does what"; interviewers want the same.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long is the client-visible blip? (Detection timeout plus metadata refresh; typically seconds.)</li><li>What if it was the active controller that died? (The Raft quorum elects a new controller.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,semantics" data-company="Typical,Uber">
+          <summary>How do Kafka transactions work, and what is a zombie producer?</summary>
+          <div class="answer">
+            <p>A transactional producer has a stable <code>transactional.id</code>. On <code>initTransactions()</code>, the <b>transaction coordinator</b> (a broker, state kept in <code>__transaction_state</code>) bumps the producer's <b>epoch</b> and finishes or aborts any half-done transaction from a previous instance. Then the app calls <code>beginTransaction()</code>, sends to many partitions, adds its consumed offsets with <code>sendOffsetsToTransaction()</code>, and calls <code>commitTransaction()</code>. The coordinator writes commit or abort <b>markers</b> into every partition involved. Consumers with <code>isolation.level=read_committed</code> read only up to the last stable offset and skip aborted records. A <b>zombie</b> is an old instance that was presumed dead (for example a long GC pause during failover) and wakes up still thinking it owns the work; because its epoch is older, its writes are rejected with <code>ProducerFencedException</code>. Since 4.0 (KIP-890) the epoch is bumped on every transaction, closing "hanging transaction" holes.</p>
+            <div class="approach"><h5>How to answer</h5><p>The API sequence, the coordinator and markers, read_committed, then fencing. Draw two producers with epochs 4 and 5.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the cost? (Extra round trips and latency up to the commit interval for read_committed readers.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,semantics,design" data-company="Amazon,Uber,PhonePe">
+          <summary>How do you get exactly-once results when the consumer writes to a database?</summary>
+          <div class="answer">
+            <p>Kafka transactions do not reach into your database, so pick one of three patterns. (1) <b>Store offsets with the data:</b> in one DB transaction, write the result and the consumed partition-offset into an offsets table; on start, seek to the stored offsets instead of Kafka's. This is truly exactly-once into that database. (2) <b>Idempotent writes:</b> upsert by a natural key, or insert with the event ID under a unique constraint and ignore conflicts; at-least-once delivery then produces exactly-once state. (3) <b>Versioned updates:</b> only apply an event if its version is newer than the stored one. For side effects that cannot be undone, like charging a card or sending an email, pass an idempotency key to the provider and record it. I would say "effectively once" and explain which of these I use.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with "Kafka EOS stops at Kafka's edge". Interview write-ups note candidates often overclaim here, so being precise is the win.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which pattern for a counter? (Offsets with data, or dedup table, since increments are not idempotent.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,performance,design" data-company="Walmart,Typical">
+          <summary>How do you choose the number of partitions? Show the math.</summary>
+          <div class="answer">
+            <p>Partitions &#8805; max(target throughput / per-partition producer throughput, target throughput / per-partition consumer throughput), plus headroom. Example: we need 60 MB/s at peak. A test with <code>kafka-producer-perf-test.sh</code> shows about 20 MB/s per partition on the produce side, but our consumer does a database write and manages only 5 MB/s per partition. So 60 / 20 = 3 and 60 / 5 = 12; we need at least 12. Planning for 2-3x growth gives 24 to 36; I would choose something like 24 or 30 rather than re-partition later, because adding partitions remaps keys. Then a sanity check against cost: each partition adds open files, memory, replication fetches and leader elections during failure, so thousands of partitions per broker are a smell. KRaft raised the cluster-wide ceiling, but per-partition costs remain.</p>
+            <div class="approach"><h5>How to answer</h5><p>Formula, worked example with made-up but labelled numbers, growth factor, cost of too many. The numbers here are illustrative; say "I would measure".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you reduce the partition count later? (No; you must create a new topic and migrate.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,performance,design" data-company="Uber,Flipkart,Typical">
+          <summary>What is a hot partition and how do you fix it?</summary>
+          <div class="answer">
+            <p>A hot partition gets far more traffic than its siblings because the key is skewed: a celebrity user, a giant seller during a sale, a default key like "unknown". Its consumer lags while others idle, and its leader broker runs hot. Fixes, depending on whether you need per-key order: <b>salt the key</b> (<code>sellerId#0..7</code>) to spread one key over several partitions and re-aggregate downstream, accepting no order across the salted sub-keys; a <b>custom partitioner</b> that sends known heavy keys to dedicated partitions; a <b>separate topic</b> for the whales; or fix the bad default key. Detect it with per-partition bytes-in and per-partition lag, not topic totals.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cause, symptom, detection, then fixes ordered by how much ordering they give up. The ECMP elephant-flow analogy is ideal for you.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you re-aggregate salted keys? (A second stage keyed by the original key, or sum in the sink.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,design" data-company="Walmart,Typical">
+          <summary>What happens if you add partitions to a live keyed topic?</summary>
+          <div class="answer">
+            <p>New records are hashed modulo the new count, so many keys now map to a different partition, while their older records stay in the old partition. For a while, a consumer may see a key's new events on partition 7 before it finishes the old events on partition 2: per-key ordering breaks across the change. Consumers also rebalance to pick up the new partitions, and if they start new partitions at <code>latest</code> they can skip records written before they were assigned (set <code>auto.offset.reset=earliest</code>). Safe approaches: over-provision partitions at creation; or create a new topic with more partitions, dual-write or migrate, and cut consumers over once the old topic is drained.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain the hash change, the ordering consequence, the subtle offset-reset trap, then the safe migration.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would consistent hashing help? (It would reduce how many keys move, but Kafka's default partitioner is plain modulo.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,kraft" data-company="Typical,Microsoft">
+          <summary>ZooKeeper vs KRaft: what changed and why does it matter?</summary>
+          <div class="answer">
+            <p>Before, cluster metadata (brokers, topics, partition leaders, ISR, configs) lived in a separate ZooKeeper ensemble, and one broker acted as controller, pushing changes to others over RPC. That meant two distributed systems to run and secure, and a slow controller failover because a new controller had to load all metadata from ZooKeeper. With <b>KRaft</b> (KIP-500), metadata is itself a Raft-replicated log, <code>__cluster_metadata</code>, managed by a small quorum of controller nodes (usually 3, or 5 for large clusters). Brokers simply replicate that log, like consumers. Benefits: one system, much faster failover and restart, and far more partitions per cluster. ZooKeeper mode was removed in Kafka 4.0 (March 2025); you migrate on 3.9 first, then upgrade.</p>
+            <div class="approach"><h5>How to answer</h5><p>Before, after, three benefits, and the 4.0 fact. A control-plane vs data-plane bridge from routers works well.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How many controller failures can a 3-node quorum survive? (One; 5 nodes survive two.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,replication" data-company="Typical">
+          <summary>What is unclean leader election, and when would you enable it?</summary>
+          <div class="answer">
+            <p>If every in-sync replica of a partition is gone, Kafka must choose: wait for an ISR member to come back (the partition stays offline) or let an out-of-sync replica become leader (the partition comes back now, but records it never received are lost, and the others truncate to match). <code>unclean.leader.election.enable</code> is <code>false</code> by default, which picks consistency. Enabling it picks availability. It can make sense for data where gaps are acceptable and an outage is not, like metrics or logs; never for orders or payments. Our research notes record that Slack ran with it enabled for some clusters, favouring availability. This is the CAP trade-off made into one config flag.</p>
+            <div class="approach"><h5>How to answer</h5><p>The dilemma, the default, one use case per side, the CAP link.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does ELR change this? (Some replicas outside the ISR are known to have every committed record and can lead safely.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,storage" data-company="Typical,Uber">
+          <summary>What is tiered storage and when would you enable it?</summary>
+          <div class="answer">
+            <p>With tiered storage (KIP-405, production-ready since 3.9), closed segments are uploaded to remote object storage through a plugin, while a short hot tail stays on local disk (<code>local.retention.ms</code>), and <code>retention.ms</code> sets the total. Benefits: long retention (months) at object-storage prices, smaller local disks, and much faster broker replacement and rebalancing because less data lives locally. Costs: reads of old data have higher latency, you depend on a plugin (Kafka ships no S3 implementation itself), and compacted topics are not supported. I would enable it when teams need weeks or months of replay, or when disk cost and rebalance time dominate.</p>
+            <div class="approach"><h5>How to answer</h5><p>Mechanism, three benefits, three costs, one decision rule.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How is this different from Pulsar's design? (Pulsar always separates storage; Kafka keeps a local hot tier.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,k8s,ops" data-company="Typical">
+          <summary>How do you run Kafka on Kubernetes, and what is hard about it?</summary>
+          <div class="answer">
+            <p>I would use an operator, usually <b>Strimzi</b>: you declare a <code>Kafka</code> resource plus <code>KafkaNodePool</code>s for controllers and brokers, and topics and users as <code>KafkaTopic</code> and <code>KafkaUser</code> resources; the operator creates pods, persistent volumes, certificates and does safe rolling restarts. The hard parts: each broker needs <b>stable identity and its own persistent volume</b>; clients outside the cluster must reach a <b>specific</b> broker (the partition leader), so you need per-broker addresses through advertised listeners (NodePort, LoadBalancer or Ingress), not one load-balanced address; rack awareness from zone labels; PodDisruptionBudgets so node drains never take two replicas down; rolling updates that wait for no under-replicated partitions; and rebalancing data when scaling, which Strimzi does through Cruise Control (<code>KafkaRebalance</code>).</p>
+            <div class="approach"><h5>How to answer</h5><p>Operator first, then the "per-broker addressing" gotcha, which is the number-one issue. Link it to operators and StatefulSets: <a href="{{BASE}}devops/k8s-10">StatefulSets &amp; Operators</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Is running Kafka on K8s a good idea? (Fine with an operator and a team that knows both; otherwise use a managed service.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,streams" data-company="Typical,Uber">
+          <summary>Kafka Streams vs Flink vs a plain consumer: how do you choose?</summary>
+          <div class="answer">
+            <p>A <b>plain consumer</b> is right for stateless or simple work: read, call a service, write. <b>Kafka Streams</b> is a library inside your app, no cluster to run, with local RocksDB state backed by changelog topics, windows, joins and exactly-once within Kafka; good for microservice-sized stateful processing where input and output are Kafka. <b>Flink</b> is a separate cluster with checkpointed state, strong event-time and watermark handling, SQL, and many sources and sinks; good for large, shared, stateful pipelines like windowed analytics or fraud features. Rule of thumb from our research: Kafka Streams for app-embedded processing, Flink for big shared pipelines.</p>
+            <div class="approach"><h5>How to answer</h5><p>One line per option, then one example each. See <a href="{{BASE}}devops/kafka-09">Connect, Streams &amp; Flink</a>.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Where does state live, and how is it recovered after a crash? (RocksDB plus changelog topic; Flink checkpoints.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka,consumers" data-company="Typical,Walmart,Uber">
+          <summary>What are share groups (Queues for Kafka), and when would you use one?</summary>
+          <div class="answer">
+            <p>Share groups (KIP-932, production-ready in Kafka 4.2) are a new kind of group where <b>many consumers can read the same partition</b>. Each record is acquired with a time-limited lock (30 seconds by default) and acknowledged individually: accept, release for redelivery, reject, or renew the lock (since 4.2). Each record counts its delivery attempts; after 5 by default it is archived, and since 4.4 it can go to a dead-letter queue (KIP-1191). You give up ordering, and you gain scaling beyond the partition count and per-message acks, so slow jobs no longer block a partition. I would use it for work queues such as sending notifications or resizing images, exactly the gap Uber's and Walmart's consumer proxies were built to fill.</p>
+            <div class="approach"><h5>How to answer</h5><p>What, how (lock, acks, delivery count), trade-off (ordering), when. Mention the version; it shows you are current.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would you replace SQS with this? (If we already run Kafka 4.2+, maybe; otherwise SQS is less to operate.)</li></ul></div>
+          </div>
+        </details>
+      

@@ -1,0 +1,133 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> History chart + threshold alerts. Ask push vs poll. Write the numbers: 500M products, 1M extension users, chart under 500 ms, alert within 1 hour (or seconds for stocks).</li>
+          <li><strong>5-10 min: estimation</strong> Show tiering is forced by the fetch budget (12B vs 230M fetches a day). Note storage is small; bursts are the problem.</li>
+          <li><strong>10-15 min: API and data model</strong> Watches sharded by product with an index on target price. History in a TSDB.</li>
+          <li><strong>15-25 min: architecture</strong> Scheduler, fetchers, Kafka, validator/change detector, matcher, notification system.</li>
+          <li><strong>25-40 min: deep dives</strong> Crossing query and re-arming; trust and validation; flash-sale fan-out; chart rollups. For stocks, the in-memory per-symbol books.</li>
+          <li><strong>40-45 min: wrap up</strong> Failure modes, what you would monitor (fetch success rate, freshness per tier, quarantine rate, alert lag), and what you would build next.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Two loops joined by Kafka. The collect loop: a scheduler keeps every product in a per-shop sorted set by next-due time, tiered by how many people watch it, so we fetch about 230M times a day instead of 12B; workers use official APIs or polite fetching with a per-shop token bucket, and the extension's reports are only hints. Every observation goes to one Kafka topic keyed by product. The react loop: a validator rejects nonsense prices and writes changes to a time-series DB; the matcher takes each price change and, in one transaction, disarms every armed watch on that product whose target is at or above the new price, then hands one idempotent alert per watch to the notification system. Watches re-arm with hysteresis. Charts read daily rollups from a cache. The sizing event is the flash-sale burst, absorbed by Kafka, digests and per-user caps."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: tiered fetch scheduling with the arithmetic, Kafka keyed by product, a TSDB for history, watches indexed by product and target with an armed flag, one alert per crossing, reuse of a notification system. SDE-2 adds: why the armed flag (not the old price) must stop repeats, validation and quarantine of untrusted prices, the flash-sale burst maths against provider limits, hysteresis for re-arming, rollups for fast charts, and the in-memory per-symbol books for the stock variant.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a web crawler.</b> A crawler discovers new pages and follows links; a price tracker re-visits pages it already knows, on a schedule driven by how many people care. They share politeness and scheduling, not discovery. Also do not confuse <b>a crossing</b> ("this user has not been told and the price is now at or below their line") with <b>a condition</b> ("price &lt;= target"): the condition is true for days, the crossing happens once.</p></div>
+
+        <h3>Follow-up questions</h3>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Amazon">
+          <summary>A price changes. How do you find which users to alert, efficiently and without duplicates?</summary>
+          <div class="answer">
+            <p>Index watches by <code>(product_id, condition, armed, target_price)</code> and query armed watches with <code>target &gt;= new_price</code>. The armed flag (not the old price) is what prevents repeats, so the query still works if a price event was lost or reordered, or the watch was created below its target. Each match is disarmed in the same transaction and recorded with a unique <code>(watch_id, crossing_id)</code>, so retries cannot double-send. Re-arm with hysteresis when the price climbs back above target plus a margin.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with the naive scan and say why it fails (cost grows with watchers, and it repeats alerts), then give the range query and the disarm/re-arm rule. Draw the number line.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the price jumps up and back down within one fetch interval? (We never saw it; that is acceptable within the freshness budget.)</li><li>How do percentage-drop watches fit the same index?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>Design price alerts for stock tickers where prices update many times per second.</summary>
+          <div class="answer">
+            <p>Ingest the exchange or vendor feed into Kafka keyed by symbol. Matcher processes each own a set of symbols (consistent hashing or a static assignment) and keep, per symbol, a "below" book sorted descending and an "above" book sorted ascending, in memory. On each tick, pop alerts from the front while the tick crosses them; emit alert events. New alerts are written to the database and then sent to the owning matcher via Kafka. On restart, a matcher loads its symbols' alerts from the database and resumes from its last committed offset. Throttle per user and per alert so a price oscillating around 180.00 does not send 50 pushes.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast with the shop-price version: there the database index is enough because changes are rare; here the match rate (thousands of symbols x many ticks per second) forces in-memory books. Mention it resembles an order book.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>One symbol (a meme stock) has 2M alerts. How do you shard it? (Split its books by price range across processes.)</li><li>How do you support "moved 5% today"? (Compute from the open price; it becomes an absolute threshold for the day.)</li><li>How do clients see live prices? (SSE or WebSocket fan-out per symbol; see Real-time Updates.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>You cannot refresh 500M products every hour. How do you decide what to fetch?</summary>
+          <div class="answer">
+            <p>Priority scheduling by interest. Tier products by watchers, extension page views and price volatility: hot hourly, warm daily, cold weekly. Store next due time in a per-shop sorted set and pop overdue items. A new watch triggers a one-off fetch. Recompute tiers as watch counts change. The arithmetic: hourly for all would be 12B fetches a day; tiering gives about 230M.</p>
+            <div class="approach"><h5>How to answer</h5><p>Lead with the arithmetic, then the tiers, then politeness (token bucket, robots.txt, official APIs). The arithmetic makes the design look inevitable.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A cold product suddenly gets 10,000 watchers. What happens?</li><li>How do you avoid all hourly products becoming due at the same second? (Add jitter to next due times.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Uber">
+          <summary>Extension users report prices. How do you stop fake or wrong prices from triggering alerts?</summary>
+          <div class="answer">
+            <p>Treat reports as untrusted hints. Authenticate installs, rate-limit per install and per IP, and drop reports outside a sanity band. Never alert on one report: either require several agreeing reports from distinct installs within a short window, or use the report to trigger an immediate fetch of our own and alert only on our confirmed price. Keep a reputation score per install to downweight bad reporters.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "hint" from "truth" out loud. Then say the same validator also protects you from your own parser bugs.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A shop shows different prices by region or to logged-in users. How do you model that? (Price is per shop, region, condition; extension reports carry region.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>How do you serve a 2-year price chart in under 500 ms?</summary>
+          <div class="answer">
+            <p>Store history in a time-series DB partitioned by product and time. Keep raw points for 30 days, hourly rollups for a year, daily beyond, maintained by continuous aggregates. The API picks the coarsest resolution that still looks right for the range, so a 2-year chart is about 730 rows from one partition. Cache the rendered series in Redis per (product, range), invalidated on price change.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "downsample, then cache" and give the row counts.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not just SQL? (Fine at small scale; TSDB adds compression and automatic rollups.)</li><li>How do you show "lowest price ever" cheaply? (Keep min/max per product in the product row, updated on change.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Flipkart">
+          <summary>It is a big sale day. One product with 200,000 watchers drops. What breaks and how do you handle it?</summary>
+          <div class="answer">
+            <p>The matcher must page through 200,000 matches and the notification system must send them. Keep it asynchronous: the matcher pages the watch range in chunks, emits chunk tasks keyed by watch id so all partitions share the work, and writes alert events to Kafka. Notification consumers scale on lag. Apply per-user caps and digests. If lag exceeds the freshness budget, delay low-priority alerts first. Pre-scale before known sale events.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the hot-key problem (one product = one partition), then the re-keying fix, then user-facing protections.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you avoid all 200,000 users clicking through at once and overloading the shop page? (Not ours to protect, but stagger sends if the partner asks.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Amazon">
+          <summary>The price wobbles 2,799 / 2,801 / 2,799 around a target of 2,800. How many alerts does the user get?</summary>
+          <div class="answer">
+            <p>One. The watch is disarmed after it fires and re-arms only after the price rises above the target by a margin (for example 5%), so small oscillations are ignored. Also cap alerts per watch per hour as a second line of defence.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the word "hysteresis" and compare it to a thermostat. Then mention the rate limit as a backstop.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The user wants an alert every time it gets even cheaper. (Store the last notified price and alert only on a new low below it by a minimum step.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Why shard watches by product rather than by user?</summary>
+          <div class="answer">
+            <p>The hot query is "price of product P changed; which watches care?". Sharding by product keeps it on one shard. "Show my watches" is less frequent and is served by a secondary index (or a user-keyed copy kept in sync by events). The opposite choice would turn every price change into a scatter-gather across all shards.</p>
+            <div class="approach"><h5>How to answer</h5><p>Always shard by the key of your hottest query, then say how you serve the other query.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What about a product with millions of watchers? (Sub-partition its watches by target price range.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>The shop changes its page and your parser now reads every price as 0. What happens in your design?</summary>
+          <div class="answer">
+            <p>The validator rejects prices outside the sanity band (for example under 50% of the recent minimum) into quarantine; no history row, no alert. Canary products for that shop alarm within one cycle after a parser deploy or a site change. Prefer structured sources (APIs, embedded product data) so layout changes matter less. After the fix, replay the quarantined observations.</p>
+            <div class="approach"><h5>How to answer</h5><p>Turn it into a principle: side effects visible to users go through a validation gate, and you detect drift with canaries.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a real 70% price cut happens and the sanity band quarantines it? (Confirm with a second fetch or second extractor, then release.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber">
+          <summary>Polling vs push for price data: when do you choose which?</summary>
+          <div class="answer">
+            <p>Push when a source offers it: exchange feeds for stocks, partner webhooks or feeds for shops. It is fresher and cheaper. Poll when there is no feed, with tiers and politeness. The extension is a third source: crowd push, but untrusted. Many real systems mix all three and merge them into one observation stream.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the decision rule, then show the single Kafka topic that all sources feed so the rest of the pipeline does not care.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect that a push feed has silently stopped? (Heartbeats and a freshness metric per source.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: the Prime Day alert storm</h4>
+          <div class="situation">At 00:00 on a big sale day, 3,000 tracked products drop at once. 25M alerts are due. The email provider allows 5,000 sends per second for your account.</div>
+          <div class="bad">Weak answer: "Add more servers to the alert service." More servers do not raise the provider's send limit, and the matcher will still push everything at once.</div>
+          <div class="good">Strong answer: do the math: 25M / 5,000 per second = about 83 minutes, which breaks a 1-hour budget. So (1) send push notifications (higher limits) for users who allow them, (2) switch users with many hits to one digest, cutting volume several times, (3) order the alert queue by priority (paid users, biggest drops), (4) ask the provider for a temporary limit raise ahead of a known event. Kafka absorbs the backlog; consumers scale on lag up to the provider limit.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>How do you show the user the right price if the price changes again before the email goes out? (Re-read current price at send time; drop the alert if it no longer holds.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: the stock alert that fired late</h4>
+          <div class="situation">Users complain that "AAPL below 180" alerts arrive 40 seconds after the price crossed. Market open had a burst of ticks.</div>
+          <div class="bad">Weak answer: "Use a faster database for alerts."</div>
+          <div class="good">Strong answer: measure where the 40 seconds went: feed ingest lag, matcher consumer lag, notification queue lag. Usually a single hot partition (one busy symbol) or a matcher doing a database call per tick. Fix by keeping the books in memory, splitting hot symbols across partitions, giving stock alerts their own high-priority notification lane, and scaling matchers on lag before market open.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>What is your SLO and how do you alert on it? (For example p99 tick-to-push under 5 s, measured with timestamps on each event.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Fetching every product on the same schedule, and never doing the arithmetic.</li>
+          <li>Matching by scanning watches on a timer instead of reacting to price changes.</li>
+          <li>Alerting on "price &lt;= target" with no armed/disarmed flag, which re-alerts the same users on every price event.</li>
+          <li>Using the old price as the lower bound of the match query, which silently misses users when a price event is lost or arrives out of order.</li>
+          <li>Trusting extension-reported prices or a fresh parser output without validation.</li>
+          <li>Building email and push sending inside this system instead of reusing a <a href="{{BASE}}hld/d03">notification system</a>.</li>
+          <li>Proposing to evade a shop's bot defences rather than using official APIs and rate limits.</li>
+        </ul>
+      

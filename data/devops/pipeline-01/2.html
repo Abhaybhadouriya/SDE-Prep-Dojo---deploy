@@ -1,0 +1,46 @@
+
+        <h2>How data enters Kafka (and the dual-write trap)</h2>
+        <p>There are three common ways events get into Kafka. Knowing them, and why ShopStream picks the first, is a classic interview point.</p>
+        <ol class="steps">
+          <li><strong>The application produces directly.</strong> The service calls the Kafka producer in its request path. ShopStream does this: <code>order-api</code> writes to <code>orders.created</code> and writes nothing else.</li>
+          <li><strong>A log shipper or agent.</strong> Programs write log files; an agent (for example Fluent Bit) tails them and produces to Kafka. Common for logs and clickstream, where losing a few lines is acceptable.</li>
+          <li><strong>Change data capture (CDC).</strong> The application writes only to its database. A connector such as <b>Debezium</b> reads the database's own transaction log (the Postgres WAL, the MySQL binlog) and turns each committed change into a Kafka event. Shopify uses this to capture changes from more than 100 MySQL shards.</li>
+        </ol>
+
+        <h3>The dual-write problem, in plain words</h3>
+        <p>Suppose the order service saves the order in its database <i>and then</i> publishes an event to Kafka. Those are two separate writes to two separate systems. There is no single "commit" that covers both. So one can succeed and the other fail:</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Dual write failure compared with a single write to Kafka or an outbox">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="22">Dual write: two commits, no atomicity</text>
+            <rect class="box svc" x="20" y="40" width="150" height="56"/><text class="label" x="95" y="68">order service</text>
+            <rect class="box db" x="250" y="34" width="150" height="40"/><text class="label" x="325" y="54">DB: saved</text>
+            <rect class="box fail" x="250" y="86" width="150" height="40"/><text class="label" x="325" y="106">Kafka: crashed</text>
+            <path class="arrow ok" d="M170 60 L246 54"/>
+            <path class="arrow bad" d="M170 80 L246 104"/>
+            <text class="label small bad" x="590" y="70">order exists, but nobody downstream</text>
+            <text class="label small bad" x="590" y="92">ever hears about it (lost event)</text>
+
+            <text class="label left" x="20" y="160">Fix A (ShopStream): write ONE system first</text>
+            <rect class="box svc" x="20" y="176" width="150" height="50"/><text class="label" x="95" y="201">order-api</text>
+            <rect class="box kafka" x="250" y="176" width="150" height="50"/><text class="label" x="325" y="201">Kafka only</text>
+            <rect class="box db" x="470" y="176" width="110" height="50"/><text class="label" x="525" y="201">sink to DB</text>
+            <path class="arrow" d="M170 201 L246 201"/><path class="arrow" d="M400 201 L466 201"/>
+
+            <text class="label left" x="600" y="160">Fix B: outbox + CDC</text>
+            <rect class="box db" x="600" y="176" width="190" height="50"/><text class="label small" x="695" y="193">orders + outbox row</text><text class="label small" x="695" y="212">in ONE DB transaction</text>
+            <text class="label small" x="695" y="246">Debezium tails it to Kafka</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M95 201 L325 201 L525 201"/></circle>
+          </svg>
+          <figcaption>Top: the dual-write trap. Bottom: two standard fixes. ShopStream uses fix A: the API's only durable write is to Kafka; Postgres is filled from Kafka by the sink.</figcaption>
+        </figure>
+
+        <p>ShopStream sidesteps the problem by design: the API's only durable write is to Kafka. The database is a <b>downstream copy</b> built by <code>postgres-sink</code>. If Postgres is down, nothing is lost; the sink waits and catches up.</p>
+        <p>That choice works because the order's "source of truth" is the event log. In many real companies, the database must be the source of truth (because other code reads it right after the write, or because it enforces stock limits). Then the standard fix is the <b>transactional outbox</b>: in the same database transaction as the business row, insert a row into an <code>outbox</code> table. A relay (often Debezium with its Outbox Event Router) publishes the outbox rows to Kafka. Both rows commit or neither does, so the event can never be lost. The relay is <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a>, so consumers still need to handle duplicates. Page <a href="{{BASE}}devops/pipeline-03">03</a> goes deeper, and <a href="{{BASE}}devops/kafka-09">Kafka Connect and Debezium</a> explains CDC itself.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The dual-write problem is the same as updating the RIB and the hardware FIB as two independent steps with no rollback: if the second step fails, the two tables disagree and nothing tells you. The outbox is like writing the intended change into a journal inside the same atomic commit, and letting a separate daemon replay the journal into the second table until it succeeds. Where it breaks: the replay daemon may apply the same entry twice after a crash, so the second table must accept repeats (be idempotent).</p>
+        </div>
+      

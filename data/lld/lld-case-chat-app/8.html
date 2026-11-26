@@ -1,0 +1,502 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>One file for Java and C++, a module plus a driver for Python. In a real round, split Java into <code>model/</code> (User, Message, Receipt, Chat and subclasses), <code>client/</code> (ChatClient and implementations), <code>service/</code> (ChatServer) and <code>Main</code>. The same files live in <code>lld-code/lld-case-chat-app/</code> in this repo; each was compiled and run, and the output below is the real output. All three print the same story; the C++ version takes the same locks with <code>std::lock_guard</code>. The MinGW.org g++ 6.3 used for the output below has no <code>std::mutex</code>, so there the <code>Mutex</code> type falls back to a no-op with the same <code>lock()</code>/<code>unlock()</code>; the same file was also built with real threads on Linux (WSL Ubuntu, g++ 13, <code>-pthread</code>) and printed the same output (<code>run-cpp-linux.txt</code>). In C++ the 4-sender block runs the senders interleaved on one thread.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
+
+// ---------- errors ----------
+class ChatException extends RuntimeException {
+    ChatException(String msg) { super(msg); }
+}
+
+// ---------- per-recipient receipt: a State machine written as an enum ----------
+// Each constant decides what an event does to it. Receipts only move forward.
+enum Receipt {
+    SENT      { Receipt onDelivered() { return DELIVERED; } Receipt onRead() { return READ; } },
+    DELIVERED { Receipt onDelivered() { return this; }      Receipt onRead() { return READ; } },
+    READ      { Receipt onDelivered() { return this; }      Receipt onRead() { return this; } };
+
+    abstract Receipt onDelivered();
+    abstract Receipt onRead();
+}
+
+// ---------- model ----------
+final class User {
+    final String id, name;
+    User(String id, String name) { this.id = id; this.name = name; }
+}
+
+final class Message {
+    final String id, chatId, senderId, text;
+    final long seq;                                              // order inside the chat
+    private final Map&lt;String, Receipt&gt; receipts = new LinkedHashMap&lt;&gt;();  // recipient -&gt; state
+    private final Map&lt;String, Long&gt; pushedIn = new HashMap&lt;&gt;();             // recipient -&gt; connection that got a push
+
+    Message(String id, String chatId, String senderId, long seq, String text, Collection&lt;String&gt; recipients) {
+        this.id = id; this.chatId = chatId; this.senderId = senderId; this.seq = seq; this.text = text;
+        for (String r : recipients) receipts.put(r, Receipt.SENT);
+    }
+
+    /** Applies one event for one recipient; true only if the state really changed. */
+    synchronized boolean apply(String userId, boolean read) {
+        Receipt old = receipts.get(userId);
+        if (old == null) return false;
+        Receipt next = read ? old.onRead() : old.onDelivered();
+        if (next == old) return false;
+        receipts.put(userId, next);
+        return true;
+    }
+
+    synchronized Receipt receiptOf(String userId) { return receipts.get(userId); }
+
+    /** CAS that only avoids a duplicate push inside one connection; it is NOT the DELIVERED tick. */
+    synchronized boolean claimPush(String userId, long connection) {
+        if (receipts.get(userId) != Receipt.SENT) return false;        // already acknowledged
+        Long prev = pushedIn.put(userId, connection);
+        return prev == null || prev != connection;
+    }
+
+    /** A removed member must not hold the group's double tick hostage. */
+    synchronized void forget(String userId) { receipts.remove(userId); }
+
+    /** What the sender sees: the lowest state over all recipients (WhatsApp-style ticks). */
+    synchronized Receipt status() {
+        if (receipts.isEmpty()) return Receipt.SENT;
+        Receipt min = Receipt.READ;
+        for (Receipt r : receipts.values()) if (r.ordinal() &lt; min.ordinal()) min = r;
+        return min;
+    }
+
+    synchronized List&lt;String&gt; recipients() { return new ArrayList&lt;&gt;(receipts.keySet()); }
+
+    @Override public String toString() { return "#" + seq + " " + senderId + ": " + text; }
+}
+
+abstract class Chat {
+    final String id;
+    final Object lock = new Object();
+    protected final Map&lt;String, Long&gt; members = new LinkedHashMap&lt;&gt;();  // userId -&gt; first seq they may see
+    protected final List&lt;Message&gt; messages = new ArrayList&lt;&gt;();
+    private long nextSeq = 1;
+
+    Chat(String id) { this.id = id; }
+
+    abstract String title();
+    abstract void checkCanChangeMembers(String byUser, String target, boolean adding);
+
+    boolean isMember(String userId) { return members.containsKey(userId); }
+    long lastSeq() { return nextSeq - 1; }
+    void join(String userId) { members.putIfAbsent(userId, nextSeq); }   // sees only what comes next
+    void leave(String userId) { members.remove(userId); }
+
+    /** Caller holds lock: one sequence number per message, no gaps, no duplicates. */
+    Message append(String msgId, String senderId, String text) {
+        List&lt;String&gt; to = new ArrayList&lt;&gt;();
+        for (String m : members.keySet()) if (!m.equals(senderId)) to.add(m);
+        Message msg = new Message(msgId, id, senderId, nextSeq++, text, to);
+        messages.add(msg);
+        return msg;
+    }
+
+    /** Caller holds lock: seq numbers are 1..lastSeq with no gaps, so this is an index. */
+    Message bySeq(long seq) { return seq &gt;= 1 &amp;&amp; seq &lt;= messages.size() ? messages.get((int) (seq - 1)) : null; }
+
+    /** Caller holds lock: messages this member may see (from the seq they joined at). */
+    List&lt;Message&gt; visibleTo(String userId) {
+        long from = members.get(userId);
+        List&lt;Message&gt; out = new ArrayList&lt;&gt;();
+        for (Message m : messages) if (m.seq &gt;= from) out.add(m);
+        return out;
+    }
+}
+
+final class DirectChat extends Chat {
+    DirectChat(String id, String a, String b) { super(id); join(a); join(b); }
+    String title() { return "direct " + String.join("+", members.keySet()); }
+    void checkCanChangeMembers(String byUser, String target, boolean adding) {
+        throw new ChatException("a direct chat has exactly two members");
+    }
+}
+
+final class GroupChat extends Chat {
+    final String name;
+    private final Set&lt;String&gt; admins = new HashSet&lt;&gt;();
+    static final int MAX_MEMBERS = 256;
+
+    GroupChat(String id, String name, String creator) { super(id); this.name = name; join(creator); admins.add(creator); }
+    String title() { return "group '" + name + "'"; }
+
+    void checkCanChangeMembers(String byUser, String target, boolean adding) {
+        boolean selfLeave = !adding &amp;&amp; byUser.equals(target);
+        if (!selfLeave &amp;&amp; !admins.contains(byUser)) throw new ChatException(byUser + " is not an admin of " + name);
+        if (adding &amp;&amp; members.size() &gt;= MAX_MEMBERS) throw new ChatException("group is full");
+    }
+
+    @Override void leave(String userId) {
+        super.leave(userId);
+        admins.remove(userId);
+        if (admins.isEmpty() &amp;&amp; !members.isEmpty()) admins.add(members.keySet().iterator().next()); // oldest member
+    }
+}
+
+// ---------- Observer: a connected device ----------
+interface ChatClient {
+    void onMessage(Message m);
+    void onReceipt(Message m, String byUser, Receipt now);
+}
+
+// ---------- Mediator: users never talk to each other, only through the server ----------
+final class ChatServer {
+    private final Map&lt;String, User&gt; users = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Chat&gt; chats = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Set&lt;String&gt;&gt; chatsOf = new ConcurrentHashMap&lt;&gt;();
+    private static final class Connection {
+        final ChatClient client; final long id;
+        Connection(ChatClient client, long id) { this.client = client; this.id = id; }
+    }
+    private final Map&lt;String, Connection&gt; online = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicLong msgIds = new AtomicLong(), groupIds = new AtomicLong(), connIds = new AtomicLong();
+
+    void register(User u) {
+        if (users.putIfAbsent(u.id, u) != null) throw new ChatException("user " + u.id + " exists");
+        chatsOf.put(u.id, ConcurrentHashMap.newKeySet());
+    }
+
+    private void needUser(String id) { if (!users.containsKey(id)) throw new ChatException("no user " + id); }
+
+    Chat chat(String chatId) {
+        Chat c = chats.get(chatId);
+        if (c == null) throw new ChatException("no chat " + chatId);
+        return c;
+    }
+
+    /** Idempotent: the same pair always gets the same chat. */
+    DirectChat direct(String a, String b) {
+        needUser(a); needUser(b);
+        if (a.equals(b)) throw new ChatException("cannot chat with yourself");
+        String key = a.compareTo(b) &lt; 0 ? "d:" + a + ":" + b : "d:" + b + ":" + a;
+        DirectChat c = (DirectChat) chats.computeIfAbsent(key, k -&gt; new DirectChat(k, a, b));
+        chatsOf.get(a).add(key); chatsOf.get(b).add(key);
+        return c;
+    }
+
+    GroupChat group(String creator, String name, String... others) {
+        needUser(creator);
+        GroupChat g = new GroupChat("g" + groupIds.incrementAndGet(), name, creator);
+        chats.put(g.id, g);
+        chatsOf.get(creator).add(g.id);
+        for (String o : others) addMember(creator, g.id, o);
+        return g;
+    }
+
+    void addMember(String by, String chatId, String user) {
+        needUser(user);
+        Chat c = chat(chatId);
+        synchronized (c.lock) {
+            if (!c.isMember(by)) throw new ChatException(by + " is not in " + c.title());
+            c.checkCanChangeMembers(by, user, true);   // permission first, even for a no-op
+            if (c.isMember(user)) return;
+            c.join(user);
+        }
+        chatsOf.get(user).add(chatId);
+    }
+
+    void removeMember(String by, String chatId, String user) {
+        Chat c = chat(chatId);
+        synchronized (c.lock) {
+            if (!c.isMember(by) || !c.isMember(user)) throw new ChatException("not a member");
+            c.checkCanChangeMembers(by, user, false);
+            c.leave(user);
+            for (Message m : c.messages) if (m.receiptOf(user) != Receipt.READ) m.forget(user);
+        }
+        chatsOf.get(user).remove(chatId);
+    }
+
+    /** A device comes online: every message this user has not ACKNOWLEDGED (still SENT) is pushed again,
+     *  in seq order per chat. A push that was lost last time is therefore re-sent: at-least-once. */
+    void connect(String userId, ChatClient client) {
+        needUser(userId);
+        Connection conn = new Connection(client, connIds.incrementAndGet());
+        online.put(userId, conn);
+        for (String chatId : chatsOf.get(userId)) {
+            Chat c = chats.get(chatId);
+            List&lt;Message&gt; pending = new ArrayList&lt;&gt;();
+            synchronized (c.lock) {
+                if (!c.isMember(userId)) continue;
+                for (Message m : c.visibleTo(userId)) if (m.receiptOf(userId) == Receipt.SENT) pending.add(m);
+            }
+            for (Message m : pending) deliver(userId, conn, m);     // outside the lock
+        }
+    }
+
+    void disconnect(String userId) { online.remove(userId); }
+
+    Message send(String senderId, String chatId, String text) {
+        if (text == null || text.trim().isEmpty()) throw new ChatException("empty message");
+        Chat c = chat(chatId);
+        Message m;
+        synchronized (c.lock) {
+            if (!c.isMember(senderId)) throw new ChatException(senderId + " is not in " + c.title());
+            m = c.append("m" + msgIds.incrementAndGet(), senderId, text.trim());
+        }
+        for (String r : m.recipients()) {          // fan-out after unlock
+            Connection cn = online.get(r);
+            if (cn != null) deliver(r, cn, m);
+        }
+        return m;
+    }
+
+    /** Push; the state does NOT change here. The CAS only stops a second push on the same connection
+     *  (send's fan-out racing connect's catch-up). If the push is lost, the receipt stays SENT. */
+    private void deliver(String userId, Connection conn, Message m) {
+        if (!m.claimPush(userId, conn.id)) return;
+        conn.client.onMessage(m);
+    }
+
+    /** The device confirms it stored message seq of chatId: only this moves SENT -&gt; DELIVERED.
+     *  Idempotent, so a duplicate ack (or an ack for a re-sent copy) changes nothing. */
+    boolean ack(String userId, String chatId, long seq) {
+        Chat c = chat(chatId);
+        Message m;
+        synchronized (c.lock) {
+            if (!c.isMember(userId)) return false;
+            m = c.bySeq(seq);
+            if (m == null || !m.apply(userId, false)) return false;
+        }
+        tellSender(m, userId);
+        return true;
+    }
+
+    private void tellSender(Message m, String byUser) {
+        Connection s = online.get(m.senderId);
+        if (s != null) s.client.onReceipt(m, byUser, m.receiptOf(byUser));
+    }
+
+    /** Marks everything up to and including uptoSeq as read; returns how many changed. */
+    int markRead(String userId, String chatId, long uptoSeq) {
+        Chat c = chat(chatId);
+        List&lt;Message&gt; changed = new ArrayList&lt;&gt;();
+        synchronized (c.lock) {
+            if (!c.isMember(userId)) throw new ChatException(userId + " is not in " + c.title());
+            for (Message m : c.visibleTo(userId))
+                if (m.seq &lt;= uptoSeq &amp;&amp; !m.senderId.equals(userId) &amp;&amp; m.apply(userId, true)) changed.add(m);
+        }
+        for (Message m : changed) tellSender(m, userId);
+        return changed.size();
+    }
+
+    int unread(String userId, String chatId) {
+        Chat c = chat(chatId);
+        synchronized (c.lock) {
+            if (!c.isMember(userId)) throw new ChatException(userId + " is not in " + c.title());
+            int n = 0;
+            for (Message m : c.visibleTo(userId)) if (!m.senderId.equals(userId) &amp;&amp; m.receiptOf(userId) != Receipt.READ) n++;
+            return n;
+        }
+    }
+
+    /** Newest page first in time order: up to limit messages with seq &lt; beforeSeq. */
+    List&lt;Message&gt; history(String userId, String chatId, long beforeSeq, int limit) {
+        Chat c = chat(chatId);
+        synchronized (c.lock) {
+            if (!c.isMember(userId)) throw new ChatException(userId + " is not in " + c.title());
+            List&lt;Message&gt; vis = c.visibleTo(userId), out = new ArrayList&lt;&gt;();
+            for (int i = vis.size() - 1; i &gt;= 0 &amp;&amp; out.size() &lt; limit; i--) if (vis.get(i).seq &lt; beforeSeq) out.add(vis.get(i));
+            Collections.reverse(out);
+            return out;
+        }
+    }
+}
+
+// ---------- demo devices ----------
+// A device stores a message, then acknowledges it; it drops copies it already has (dedupe by chat + seq).
+abstract class Device implements ChatClient {
+    protected final ChatServer server; protected final String owner;
+    private final Set&lt;String&gt; have = ConcurrentHashMap.newKeySet();   // "chatId#seq" already stored
+    Device(ChatServer server, String owner) { this.server = server; this.owner = owner; }
+    public final void onMessage(Message m) {
+        if (!arrives(m)) return;                                  // lost on the wire
+        if (have.add(m.chatId + "#" + m.seq)) store(m); else duplicate(m);
+        if (sendAck(m)) server.ack(owner, m.chatId, m.seq);       // ack a duplicate too: the first ack may be the lost one
+    }
+    protected boolean arrives(Message m) { return true; }
+    protected abstract void store(Message m);
+    protected void duplicate(Message m) { }
+    protected boolean sendAck(Message m) { return true; }
+}
+
+final class ConsoleClient extends Device {
+    ConsoleClient(ChatServer server, String owner) { super(server, owner); }
+    protected void store(Message m) { System.out.println("  [" + owner + " device] got " + m); }
+    protected void duplicate(Message m) { System.out.println("  [" + owner + " device] duplicate " + m.id + " dropped, acked again"); }
+    public void onReceipt(Message m, String byUser, Receipt now) {
+        System.out.println("  [" + owner + " device] " + m.id + " " + now + " by " + byUser + " (overall " + m.status() + ")");
+    }
+}
+
+final class CountingClient extends Device {
+    final Set&lt;String&gt; seen = ConcurrentHashMap.newKeySet();
+    final AtomicLong pushes = new AtomicLong();
+    CountingClient(ChatServer server, String owner) { super(server, owner); }
+    @Override protected boolean arrives(Message m) { pushes.incrementAndGet(); return true; }
+    protected void store(Message m) { seen.add(m.id); }
+    public void onReceipt(Message m, String byUser, Receipt now) { }
+}
+
+// Loses things on purpose: pushes never arrive (dropPush), or acks never reach the server (dropAck).
+final class LossyClient extends Device {
+    final Set&lt;Long&gt; stored = ConcurrentHashMap.newKeySet();
+    volatile boolean dropPush, dropAck;
+    LossyClient(ChatServer server, String owner, boolean dropPush, boolean dropAck) {
+        super(server, owner); this.dropPush = dropPush; this.dropAck = dropAck;
+    }
+    @Override protected boolean arrives(Message m) { return !dropPush; }
+    protected void store(Message m) { stored.add(m.seq); System.out.println("  [" + owner + " device] stored " + m); }
+    @Override protected void duplicate(Message m) { System.out.println("  [" + owner + " device] duplicate #" + m.seq + " dropped, acked again"); }
+    @Override protected boolean sendAck(Message m) { return !dropAck; }
+    public void onReceipt(Message m, String byUser, Receipt now) { }
+}
+
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+    static void expectError(Runnable r, String contains) {
+        try { r.run(); } catch (ChatException e) {
+            System.out.println("  rejected: " + e.getMessage());
+            check(e.getMessage().contains(contains), "error mentions " + contains);
+            return;
+        }
+        throw new AssertionError("expected error: " + contains);
+    }
+
+    public static void main(String[] args) throws Exception {
+        ChatServer s = new ChatServer();
+        for (String[] u : new String[][]{{"asha", "Asha"}, {"ben", "Ben"}, {"chen", "Chen"}, {"dev", "Dev"}})
+            s.register(new User(u[0], u[1]));
+
+        System.out.println("== 1:1 chat, Ben offline");
+        s.connect("asha", new ConsoleClient(s, "asha"));
+        DirectChat d = s.direct("asha", "ben");
+        check(s.direct("ben", "asha") == d, "direct chat is idempotent");
+        Message hi = s.send("asha", d.id, "hi Ben, free for a review?");
+        System.out.println("  " + hi.id + " status " + hi.status());
+        check(hi.status() == Receipt.SENT, "offline recipient keeps SENT");
+
+        System.out.println("== Ben connects");
+        s.connect("ben", new ConsoleClient(s, "ben"));
+        check(hi.status() == Receipt.DELIVERED, "delivered on connect (the device acked)");
+        System.out.println("  ben unread " + s.unread("ben", d.id));
+        s.markRead("ben", d.id, hi.seq);
+        check(hi.status() == Receipt.READ, "read after markRead");
+        check(s.markRead("ben", d.id, hi.seq) == 0, "markRead is idempotent");
+
+        System.out.println("== group chat, Chen offline");
+        GroupChat g = s.group("asha", "kernel-hackers", "ben", "chen");
+        Message patch = s.send("ben", g.id, "patch v2 is up");
+        System.out.println("  " + patch.id + " overall " + patch.status() + " (chen has not received it)");
+        check(patch.status() == Receipt.SENT, "group status is the lowest receipt");
+        s.connect("chen", new ConsoleClient(s, "chen"));
+        s.markRead("asha", g.id, patch.seq);
+        System.out.println("  after asha read: overall " + patch.status());
+        check(patch.status() == Receipt.DELIVERED, "one reader is not enough");
+        s.markRead("chen", g.id, patch.seq);
+        check(patch.status() == Receipt.READ, "all read -&gt; READ");
+
+        System.out.println("== Dev joins late, sees only new messages");
+        s.addMember("asha", g.id, "dev");
+        s.send("asha", g.id, "welcome Dev");
+        List&lt;String&gt; devSees = new ArrayList&lt;&gt;();
+        for (Message m : s.history("dev", g.id, Long.MAX_VALUE, 50)) devSees.add(m.toString());
+        System.out.println("  dev history " + devSees);
+        check(devSees.size() == 1, "no history before joining");
+
+        System.out.println("== rules");
+        expectError(() -&gt; s.addMember("ben", g.id, "dev"), "not an admin");
+        expectError(() -&gt; s.addMember("asha", d.id, "chen"), "exactly two");
+        expectError(() -&gt; s.send("dev", d.id, "hello?"), "not in");
+        expectError(() -&gt; s.send("asha", g.id, "   "), "empty");
+        s.removeMember("asha", g.id, "ben");
+        expectError(() -&gt; s.send("ben", g.id, "still here?"), "not in");
+        s.removeMember("asha", g.id, "asha");                 // the only admin leaves
+        s.addMember("chen", g.id, "ben");                      // chen, the oldest member, is admin now
+        check(g.isMember("ben"), "admin handed over to oldest member");
+
+        System.out.println("== paging (Ben offline again)");
+        s.disconnect("ben");
+        for (int i = 1; i &lt;= 5; i++) s.send("asha", d.id, "note " + i);
+        System.out.println("  ben unread " + s.unread("ben", d.id));
+        check(s.unread("ben", d.id) == 5, "five unread notes");
+        List&lt;Message&gt; page = s.history("ben", d.id, Long.MAX_VALUE, 2);
+        List&lt;Message&gt; older = s.history("ben", d.id, page.get(0).seq, 2);
+        System.out.println("  newest " + page + " older " + older);
+        check(page.get(1).seq == d.lastSeq() &amp;&amp; older.get(1).seq == page.get(0).seq - 1, "paging by seq");
+
+        System.out.println("== lost push and lost ack: DELIVERED only after a device ack");
+        s.markRead("ben", d.id, d.lastSeq());                         // ben read the notes on another device
+        s.connect("ben", new LossyClient(s, "ben", true, false));     // the socket write is lost
+        Message lost = s.send("asha", d.id, "did this arrive?");
+        System.out.println("  push lost: " + lost.id + " is " + lost.receiptOf("ben"));
+        check(lost.receiptOf("ben") == Receipt.SENT, "a lost push stays SENT");
+        s.disconnect("ben");
+        LossyClient noAck = new LossyClient(s, "ben", false, true);    // stored, but the ack is lost
+        s.connect("ben", noAck);
+        check(noAck.stored.contains(lost.seq) &amp;&amp; lost.receiptOf("ben") == Receipt.SENT, "re-sent on reconnect, ack lost");
+        s.disconnect("ben");
+        noAck.dropAck = false;                                         // same device, network healthy again
+        s.connect("ben", noAck);
+        System.out.println("  after reconnect + ack: " + lost.receiptOf("ben"));
+        check(lost.receiptOf("ben") == Receipt.DELIVERED, "at-least-once push + ack = delivered");
+        check(!s.ack("ben", d.id, lost.seq), "a second ack changes nothing");
+
+        System.out.println("== 4 senders x 250 messages into one group");
+        ChatServer s2 = new ChatServer();
+        String[] ids = {"u1", "u2", "u3", "u4", "watcher"};
+        for (String id : ids) s2.register(new User(id, id));
+        GroupChat big = s2.group("u1", "load", "u2", "u3", "u4", "watcher");
+        CountingClient watcher = new CountingClient(s2, "watcher");
+        s2.connect("watcher", watcher);
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 1; t &lt;= 4; t++) {
+            final String sender = "u" + t;
+            fs.add(pool.submit(() -&gt; { for (int i = 0; i &lt; 250; i++) s2.send(sender, big.id, sender + "-" + i); }));
+        }
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        List&lt;Message&gt; all = s2.history("watcher", big.id, Long.MAX_VALUE, 2000);
+        Set&lt;Long&gt; seqs = new HashSet&lt;&gt;();
+        for (Message m : all) seqs.add(m.seq);
+        System.out.println("  messages " + all.size() + ", distinct seqs " + seqs.size() + ", max seq " + big.lastSeq()
+                + ", watcher pushes " + watcher.pushes.get());
+        check(all.size() == 1000 &amp;&amp; seqs.size() == 1000 &amp;&amp; big.lastSeq() == 1000, "seq 1..1000 with no gaps or duplicates");
+        check(watcher.pushes.get() == 1000 &amp;&amp; watcher.seen.size() == 1000, "each message pushed exactly once");
+
+        System.out.println("All " + checks + " checks passed");
+    }
+}</code></pre>
+    </div>
+  </div>
+  

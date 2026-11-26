@@ -1,0 +1,126 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min.</strong> Clarify: which windows, K max, exact or approximate, per-category? Write them down.</li>
+          <li><strong>5-10 min.</strong> Estimate: 700k events/s, 4B keys, 64 GB, reads are tiny once precomputed.</li>
+          <li><strong>10-15 min.</strong> API (read from cache, write fire-and-forget) and data (events, minute buckets, window totals, published list).</li>
+          <li><strong>15-25 min.</strong> Draw Kafka -&gt; aggregators -&gt; local top-K -&gt; merger -&gt; Redis -&gt; API. Say why merging is exact when keyed by item.</li>
+          <li><strong>25-40 min.</strong> Deep dives the interviewer picks: windows, sketch + heap, hot keys, Lambda.</li>
+          <li><strong>40-45 min.</strong> Failures and monitoring: consumer lag, result age, sketch error budget.</li>
+        </ol>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Level</th><th>What the answer looks like</th></tr></thead>
+            <tbody>
+              <tr><td><b>SDE-1 answer looks like...</b></td><td>"Events go to Kafka keyed by itemId; each aggregator counts its items per minute and keeps a local top-K heap, a merger combines them into the global list every minute, and the API serves that list from Redis."</td></tr>
+              <tr><td><b>SDE-2 adds...</b></td><td>"I explain why the merge is exact only when one shard owns each item, size a count-min sketch from epsilon and delta when 4 billion keys do not fit, salt only detected hot keys, and pair the fast approximate path with an hourly exact batch."</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Common mistakes:</b> computing top-K per request; sorting all 4B items; one global counter table; claiming merged local top-Ks are always exact; using a count-min sketch for exact counts; forgetting late events and duplicates; using Prometheus for a billion-key ranking.</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>Design Amazon's "best sellers by category" (sales rank).</summary>
+          <div class="answer">
+            <p>Writes are about 400/s, reads about 40,000/s, results updated hourly - so batch is fine. Store raw sales logs in object storage; run an hourly two-step MapReduce/Spark job: sum quantity per (category, product) for the past week, then sort within each category. Write the top N per category to a <code>sales_rank</code> table and cache it; reads hit the cache. If the business wants fresher ranks for hot categories, add a streaming path for those only.</p>
+            <div class="approach"><h5>How to answer</h5><p>Let the numbers pick the architecture: low write rate + hourly freshness means batch. Then show the MapReduce steps.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>An item is in multiple categories - what changes?</li><li>How would you make it near real-time?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>Design top-K most viewed videos for the last hour, day, month and all time.</summary>
+          <div class="answer">
+            <p>Events to Kafka keyed by videoId (700k/s). A stream processor pre-aggregates per video per minute, maintains window totals (add new minute, subtract expired) and a local top-K heap per window. A merger combines local lists every few seconds - exact because each video is on one partition - and publishes per-window results to Redis. The API reads only Redis. All-time counts go to a sharded KV store (64 GB). Raw events land in object storage for an exact batch recompute.</p>
+            <div class="approach"><h5>How to answer</h5><p>Requirements, numbers, one clear pipeline, then pick two deep dives (windows and hot keys) unprompted.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Make "last hour" truly sliding.</li><li>One video gets 30% of all views.</li><li>A consumer crashes - do you lose counts?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>Can you get the global top-K by merging each shard's top-K?</summary>
+          <div class="answer">
+            <p>Only if each item's full count lives on one shard (partitioned by item). Otherwise an item that is just below the cut on every shard can be the overall winner and is never sent up. Fixes: partition by item; send K plus a buffer; or do two passes - collect candidates, then recount only them exactly. Apache Druid's TopN is a real example: it merges the top 1,000 per segment and documents that the result is approximate above 1,000 distinct values.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the counter-example (48 + 48 = 96 beats 50), then the fixes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How big a buffer is "enough"?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon,Atlassian">
+          <summary>Explain the count-min sketch. Why does it never under-count?</summary>
+          <div class="answer">
+            <p>A grid of d rows by w counters with d independent hashes. Add: increment one counter per row. Query: minimum across the rows. Other items can only add to a counter through collisions, never remove, so each counter is at least the true count, and so is the minimum. Size: w = ceil(e/epsilon), d = ceil(ln(1/delta)); 0.1% error at 99% confidence needs about 13,600 counters (about 54 KB). Pair it with a K-sized min-heap to keep the actual winners, since a sketch cannot list its keys.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the grid, do one add and one query, state the guarantee and the sizing formula.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Can you merge two sketches? (Yes, cell-wise add, same dimensions and hashes.)</li><li>Can you delete? (Only decrement items you previously added.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Atlassian">
+          <summary>Show the top-K popular pages, but exclude pages the user has already viewed.</summary>
+          <div class="answer">
+            <p>Do not personalize the counting. Compute a global (or per-space) ranked candidate list of K plus a buffer (for example 3K) in the pipeline. At read time, filter out the user's viewed pages using a per-user viewed set or a Bloom filter (a false positive only hides a page, which is harmless), and return the first K left. If the user has seen most candidates, fall back to a longer list.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate global computation from per-user filtering, explain buffer sizing and why a Bloom filter's error direction is acceptable.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Add time decay so old popular pages fade.</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>How do you implement a sliding last-hour window without huge state?</summary>
+          <div class="answer">
+            <p>Keep per-item counts in 60 one-minute buckets (a ring buffer). Each minute, add the newest bucket into the hour total and subtract the bucket that fell out; update the heap for items that changed. Alternatively run a second Kafka consumer group one hour behind that decrements. Avoid letting the stream engine keep every overlapping window - a month sliding by the minute is 43,200 windows per event.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the blow-up number, then the bucket trick, then mention the "decrementing consumer" alternative.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>An item drops out of the top-K when its count goes down - how does the heap handle decreases?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Meta,Amazon">
+          <summary>A single viral item overloads one partition. What do you do?</summary>
+          <div class="answer">
+            <p>Pre-aggregate at the edge (each ingest server sends one summed increment per item per second), which shrinks the hottest keys the most. If still hot, salt only that key across a few partitions and have the merger add the partial counts before ranking. Batch downstream writes. Monitor per-partition lag to detect it.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cheapest fix first; explain why blind salting would break merge exactness.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect hot keys automatically?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Meta,Amazon">
+          <summary>Lambda or Kappa for this pipeline?</summary>
+          <div class="answer">
+            <p>Lambda: a fast streaming path (fresh, maybe approximate) plus a batch path over raw data (exact, late) that overwrites closed windows. Easy to reason about accuracy, but two code paths to keep in sync. Kappa: one streaming path; fix bugs by replaying Kafka from retained logs - simpler code, but needs long retention and careful reprocessing. For views I would pick Kappa with exact keyed counting; for money-like data (sales rank used in reports) add the batch reconciliation.</p>
+            <div class="approach"><h5>How to answer</h5><p>Define both in one line each, then choose based on accuracy needs and team cost.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long must Kafka retain data for Kappa here?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Meta,Amazon">
+          <summary>Why not just cache the result of a SQL query with a TTL?</summary>
+          <div class="answer">
+            <p>It works for small data, but the query itself (GROUP BY over billions of rows per window) is too slow, and when the TTL expires many requests hit the DB together (a stampede) and break the latency target. Precompute on a schedule or continuously, write the result to the cache, and keep the previous result as a fallback if the job is late.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the stampede problem and the "precompute + keep last good" fix.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the precompute job fails for an hour?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Razorpay,Meta">
+          <summary>How is "trending" different from "top-K"?</summary>
+          <div class="answer">
+            <p>Top-K ranks by raw count; trending ranks by <b>change</b> versus a baseline - otherwise "good morning" trends every day. Compute the current window count and compare it to the same item's historical rate (a ratio or z-score), with a minimum volume threshold. The pipeline is the same; only the scoring step changes. The full design is <a href="{{BASE}}hld/d29">Trending Topics</a>.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the "good morning" example, then the velocity score.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you stop bots from manufacturing a trend?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the top-K page shows yesterday's list</h4>
+          <div class="situation"><p>At 10:15 the "last hour" list is identical to 09:00's list. The API is healthy.</p></div>
+          <div class="bad"><p>Weak answer: "Flush the Redis cache."</p></div>
+          <div class="good"><p>Strong answer: the API serves whatever was published last, so look at the publisher and the pipeline. Check the published result's timestamp, Flink job status and checkpoint failures, and Kafka consumer lag per partition. A single stuck partition (a hot key or a poison message) holds back the event-time watermark, so windows never close. Fix the stuck partition, then expose result age on the page and alert when it exceeds 2 minutes.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do idle partitions affect watermarks? (Mark them idle.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: a small creator sees a wrong view count</h4>
+          <div class="situation"><p>The ranking uses a count-min sketch. A creator with 40 views sees "2,100 views".</p></div>
+          <div class="bad"><p>Weak answer: "Make the sketch wider."</p></div>
+          <div class="good"><p>Strong answer: the sketch is only trustworthy above <code>epsilon x total</code>; small items are noise by design. Never show sketch estimates as an item's count. Keep exact per-item counters (sharded KV) for display, and use the sketch only to pick the top-K candidates.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Then why use a sketch at all? (Memory per window and per node.)</li></ul></div>
+        </div>
+      

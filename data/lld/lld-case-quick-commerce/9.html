@@ -1,0 +1,897 @@
+
+  <h2>Full code</h2>
+  <h3 id="build-steps">Build it in 4 steps</h3>
+  <p>Before the full listing, here is the order to write it in. Each step is a real excerpt from the files below (cut at about 15 lines), so you can see where each idea from the patterns table actually lives.</p>
+  <div class="stepper" data-stepper>
+   <div class="step-frames">
+    <div data-step-only="1">
+<pre><code class="language-java">enum OrderStatus {
+    CREATED, CONFIRMED, PACKED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED, EXPIRED;
+    boolean canMoveTo(OrderStatus n) {
+        switch (this) {
+            case CREATED:          return n == CONFIRMED || n == CANCELLED || n == EXPIRED;
+            case CONFIRMED:        return n == PACKED || n == CANCELLED;
+            case PACKED:           return n == OUT_FOR_DELIVERY || n == CANCELLED;
+            case OUT_FOR_DELIVERY: return n == DELIVERED;
+            default:               return false;
+        }
+    }
+    boolean holdsReservation() { return this == CREATED; }
+    boolean holdsDeductedStock() { return this == CONFIRMED || this == PACKED; }
+}</code></pre>
+<pre><code class="language-java">final class StockItem {
+    final String sku;
+    final ReentrantLock lock = new ReentrantLock();
+    private int onHand, reserved;                     // guarded by lock
+    StockItem(String sku) { this.sku = sku; }
+
+    int available() { lock.lock(); try { return onHand - reserved; } finally { lock.unlock(); } }   // C: finally runs on every exit path: the goto out_unlock label
+    int onHand()    { lock.lock(); try { return onHand; } finally { lock.unlock(); } }
+    int reserved()  { lock.lock(); try { return reserved; } finally { lock.unlock(); } }
+    void restock(int q) { lock.lock(); try { onHand += q; } finally { lock.unlock(); } }
+
+    // The callers below already hold `lock` (taken in sorted SKU order by DarkStore).
+    // ... (the rest is in the full code below)</code></pre>
+    </div>
+    <div data-step-only="2">
+<pre><code class="language-java">interface StoreSelector {
+    Optional&lt;DarkStore&gt; pick(Collection&lt;DarkStore&gt; stores, double cx, double cy, Map&lt;String, Integer&gt; lines);   // C: Optional = a pointer that may be NULL, made explicit
+}</code></pre>
+<pre><code class="language-java">final class NearestFullBasketSelector implements StoreSelector {
+    private final double maxKm;
+    NearestFullBasketSelector(double maxKm) { this.maxKm = maxKm; }
+    public Optional&lt;DarkStore&gt; pick(Collection&lt;DarkStore&gt; stores, double cx, double cy, Map&lt;String, Integer&gt; lines) {
+        return stores.stream()   // C: stream() = a for-loop written as filter/map/collect
+                .filter(s -&gt; s.distanceTo(cx, cy) &lt;= maxKm &amp;&amp; s.hasAll(lines))   // C: a lambda = a function pointer plus its captured context
+                .min(Comparator.comparingDouble((DarkStore s) -&gt; s.distanceTo(cx, cy)).thenComparing(s -&gt; s.id));   // C: builds the cmp() function you would pass to qsort
+    }
+}</code></pre>
+    </div>
+    <div data-step-only="3">
+<pre><code class="language-java">    boolean reserveAll(Map&lt;String, Integer&gt; lines) {
+        List&lt;StockItem&gt; items = lockSorted(lines);
+        try {
+            for (StockItem s : items) if (!s.canReserveLocked(lines.get(s.sku))) return false;
+            for (StockItem s : items) s.reserveLocked(lines.get(s.sku));
+            return true;
+        } finally { unlock(items); }
+    }</code></pre>
+<pre><code class="language-java">    OrderStatus onPayment(String orderId, boolean success) {
+        Order o = order(orderId);
+        synchronized (o) {                                   // lock order: order monitor, then SKU locks
+            if (o.status() == OrderStatus.CREATED &amp;&amp; clock.nowMs() &gt; o.expiresAtMs) expire(o);
+            OrderStatus now = o.status();
+            if (now != OrderStatus.CREATED) {                // duplicate or out-of-order webhook
+                if (success &amp;&amp; (now == OrderStatus.EXPIRED || now == OrderStatus.CANCELLED))
+                    throw new QcException("order " + orderId + " is " + now + ": refund the payment");
+                return now;                                  // e.g. failure after success: ignored
+            }
+            if (success) { o.moveTo(OrderStatus.CONFIRMED); o.store.commitAll(o.lines); }
+            else         { o.moveTo(OrderStatus.CANCELLED); o.store.releaseAll(o.lines); }
+            return o.status();
+        }
+    }</code></pre>
+    </div>
+    <div data-step-only="4">
+<pre><code class="language-java">    public static void main(String[] args) throws Exception {
+        ManualClock clock = new ManualClock();
+        QuickCommerce qc = new QuickCommerce(new NearestFullBasketSelector(3.0), clock, 5 * 60_000);
+        qc.addProduct("milk", "Milk 1L", 60); qc.addProduct("bread", "Bread", 40); qc.addProduct("eggs", "Eggs x6", 50);
+        qc.addStore("DS-near", 0.5, 0.5); qc.addStore("DS-far", 2.0, 1.5);
+        qc.restock("DS-near", "milk", 2); qc.restock("DS-near", "bread", 10);
+        qc.restock("DS-far", "milk", 10); qc.restock("DS-far", "bread", 10); qc.restock("DS-far", "eggs", 10);
+
+        System.out.println("CREATE q1 milk x2 bread x1 (customer at 0,0)");
+        Order q1 = qc.createOrder("asha", 0, 0, m("milk", 2, "bread", 1));
+        System.out.println("  -&gt; " + q1.id + " at " + q1.store.id + " total=" + q1.total + " status=" + q1.status());
+        check(q1.store.id.equals("DS-near") &amp;&amp; q1.total == 160, "nearest store, 2x60 + 40");
+        System.out.println("  " + stock(q1.store, "milk"));
+        check(q1.store.item("milk").available() == 0 &amp;&amp; q1.store.item("milk").onHand() == 2, "reserved, not deducted");
+
+// ... (the rest is in the full code below)</code></pre>
+    </div>
+   </div>
+    <ol class="stepper-captions">
+      <li><b>Enums and data classes.</b> <code>OrderStatus</code> holds the legal transitions; <code>StockItem</code> keeps <code>onHand</code> and <code>reserved</code> behind one lock per SKU.</li>
+      <li><b>One interface, one implementation.</b> <code>StoreSelector</code> is the Strategy for picking a dark store; <code>NearestFullBasketSelector</code> is the rule the interviewer gives first.</li>
+      <li><b>The facade's core methods.</b> <code>reserveAll</code> takes the SKU locks in sorted order and checks the whole basket; <code>onPayment</code> acts only while the order is CREATED, so a late or duplicate webhook changes nothing.</li>
+      <li><b>The driver.</b> <code>main</code> builds two stores, places baskets and fires webhooks in the wrong order on purpose.</li>
+    </ol>
+  </div>
+  <h3 id="reading-order">How to read the full code</h3>
+  <p><b>Reading order:</b> Read <code>StockItem</code> and <code>DarkStore.reserveAll</code> first (the lock order lives there), then <code>OrderStatus</code>, then <code>QuickCommerce.createOrder</code>, <code>onPayment</code> and <code>cancel</code>. Skip <code>ManualClock</code> and the race harness in <code>Main</code> on a first read.</p>
+  <details class="callout note">
+    <summary><b>Java for C readers</b>: the idioms this page's code uses (open if a line looks strange)</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>x -&gt; x.price</code> (lambda)</td><td>An anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you would hand to <code>qsort</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A pointer to a function that already exists, written without a wrapper: <code>Post::score</code> is <code>&amp;post_score</code>.</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, made explicit in the type, so the caller has to say what happens when it is empty (<code>orElse</code>, <code>isPresent</code>, <code>map</code>).</td></tr>
+        <tr><td><code>.stream().filter(..).map(..).collect(..)</code></td><td>A for-loop written as a pipeline: <code>filter</code> is <code>if (!pred(x)) continue;</code>, <code>map</code> transforms each element, <code>collect</code>/<code>toList</code> appends the survivors to a new array.</td></tr>
+        <tr><td><code>map.computeIfAbsent(k, f)</code></td><td>Lookup-or-create in one call: find <code>k</code>; if it is missing, call <code>f</code>, insert the result and return it.</td></tr>
+        <tr><td><code>Comparator.comparing(f).reversed().thenComparing(g)</code></td><td>Builds the <code>cmp()</code> function field by field: compare by <code>f</code>, negate the result, break ties with <code>g</code>.</td></tr>
+        <tr><td><code>enum</code> with fields and methods</td><td>A Java enum is a fixed set of singleton objects: think of a <code>static const</code> array of structs that can carry function pointers.</td></tr>
+        <tr><td><code>lock(); try { ... } finally { unlock(); }</code></td><td>The <code>finally</code> block runs on every exit path, normal return or exception: it is the <code>goto out_unlock;</code> label of kernel C.</td></tr>
+        <tr><td><code>synchronized</code></td><td>Take the object's built-in mutex on entry and release it on every exit. It is reentrant: the owning thread may enter again.</td></tr>
+        <tr><td><code>throw new XException(..)</code></td><td>Unwinds to the nearest <code>catch</code>: an error return that a caller cannot silently ignore.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The source files mark the first use of each idiom with a short <code>// C: ...</code> comment. The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <p>Java is the primary version and contains the 20-thread race with mixed SKU order. Python mirrors it (locks via <code>threading.Lock</code>, sorted acquisition via <code>ExitStack</code>) with a unittest suite that includes a deadlock check and a payment-versus-expiry race. C++14 is single-threaded (the MinGW g++ 6.3 used for testing has no <code>std::mutex</code>); comments mark where locks go. Source: <code>lld-code/lld-case-quick-commerce/</code>.</p>
+  <h3>Java (primary)</h3>
+  <p>Everything is in one <code>Main.java</code> so the page reads top to bottom: <code>javac -d out Main.java &amp;&amp; java -cp out Main</code>. In a real round, split it into one top-level type per file (see <a href="{{BASE}}lld/lld-int-code-layout">code layout</a>).</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Main.java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+// Quick-commerce order + inventory (Zepto style): reserve at create, deduct at confirm, release on
+// cancel / payment failure / timeout. In-memory, thread-safe. Build: javac -d out Main.java &amp;&amp; java -cp out Main
+
+class QcException extends RuntimeException {
+    QcException(String msg) { super(msg); }
+}
+
+// ---------- time is injected so tests can move it ----------
+interface Clock { long nowMs(); }
+final class ManualClock implements Clock {
+    private final AtomicLong now = new AtomicLong();
+    public long nowMs() { return now.get(); }
+    void advance(long ms) { now.addAndGet(ms); }
+}
+
+// ---------- inventory ----------
+final class Product {
+    final String sku, name; final int price;         // price in rupees
+    Product(String sku, String name, int price) { this.sku = sku; this.name = name; this.price = price; }
+}
+
+/** One SKU in one dark store. Invariant: 0 &lt;= reserved &lt;= onHand. available = onHand - reserved. */
+final class StockItem {
+    final String sku;
+    final ReentrantLock lock = new ReentrantLock();
+    private int onHand, reserved;                     // guarded by lock
+    StockItem(String sku) { this.sku = sku; }
+
+    int available() { lock.lock(); try { return onHand - reserved; } finally { lock.unlock(); } }   // C: finally runs on every exit path: the goto out_unlock label
+    int onHand()    { lock.lock(); try { return onHand; } finally { lock.unlock(); } }
+    int reserved()  { lock.lock(); try { return reserved; } finally { lock.unlock(); } }
+    void restock(int q) { lock.lock(); try { onHand += q; } finally { lock.unlock(); } }
+
+    // The callers below already hold `lock` (taken in sorted SKU order by DarkStore).
+    boolean canReserveLocked(int q) { return onHand - reserved &gt;= q; }
+    void reserveLocked(int q)  { reserved += q; }
+    void releaseLocked(int q)  { reserved -= q; }
+    void commitLocked(int q)   { reserved -= q; onHand -= q; }
+}
+
+final class DarkStore {
+    final String id; final double x, y;               // grid position in km
+    private final Map&lt;String, StockItem&gt; stock = new ConcurrentHashMap&lt;&gt;();
+    DarkStore(String id, double x, double y) { this.id = id; this.x = x; this.y = y; }
+
+    StockItem item(String sku) { return stock.computeIfAbsent(sku, StockItem::new); }   // C: Type::method = a pointer to an existing function
+    int available(String sku) { StockItem s = stock.get(sku); return s == null ? 0 : s.available(); }
+    double distanceTo(double cx, double cy) { return Math.hypot(x - cx, y - cy); }
+
+    boolean hasAll(Map&lt;String, Integer&gt; lines) {
+        for (Map.Entry&lt;String, Integer&gt; e : lines.entrySet()) if (available(e.getKey()) &lt; e.getValue()) return false;
+        return true;
+    }
+
+    /** All-or-nothing reservation. Locks are taken in sorted SKU order, so two baskets never deadlock. */
+    boolean reserveAll(Map&lt;String, Integer&gt; lines) {
+        List&lt;StockItem&gt; items = lockSorted(lines);
+        try {
+            for (StockItem s : items) if (!s.canReserveLocked(lines.get(s.sku))) return false;
+            for (StockItem s : items) s.reserveLocked(lines.get(s.sku));
+            return true;
+        } finally { unlock(items); }
+    }
+
+    void releaseAll(Map&lt;String, Integer&gt; lines) {
+        List&lt;StockItem&gt; items = lockSorted(lines);
+        try { for (StockItem s : items) s.releaseLocked(lines.get(s.sku)); } finally { unlock(items); }
+    }
+
+    void commitAll(Map&lt;String, Integer&gt; lines) {
+        List&lt;StockItem&gt; items = lockSorted(lines);
+        try { for (StockItem s : items) s.commitLocked(lines.get(s.sku)); } finally { unlock(items); }
+    }
+
+    private List&lt;StockItem&gt; lockSorted(Map&lt;String, Integer&gt; lines) {
+        List&lt;StockItem&gt; items = new ArrayList&lt;&gt;();
+        for (String sku : new TreeSet&lt;&gt;(lines.keySet())) items.add(item(sku));   // global order: SKU name
+        for (StockItem s : items) s.lock.lock();
+        return items;
+    }
+    private static void unlock(List&lt;StockItem&gt; items) {
+        for (int i = items.size() - 1; i &gt;= 0; i--) items.get(i).lock.unlock();
+    }
+}
+
+// ---------- order state ----------
+enum OrderStatus {
+    CREATED, CONFIRMED, PACKED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED, EXPIRED;
+    boolean canMoveTo(OrderStatus n) {
+        switch (this) {
+            case CREATED:          return n == CONFIRMED || n == CANCELLED || n == EXPIRED;
+            case CONFIRMED:        return n == PACKED || n == CANCELLED;
+            case PACKED:           return n == OUT_FOR_DELIVERY || n == CANCELLED;
+            case OUT_FOR_DELIVERY: return n == DELIVERED;
+            default:               return false;
+        }
+    }
+    boolean holdsReservation() { return this == CREATED; }
+    boolean holdsDeductedStock() { return this == CONFIRMED || this == PACKED; }
+}
+
+final class Order {
+    final String id, customer; final DarkStore store;
+    final Map&lt;String, Integer&gt; lines; final int total; final long expiresAtMs;
+    private OrderStatus status = OrderStatus.CREATED;
+    Order(String id, String customer, DarkStore store, Map&lt;String, Integer&gt; lines, int total, long expiresAtMs) {
+        this.id = id; this.customer = customer; this.store = store;
+        this.lines = Collections.unmodifiableMap(new TreeMap&lt;&gt;(lines)); this.total = total; this.expiresAtMs = expiresAtMs;
+    }
+    synchronized OrderStatus status() { return status; }
+    /** Guarded transition; returns the old status. Exactly one of two racing callers wins. */
+    synchronized OrderStatus moveTo(OrderStatus n) {
+        if (!status.canMoveTo(n)) throw new QcException("order " + id + ": " + status + " -&gt; " + n + " not allowed");
+        OrderStatus old = status; status = n; return old;
+    }
+}
+
+// ---------- strategy: which dark store serves this basket ----------
+interface StoreSelector {
+    Optional&lt;DarkStore&gt; pick(Collection&lt;DarkStore&gt; stores, double cx, double cy, Map&lt;String, Integer&gt; lines);   // C: Optional = a pointer that may be NULL, made explicit
+}
+
+final class NearestFullBasketSelector implements StoreSelector {
+    private final double maxKm;
+    NearestFullBasketSelector(double maxKm) { this.maxKm = maxKm; }
+    public Optional&lt;DarkStore&gt; pick(Collection&lt;DarkStore&gt; stores, double cx, double cy, Map&lt;String, Integer&gt; lines) {
+        return stores.stream()   // C: stream() = a for-loop written as filter/map/collect
+                .filter(s -&gt; s.distanceTo(cx, cy) &lt;= maxKm &amp;&amp; s.hasAll(lines))   // C: a lambda = a function pointer plus its captured context
+                .min(Comparator.comparingDouble((DarkStore s) -&gt; s.distanceTo(cx, cy)).thenComparing(s -&gt; s.id));   // C: builds the cmp() function you would pass to qsort
+    }
+}
+
+// ---------- service facade ----------
+final class QuickCommerce {
+    private final Map&lt;String, Product&gt; catalog = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, DarkStore&gt; stores = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Order&gt; orders = new ConcurrentHashMap&lt;&gt;();
+    private final AtomicInteger seq = new AtomicInteger();
+    private final StoreSelector selector; private final Clock clock; private final long holdMs;
+
+    QuickCommerce(StoreSelector selector, Clock clock, long holdMs) {
+        this.selector = selector; this.clock = clock; this.holdMs = holdMs;
+    }
+
+    void addProduct(String sku, String name, int price) { catalog.put(sku, new Product(sku, name, price)); }
+    void addStore(String id, double x, double y) { stores.putIfAbsent(id, new DarkStore(id, x, y)); }
+    void restock(String storeId, String sku, int qty) {
+        if (!catalog.containsKey(sku) || qty &lt;= 0) throw new QcException("bad restock " + sku + " " + qty);
+        store(storeId).item(sku).restock(qty);
+    }
+
+    /** Pick a store, reserve the whole basket there, create the order (awaiting payment). */
+    Order createOrder(String customer, double cx, double cy, Map&lt;String, Integer&gt; lines) {
+        if (lines.isEmpty()) throw new QcException("empty basket");
+        int total = 0;
+        for (Map.Entry&lt;String, Integer&gt; e : lines.entrySet()) {
+            Product p = catalog.get(e.getKey());
+            if (p == null || e.getValue() &lt;= 0) throw new QcException("bad line " + e);
+            total += p.price * e.getValue();
+        }
+        List&lt;DarkStore&gt; candidates = new ArrayList&lt;&gt;(stores.values());
+        while (true) {
+            Optional&lt;DarkStore&gt; pick = selector.pick(candidates, cx, cy, lines);
+            if (!pick.isPresent()) throw new QcException("out of stock nearby for " + lines);
+            DarkStore s = pick.get();
+            if (s.reserveAll(lines)) {                       // the real check, under the SKU locks
+                Order o = new Order("q" + seq.incrementAndGet(), customer, s, lines, total, clock.nowMs() + holdMs);
+                orders.put(o.id, o);
+                return o;
+            }
+            candidates.remove(s);                            // stock moved since hasAll(): try the next store
+        }
+    }
+
+    /** Payment callback. Acts only while the order is CREATED (awaiting payment). A duplicate, or a
+     *  late webhook that arrives after the order moved on (gateways retry and reorder), changes nothing:
+     *  a failure after success must not release stock that was already committed. */
+    OrderStatus onPayment(String orderId, boolean success) {
+        Order o = order(orderId);
+        synchronized (o) {                                   // lock order: order monitor, then SKU locks
+            if (o.status() == OrderStatus.CREATED &amp;&amp; clock.nowMs() &gt; o.expiresAtMs) expire(o);
+            OrderStatus now = o.status();
+            if (now != OrderStatus.CREATED) {                // duplicate or out-of-order webhook
+                if (success &amp;&amp; (now == OrderStatus.EXPIRED || now == OrderStatus.CANCELLED))
+                    throw new QcException("order " + orderId + " is " + now + ": refund the payment");
+                return now;                                  // e.g. failure after success: ignored
+            }
+            if (success) { o.moveTo(OrderStatus.CONFIRMED); o.store.commitAll(o.lines); }
+            else         { o.moveTo(OrderStatus.CANCELLED); o.store.releaseAll(o.lines); }
+            return o.status();
+        }
+    }
+
+    void pack(String orderId) { order(orderId).moveTo(OrderStatus.PACKED); }
+    void dispatch(String orderId) { order(orderId).moveTo(OrderStatus.OUT_FOR_DELIVERY); }
+    void deliver(String orderId) { order(orderId).moveTo(OrderStatus.DELIVERED); }
+
+    void cancel(String orderId) {
+        Order o = order(orderId);
+        synchronized (o) {                                   // state change and its side effect together
+            OrderStatus old = o.moveTo(OrderStatus.CANCELLED);
+            if (old.holdsReservation()) o.store.releaseAll(o.lines);                  // never deducted
+            else if (old.holdsDeductedStock()) o.lines.forEach((k, v) -&gt; o.store.item(k).restock(v)); // put back on shelf
+        }
+    }
+
+    /** Called by a scheduler every few seconds. Returns how many holds were released. */
+    int sweepExpired() {
+        int n = 0;
+        for (Order o : orders.values())
+            if (o.status() == OrderStatus.CREATED &amp;&amp; clock.nowMs() &gt; o.expiresAtMs &amp;&amp; expire(o)) n++;
+        return n;
+    }
+
+    private boolean expire(Order o) {
+        synchronized (o) {                                   // reentrant: onPayment may already hold it
+            try { o.moveTo(OrderStatus.EXPIRED); } catch (QcException lostRace) { return false; }
+            o.store.releaseAll(o.lines);
+            return true;
+        }
+    }
+
+    Order order(String id) { Order o = orders.get(id); if (o == null) throw new QcException("unknown order " + id); return o; }
+    DarkStore store(String id) { DarkStore s = stores.get(id); if (s == null) throw new QcException("unknown store " + id); return s; }
+}
+
+// ---------- demo driver ----------
+public class Main {
+    static int checks = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); checks++; }
+    static Map&lt;String, Integer&gt; m(Object... kv) {
+        Map&lt;String, Integer&gt; out = new LinkedHashMap&lt;&gt;();
+        for (int i = 0; i &lt; kv.length; i += 2) out.put((String) kv[i], (Integer) kv[i + 1]);
+        return out;
+    }
+    static void expectFail(Runnable r) {
+        try { r.run(); check(false, "should fail"); }
+        catch (QcException e) { System.out.println("rejected: " + e.getMessage()); checks++; }
+    }
+    static String stock(DarkStore s, String sku) {
+        StockItem i = s.item(sku);
+        return sku + "@" + s.id + " onHand=" + i.onHand() + " reserved=" + i.reserved() + " available=" + i.available();
+    }
+
+    public static void main(String[] args) throws Exception {
+        ManualClock clock = new ManualClock();
+        QuickCommerce qc = new QuickCommerce(new NearestFullBasketSelector(3.0), clock, 5 * 60_000);
+        qc.addProduct("milk", "Milk 1L", 60); qc.addProduct("bread", "Bread", 40); qc.addProduct("eggs", "Eggs x6", 50);
+        qc.addStore("DS-near", 0.5, 0.5); qc.addStore("DS-far", 2.0, 1.5);
+        qc.restock("DS-near", "milk", 2); qc.restock("DS-near", "bread", 10);
+        qc.restock("DS-far", "milk", 10); qc.restock("DS-far", "bread", 10); qc.restock("DS-far", "eggs", 10);
+
+        System.out.println("CREATE q1 milk x2 bread x1 (customer at 0,0)");
+        Order q1 = qc.createOrder("asha", 0, 0, m("milk", 2, "bread", 1));
+        System.out.println("  -&gt; " + q1.id + " at " + q1.store.id + " total=" + q1.total + " status=" + q1.status());
+        check(q1.store.id.equals("DS-near") &amp;&amp; q1.total == 160, "nearest store, 2x60 + 40");
+        System.out.println("  " + stock(q1.store, "milk"));
+        check(q1.store.item("milk").available() == 0 &amp;&amp; q1.store.item("milk").onHand() == 2, "reserved, not deducted");
+
+        System.out.println("CREATE q2 milk x1 eggs x1 -&gt; near store has neither now");
+        Order q2 = qc.createOrder("ravi", 0, 0, m("milk", 1, "eggs", 1));
+        System.out.println("  -&gt; " + q2.id + " at " + q2.store.id);
+        check(q2.store.id.equals("DS-far"), "falls back to the farther store that has the full basket");
+        expectFail(() -&gt; qc.createOrder("far-away", 9, 9, m("milk", 1)));
+
+        System.out.println("PAY q1 ok (twice: duplicate webhook)");
+        qc.onPayment(q1.id, true);
+        check(qc.onPayment(q1.id, true) == OrderStatus.CONFIRMED, "idempotent confirm");
+        System.out.println("  " + stock(q1.store, "milk"));
+        check(q1.store.item("milk").onHand() == 0 &amp;&amp; q1.store.item("milk").reserved() == 0, "deducted once");
+
+        System.out.println("LATE failure webhook for paid q1 -&gt; ignored");
+        check(qc.onPayment(q1.id, false) == OrderStatus.CONFIRMED, "late failure does not cancel a paid order");
+        System.out.println("  " + stock(q1.store, "milk"));
+        check(q1.store.item("milk").onHand() == 0 &amp;&amp; q1.store.item("milk").reserved() == 0, "success then failure leaves counters unchanged");
+
+        System.out.println("PAY q2 failed -&gt; stock released");
+        qc.onPayment(q2.id, false);
+        check(q2.status() == OrderStatus.CANCELLED &amp;&amp; q2.store.item("eggs").available() == 10, "eggs back");
+
+        System.out.println("CANCEL q1 after packing -&gt; back on the shelf");
+        qc.pack(q1.id);
+        qc.cancel(q1.id);
+        check(q1.store.item("milk").available() == 2, "milk restocked");
+
+        System.out.println("TIMEOUT: q3 holds bread, clock +6 min, then sweep");
+        Order q3 = qc.createOrder("meera", 0, 0, m("bread", 4));
+        clock.advance(6 * 60_000);
+        check(qc.sweepExpired() == 1 &amp;&amp; q3.status() == OrderStatus.EXPIRED, "hold expired");
+        check(q3.store.item("bread").available() == 10, "bread released");
+        expectFail(() -&gt; qc.onPayment(q3.id, true));
+
+        System.out.println("RACE 20 shoppers, 5 milk left in DS-race; half the baskets list bread first");
+        QuickCommerce race = new QuickCommerce(new NearestFullBasketSelector(5), clock, 60_000);
+        race.addProduct("milk", "Milk 1L", 60); race.addProduct("bread", "Bread", 40);
+        race.addStore("DS-race", 0, 0);
+        race.restock("DS-race", "milk", 5); race.restock("DS-race", "bread", 100);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch go = new CountDownLatch(1);
+        List&lt;Future&lt;Order&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 20; i++) {
+            final Map&lt;String, Integer&gt; basket = (i % 2 == 0) ? m("milk", 1, "bread", 1) : m("bread", 1, "milk", 1);
+            final String who = "u" + i;
+            fs.add(pool.submit(() -&gt; {
+                go.await();
+                try { return race.createOrder(who, 0, 0, basket); } catch (QcException e) { return null; }
+            }));
+        }
+        go.countDown();
+        List&lt;Order&gt; won = new ArrayList&lt;&gt;();
+        for (Future&lt;Order&gt; f : fs) { Order o = f.get(10, TimeUnit.SECONDS); if (o != null) won.add(o); }
+        pool.shutdown();
+        DarkStore ds = race.store("DS-race");
+        System.out.println("  orders=" + won.size() + "  " + stock(ds, "milk"));
+        check(won.size() == 5 &amp;&amp; ds.item("milk").available() == 0 &amp;&amp; ds.item("milk").reserved() == 5, "never oversold");
+        for (int i = 0; i &lt; 3; i++) race.onPayment(won.get(i).id, true);
+        clock.advance(2 * 60_000);
+        check(race.sweepExpired() == 2, "two unpaid holds expire");
+        System.out.println("  after 3 paid + 2 expired: " + stock(ds, "milk"));
+        check(ds.item("milk").onHand() == 2 &amp;&amp; ds.item("milk").reserved() == 0, "sold 3, 2 back on sale");
+
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+}</code></pre>
+    </div>
+  </div>
+  <h3>Python</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Quick-commerce order + inventory (Zepto style): reserve at create, deduct at confirm, release on
+cancel / payment failure / timeout. In-memory, thread-safe. Run: python main.py ; tests: python -m unittest"""
+from __future__ import annotations
+
+import itertools
+import math
+import threading
+from contextlib import ExitStack
+from enum import Enum
+from typing import Dict, Iterable, List, Optional
+
+
+class QcError(Exception):
+    pass
+
+
+class ManualClock:
+    def __init__(self) -&gt; None:
+        self._now = 0
+        self._lock = threading.Lock()
+
+    def now_ms(self) -&gt; int:
+        with self._lock:
+            return self._now
+
+    def advance(self, ms: int) -&gt; None:
+        with self._lock:
+            self._now += ms
+
+
+class StockItem:
+    """One SKU in one dark store. Invariant: 0 &lt;= reserved &lt;= on_hand."""
+
+    def __init__(self, sku: str):
+        self.sku = sku
+        self.lock = threading.Lock()
+        self.on_hand = 0      # guarded by lock
+        self.reserved = 0     # guarded by lock
+
+    def available(self) -&gt; int:
+        with self.lock:
+            return self.on_hand - self.reserved
+
+    def restock(self, q: int) -&gt; None:
+        with self.lock:
+            self.on_hand += q
+
+
+class DarkStore:
+    def __init__(self, sid: str, x: float, y: float):
+        self.id, self.x, self.y = sid, x, y
+        self._stock: Dict[str, StockItem] = {}
+        self._map_lock = threading.Lock()
+
+    def item(self, sku: str) -&gt; StockItem:
+        with self._map_lock:
+            if sku not in self._stock:
+                self._stock[sku] = StockItem(sku)
+            return self._stock[sku]
+
+    def available(self, sku: str) -&gt; int:
+        return self.item(sku).available()
+
+    def distance_to(self, cx: float, cy: float) -&gt; float:
+        return math.hypot(self.x - cx, self.y - cy)
+
+    def has_all(self, lines: Dict[str, int]) -&gt; bool:
+        return all(self.available(s) &gt;= q for s, q in lines.items())
+
+    def _locked(self, lines: Dict[str, int]):
+        """Take every SKU lock in sorted order (one global order = no deadlock)."""
+        stack = ExitStack()
+        items = [self.item(s) for s in sorted(lines)]
+        for it in items:
+            stack.enter_context(it.lock)
+        return stack, items
+
+    def reserve_all(self, lines: Dict[str, int]) -&gt; bool:
+        stack, items = self._locked(lines)
+        with stack:
+            if any(it.on_hand - it.reserved &lt; lines[it.sku] for it in items):
+                return False
+            for it in items:
+                it.reserved += lines[it.sku]
+            return True
+
+    def release_all(self, lines: Dict[str, int]) -&gt; None:
+        stack, items = self._locked(lines)
+        with stack:
+            for it in items:
+                it.reserved -= lines[it.sku]
+
+    def commit_all(self, lines: Dict[str, int]) -&gt; None:
+        stack, items = self._locked(lines)
+        with stack:
+            for it in items:
+                it.reserved -= lines[it.sku]
+                it.on_hand -= lines[it.sku]
+
+
+class OrderStatus(Enum):
+    CREATED = "CREATED"
+    CONFIRMED = "CONFIRMED"
+    PACKED = "PACKED"
+    OUT_FOR_DELIVERY = "OUT_FOR_DELIVERY"
+    DELIVERED = "DELIVERED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+_NEXT = {
+    OrderStatus.CREATED: {OrderStatus.CONFIRMED, OrderStatus.CANCELLED, OrderStatus.EXPIRED},
+    OrderStatus.CONFIRMED: {OrderStatus.PACKED, OrderStatus.CANCELLED},
+    OrderStatus.PACKED: {OrderStatus.OUT_FOR_DELIVERY, OrderStatus.CANCELLED},
+    OrderStatus.OUT_FOR_DELIVERY: {OrderStatus.DELIVERED},
+    OrderStatus.DELIVERED: set(), OrderStatus.CANCELLED: set(), OrderStatus.EXPIRED: set(),
+}
+
+
+class Order:
+    def __init__(self, oid, customer, store: DarkStore, lines: Dict[str, int], total: int, expires_at_ms: int):
+        self.id, self.customer, self.store = oid, customer, store
+        self.lines = dict(sorted(lines.items()))
+        self.total, self.expires_at_ms = total, expires_at_ms
+        self._status = OrderStatus.CREATED
+        self.lock = threading.RLock()
+
+    @property
+    def status(self) -&gt; OrderStatus:
+        with self.lock:
+            return self._status
+
+    def move_to(self, nxt: OrderStatus) -&gt; OrderStatus:
+        with self.lock:
+            if nxt not in _NEXT[self._status]:
+                raise QcError(f"order {self.id}: {self._status.value} -&gt; {nxt.value} not allowed")
+            old, self._status = self._status, nxt
+            return old
+
+
+class NearestFullBasketSelector:
+    def __init__(self, max_km: float):
+        self.max_km = max_km
+
+    def pick(self, stores: Iterable[DarkStore], cx, cy, lines) -&gt; Optional[DarkStore]:
+        ok = [s for s in stores if s.distance_to(cx, cy) &lt;= self.max_km and s.has_all(lines)]
+        return min(ok, key=lambda s: (s.distance_to(cx, cy), s.id), default=None)
+
+
+class QuickCommerce:
+    def __init__(self, selector, clock: ManualClock, hold_ms: int):
+        self.selector, self.clock, self.hold_ms = selector, clock, hold_ms
+        self._prices: Dict[str, int] = {}
+        self._stores: Dict[str, DarkStore] = {}
+        self._orders: Dict[str, Order] = {}
+        self._seq = itertools.count(1)
+        self._reg = threading.Lock()
+
+    def add_product(self, sku: str, price: int) -&gt; None:
+        with self._reg:
+            self._prices[sku] = price
+
+    def add_store(self, sid: str, x: float, y: float) -&gt; None:
+        with self._reg:
+            self._stores.setdefault(sid, DarkStore(sid, x, y))
+
+    def restock(self, sid: str, sku: str, qty: int) -&gt; None:
+        if sku not in self._prices or qty &lt;= 0:
+            raise QcError(f"bad restock {sku} {qty}")
+        self.store(sid).item(sku).restock(qty)
+
+    def create_order(self, customer: str, cx: float, cy: float, lines: Dict[str, int]) -&gt; Order:
+        if not lines:
+            raise QcError("empty basket")
+        total = 0
+        for sku, q in lines.items():
+            if sku not in self._prices or q &lt;= 0:
+                raise QcError(f"bad line {sku}={q}")
+            total += self._prices[sku] * q
+        with self._reg:
+            candidates = list(self._stores.values())
+        while True:
+            s = self.selector.pick(candidates, cx, cy, lines)
+            if s is None:
+                raise QcError(f"out of stock nearby for {lines}")
+            if s.reserve_all(lines):                     # the real check, under the SKU locks
+                o = Order(f"q{next(self._seq)}", customer, s, lines, total, self.clock.now_ms() + self.hold_ms)
+                with self._reg:
+                    self._orders[o.id] = o
+                return o
+            candidates.remove(s)
+
+    def on_payment(self, oid: str, success: bool) -&gt; OrderStatus:
+        """Acts only while the order is CREATED. A duplicate or late webhook (gateways retry and
+        reorder) changes nothing: a failure after success must not release committed stock."""
+        o = self.order(oid)
+        with o.lock:                                     # lock order: order lock, then SKU locks
+            if o.status is OrderStatus.CREATED and self.clock.now_ms() &gt; o.expires_at_ms:
+                self._expire(o)
+            now = o.status
+            if now is not OrderStatus.CREATED:           # duplicate or out-of-order webhook
+                if success and now in (OrderStatus.EXPIRED, OrderStatus.CANCELLED):
+                    raise QcError(f"order {oid} is {now.value}: refund the payment")
+                return now                               # e.g. failure after success: ignored
+            if success:
+                o.move_to(OrderStatus.CONFIRMED)
+                o.store.commit_all(o.lines)
+            else:
+                o.move_to(OrderStatus.CANCELLED)
+                o.store.release_all(o.lines)
+            return o.status
+
+    def pack(self, oid: str) -&gt; None:
+        self.order(oid).move_to(OrderStatus.PACKED)
+
+    def dispatch(self, oid: str) -&gt; None:
+        self.order(oid).move_to(OrderStatus.OUT_FOR_DELIVERY)
+
+    def deliver(self, oid: str) -&gt; None:
+        self.order(oid).move_to(OrderStatus.DELIVERED)
+
+    def cancel(self, oid: str) -&gt; None:
+        o = self.order(oid)
+        with o.lock:                                     # state change and its side effect together
+            old = o.move_to(OrderStatus.CANCELLED)
+            if old is OrderStatus.CREATED:
+                o.store.release_all(o.lines)             # was only reserved
+            elif old in (OrderStatus.CONFIRMED, OrderStatus.PACKED):
+                for sku, q in o.lines.items():           # was deducted: put it back on the shelf
+                    o.store.item(sku).restock(q)
+
+    def sweep_expired(self) -&gt; int:
+        with self._reg:
+            snapshot = list(self._orders.values())
+        now = self.clock.now_ms()
+        return sum(1 for o in snapshot
+                   if o.status is OrderStatus.CREATED and now &gt; o.expires_at_ms and self._expire(o))
+
+    def _expire(self, o: Order) -&gt; bool:
+        with o.lock:                                     # RLock: on_payment may already hold it
+            try:
+                o.move_to(OrderStatus.EXPIRED)
+            except QcError:
+                return False                             # payment or cancel won the race
+            o.store.release_all(o.lines)
+            return True
+
+    def order(self, oid: str) -&gt; Order:
+        with self._reg:
+            o = self._orders.get(oid)
+        if o is None:
+            raise QcError(f"unknown order {oid}")
+        return o
+
+    def store(self, sid: str) -&gt; DarkStore:
+        with self._reg:
+            s = self._stores.get(sid)
+        if s is None:
+            raise QcError(f"unknown store {sid}")
+        return s
+
+
+def build(clock: ManualClock) -&gt; QuickCommerce:
+    qc = QuickCommerce(NearestFullBasketSelector(3.0), clock, 5 * 60_000)
+    for sku, price in (("milk", 60), ("bread", 40), ("eggs", 50)):
+        qc.add_product(sku, price)
+    qc.add_store("DS-near", 0.5, 0.5)
+    qc.add_store("DS-far", 2.0, 1.5)
+    qc.restock("DS-near", "milk", 2)
+    qc.restock("DS-near", "bread", 10)
+    for sku in ("milk", "bread", "eggs"):
+        qc.restock("DS-far", sku, 10)
+    return qc
+
+
+def demo() -&gt; None:
+    clock = ManualClock()
+    qc = build(clock)
+    q1 = qc.create_order("asha", 0, 0, {"milk": 2, "bread": 1})
+    milk = q1.store.item("milk")
+    print(f"CREATE {q1.id} at {q1.store.id} total={q1.total} milk on_hand={milk.on_hand} reserved={milk.reserved}")
+    q2 = qc.create_order("ravi", 0, 0, {"milk": 1, "eggs": 1})
+    print(f"CREATE {q2.id} at {q2.store.id} (near store lacks the full basket)")
+    qc.on_payment(q1.id, True)
+    print(f"PAY {q1.id} ok twice -&gt; {qc.on_payment(q1.id, True).value}; milk on_hand={milk.on_hand}")
+    print(f"LATE failure webhook for {q1.id} -&gt; {qc.on_payment(q1.id, False).value}; "
+          f"milk on_hand={milk.on_hand} reserved={milk.reserved}")
+    qc.on_payment(q2.id, False)
+    print(f"PAY {q2.id} failed -&gt; {q2.status.value}; eggs available={q2.store.available('eggs')}")
+    q3 = qc.create_order("meera", 0, 0, {"bread": 4})
+    clock.advance(6 * 60_000)
+    print(f"after 6 min: expired={qc.sweep_expired()} {q3.id}={q3.status.value} bread available={q3.store.available('bread')}")
+    try:
+        qc.on_payment(q3.id, True)
+    except QcError as e:
+        print("rejected:", e)
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_main.py">
+<pre><code class="language-python">import threading
+import unittest
+
+from main import ManualClock, NearestFullBasketSelector, OrderStatus, QcError, QuickCommerce, build
+
+
+class QuickCommerceTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = ManualClock()
+        self.qc = build(self.clock)
+
+    def test_reserve_then_deduct(self):
+        o = self.qc.create_order("a", 0, 0, {"milk": 2})
+        milk = o.store.item("milk")
+        self.assertEqual((o.store.id, milk.on_hand, milk.reserved, milk.available()), ("DS-near", 2, 2, 0))
+        self.qc.on_payment(o.id, True)
+        self.assertEqual((milk.on_hand, milk.reserved), (0, 0))
+
+    def test_duplicate_payment_is_idempotent(self):
+        o = self.qc.create_order("a", 0, 0, {"bread": 3})
+        self.qc.on_payment(o.id, True)
+        self.assertEqual(self.qc.on_payment(o.id, True), OrderStatus.CONFIRMED)
+        self.assertEqual(o.store.item("bread").on_hand, 7)          # deducted once, not twice
+
+    def test_success_then_failure_webhook_leaves_counters_unchanged(self):
+        self.qc.restock("DS-near", "milk", 3)                       # on_hand = 5
+        a = self.qc.create_order("a", 0, 0, {"milk": 2})
+        b = self.qc.create_order("b", 0, 0, {"milk": 2})
+        milk = a.store.item("milk")
+        self.qc.on_payment(a.id, True)
+        self.assertEqual((milk.on_hand, milk.reserved), (3, 2))
+        self.assertEqual(self.qc.on_payment(a.id, False), OrderStatus.CONFIRMED)   # late failure ignored
+        self.assertEqual((milk.on_hand, milk.reserved, a.status, b.status),
+                         (3, 2, OrderStatus.CONFIRMED, OrderStatus.CREATED))  # b keeps its reservation
+
+    def test_payment_after_cancel_is_rejected_for_refund(self):
+        o = self.qc.create_order("a", 0, 0, {"bread": 1})
+        self.qc.cancel(o.id)
+        with self.assertRaises(QcError):
+            self.qc.on_payment(o.id, True)
+        self.assertEqual(o.store.available("bread"), 10)
+
+    def test_falls_back_to_store_with_full_basket(self):
+        self.assertEqual(self.qc.create_order("a", 0, 0, {"milk": 1, "eggs": 1}).store.id, "DS-far")
+
+    def test_out_of_range_and_bad_lines(self):
+        with self.assertRaises(QcError):
+            self.qc.create_order("a", 9, 9, {"milk": 1})
+        with self.assertRaises(QcError):
+            self.qc.create_order("a", 0, 0, {"caviar": 1})
+        with self.assertRaises(QcError):
+            self.qc.create_order("a", 0, 0, {"milk": 0})
+
+    def test_failed_payment_releases(self):
+        o = self.qc.create_order("a", 0, 0, {"eggs": 4})
+        self.qc.on_payment(o.id, False)
+        self.assertEqual((o.status, o.store.available("eggs")), (OrderStatus.CANCELLED, 10))
+
+    def test_expiry_releases_and_late_payment_rejected(self):
+        o = self.qc.create_order("a", 0, 0, {"bread": 4})
+        self.clock.advance(5 * 60_000 + 1)
+        self.assertEqual(self.qc.sweep_expired(), 1)
+        self.assertEqual(o.store.available("bread"), 10)
+        with self.assertRaises(QcError):
+            self.qc.on_payment(o.id, True)
+
+    def test_cancel_after_pack_restocks_but_not_after_dispatch(self):
+        a = self.qc.create_order("a", 0, 0, {"bread": 2})
+        self.qc.on_payment(a.id, True)
+        self.qc.pack(a.id)
+        self.qc.cancel(a.id)
+        self.assertEqual(a.store.available("bread"), 10)
+        b = self.qc.create_order("b", 0, 0, {"bread": 1})
+        self.qc.on_payment(b.id, True)
+        self.qc.pack(b.id)
+        self.qc.dispatch(b.id)
+        with self.assertRaises(QcError):
+            self.qc.cancel(b.id)
+
+    def test_concurrent_baskets_never_oversell_or_deadlock(self):
+        qc = QuickCommerce(NearestFullBasketSelector(5), self.clock, 60_000)
+        qc.add_product("milk", 60)
+        qc.add_product("bread", 40)
+        qc.add_store("S", 0, 0)
+        qc.restock("S", "milk", 5)
+        qc.restock("S", "bread", 100)
+        won, gate = [], threading.Barrier(20)
+
+        def shopper(i):
+            basket = {"milk": 1, "bread": 1} if i % 2 else {"bread": 1, "milk": 1}
+            gate.wait()
+            try:
+                won.append(qc.create_order(f"u{i}", 0, 0, basket))
+            except QcError:
+                pass
+
+        ts = [threading.Thread(target=shopper, args=(i,)) for i in range(20)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertFalse(any(t.is_alive() for t in ts), "deadlock")
+        milk = qc.store("S").item("milk")
+        self.assertEqual((len(won), milk.reserved, milk.available()), (5, 5, 0))
+
+    def test_expiry_and_payment_race_has_one_winner(self):
+        for _ in range(50):
+            clock = ManualClock()
+            qc = build(clock)
+            o = qc.create_order("a", 0, 0, {"milk": 1})
+            clock.advance(5 * 60_000)                    # exactly at the deadline: payment still allowed
+            outcomes = []
+
+            def pay():
+                try:
+                    outcomes.append(qc.on_payment(o.id, True))
+                except QcError:
+                    outcomes.append("late")
+
+            t = threading.Thread(target=pay)
+            t.start()
+            clock.advance(1)
+            qc.sweep_expired()
+            t.join()
+            milk = o.store.item("milk")
+            self.assertEqual(milk.reserved, 0)
+            self.assertEqual(milk.on_hand, 1 if o.status is OrderStatus.CONFIRMED else 2)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+  </div>
+  

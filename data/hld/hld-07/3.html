@@ -1,0 +1,114 @@
+
+        <h2>Indexes: primary, secondary, composite, covering</h2>
+        <p>An <b>index</b> is a separate, sorted data structure that maps a column value to where the row lives. Without one, the database does a <b>full table scan</b>: read every row and test it. With one, it walks a short path to the answer. The price is real: every insert, update and delete must also update every index on the table, and an index can take almost as much disk as the data itself (Hello Interview). For a table of a few hundred rows, a scan is often faster than using an index.</p>
+
+        <h3>How a B-tree index finds a row</h3>
+        <p>Almost every relational index is a <b>B-tree</b> (strictly a B+ tree: values live in the leaves, leaves are linked left to right). Each node is one disk page, typically 8 KB in Postgres, so one node holds hundreds of keys. The tree is short and fat. With a fan-out of a few hundred, three levels reach millions of rows and four levels reach billions. Finding <code>id = 350</code> might read only 2 to 3 pages: root, maybe one internal node, then a leaf.</p>
+        <div class="callout tip"><p><b>Worked estimate (rule of thumb).</b></p>
+          <ol class="steps">
+            <li><strong>Fan-out.</strong> An 8 KB page divided by about 20 bytes per entry (an 8-byte key, a 6-byte child pointer and some overhead) gives about 400 children per node.</li>
+            <li><strong>Rows per depth.</strong> 400<sup>2</sup> = 160 thousand, 400<sup>3</sup> = 64 million, 400<sup>4</sup> = 25.6 billion leaf entries.</li>
+            <li><strong>So</strong> a billion-row table is 4 levels deep, and a point lookup costs 3 to 4 page reads. The root and upper levels are almost always in RAM, so in practice it is 1 to 2 real disk reads. That is why point reads on an indexed column stay fast as the table grows 1,000x: you add one level, not 1,000x the work.</li>
+          </ol>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 820 320" role="img" aria-label="B-tree lookup from root to leaf">
+            
+            <rect class="box k" x="300" y="20" width="220" height="50"/>
+            <text class="label mono" x="410" y="45">[ 200 | 500 ]</text>
+            <text class="label small" x="600" y="45">root page (8 KB)</text>
+
+            <rect class="box svc" x="40" y="120" width="200" height="50"/>
+            <text class="label mono" x="140" y="145">[ 50 | 120 ]</text>
+            <rect class="box svc highlight" x="310" y="120" width="200" height="50"/>
+            <text class="label mono" x="410" y="145">[ 300 | 400 ]</text>
+            <rect class="box svc" x="580" y="120" width="200" height="50"/>
+            <text class="label mono" x="680" y="145">[ 650 | 800 ]</text>
+
+            <path class="arrow" d="M330 70 L170 116"/>
+            <path class="arrow" d="M410 70 L410 116"/>
+            <path class="arrow" d="M490 70 L650 116"/>
+
+            <rect class="box db" x="150" y="230" width="150" height="56"/>
+            <text class="label mono small" x="225" y="252">200..299</text>
+            <text class="label small" x="225" y="272">leaf</text>
+            <rect class="box db highlight" x="335" y="230" width="150" height="56"/>
+            <text class="label mono small" x="410" y="252">300..399</text>
+            <text class="label small" x="410" y="272">350 -&gt; row ptr</text>
+            <rect class="box db" x="520" y="230" width="150" height="56"/>
+            <text class="label mono small" x="595" y="252">400..499</text>
+            <text class="label small" x="595" y="272">leaf</text>
+            <path class="arrow" d="M370 170 L240 226"/>
+            <path class="arrow" d="M410 170 L410 226"/>
+            <path class="arrow" d="M450 170 L580 226"/>
+            <path class="arrow dashed both" d="M300 300 L335 300"/>
+            <path class="arrow dashed both" d="M485 300 L520 300"/>
+            <text class="label small" x="410" y="312">leaves linked: range scans walk sideways</text>
+
+            <circle class="packet gold" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M410 30 L410 60 L410 130 L410 160 L410 250"/></circle>
+          </svg>
+          <figcaption>Looking up 350: the root says "between 200 and 500", the internal node says "between 300 and 400", the leaf holds the pointer. Three page reads. Linked leaves make <code>BETWEEN</code> and <code>ORDER BY</code> cheap.</figcaption>
+        </figure>
+
+        <h3>Primary vs secondary index</h3>
+        <p>The <b>primary index</b> is built on the primary key. A <b>secondary index</b> is any other index, such as on <code>email</code>. What a secondary index entry points to differs by engine, and Uber's famous migration write-up shows why it matters:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>MySQL InnoDB</th><th>PostgreSQL</th></tr></thead>
+            <tbody>
+              <tr><td>Table layout</td><td><b>Clustered</b>: rows live inside the PK B-tree, sorted by PK</td><td><b>Heap</b>: rows in an unordered file; every index points at a physical location (ctid)</td></tr>
+              <tr><td>Secondary index stores</td><td>The PK value; lookup = two B-tree searches</td><td>The row's ctid; lookup = one index search + one heap read</td></tr>
+              <tr><td>Update of one column</td><td>Only indexes on changed columns are touched</td><td>A new row version gets a new ctid, so every index may need a new entry (Uber: one update, 12 index writes, all in the WAL)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Postgres later added optimizations for this (heap-only tuple updates), but the lesson stays: more indexes means more write amplification. Index the queries you have, not the ones you might have.</p>
+
+        <h3>Composite indexes and the leftmost-prefix rule</h3>
+        <p>A <b>composite</b> (multi-column) index on <code>(user_id, created_at)</code> sorts first by user, then by time within each user. Think of a phone book sorted by last name then first name. It is great for "Sharma, Riya" and for "all Sharmas", and useless for "everyone named Riya".</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Query on index <code>(user_id, created_at)</code></th><th>Uses index well?</th></tr></thead>
+            <tbody>
+              <tr><td><code>WHERE user_id = 42</code></td><td>Yes (leftmost column)</td></tr>
+              <tr><td><code>WHERE user_id = 42 AND created_at &gt; '2026-11-01'</code></td><td>Yes (equality, then range)</td></tr>
+              <tr><td><code>WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20</code></td><td>Yes, and no sort step: rows come out in order</td></tr>
+              <tr><td><code>WHERE created_at &gt; '2026-11-01'</code></td><td>Poorly: leading column skipped (PostgreSQL 18+ can "skip scan" when user_id has few distinct values; older versions cannot)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The rule of thumb from the Postgres docs: put columns used with <b>equality first</b>, the <b>range or sort column last</b>, and be suspicious of indexes with more than three columns. Postgres allows up to 32 columns, but that is a limit, not a goal.</p>
+
+        <h3>Covering indexes</h3>
+        <p>A <b>covering index</b> contains every column the query needs, so the database answers from the index alone and never reads the table. Postgres calls this an <b>index-only scan</b> and lets you add non-key payload columns with <code>INCLUDE</code>:</p>
+<pre><code class="language-sql">-- feed query: newest 20 orders for a user, showing status and total
+CREATE INDEX orders_user_time
+  ON orders (user_id, created_at DESC)
+  INCLUDE (status, total_amount);
+
+SELECT created_at, status, total_amount
+FROM orders
+WHERE user_id = 42
+ORDER BY created_at DESC
+LIMIT 20;           -- served entirely from the index</code></pre>
+        <p>One Postgres detail: index entries carry no visibility information, so an index-only scan checks a <b>visibility map</b> (one bit per table page). It only saves work on pages marked "all visible", which is the norm for mostly static rows.</p>
+
+        <h3>Other index shapes you should name</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Index</th><th>Good at</th><th>Bad at</th><th>Where you meet it</th></tr></thead>
+            <tbody>
+              <tr><td>B-tree / B+ tree</td><td>Equality, range, sort, prefix</td><td>Very high write rates</td><td>Postgres, MySQL, MongoDB (WiredTiger)</td></tr>
+              <tr><td>Hash</td><td>Exact match in O(1)</td><td>Ranges, sorting</td><td>Redis dict, Postgres hash index, memcached</td></tr>
+              <tr><td>LSM tree (SSTables)</td><td>Heavy writes</td><td>Reads need several files</td><td>Cassandra, RocksDB, ScyllaDB, LevelDB</td></tr>
+              <tr><td>Inverted index</td><td>Full-text search: word -&gt; list of docs</td><td>Updates are batchy</td><td>Elasticsearch / Lucene, Postgres GIN</td></tr>
+              <tr><td>Geospatial (geohash, quadtree, R-tree)</td><td>"Near me" queries</td><td>Non-spatial queries</td><td>PostGIS, Redis GEO; see <a href="{{BASE}}hld/hld-15">hld-15</a></td></tr>
+              <tr><td>Skip list</td><td>Sorted in-memory sets</td><td>Disk</td><td>Redis sorted sets, LSM memtables</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Indexes can also be <b>dense</b> (one entry per row; find by binary search, more upkeep) or <b>sparse</b> (one entry per block; smaller, then scan inside the block). Kafka's offset index and SSTable block indexes are sparse; most B-tree secondary indexes are dense.</p>
+
+        <div class="callout interview"><p>Say it like this: "For every API I listed, here is the index that serves it. <code>(user_id, created_at DESC)</code> covers the history page with no sort. I am not indexing <code>status</code> alone because it has four values; a scan of the index would not narrow much." Tying each index to a query is what separates strong answers.</p></div>
+      

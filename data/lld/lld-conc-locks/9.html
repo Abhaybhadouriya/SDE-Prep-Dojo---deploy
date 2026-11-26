@@ -1,0 +1,450 @@
+
+  <h2>The same tools in C++ and Python</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-locks/</code>, followed by its real output. Each program checks its own result: counters reach the exact expected value, the semaphore never lets more than 3 in, the gate releases all waiters.</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">// Locks, Conditions &amp; Semaphores - one runnable tour. Java 21.
+// Build and run:  javac LocksDemo.java &amp;&amp; java LocksDemo
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.ReentrantLock;
+
+public class LocksDemo {
+
+    // 1. synchronized: the built-in monitor. Lock released automatically, even on exception.
+    static class SyncCounter {
+        private int value;
+        public synchronized void inc() { value++; }
+        public synchronized int get() { return value; }
+    }
+
+    // 2. ReentrantLock: same mutual exclusion, plus tryLock, timeouts, fairness, many Conditions.
+    static class LockCounter {
+        private final ReentrantLock lock = new ReentrantLock();
+        private int value;
+        public void inc() {
+            lock.lock();
+            try { value++; } finally { lock.unlock(); }   // ALWAYS unlock in finally
+        }
+        public int get() {
+            lock.lock();
+            try { return value; } finally { lock.unlock(); }
+        }
+    }
+
+    // 3. tryLock with timeout: transfer between two accounts without hanging forever.
+    static class Account {
+        final int id;
+        final ReentrantLock lock = new ReentrantLock();
+        int balance;
+        Account(int id, int balance) { this.id = id; this.balance = balance; }
+    }
+
+    /** Returns true if the money moved, false if we gave up (caller may retry or report "busy"). */
+    static boolean transfer(Account from, Account to, int amount) throws InterruptedException {
+        // Lock ordering by id removes the deadlock; tryLock adds a time limit on top.
+        Account first = from.id &lt; to.id ? from : to;
+        Account second = from.id &lt; to.id ? to : from;
+        if (!first.lock.tryLock(50, TimeUnit.MILLISECONDS)) return false;
+        try {
+            if (!second.lock.tryLock(50, TimeUnit.MILLISECONDS)) return false;
+            try {
+                if (from.balance &lt; amount) return false;
+                from.balance -= amount;
+                to.balance += amount;
+                return true;
+            } finally { second.lock.unlock(); }
+        } finally { first.lock.unlock(); }
+    }
+
+    // 4. Condition: "wait until the gate is open". The while loop guards against spurious wakeups.
+    static class Gate {
+        private final ReentrantLock lock = new ReentrantLock();
+        private final Condition opened = lock.newCondition();
+        private boolean open;
+        void await() throws InterruptedException {
+            lock.lock();
+            try {
+                while (!open) opened.await();   // releases the lock while sleeping, re-takes it on wake
+            } finally { lock.unlock(); }
+        }
+        void open() {
+            lock.lock();
+            try { open = true; opened.signalAll(); } finally { lock.unlock(); }
+        }
+    }
+
+    // 5. Reentrancy: the same thread may take a lock it already holds.
+    static class Reentrant {
+        private final ReentrantLock lock = new ReentrantLock();
+        int outer() {
+            lock.lock();
+            try { return inner() + lock.getHoldCount(); } finally { lock.unlock(); }
+        }
+        int inner() {
+            lock.lock();                         // would self-deadlock with a non-reentrant mutex
+            try { return lock.getHoldCount(); } finally { lock.unlock(); }
+        }
+    }
+
+    // 6. Semaphore: at most N callers inside at once (a pool of 3 "DB connections").
+    static class ConnectionLimiter {
+        private final Semaphore permits = new Semaphore(3, true);
+        private final AtomicInteger inside = new AtomicInteger();
+        private final AtomicInteger maxSeen = new AtomicInteger();
+        void query() throws InterruptedException {
+            permits.acquire();
+            try {
+                int now = inside.incrementAndGet();
+                maxSeen.accumulateAndGet(now, Math::max);
+                Thread.sleep(5);
+                inside.decrementAndGet();
+            } finally { permits.release(); }
+        }
+        int maxSeen() { return maxSeen.get(); }
+    }
+
+    static void runAll(int n, Runnable r) throws InterruptedException {
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) ts.add(Thread.ofPlatform().start(r));
+        for (Thread t : ts) t.join();
+    }
+
+    public static void main(String[] args) throws Exception {
+        SyncCounter sc = new SyncCounter();
+        LockCounter lc = new LockCounter();
+        runAll(8, () -&gt; { for (int i = 0; i &lt; 100_000; i++) { sc.inc(); lc.inc(); } });
+        System.out.println("synchronized counter = " + sc.get() + " (expect 800000)");
+        System.out.println("ReentrantLock counter = " + lc.get() + " (expect 800000)");
+
+        Account a = new Account(1, 1_000), b = new Account(2, 1_000);
+        AtomicInteger gaveUp = new AtomicInteger();
+        runAll(4, () -&gt; {
+            for (int i = 0; i &lt; 2_000; i++) {
+                try {
+                    boolean ok = (i % 2 == 0) ? transfer(a, b, 1) : transfer(b, a, 1);
+                    if (!ok) gaveUp.incrementAndGet();
+                } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            }
+        });
+        System.out.println("total money after opposite-direction transfers = " + (a.balance + b.balance)
+                + " (expect 2000), gave up " + gaveUp.get() + " times, no deadlock");
+
+        Gate gate = new Gate();
+        CountDownLatch passed = new CountDownLatch(3);
+        for (int i = 0; i &lt; 3; i++) Thread.ofPlatform().start(() -&gt; {
+            try { gate.await(); passed.countDown(); } catch (InterruptedException ignored) { }
+        });
+        Thread.sleep(50);
+        System.out.println("waiting at gate, passed so far = " + (3 - passed.getCount()));
+        gate.open();
+        System.out.println("gate opened, all passed = " + passed.await(1, TimeUnit.SECONDS));
+
+        System.out.println("reentrant hold counts inner+outer = " + new Reentrant().outer() + " (expect 3: 2 + 1)");
+
+        ConnectionLimiter limiter = new ConnectionLimiter();
+        runAll(10, () -&gt; {
+            for (int i = 0; i &lt; 5; i++) {
+                try { limiter.query(); } catch (InterruptedException e) { return; }
+            }
+        });
+        System.out.println("max threads inside semaphore = " + limiter.maxSeen() + " (never above 3)");
+
+        // CountDownLatch as a starting gun + finish line.
+        int workers = 4;
+        CountDownLatch start = new CountDownLatch(1), done = new CountDownLatch(workers);
+        AtomicInteger work = new AtomicInteger();
+        for (int i = 0; i &lt; workers; i++) Thread.ofPlatform().start(() -&gt; {
+            try { start.await(); work.incrementAndGet(); } catch (InterruptedException ignored) { }
+            finally { done.countDown(); }
+        });
+        start.countDown();               // fire the gun
+        done.await();                    // wait for every worker
+        System.out.println("latch: all " + work.get() + " workers finished");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out LocksDemo.java &amp;&amp; java -cp out LocksDemo
+synchronized counter = 800000 (expect 800000)
+ReentrantLock counter = 800000 (expect 800000)
+total money after opposite-direction transfers = 2000 (expect 2000), gave up 0 times, no deadlock
+waiting at gate, passed so far = 0
+gate opened, all passed = true
+reentrant hold counts inner+outer = 3 (expect 3: 2 + 1)
+max threads inside semaphore = 3 (never above 3)
+latch: all 4 workers finished</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Locks, condition variables and a hand-made semaphore in C++14.
+// Build and run:  g++ -std=c++14 -O2 -Wall -pthread locks.cpp -o locks &amp;&amp; ./locks
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+// (C++14 has std::mutex, std::timed_mutex, std::recursive_mutex and std::condition_variable;
+//  std::counting_semaphore and std::latch only arrive in C++20, so we build them here.)
+#include &lt;atomic&gt;
+#include &lt;chrono&gt;
+#include &lt;condition_variable&gt;
+#include &lt;cstdio&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+// A counting semaphore = a counter guarded by a mutex + a condition variable.
+class Semaphore {
+public:
+    explicit Semaphore(int permits) : permits_(permits) {}
+    void acquire() {
+        std::unique_lock&lt;std::mutex&gt; lk(m_);
+        cv_.wait(lk, [this] { return permits_ &gt; 0; });   // predicate form = the while loop
+        --permits_;
+    }
+    void release() {
+        { std::lock_guard&lt;std::mutex&gt; lk(m_); ++permits_; }
+        cv_.notify_one();
+    }
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    int permits_;
+};
+
+// A one-shot latch (C++20 has std::latch).
+class Latch {
+public:
+    explicit Latch(int count) : count_(count) {}
+    void count_down() {
+        std::lock_guard&lt;std::mutex&gt; lk(m_);
+        if (--count_ == 0) cv_.notify_all();
+    }
+    void wait() {
+        std::unique_lock&lt;std::mutex&gt; lk(m_);
+        cv_.wait(lk, [this] { return count_ == 0; });
+    }
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    int count_;
+};
+
+// A tiny spinlock: fine for a few instructions, terrible if the holder can sleep.
+class SpinLock {
+public:
+    void lock() { while (flag_.test_and_set(std::memory_order_acquire)) { /* spin */ } }
+    void unlock() { flag_.clear(std::memory_order_release); }
+private:
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+};
+
+int main() {
+    // 1. std::mutex + lock_guard (RAII: unlocks when the scope ends, like a finally block)
+    std::mutex m;
+    long counter = 0;
+    std::vector&lt;std::thread&gt; ts;
+    for (int t = 0; t &lt; 8; ++t)
+        ts.emplace_back([&amp;] { for (int i = 0; i &lt; 100000; ++i) { std::lock_guard&lt;std::mutex&gt; g(m); ++counter; } });
+    for (auto&amp; t : ts) t.join();
+    ts.clear();
+    std::printf("mutex counter = %ld (expect 800000)\n", counter);
+
+    // 2. SpinLock with the same lock_guard (any type with lock()/unlock() works)
+    SpinLock sl;
+    long spun = 0;
+    for (int t = 0; t &lt; 4; ++t)
+        ts.emplace_back([&amp;] { for (int i = 0; i &lt; 100000; ++i) { std::lock_guard&lt;SpinLock&gt; g(sl); ++spun; } });
+    for (auto&amp; t : ts) t.join();
+    ts.clear();
+    std::printf("spinlock counter = %ld (expect 400000)\n", spun);
+
+    // 3. try_lock_for on a timed_mutex: give up instead of waiting forever
+    std::timed_mutex tm;
+    tm.lock();
+    bool got = true;
+    std::thread other([&amp;] { got = tm.try_lock_for(std::chrono::milliseconds(30)); if (got) tm.unlock(); });
+    other.join();
+    tm.unlock();
+    std::printf("try_lock_for while held elsewhere -&gt; %s\n", got ? "got it" : "timed out, did something else");
+
+    // 4. condition_variable: wait until ready (predicate handles spurious wakeups)
+    std::mutex gm;
+    std::condition_variable gcv;
+    bool open = false;
+    std::atomic&lt;int&gt; passed(0);
+    for (int t = 0; t &lt; 3; ++t)
+        ts.emplace_back([&amp;] {
+            std::unique_lock&lt;std::mutex&gt; lk(gm);
+            gcv.wait(lk, [&amp;] { return open; });
+            ++passed;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    std::printf("before open: passed = %d\n", passed.load());
+    { std::lock_guard&lt;std::mutex&gt; lk(gm); open = true; }
+    gcv.notify_all();
+    for (auto&amp; t : ts) t.join();
+    ts.clear();
+    std::printf("after open: passed = %d\n", passed.load());
+
+    // 5. Semaphore limits concurrency to 3
+    Semaphore sem(3);
+    std::atomic&lt;int&gt; inside(0), maxSeen(0);
+    for (int t = 0; t &lt; 10; ++t)
+        ts.emplace_back([&amp;] {
+            for (int i = 0; i &lt; 5; ++i) {
+                sem.acquire();
+                int now = ++inside;
+                int prev = maxSeen.load();
+                while (now &gt; prev &amp;&amp; !maxSeen.compare_exchange_weak(prev, now)) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                --inside;
+                sem.release();
+            }
+        });
+    for (auto&amp; t : ts) t.join();
+    ts.clear();
+    std::printf("max inside semaphore = %d (never above 3)\n", maxSeen.load());
+
+    // 6. Latch: wait for 4 workers
+    Latch done(4);
+    for (int t = 0; t &lt; 4; ++t) ts.emplace_back([&amp;] { done.count_down(); });
+    done.wait();
+    for (auto&amp; t : ts) t.join();
+    std::printf("latch released after 4 count_downs\n");
+
+    // 7. recursive_mutex: the same thread may lock twice (Java's ReentrantLock behaves like this)
+    std::recursive_mutex rm;
+    rm.lock(); rm.lock();
+    std::printf("recursive_mutex locked twice by one thread\n");
+    rm.unlock(); rm.unlock();
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread locks.cpp -o locks &amp;&amp; ./locks
+mutex counter = 800000 (expect 800000)
+spinlock counter = 400000 (expect 400000)
+try_lock_for while held elsewhere -&gt; timed out, did something else
+before open: passed = 0
+after open: passed = 3
+max inside semaphore = 3 (never above 3)
+latch released after 4 count_downs
+recursive_mutex locked twice by one thread</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Locks, conditions and semaphores in Python 3.11.  Run:  python locks.py
+
+The GIL does not make `x += 1` atomic across threads, so real locks are still needed.
+"""
+import threading
+import time
+
+
+class Counter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.value = 0
+
+    def inc(self):
+        with self._lock:            # acquire ... finally release
+            self.value += 1
+
+
+class Gate:
+    def __init__(self):
+        self._cond = threading.Condition()   # a Lock plus a wait queue
+        self._open = False
+
+    def wait_open(self):
+        with self._cond:
+            self._cond.wait_for(lambda: self._open)   # loops on the predicate for you
+
+    def open(self):
+        with self._cond:
+            self._open = True
+            self._cond.notify_all()
+
+
+def run_all(n, fn):
+    ts = [threading.Thread(target=fn) for _ in range(n)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+
+def main():
+    c = Counter()
+    run_all(8, lambda: [c.inc() for _ in range(20_000)])
+    print("locked counter =", c.value, "(expect 160000)")
+
+    # tryLock with timeout
+    lock = threading.Lock()
+    lock.acquire()
+    got = []
+    t = threading.Thread(target=lambda: got.append(lock.acquire(timeout=0.03)))
+    t.start(); t.join()
+    lock.release()
+    print("acquire(timeout) while held -&gt;", "got it" if got[0] else "timed out")
+
+    # reentrancy: RLock may be taken twice by the same thread, Lock may not
+    r = threading.RLock()
+    with r:
+        with r:
+            print("RLock taken twice by one thread")
+
+    gate = Gate()
+    passed = []
+    ts = [threading.Thread(target=lambda: (gate.wait_open(), passed.append(1))) for _ in range(3)]
+    for t in ts:
+        t.start()
+    time.sleep(0.03)
+    print("before open: passed =", len(passed))
+    gate.open()
+    for t in ts:
+        t.join()
+    print("after open: passed =", len(passed))
+
+    sem = threading.BoundedSemaphore(3)       # Bounded: releasing too often raises ValueError
+    inside = [0]
+    max_seen = [0]
+    guard = threading.Lock()
+
+    def query():
+        for _ in range(5):
+            with sem:
+                with guard:
+                    inside[0] += 1
+                    max_seen[0] = max(max_seen[0], inside[0])
+                time.sleep(0.002)
+                with guard:
+                    inside[0] -= 1
+
+    run_all(10, query)
+    print("max inside semaphore =", max_seen[0], "(never above 3)")
+
+    # Barrier: every party waits until all have arrived (Python has no CountDownLatch class)
+    barrier = threading.Barrier(4)
+    arrived = []
+    run_all(4, lambda: (arrived.append(1), barrier.wait()))
+    print("barrier released", len(arrived), "threads together")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python locks.py
+locked counter = 160000 (expect 160000)
+acquire(timeout) while held -&gt; timed out
+RLock taken twice by one thread
+before open: passed = 0
+after open: passed = 3
+max inside semaphore = 3 (never above 3)
+barrier released 4 threads together</code></pre>
+    </div>
+  </div>

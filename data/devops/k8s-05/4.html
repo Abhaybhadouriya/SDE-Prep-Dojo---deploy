@@ -1,0 +1,71 @@
+
+        <h2>Pod networking inside one node</h2>
+        <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+        <p>When the kubelet starts a pod, the container runtime first creates a <b>pod sandbox</b>: a tiny "pause" process that owns a fresh <b>network namespace</b>. Then the runtime calls the <strong>CNI plugin</strong> with the command <code>ADD</code>. The plugin:</p>
+        <ol class="steps">
+          <li><strong>Creates a veth pair</strong> - one end becomes <code>eth0</code> inside the pod's namespace, the other end stays on the host (named like <code>veth3a9f...</code> or <code>cali...</code>).</li>
+          <li><strong>Asks IPAM for an address</strong> - IPAM (IP address management) is a separate small plugin that hands out an IP from this node's pod CIDR, for example 10.244.1.7.</li>
+          <li><strong>Wires the host side</strong> - attaches it to a Linux bridge (<code>cni0</code>, <a href="{{BASE}}interview/glossary#flannel">Flannel</a>/bridge plugin style) or adds a /32 host route to it (Calico/Cilium style).</li>
+          <li><strong>Sets the pod's default route</strong> and returns the IP as JSON to the runtime, which reports it to the kubelet, which writes it into the pod's <code>status.podIP</code>.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Inside a node: each pod network namespace has eth0 connected by a veth pair to the cni0 bridge, which routes out through the node eth0">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="780" height="280"/>
+            <text class="zone-label" x="26" y="32">node-1 (root network namespace) - pod CIDR 10.244.1.0/24</text>
+            <rect class="zone docker" x="40" y="50" width="200" height="90"/>
+            <text class="zone-label" x="54" y="70">pod A netns</text>
+            <rect class="box docker" x="70" y="82" width="140" height="44"/>
+            <text class="label" x="140" y="104">eth0 10.244.1.7</text>
+            <rect class="zone docker" x="300" y="50" width="200" height="90"/>
+            <text class="zone-label" x="314" y="70">pod B netns</text>
+            <rect class="box docker" x="330" y="82" width="140" height="44"/>
+            <text class="label" x="400" y="104">eth0 10.244.1.8</text>
+            <rect class="box svc" x="70" y="180" width="430" height="44"/>
+            <text class="label" x="285" y="202">cni0 bridge 10.244.1.1 (pods' gateway)</text>
+            <path class="arrow both" d="M140 126 L140 178"/>
+            <text class="label small" x="180" y="156">veth</text>
+            <path class="arrow both" d="M400 126 L400 178"/>
+            <text class="label small" x="440" y="156">veth</text>
+            <rect class="box k8s" x="560" y="80" width="200" height="60"/>
+            <text class="label" x="660" y="102">routing table</text>
+            <text class="label small" x="660" y="124">+ netfilter (kube-proxy)</text>
+            <rect class="box client" x="560" y="220" width="200" height="50"/>
+            <text class="label" x="660" y="245">eth0 192.168.1.10</text>
+            <path class="arrow both" d="M500 202 L558 120"/>
+            <path class="arrow both" d="M660 140 L660 218"/>
+            <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M140 126 L140 190 L400 190 L400 126"/></circle>
+          </svg>
+          <figcaption>Same-node traffic (the moving dot) never leaves the box: pod A -> veth -> bridge -> veth -> pod B. Cross-node traffic goes through the host routing table and out of the node's eth0.</figcaption>
+        </figure>
+        <p>The CNI config lives on every node in <code>/etc/cni/net.d/</code> and the plugin binaries in <code>/opt/cni/bin/</code>. A trimmed example (Flannel):</p>
+<pre><code class="language-json">{
+  "name": "cbr0",
+  "cniVersion": "1.0.0",
+  "plugins": [
+    { "type": "flannel", "delegate": { "hairpinMode": true, "isDefaultGateway": true } },
+    { "type": "portmap", "capabilities": { "portMappings": true } }
+  ]
+}</code></pre>
+        <p><code>hairpinMode: true</code> lets a pod reach <i>itself</i> through its own Service IP (the packet leaves on the veth, is DNATed back to the same pod, and must be allowed to go back out the port it came in on, a "hairpin" turn). <code>isDefaultGateway</code> makes the bridge the pod's default route.</p>
+<pre class="terminal"><code>$ kubectl get pods -o wide
+NAME        READY   STATUS    IP            NODE
+backend-1   1/1     Running   10.244.1.7    node-1
+backend-2   1/1     Running   10.244.2.9    node-2
+
+$ kubectl get node node-1 -o jsonpath='{.spec.podCIDR}'
+10.244.1.0/24
+
+# on node-1
+$ ip route
+default via 192.168.1.1 dev eth0
+10.244.1.0/24 dev cni0 proto kernel scope link src 10.244.1.1
+10.244.2.0/24 via 10.244.2.0 dev flannel.1 onlink
+192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.10</code></pre>
+        <p>Look at the third line: "to reach node-2's pods, go via <code>flannel.1</code>". That device is a <b><a href="{{BASE}}interview/glossary#vxlan">VXLAN</a> tunnel endpoint</b>. Which brings us to the big question.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is plain Linux: <code>ip netns</code>, <code>ip link add type veth</code>, a Linux bridge acting as a soft L2 switch, and a routing table. You could build it by hand with a dozen <code>ip</code> commands. The pause container is just a process that keeps <code>/proc/&lt;pid&gt;/ns/net</code> alive while app containers come and go. Where it breaks: you never configure it by hand; the CNI binary does it in milliseconds on every pod start, and does the reverse on <code>DEL</code>.</p>
+        </div>
+        <div class="callout tip"><p><b>Go deeper.</b> On EKS the VPC CNI gives every pod a real VPC IP, so subnet sizing matters: see <a href="{{BASE}}devops/devops-aws-01#cidr">AWS Networking: CIDR planning</a>.</p></div>
+      

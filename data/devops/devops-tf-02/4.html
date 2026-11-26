@@ -1,0 +1,133 @@
+
+  <h2>The S3 backend with locking</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>Here is a production-shaped backend block:</p>
+<pre><code class="language-hcl">terraform {
+  required_version = "&gt;= 1.11"
+
+  backend "s3" {
+    bucket       = "dojo-tfstate-123456789012-ap-south-1"
+    key          = "network/prod/terraform.tfstate"   # one key per stack + environment
+    region       = "ap-south-1"
+    encrypt      = true                                # server-side encryption of state + lock
+    kms_key_id   = "arn:aws:kms:ap-south-1:123456789012:key/EXAMPLE-KEY-ID"
+    use_lockfile = true                                # S3-native locking (1.11+)
+  }
+}</code></pre>
+  <p>Backend blocks cannot use variables (they are read before anything else). For "same code, different environment", leave values out and pass them at init: <code>terraform init -backend-config=backend/prod.hcl</code>. This is called <b>partial configuration</b>.</p>
+
+  <h3>Why locking: two applies at once</h3>
+  <p>Without a lock, Alice and the CI pipeline can both read serial 7, both make changes, and both write serial 8. The second write silently overwrites the first, and state no longer matches reality. A lock turns this into a clean error for the second runner.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 290" role="img" aria-label="Alice and the CI job both try to create the lock object in S3 with a conditional write. Alice wins with 200 OK; CI gets 412 Precondition Failed and Terraform reports Error acquiring the state lock">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="20" y="40" width="170" height="60"/>
+      <text class="label" x="105" y="66">Alice: apply</text>
+      <text class="label small" x="105" y="86">laptop</text>
+      <rect class="box client" x="20" y="190" width="170" height="60"/>
+      <text class="label" x="105" y="216">CI job: apply</text>
+      <text class="label small" x="105" y="236">same stack</text>
+      <rect class="zone" x="400" y="20" width="390" height="250"/>
+      <text class="zone-label" x="414" y="42">S3 bucket</text>
+      <rect class="box ok" x="430" y="60" width="340" height="56"/>
+      <text class="label" x="600" y="84">network/prod/terraform.tfstate.tflock</text>
+      <text class="label small" x="600" y="104">created by Alice (PUT If-None-Match: *)</text>
+      <rect class="box db" x="430" y="180" width="340" height="56"/>
+      <text class="label" x="600" y="204">network/prod/terraform.tfstate</text>
+      <text class="label small" x="600" y="224">versioned, SSE-KMS</text>
+      <path class="arrow ok" d="M190 70 L425 88"/>
+      <text class="label small ok" x="300" y="64">200 OK: lock held</text>
+      <path class="arrow bad dashed" d="M190 220 L425 100"/>
+      <text class="label small bad" x="290" y="190">412 Precondition Failed</text>
+      <circle class="packet ok" r="7"><animateMotion dur="2.2s" repeatCount="indefinite" path="M190 70 L430 88"/></circle>
+      <circle class="packet bad" r="7"><animateMotion dur="2.2s" begin="0.4s" repeatCount="indefinite" path="M190 220 L420 104 L190 220"/></circle>
+      <path class="arrow" d="M600 116 L600 175"/>
+      <text class="label small left" x="610" y="152">only the lock holder writes</text>
+    </svg>
+    <figcaption>S3-native locking: the lock is a <code>.tflock</code> object next to the state. Creating it uses an S3 conditional write that fails if the object already exists, so exactly one runner wins.</figcaption>
+  </figure>
+  <p>What the loser sees (abridged):</p>
+<pre class="terminal"><code>$ terraform apply
+Acquiring state lock. This may take a few moments...
+╷
+│ Error: Error acquiring the state lock
+│
+│ Error message: operation error S3: PutObject, https response error
+│ StatusCode: 412, ... PreconditionFailed
+│ Lock Info:
+│   ID:        6b1c2f0e-4d7a-...
+│   Path:      dojo-tfstate-123456789012-ap-south-1/network/prod/terraform.tfstate
+│   Operation: OperationTypeApply
+│   Who:       alice@alice-laptop
+│   Version:   1.11.0
+│   Created:   2026-11-23 09:41:12.5 +0000 UTC
+│
+│ Terraform acquires a state lock to protect the state from being written
+│ by multiple users at the same time. Please resolve the issue above and try
+│ again. For most commands, you can disable locking with the "-lock=false"
+│ flag, but this is not recommended.
+╵</code></pre>
+  <p>Use <code>-lock-timeout=5m</code> in CI to wait instead of failing at once. If a run crashed and left a stale lock, confirm nobody is running, then <code>terraform force-unlock 6b1c2f0e-4d7a-...</code>. Never use <code>-lock=false</code> on shared state.</p>
+
+  <h3>S3-native lock vs the classic DynamoDB lock</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th></th><th>DynamoDB table (classic)</th><th>S3 lock file (current)</th></tr></thead>
+      <tbody>
+        <tr><td>Config</td><td><code>dynamodb_table = "tf-locks"</code></td><td><code>use_lockfile = true</code></td></tr>
+        <tr><td>Mechanism</td><td>Conditional <code>PutItem</code> on a table whose partition key is the string <code>LockID</code>; fails if the item exists</td><td>Conditional <code>PutObject</code> of <code>&lt;key&gt;.tflock</code>; fails if the object exists</td></tr>
+        <tr><td>Extra infra</td><td>A DynamoDB table + IAM for it</td><td>None (same bucket)</td></tr>
+        <tr><td>Status</td><td>Deprecated since Terraform 1.11; still works with a warning</td><td>Generally available in 1.11 (introduced as experimental in 1.10)</td></tr>
+        <tr><td>IAM needed</td><td><code>dynamodb:DescribeTable, GetItem, PutItem, DeleteItem</code></td><td><code>s3:GetObject, PutObject, DeleteObject</code> on the <code>.tflock</code> key</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Many existing companies still run the S3 + DynamoDB pattern, so you must know both. To migrate, set <b>both</b> arguments and run <code>terraform init -reconfigure</code> (Terraform then takes both locks); once every user and pipeline is on 1.11+, remove <code>dynamodb_table</code>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Both are a <b>compare-and-swap</b> on a remote key. The S3 version is literally <code>open(path, O_CREAT | O_EXCL)</code> as a lock file, the oldest trick in Unix (think <code>/var/run/*.pid</code> or <code>/var/lock/LCK..ttyS0</code>), except the filesystem is S3 and the atomicity comes from S3's conditional writes. And like a lock file after <code>kill -9</code>, a crashed run leaves a stale lock that someone must remove by hand (<code>force-unlock</code>). There is no lease or TTL: this is not a <a href="{{BASE}}interview/glossary#lease">lease</a>-based <a href="{{BASE}}interview/glossary#distributed-lock">distributed lock</a>, so it relies on humans checking that the holder is really dead.</p>
+  </div>
+
+  <h3>Bootstrapping: the bucket that holds the state of the bucket</h3>
+  <p>Chicken and egg: the state bucket must exist before any config can use it. The usual answer is a tiny <b>bootstrap</b> config, applied once with local state, that creates the bucket (and the KMS key). Then you add a backend block to it and run <code>terraform init -migrate-state</code>, which copies the local state into S3.</p>
+<pre><code class="language-hcl">resource "aws_s3_bucket" "tfstate" {
+  bucket = "dojo-tfstate-123456789012-ap-south-1"
+  lifecycle { prevent_destroy = true }          # a destroy plan errors out
+}
+
+resource "aws_s3_bucket_versioning" "tfstate" {
+  bucket = aws_s3_bucket.tfstate.id
+  versioning_configuration { status = "Enabled" }   # every state write kept
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
+  bucket = aws_s3_bucket.tfstate.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.tfstate.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "tfstate" {
+  bucket                  = aws_s3_bucket.tfstate.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}</code></pre>
+<pre class="terminal"><code>$ terraform init -migrate-state
+Initializing the backend...
+Do you want to copy existing state to the new backend?
+  Pre-existing state was found while migrating the previous "local" backend to the
+  newly configured "s3" backend. No existing state was found in the newly
+  configured "s3" backend. Do you want to copy this state to the new "s3"
+  backend? Enter "yes" to copy and "no" to start with an empty state.
+
+  Enter a value: yes
+
+Successfully configured the backend "s3"! Terraform will automatically
+use this backend unless the backend configuration changes.</code></pre>
+  <p><b>Key layout.</b> One state file per stack per environment (<code>network/prod/terraform.tfstate</code>, <code>network/dev/...</code>, <code>app-payments/prod/...</code>). Smaller states mean faster plans, smaller blast radius, and fewer people blocked by one lock. AWS's guidance goes further: separate buckets (ideally separate AWS accounts) per environment, so dev credentials simply cannot read prod state. If you use workspaces with the S3 backend, non-default workspaces are stored under <code>env:/&lt;workspace&gt;/&lt;key&gt;</code>.</p>

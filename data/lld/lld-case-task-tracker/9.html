@@ -1,0 +1,41 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Unlike a cricket scorer, a task board has <b>many writers</b>: a whole team edits, moves and plans at the same time. Three problems to name and solve:</p>
+  <ul>
+    <li><b>Races inside the board</b> (two creates getting the same key, a sprint close running while someone moves an issue). Fix: one lock per board, held for the whole write template. Key generation (<code>nextNumber++</code>) is inside it. Different boards run fully in parallel. The Java test runs 8 threads creating and moving 2,000 issues on one board and checks 2,000 unique keys and exactly 4,000 events.</li>
+    <li><b>Torn reads</b> (a search sees the new status but the old version). Fix: readers copy <code>IssueView</code>s under the lock, then filter and sort outside it, so the lock is held only for the copy.</li>
+    <li><b>Lost updates</b> (two browser tabs load v1; the second save silently overwrites the first). A lock cannot fix this, because the two saves are seconds apart and each one is atomic. Fix: optimistic concurrency. The client sends the version it loaded; the server refuses if it changed.</li>
+  </ul>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Optimistic version check: Alice and Bob both load version 1, Alice saves first and the issue becomes version 2, Bob's save with expected version 1 is refused"><rect class="box client" x="40" y="20" width="160" height="36"/><text class="label" x="120" y="43">Alice (browser)</text><path class="arrow dashed none" d="M120 56 L120 300" style="marker-end:none"/><rect class="box db" x="320" y="20" width="160" height="36"/><text class="label" x="400" y="43">Server: PAY-3</text><path class="arrow dashed none" d="M400 56 L400 300" style="marker-end:none"/><rect class="box client" x="600" y="20" width="160" height="36"/><text class="label" x="680" y="43">Bob (browser)</text><path class="arrow dashed none" d="M680 56 L680 300" style="marker-end:none"/><g data-step="1"><path class="arrow" d="M396 85 L124 85"/><text class="label small" x="260" y="78">load: v1</text><path class="arrow" d="M404 85 L676 85"/><text class="label small" x="540" y="78">load: v1</text><rect class="box cache" x="335" y="95" width="130" height="26"/><text class="label small" x="400" y="113">title, LOW, v1</text></g><g data-step="2"><path class="arrow" d="M120 150 L396 150"/><text class="label small" x="260" y="143">edit(TITLE, expected v1)</text><rect class="box ok" x="335" y="160" width="130" height="26"/><text class="label small" x="400" y="178">v1 = v1: apply, v2</text></g><g data-step="3"><path class="arrow" d="M680 215 L404 215"/><text class="label small" x="540" y="208">edit(PRIORITY, expected v1)</text><rect class="box fail" x="335" y="225" width="130" height="26"/><text class="label small" x="400" y="243">v1 != v2: StaleUpdate</text><path class="arrow dashed" d="M466 238 L676 238"/><text class="label small" x="575" y="256">409: reload and retry</text></g><g data-step="4"><text class="label small" x="400" y="284">Bob reloads v2 (sees the new title), sets HIGH: v3. Nothing was silently overwritten.</text></g></svg>
+    <ol class="stepper-captions">
+      <li>Alice and Bob both open PAY-3 and see version 1.</li>
+      <li>Alice saves a new title with "expected v1". It matches, so the change is applied and the version becomes 2.</li>
+      <li>Bob saves a new priority with "expected v1". The issue is now v2, so the server refuses with <code>StaleUpdate</code> (HTTP 409 or 412).</li>
+      <li>Bob's screen reloads v2, he sees Alice's title, re-applies HIGH, and the issue becomes v3. Nothing was silently lost.</li>
+    </ol>
+  </div>
+  <ul>
+    <li><b>Listeners outside the lock.</b> Events are collected during the write and delivered after unlock. A slow or failing webhook never holds the board, and a refused write delivers nothing (test 10).</li>
+    <li><b>Lock order.</b> Every operation takes exactly one board lock, so there is no lock-ordering deadlock. The one cross-board read (<code>activityOf</code>) takes the locks one at a time, never two at once. If you add "move issue to another board", lock both boards in key order.</li>
+    <li><b>In a database</b> the same ideas become a conditional update (<code>WHERE version = ?</code>), a unique index on the issue key, and the audit insert in the same transaction as the change.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The version check is compare-and-swap at the application level: "store the new value only if the old one is what I read", exactly <code>cmpxchg</code>, or a seqlock reader that retries when the sequence moved. Per-board locks instead of one global lock is the Big Kernel Lock story: the BKL was removed in favour of fine-grained locks so unrelated work stops serialising. And "collect events in the lock, deliver after unlock" is how you avoid calling a notifier chain while holding a spinlock.</p>
+  </div>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

@@ -1,0 +1,74 @@
+
+        <h2>Batching and PagedAttention</h2>
+        <p>Because decode is memory-bound, the trick is to <b>read the weights once and use them for many requests</b>. That is batching. Databricks measured a single A100 serving MPT-7B: batch size 64 gave about 14x the throughput of batch size 1, while per-user latency went up about 4x. Batching is a throughput-versus-latency dial.</p>
+
+        <h3>Static vs continuous batching</h3>
+        <p>With <strong>static batching</strong> the server waits for a group of requests, runs them together, and keeps the batch fixed until <em>every</em> request finishes. A 20-token answer waits for a 1,000-token answer in the same batch, and its GPU slot sits idle. <strong>Continuous batching</strong> (the Orca paper calls it <em>iteration-level scheduling</em>) re-forms the batch after every decode step: finished sequences leave, waiting ones join.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Static batching leaves idle slots until the longest request ends; continuous batching refills slots each step">
+            <text class="label left" x="20" y="25">Static batching (4 slots)</text>
+            <rect class="box svc" x="20" y="40" width="380" height="24"/><text class="label small" x="210" y="52">request A (long)</text>
+            <rect class="box svc" x="20" y="70" width="120" height="24"/><rect class="box ghost" x="140" y="70" width="260" height="24"/><text class="label small" x="270" y="82">idle</text>
+            <rect class="box svc" x="20" y="100" width="200" height="24"/><rect class="box ghost" x="220" y="100" width="180" height="24"/><text class="label small" x="310" y="112">idle</text>
+            <rect class="box svc" x="20" y="130" width="80" height="24"/><rect class="box ghost" x="100" y="130" width="300" height="24"/><text class="label small" x="250" y="142">idle</text>
+            <text class="label small" x="210" y="175">new requests must wait for A to finish</text>
+
+            <text class="label left" x="470" y="25">Continuous batching (4 slots)</text>
+            <rect class="box svc" x="470" y="40" width="380" height="24"/><text class="label small" x="660" y="52">request A (long)</text>
+            <rect class="box svc" x="470" y="70" width="120" height="24"/><rect class="box kafka" x="590" y="70" width="260" height="24"/><text class="label small" x="720" y="82">E joins</text>
+            <rect class="box svc" x="470" y="100" width="200" height="24"/><rect class="box kafka" x="670" y="100" width="180" height="24"/><text class="label small" x="760" y="112">F joins</text>
+            <rect class="box svc" x="470" y="130" width="80" height="24"/><rect class="box kafka" x="550" y="130" width="150" height="24"/><text class="label small" x="625" y="142">G</text><rect class="box cache" x="700" y="130" width="150" height="24"/><text class="label small" x="775" y="142">H</text>
+            <text class="label small" x="660" y="175">a freed slot is refilled on the next step</text>
+
+            <path class="arrow" marker-end="url(#arrow)" d="M20 210 L400 210"/><text class="label small" x="210" y="230">decode steps</text>
+            <path class="arrow" marker-end="url(#arrow)" d="M470 210 L850 210"/><text class="label small" x="660" y="230">decode steps</text>
+            <text class="label" x="450" y="275">Same GPU, same model: the right side has no idle slots</text>
+          </svg>
+          <figcaption>Each row is one batch slot on one GPU. Grey is wasted capacity. Continuous batching swaps a new request into a slot the moment the old one finishes.</figcaption>
+        </figure>
+
+        <div class="stats">
+          <div class="stat"><b>36.9x</b><span>Orca vs FasterTransformer, GPT-3 175B, same latency</span></div>
+          <div class="stat"><b>8x</b><span>continuous batching alone vs naive static (Anyscale)</span></div>
+          <div class="stat"><b>23x</b><span>continuous batching + PagedAttention (Anyscale)</span></div>
+        </div>
+        <p>The Anyscale numbers come from OPT-13B on one A100 40 GB, compared with naive static batching. The exact multiplier depends on how much output lengths vary: the more they vary, the more static batching wastes.</p>
+
+        <h3>PagedAttention: virtual memory for the KV cache</h3>
+        <p>Continuous batching moves the bottleneck to memory. Older servers reserved one <em>contiguous</em> KV region per request, sized for the maximum possible output length. Most requests never use that space. The vLLM team reported that existing systems wasted <b>60% to 80%</b> of KV memory to fragmentation and over-reservation.</p>
+        <p><strong>PagedAttention</strong> (the vLLM paper) splits the KV cache into small fixed-size <em>blocks</em>, allocates them on demand, and keeps a per-request <em>block table</em> that maps logical token positions to physical blocks anywhere in GPU memory. Waste falls to <b>under 4%</b> (only the last, partly filled block). More free memory means bigger batches, which means more throughput: the paper reports 2-4x over FasterTransformer and Orca at the same latency, and the vLLM blog reports up to 24x over plain Hugging Face Transformers.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 900 270" role="img" aria-label="Block tables map each request's logical KV blocks to scattered physical GPU blocks, with a shared prefix block">
+            <text class="label left" x="20" y="25">Block tables (per request)</text>
+            <rect class="box client" x="20" y="45" width="200" height="34"/><text class="label small" x="120" y="62">Req A: 0 &rarr; 7, 1 &rarr; 2, 2 &rarr; 9</text>
+            <rect class="box client" x="20" y="95" width="200" height="34"/><text class="label small" x="120" y="112">Req B: 0 &rarr; 7, 1 &rarr; 4</text>
+            <text class="label small" x="120" y="150">block 0 = same system prompt</text>
+
+            <text class="label left" x="330" y="25">Physical KV blocks in GPU memory</text>
+            <rect class="box ghost" x="330" y="45" width="60" height="50"/><text class="label small" x="360" y="70">0</text>
+            <rect class="box ghost" x="400" y="45" width="60" height="50"/><text class="label small" x="430" y="70">1</text>
+            <rect class="box svc" x="470" y="45" width="60" height="50"/><text class="label small" x="500" y="70">2 A</text>
+            <rect class="box ghost" x="540" y="45" width="60" height="50"/><text class="label small" x="570" y="70">3</text>
+            <rect class="box kafka" x="610" y="45" width="60" height="50"/><text class="label small" x="640" y="70">4 B</text>
+            <rect class="box ghost" x="680" y="45" width="60" height="50"/><text class="label small" x="710" y="70">5</text>
+            <rect class="box ghost" x="750" y="45" width="60" height="50"/><text class="label small" x="780" y="70">6</text>
+            <rect class="box cache" x="330" y="110" width="60" height="50"/><text class="label small" x="360" y="135">7 A+B</text>
+            <rect class="box ghost" x="400" y="110" width="60" height="50"/><text class="label small" x="430" y="135">8</text>
+            <rect class="box svc" x="470" y="110" width="60" height="50"/><text class="label small" x="500" y="135">9 A</text>
+            <text class="label small" x="640" y="135">free blocks go back to a pool</text>
+
+            <path class="arrow" marker-end="url(#arrow)" d="M220 62 C 280 62, 300 135, 322 135"/>
+            <path class="arrow dashed" marker-end="url(#arrow)" d="M220 112 L322 130"/>
+            <text class="label" x="450" y="215">Like OS paging: no big contiguous reservation, shared pages are refcounted</text>
+            <text class="label small" x="450" y="245">Block 7 (the shared system-prompt prefix) is stored once and used by both requests</text>
+          </svg>
+          <figcaption>PagedAttention: each request owns a small table that points at scattered fixed-size blocks. Two requests with the same prefix can point at the same block, which is the basis of prefix caching.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is exactly the kernel's virtual memory: block table = page table, KV block = page frame, sharing a prefix block = two processes mapping the same read-only page, and copy-on-write when one of them diverges (vLLM uses this for parallel sampling, cutting memory up to 55%). The vLLM authors say outright that the design comes from OS paging. If you can explain <code>mmap</code> and page tables, you can explain PagedAttention.</p>
+        </div>
+      

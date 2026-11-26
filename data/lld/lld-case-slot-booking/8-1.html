@@ -1,0 +1,822 @@
+<h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+      <p><code>python/main.py</code></p>
+<pre><code class="language-python">"""Doctor appointment / fitness class slot booking - in-memory machine-coding solution."""
+from __future__ import annotations
+
+import threading
+from abc import ABC, abstractmethod
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Callable, Deque, Dict, List, Optional
+
+
+class Tier(Enum):
+    PLATINUM = 10
+    GOLD = 5
+    SILVER = 3
+    UNLIMITED = 10**9
+
+    @property
+    def quota(self) -&gt; int:
+        return self.value
+
+
+class Status(Enum):
+    CONFIRMED = "CONFIRMED"
+    WAITLISTED = "WAITLISTED"
+    CANCELLED = "CANCELLED"
+
+
+class BookingError(Exception):
+    pass
+
+
+def parse(hhmm: str) -&gt; int:
+    h, m = (int(x) for x in hhmm.strip().split(":"))
+    if not (0 &lt;= h &lt;= 24 and 0 &lt;= m &lt;= 59):
+        raise BookingError(f"bad time {hhmm}")
+    return h * 60 + m
+
+
+def fmt(minutes: int) -&gt; str:
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+@dataclass(frozen=True)
+class TimeRange:
+    start: int  # minutes since midnight, [start, end)
+    end: int
+
+    def __post_init__(self) -&gt; None:
+        if self.start &lt; 0 or self.end &gt; 24 * 60 or self.start &gt;= self.end:
+            raise BookingError("bad time range")
+
+    def overlaps(self, other: "TimeRange") -&gt; bool:
+        return self.start &lt; other.end and other.start &lt; self.end
+
+    def __str__(self) -&gt; str:
+        return f"{fmt(self.start)}-{fmt(self.end)}"
+
+
+@dataclass(frozen=True)
+class Provider:  # a doctor, or a gym centre
+    name: str
+    category: str  # speciality or workout type
+    rating: float
+
+
+@dataclass(frozen=True)
+class User:
+    name: str
+    tier: Tier
+
+
+@dataclass(eq=False)
+class Slot:
+    id: str
+    provider: Provider
+    time: TimeRange
+    capacity: int
+    waitlist_limit: int
+    confirmed: Dict[str, None] = field(default_factory=dict)  # ordered set of booking ids
+    waitlist: Deque[str] = field(default_factory=deque)
+    cancelled: bool = False
+
+    def free(self) -&gt; int:
+        return self.capacity - len(self.confirmed)
+
+    def label(self) -&gt; str:
+        return f"{self.provider.name} {self.time}"
+
+
+@dataclass(eq=False)
+class Booking:
+    id: str
+    user: str
+    slot: Slot
+    status: Status
+
+
+# ---------- rules (chain of checks) ----------
+class BookingRule(ABC):
+    @abstractmethod
+    def check(self, user: User, slot: Slot, others: List[Booking]) -&gt; None:
+        """Raise BookingError if the user may not hold this slot."""
+
+
+class NoDuplicateRule(BookingRule):
+    def check(self, user, slot, others):
+        if any(b.slot is slot for b in others):
+            raise BookingError(f"{user.name} already holds or waits for {slot.label()}")
+
+
+class NoOverlapRule(BookingRule):
+    def check(self, user, slot, others):
+        for b in others:
+            if b.status is Status.CONFIRMED and b.slot.time.overlaps(slot.time):
+                raise BookingError(f"{user.name} already has {b.slot.label()} at that time")
+
+
+class TierQuotaRule(BookingRule):
+    def check(self, user, slot, others):
+        used = sum(1 for b in others if b.status is Status.CONFIRMED)
+        if used &gt;= user.tier.quota:
+            raise BookingError(f"{user.tier.name} tier allows {user.tier.quota} bookings")
+
+
+def default_rules() -&gt; List[BookingRule]:
+    return [NoDuplicateRule(), NoOverlapRule(), TierQuotaRule()]
+
+
+# ---------- ranking strategies ----------
+RankingStrategy = Callable[[List[Slot]], List[Slot]]
+
+
+def by_start_time(slots: List[Slot]) -&gt; List[Slot]:
+    return sorted(slots, key=lambda s: (s.time.start, s.provider.name))
+
+
+def by_rating(slots: List[Slot]) -&gt; List[Slot]:
+    return sorted(slots, key=lambda s: (-s.provider.rating, s.time.start))
+
+
+Listener = Callable[[str, str], None]
+
+
+# ---------- service (facade) ----------
+class BookingService:
+    def __init__(self, slot_minutes: int, cancel_cutoff: int, clock: Callable[[], int],
+                 rules: Optional[List[BookingRule]] = None) -&gt; None:
+        self._slot_minutes = slot_minutes
+        self._cutoff = cancel_cutoff
+        self._clock = clock
+        self._rules = rules if rules is not None else default_rules()
+        self._providers: Dict[str, Provider] = {}
+        self._users: Dict[str, User] = {}
+        self._slots: Dict[str, Slot] = {}
+        self._bookings: Dict[str, Booking] = {}
+        self._by_user: Dict[str, List[Booking]] = {}
+        self._per_provider: Dict[str, int] = {}
+        self._listeners: List[Listener] = []
+        self._lock = threading.Lock()
+        self._next_slot = 1
+        self._next_booking = 1
+
+    def add_listener(self, listener: Listener) -&gt; None:
+        self._listeners.append(listener)
+
+    def register_provider(self, name: str, category: str, rating: float) -&gt; None:
+        with self._lock:
+            if name in self._providers:
+                raise BookingError(f"{name} already registered")
+            self._providers[name] = Provider(name, category, rating)
+
+    def register_user(self, name: str, tier: Tier) -&gt; None:
+        with self._lock:
+            if name in self._users:
+                raise BookingError(f"{name} already registered")
+            self._users[name] = User(name, tier)
+            self._by_user[name] = []
+
+    def add_slot(self, provider: str, start: str, end: str, capacity: int, waitlist_limit: int) -&gt; str:
+        with self._lock:
+            p = self._provider(provider)
+            t = TimeRange(parse(start), parse(end))
+            if t.end - t.start != self._slot_minutes:
+                raise BookingError(f"slots are {self._slot_minutes} mins only")
+            if capacity &lt; 1 or waitlist_limit &lt; 0:
+                raise BookingError("bad capacity")
+            for s in self._slots.values():
+                if s.provider is p and not s.cancelled and s.time.overlaps(t):
+                    raise BookingError(f"{p.name} already has {s.time}")
+            sid = f"S{self._next_slot}"
+            self._next_slot += 1
+            self._slots[sid] = Slot(sid, p, t, capacity, waitlist_limit)
+            return sid
+
+    def available(self, category: str, ranking: RankingStrategy = by_start_time) -&gt; List[Slot]:
+        with self._lock:
+            now = self._clock()
+            found = [s for s in self._slots.values()
+                     if not s.cancelled and s.free() &gt; 0 and s.time.start &gt; now
+                     and s.provider.category == category]
+            return ranking(found)
+
+    def book(self, user_name: str, slot_id: str) -&gt; Booking:
+        events = []
+        with self._lock:
+            user = self._user(user_name)
+            slot = self._slot(slot_id)
+            if slot.cancelled:
+                raise BookingError(f"{slot.label()} is cancelled")
+            if slot.time.start &lt;= self._clock():
+                raise BookingError(f"{slot.label()} has started")
+            for rule in self._rules:  # validate first, mutate after
+                rule.check(user, slot, self._active(user_name))
+            if slot.free() &gt; 0:
+                b = self._new_booking(user, slot, Status.CONFIRMED)
+                slot.confirmed[b.id] = None
+                self._count(slot, +1)
+            elif len(slot.waitlist) &lt; slot.waitlist_limit:
+                b = self._new_booking(user, slot, Status.WAITLISTED)
+                slot.waitlist.append(b.id)
+                events.append((user.name, f"waitlisted #{len(slot.waitlist)} for {slot.label()}"))
+            else:
+                raise BookingError(f"{slot.label()} and its waitlist are full")
+        self._fire(events)  # slow I/O outside the lock
+        return b
+
+    def cancel(self, booking_id: str) -&gt; None:
+        events = []
+        with self._lock:
+            b = self._bookings.get(booking_id)
+            if b is None:
+                raise BookingError(f"no booking {booking_id}")
+            if b.status is Status.CANCELLED:
+                raise BookingError(f"{booking_id} already cancelled")
+            slot = b.slot
+            if b.status is Status.WAITLISTED:
+                slot.waitlist.remove(b.id)
+                b.status = Status.CANCELLED
+                return
+            if self._clock() &gt; slot.time.start - self._cutoff:
+                raise BookingError(f"too late: cancel at least {self._cutoff} min before start")
+            del slot.confirmed[b.id]
+            b.status = Status.CANCELLED
+            self._count(slot, -1)
+            self._promote(slot, events)
+        self._fire(events)
+
+    def cancel_slot(self, slot_id: str) -&gt; None:
+        events = []
+        with self._lock:
+            slot = self._slot(slot_id)
+            if slot.cancelled:
+                return
+            slot.cancelled = True
+            for bid in list(slot.confirmed) + list(slot.waitlist):
+                b = self._bookings[bid]
+                if b.status is Status.CONFIRMED:
+                    self._count(slot, -1)
+                b.status = Status.CANCELLED
+                events.append((b.user, f"{slot.label()} was cancelled by the provider"))
+            slot.confirmed.clear()
+            slot.waitlist.clear()
+        self._fire(events)
+
+    def bookings_of(self, user_name: str) -&gt; List[str]:
+        with self._lock:
+            self._user(user_name)
+            return [f"{b.id} {b.slot.label()} {b.status.value}" for b in self._active(user_name)]
+
+    def trending(self) -&gt; str:
+        with self._lock:
+            best, best_n = None, 0
+            for name in sorted(self._per_provider):
+                if self._per_provider[name] &gt; best_n:
+                    best, best_n = name, self._per_provider[name]
+            return "none" if best is None else f"{best} ({best_n})"
+
+    def status_of(self, booking_id: str) -&gt; Status:
+        with self._lock:
+            return self._bookings[booking_id].status
+
+    def counts(self, slot_id: str) -&gt; tuple:
+        with self._lock:
+            s = self._slot(slot_id)
+            return len(s.confirmed), len(s.waitlist)
+
+    # ----- helpers (lock held) -----
+    def _promote(self, slot: Slot, events: list) -&gt; None:
+        while slot.free() &gt; 0 and slot.waitlist:
+            nxt = self._bookings[slot.waitlist.popleft()]
+            user = self._users[nxt.user]
+            others = [b for b in self._active(user.name) if b is not nxt]
+            try:
+                for rule in self._rules:  # the user's day may have changed since joining
+                    rule.check(user, slot, others)
+            except BookingError as e:
+                nxt.status = Status.CANCELLED
+                events.append((user.name, f"dropped from waitlist of {slot.label()}: {e}"))
+                continue
+            nxt.status = Status.CONFIRMED
+            slot.confirmed[nxt.id] = None
+            self._count(slot, +1)
+            events.append((user.name, f"promoted from waitlist: {slot.label()}"))
+
+    def _count(self, slot: Slot, delta: int) -&gt; None:
+        name = slot.provider.name
+        self._per_provider[name] = self._per_provider.get(name, 0) + delta
+
+    def _new_booking(self, user: User, slot: Slot, status: Status) -&gt; Booking:
+        b = Booking(f"B{self._next_booking}", user.name, slot, status)
+        self._next_booking += 1
+        self._bookings[b.id] = b
+        self._by_user[user.name].append(b)
+        return b
+
+    def _active(self, user_name: str) -&gt; List[Booking]:
+        return [b for b in self._by_user[user_name] if b.status is not Status.CANCELLED]
+
+    def _fire(self, events: list) -&gt; None:
+        for user, msg in events:
+            for listener in self._listeners:
+                listener(user, msg)
+
+    def _provider(self, name: str) -&gt; Provider:
+        if name not in self._providers:
+            raise BookingError(f"unknown provider {name}")
+        return self._providers[name]
+
+    def _user(self, name: str) -&gt; User:
+        if name not in self._users:
+            raise BookingError(f"unknown user {name}")
+        return self._users[name]
+
+    def _slot(self, sid: str) -&gt; Slot:
+        if sid not in self._slots:
+            raise BookingError(f"unknown slot {sid}")
+        return self._slots[sid]
+
+
+def demo() -&gt; None:
+    now = [8 * 60]
+    svc = BookingService(30, 0, lambda: now[0])
+    svc.add_listener(lambda u, m: print(f"  [notify {u}] {m}"))
+    svc.register_provider("Dr.Curious", "Cardiologist", 4.2)
+    svc.register_provider("Dr.Daring", "Dermatologist", 4.8)
+    c2 = svc.add_slot("Dr.Curious", "12:30", "13:00", 1, 2)
+    svc.add_slot("Dr.Curious", "09:30", "10:00", 1, 2)
+    svc.add_slot("Dr.Daring", "12:30", "13:00", 1, 2)
+    for p in ("PatientA", "PatientB"):
+        svc.register_user(p, Tier.UNLIMITED)
+    a = svc.book("PatientA", c2)
+    print("PatientA -&gt;", a.id, a.status.value)
+    b = svc.book("PatientB", c2)
+    print("PatientB -&gt;", b.id, b.status.value)
+    svc.cancel(a.id)
+    print("after cancel PatientB is", svc.status_of(b.id).value)
+    print("Cardiologist slots:", [s.label() for s in svc.available("Cardiologist")])
+    print("trending:", svc.trending())
+
+
+if __name__ == "__main__":
+    demo()</code></pre>
+      <p><code>python/test_main.py</code></p>
+<pre><code class="language-python">import threading
+import unittest
+
+from main import BookingError, BookingService, Status, Tier, by_rating
+
+
+class SlotBookingTest(unittest.TestCase):
+    def setUp(self):
+        self.now = [8 * 60]
+        self.inbox = []
+        self.svc = BookingService(30, 0, lambda: self.now[0])
+        self.svc.add_listener(lambda u, m: self.inbox.append(f"{u}: {m}"))
+        self.svc.register_provider("Dr.Curious", "Cardiologist", 4.2)
+        self.svc.register_provider("Dr.Daring", "Dermatologist", 4.8)
+        self.svc.register_provider("Dr.Dreadful", "Dermatologist", 3.9)
+        self.c = self.svc.add_slot("Dr.Curious", "12:30", "13:00", 1, 2)
+        self.d = self.svc.add_slot("Dr.Daring", "12:30", "13:00", 1, 2)
+        self.e = self.svc.add_slot("Dr.Dreadful", "10:00", "10:30", 1, 2)
+        for p in ("A", "B", "C"):
+            self.svc.register_user(p, Tier.UNLIMITED)
+
+    def test_slot_rules(self):
+        with self.assertRaises(BookingError):
+            self.svc.add_slot("Dr.Curious", "09:30", "10:30", 1, 1)  # 60 min
+        with self.assertRaises(BookingError):
+            self.svc.add_slot("Dr.Curious", "12:45", "13:15", 1, 1)  # overlaps
+
+    def test_waitlist_promotion_on_cancel(self):
+        a = self.svc.book("A", self.c)
+        b = self.svc.book("B", self.c)
+        self.assertEqual(b.status, Status.WAITLISTED)
+        self.svc.cancel(a.id)
+        self.assertEqual(self.svc.status_of(b.id), Status.CONFIRMED)
+        self.assertIn("B: promoted from waitlist: Dr.Curious 12:30-13:00", self.inbox)
+
+    def test_no_overlap_and_no_duplicate(self):
+        self.svc.book("A", self.c)
+        with self.assertRaises(BookingError):
+            self.svc.book("A", self.d)  # same time, other doctor
+        with self.assertRaises(BookingError):
+            self.svc.book("A", self.c)  # same slot twice
+
+    def test_promotion_skips_user_who_now_overlaps(self):
+        a = self.svc.book("A", self.c)
+        b_wait = self.svc.book("B", self.c)  # B waits for Curious 12:30
+        self.svc.book("B", self.d)  # ...and meanwhile books Daring 12:30
+        c_wait = self.svc.book("C", self.c)
+        self.svc.cancel(a.id)
+        self.assertEqual(self.svc.status_of(b_wait.id), Status.CANCELLED)
+        self.assertEqual(self.svc.status_of(c_wait.id), Status.CONFIRMED)
+
+    def test_ranking_strategy(self):
+        names = [s.provider.name for s in self.svc.available("Dermatologist", by_rating)]
+        self.assertEqual(names, ["Dr.Daring", "Dr.Dreadful"])
+
+    def test_tier_quota_and_cutoff(self):
+        now = [5 * 60]
+        gym = BookingService(60, 30, lambda: now[0])
+        gym.register_provider("Yoga", "Yoga", 4.5)
+        ids = [gym.add_slot("Yoga", f"{h:02d}:00", f"{h + 1:02d}:00", 2, 1) for h in (6, 7, 8, 18)]
+        gym.register_user("S", Tier.SILVER)
+        bookings = [gym.book("S", sid) for sid in ids[:3]]
+        with self.assertRaises(BookingError):
+            gym.book("S", ids[3])  # 4th &gt; SILVER quota
+        gym.cancel(bookings[2].id)  # quota restored
+        gym.book("S", ids[3])
+        now[0] = 5 * 60 + 45
+        with self.assertRaises(BookingError):
+            gym.cancel(bookings[0].id)  # 15 min before start
+
+    def test_concurrent_booking_never_overbooks(self):
+        svc = BookingService(60, 30, lambda: 0)
+        svc.register_provider("HIIT", "HIIT", 4.0)
+        sid = svc.add_slot("HIIT", "07:00", "08:00", 10, 5)
+        for i in range(50):
+            svc.register_user(f"u{i}", Tier.GOLD)
+        rejected = []
+        go = threading.Event()
+
+        def worker(name):
+            go.wait()
+            try:
+                svc.book(name, sid)
+            except BookingError:
+                rejected.append(name)
+
+        threads = [threading.Thread(target=worker, args=(f"u{i}",)) for i in range(50)]
+        for t in threads:
+            t.start()
+        go.set()
+        for t in threads:
+            t.join()
+        self.assertEqual(svc.counts(sid), (10, 5))
+        self.assertEqual(len(rejected), 35)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+<pre class="terminal"><code>$ python main.py
+PatientA -&gt; B1 CONFIRMED
+  [notify PatientB] waitlisted #1 for Dr.Curious 12:30-13:00
+PatientB -&gt; B2 WAITLISTED
+  [notify PatientB] promoted from waitlist: Dr.Curious 12:30-13:00
+after cancel PatientB is CONFIRMED
+Cardiologist slots: ['Dr.Curious 09:30-10:00']
+trending: Dr.Curious (1)</code></pre>
+<pre class="terminal"><code>$ python -m unittest -v test_main
+test_concurrent_booking_never_overbooks (test_main.SlotBookingTest.test_concurrent_booking_never_overbooks) ... ok
+test_no_overlap_and_no_duplicate (test_main.SlotBookingTest.test_no_overlap_and_no_duplicate) ... ok
+test_promotion_skips_user_who_now_overlaps (test_main.SlotBookingTest.test_promotion_skips_user_who_now_overlaps) ... ok
+test_ranking_strategy (test_main.SlotBookingTest.test_ranking_strategy) ... ok
+test_slot_rules (test_main.SlotBookingTest.test_slot_rules) ... ok
+test_tier_quota_and_cutoff (test_main.SlotBookingTest.test_tier_quota_and_cutoff) ... ok
+test_waitlist_promotion_on_cancel (test_main.SlotBookingTest.test_waitlist_promotion_on_cancel) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.011s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><code>cpp/main.cpp</code></p>
+<pre><code class="language-cpp">// Doctor appointment / fitness class slot booking - C++14, single file.
+// Locking: every public BookingService method takes one lock on the service (std::lock_guard), exactly like
+// the Java synchronized methods. Listeners are called after the unlock (events are collected under the lock).
+// Mutex is std::mutex when the toolchain has threads (Linux/WSL g++, MSVC, MinGW-w64 posix). The MinGW.org
+// g++ 6.3 used for run-cpp.txt has no std::mutex, so there Mutex is a no-op with the same lock()/unlock():
+// the locking code is the same in both builds. Linux build (run-cpp-linux.txt): g++ -std=c++14 -pthread main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+#if defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__)
+using Mutex = std::mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} };   // MinGW.org g++ 6.3: no std::mutex, single-threaded demo
+#endif
+
+enum class Tier { PLATINUM, GOLD, SILVER, UNLIMITED };
+static int quota(Tier t) {
+    switch (t) { case Tier::PLATINUM: return 10; case Tier::GOLD: return 5; case Tier::SILVER: return 3; default: return 1 &lt;&lt; 30; }
+}
+static const char* tierName(Tier t) {
+    switch (t) { case Tier::PLATINUM: return "PLATINUM"; case Tier::GOLD: return "GOLD"; case Tier::SILVER: return "SILVER"; default: return "UNLIMITED"; }
+}
+enum class Status { CONFIRMED, WAITLISTED, CANCELLED };
+
+struct BookingError : std::runtime_error { explicit BookingError(const std::string&amp; m) : std::runtime_error(m) {} };
+
+static int parseTime(const std::string&amp; s) {
+    int h = 0, m = 0;
+    if (std::sscanf(s.c_str(), "%d:%d", &amp;h, &amp;m) != 2 || h &lt; 0 || h &gt; 24 || m &lt; 0 || m &gt; 59) throw BookingError("bad time " + s);
+    return h * 60 + m;
+}
+static std::string fmt(int t) { char b[16]; std::snprintf(b, sizeof b, "%02d:%02d", t / 60, t % 60); return b; }
+
+struct TimeRange {
+    int start, end;  // minutes since midnight, [start, end)
+    bool overlaps(const TimeRange&amp; o) const { return start &lt; o.end &amp;&amp; o.start &lt; end; }
+    std::string str() const { return fmt(start) + "-" + fmt(end); }
+};
+
+struct Provider { std::string name, category; double rating; };
+struct User { std::string name; Tier tier; };
+
+struct Slot {
+    std::string id; const Provider* provider; TimeRange time; int capacity, waitlistLimit;
+    std::vector&lt;std::string&gt; confirmed;   // booking ids
+    std::deque&lt;std::string&gt; waitlist;     // booking ids, FIFO
+    bool cancelled = false;
+    int freeSeats() const { return capacity - (int)confirmed.size(); }
+    std::string label() const { return provider-&gt;name + " " + time.str(); }
+};
+
+struct Booking { std::string id, user; Slot* slot; Status status; };
+
+// ----- rules: a chain of checks, each may veto -----
+struct BookingRule {
+    virtual ~BookingRule() {}
+    virtual void check(const User&amp; u, const Slot&amp; s, const std::vector&lt;Booking*&gt;&amp; others) const = 0;
+};
+struct NoDuplicateRule : BookingRule {
+    void check(const User&amp; u, const Slot&amp; s, const std::vector&lt;Booking*&gt;&amp; others) const override {
+        for (auto b : others) if (b-&gt;slot == &amp;s) throw BookingError(u.name + " already holds or waits for " + s.label());
+    }
+};
+struct NoOverlapRule : BookingRule {
+    void check(const User&amp; u, const Slot&amp; s, const std::vector&lt;Booking*&gt;&amp; others) const override {
+        for (auto b : others)
+            if (b-&gt;status == Status::CONFIRMED &amp;&amp; b-&gt;slot-&gt;time.overlaps(s.time))
+                throw BookingError(u.name + " already has " + b-&gt;slot-&gt;label() + " at that time");
+    }
+};
+struct TierQuotaRule : BookingRule {
+    void check(const User&amp; u, const Slot&amp;, const std::vector&lt;Booking*&gt;&amp; others) const override {
+        int used = (int)std::count_if(others.begin(), others.end(), [](Booking* b) { return b-&gt;status == Status::CONFIRMED; });
+        if (used &gt;= quota(u.tier)) throw BookingError(std::string(tierName(u.tier)) + " tier allows " + std::to_string(quota(u.tier)) + " bookings");
+    }
+};
+
+// ----- ranking strategies -----
+using Ranking = std::function&lt;bool(const Slot*, const Slot*)&gt;;
+static const Ranking byStartTime = [](const Slot* a, const Slot* b) {
+    return a-&gt;time.start != b-&gt;time.start ? a-&gt;time.start &lt; b-&gt;time.start : a-&gt;provider-&gt;name &lt; b-&gt;provider-&gt;name;
+};
+static const Ranking byRating = [](const Slot* a, const Slot* b) {
+    return a-&gt;provider-&gt;rating != b-&gt;provider-&gt;rating ? a-&gt;provider-&gt;rating &gt; b-&gt;provider-&gt;rating : a-&gt;time.start &lt; b-&gt;time.start;
+};
+
+using Listener = std::function&lt;void(const std::string&amp;, const std::string&amp;)&gt;;
+
+class BookingService {
+public:
+    BookingService(int slotMinutes, int cutoff, std::function&lt;int()&gt; clock)
+        : slotMinutes_(slotMinutes), cutoff_(cutoff), clock_(clock) {
+        rules_.emplace_back(new NoDuplicateRule());
+        rules_.emplace_back(new NoOverlapRule());
+        rules_.emplace_back(new TierQuotaRule());
+    }
+    void addListener(Listener l) { listeners_.push_back(l); }
+
+    void registerProvider(const std::string&amp; n, const std::string&amp; cat, double rating) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (providers_.count(n)) throw BookingError(n + " already registered");
+        providers_[n] = Provider{n, cat, rating};
+    }
+    void registerUser(const std::string&amp; n, Tier t) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        if (users_.count(n)) throw BookingError(n + " already registered");
+        users_[n] = User{n, t};
+        byUser_[n];
+    }
+    std::string addSlot(const std::string&amp; prov, const std::string&amp; from, const std::string&amp; to, int cap, int wl) {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        const Provider&amp; p = provider(prov);
+        TimeRange t{parseTime(from), parseTime(to)};
+        if (t.start &gt;= t.end) throw BookingError("bad time range");
+        if (t.end - t.start != slotMinutes_) throw BookingError("slots are " + std::to_string(slotMinutes_) + " mins only");
+        for (auto&amp; kv : slots_)
+            if (kv.second-&gt;provider == &amp;p &amp;&amp; !kv.second-&gt;cancelled &amp;&amp; kv.second-&gt;time.overlaps(t))
+                throw BookingError(p.name + " already has " + kv.second-&gt;time.str());
+        std::string id = "S" + std::to_string(nextSlot_++);
+        slots_[id].reset(new Slot{id, &amp;p, t, cap, wl, {}, {}, false});
+        order_.push_back(id);
+        return id;
+    }
+    std::vector&lt;const Slot*&gt; available(const std::string&amp; cat, const Ranking&amp; rank) const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::vector&lt;const Slot*&gt; r;
+        for (auto&amp; id : order_) {
+            const Slot* s = slots_.at(id).get();
+            if (!s-&gt;cancelled &amp;&amp; s-&gt;freeSeats() &gt; 0 &amp;&amp; s-&gt;time.start &gt; clock_() &amp;&amp; s-&gt;provider-&gt;category == cat) r.push_back(s);
+        }
+        std::stable_sort(r.begin(), r.end(), rank);
+        return r;
+    }
+    Booking&amp; book(const std::string&amp; userName, const std::string&amp; slotId) {
+        std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt; events;
+        Booking* b;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);   // released at the closing brace, also when a rule throws
+            User&amp; u = user(userName);
+            Slot&amp; s = slot(slotId);
+            if (s.cancelled) throw BookingError(s.label() + " is cancelled");
+            if (s.time.start &lt;= clock_()) throw BookingError(s.label() + " has started");
+            for (auto&amp; r : rules_) r-&gt;check(u, s, active(userName));  // validate first
+            if (s.freeSeats() &gt; 0) {
+                b = &amp;newBooking(u, s, Status::CONFIRMED);
+                s.confirmed.push_back(b-&gt;id);
+                perProvider_[s.provider-&gt;name]++;
+            } else if ((int)s.waitlist.size() &lt; s.waitlistLimit) {
+                b = &amp;newBooking(u, s, Status::WAITLISTED);
+                s.waitlist.push_back(b-&gt;id);
+                events.emplace_back(u.name, "waitlisted #" + std::to_string(s.waitlist.size()) + " for " + s.label());
+            } else {
+                throw BookingError(s.label() + " and its waitlist are full");
+            }
+        }
+        fire(events);  // after the unlock: a slow listener never blocks other bookings
+        return *b;
+    }
+    void cancel(const std::string&amp; id) {
+        std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt; events;
+        {
+            std::lock_guard&lt;Mutex&gt; g(mu_);
+            auto it = bookings_.find(id);
+            if (it == bookings_.end()) throw BookingError("no booking " + id);
+            Booking&amp; b = *it-&gt;second;
+            if (b.status == Status::CANCELLED) throw BookingError(id + " already cancelled");
+            Slot&amp; s = *b.slot;
+            if (b.status == Status::WAITLISTED) {
+                s.waitlist.erase(std::find(s.waitlist.begin(), s.waitlist.end(), id));
+                b.status = Status::CANCELLED;
+                return;
+            }
+            if (clock_() &gt; s.time.start - cutoff_) throw BookingError("too late: cancel at least " + std::to_string(cutoff_) + " min before start");
+            s.confirmed.erase(std::find(s.confirmed.begin(), s.confirmed.end(), id));
+            b.status = Status::CANCELLED;
+            perProvider_[s.provider-&gt;name]--;
+            promote(s, events);   // the freed seat goes to the waitlist head in the same critical section
+        }
+        fire(events);
+    }
+    Status statusOf(const std::string&amp; id) const { std::lock_guard&lt;Mutex&gt; g(mu_); return bookings_.at(id)-&gt;status; }
+    std::string trending() const {
+        std::lock_guard&lt;Mutex&gt; g(mu_);
+        std::string best; int n = 0;
+        for (auto&amp; kv : perProvider_) if (kv.second &gt; n) { best = kv.first; n = kv.second; }
+        return n == 0 ? "none" : best + " (" + std::to_string(n) + ")";
+    }
+
+private:
+    void promote(Slot&amp; s, std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;&amp; events) {
+        while (s.freeSeats() &gt; 0 &amp;&amp; !s.waitlist.empty()) {
+            Booking&amp; next = *bookings_.at(s.waitlist.front());
+            s.waitlist.pop_front();
+            User&amp; u = users_.at(next.user);
+            std::vector&lt;Booking*&gt; others = active(u.name);
+            others.erase(std::remove(others.begin(), others.end(), &amp;next), others.end());
+            try {
+                for (auto&amp; r : rules_) r-&gt;check(u, s, others);
+            } catch (const BookingError&amp; e) {
+                next.status = Status::CANCELLED;
+                events.emplace_back(u.name, "dropped from waitlist of " + s.label() + ": " + e.what());
+                continue;
+            }
+            next.status = Status::CONFIRMED;
+            s.confirmed.push_back(next.id);
+            perProvider_[s.provider-&gt;name]++;
+            events.emplace_back(u.name, "promoted from waitlist: " + s.label());
+        }
+    }
+    Booking&amp; newBooking(User&amp; u, Slot&amp; s, Status st) {
+        std::string id = "B" + std::to_string(nextBooking_++);
+        bookings_[id].reset(new Booking{id, u.name, &amp;s, st});
+        byUser_[u.name].push_back(bookings_[id].get());
+        return *bookings_[id];
+    }
+    std::vector&lt;Booking*&gt; active(const std::string&amp; n) const {
+        std::vector&lt;Booking*&gt; r;
+        for (auto b : byUser_.at(n)) if (b-&gt;status != Status::CANCELLED) r.push_back(b);
+        return r;
+    }
+    void fire(const std::vector&lt;std::pair&lt;std::string, std::string&gt;&gt;&amp; ev) const {
+        for (auto&amp; e : ev) for (auto&amp; l : listeners_) l(e.first, e.second);
+    }
+    const Provider&amp; provider(const std::string&amp; n) const {
+        auto it = providers_.find(n);
+        if (it == providers_.end()) throw BookingError("unknown provider " + n);
+        return it-&gt;second;
+    }
+    User&amp; user(const std::string&amp; n) {
+        auto it = users_.find(n);
+        if (it == users_.end()) throw BookingError("unknown user " + n);
+        return it-&gt;second;
+    }
+    Slot&amp; slot(const std::string&amp; id) {
+        auto it = slots_.find(id);
+        if (it == slots_.end()) throw BookingError("unknown slot " + id);
+        return *it-&gt;second;
+    }
+
+    mutable Mutex mu_;   // guards every map below and the Slot seat / waitlist fields
+    int slotMinutes_, cutoff_;
+    std::function&lt;int()&gt; clock_;
+    std::vector&lt;std::unique_ptr&lt;BookingRule&gt;&gt; rules_;
+    std::map&lt;std::string, Provider&gt; providers_;   // std::map nodes never move: Provider* stays valid
+    std::map&lt;std::string, User&gt; users_;
+    std::map&lt;std::string, std::unique_ptr&lt;Slot&gt;&gt; slots_;
+    std::vector&lt;std::string&gt; order_;
+    std::map&lt;std::string, std::unique_ptr&lt;Booking&gt;&gt; bookings_;
+    std::map&lt;std::string, std::vector&lt;Booking*&gt;&gt; byUser_;
+    std::map&lt;std::string, int&gt; perProvider_;
+    std::vector&lt;Listener&gt; listeners_;
+    int nextSlot_ = 1, nextBooking_ = 1;
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) {
+    if (!ok) { std::cout &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++checks;
+}
+static bool rejects(const std::function&lt;void()&gt;&amp; f) {
+    try { f(); return false; } catch (const BookingError&amp; e) { std::cout &lt;&lt; "  rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; return true; }
+}
+
+int main() {
+    int now = 8 * 60;
+    BookingService clinic(30, 0, [&amp;now] { return now; });
+    clinic.addListener([](const std::string&amp; u, const std::string&amp; m) { std::cout &lt;&lt; "  [notify " &lt;&lt; u &lt;&lt; "] " &lt;&lt; m &lt;&lt; "\n"; });
+    clinic.registerProvider("Dr.Curious", "Cardiologist", 4.2);
+    clinic.registerProvider("Dr.Daring", "Dermatologist", 4.8);
+    clinic.registerProvider("Dr.Dreadful", "Dermatologist", 3.9);
+    check(rejects([&amp;] { clinic.addSlot("Dr.Curious", "09:30", "10:30", 1, 2); }), "30-min slots only");
+    std::string c2 = clinic.addSlot("Dr.Curious", "12:30", "13:00", 1, 2);
+    clinic.addSlot("Dr.Curious", "09:30", "10:00", 1, 2);
+    std::string d2 = clinic.addSlot("Dr.Dreadful", "12:30", "13:00", 1, 2);
+    clinic.addSlot("Dr.Daring", "11:30", "12:00", 1, 2);
+    check(rejects([&amp;] { clinic.addSlot("Dr.Curious", "09:45", "10:15", 1, 2); }), "no overlapping doctor slots");
+    for (const char* p : {"PatientA", "PatientB"}) clinic.registerUser(p, Tier::UNLIMITED);
+
+    std::string a = clinic.book("PatientA", c2).id;
+    std::string b = clinic.book("PatientB", c2).id;
+    std::cout &lt;&lt; "PatientA " &lt;&lt; a &lt;&lt; " booked, PatientB " &lt;&lt; b &lt;&lt; " waitlisted\n";
+    check(clinic.statusOf(b) == Status::WAITLISTED, "waitlisted");
+    check(rejects([&amp;] { clinic.book("PatientA", d2); }), "no two slots at the same time");
+    clinic.cancel(a);
+    check(clinic.statusOf(b) == Status::CONFIRMED, "promoted on cancel");
+    std::cout &lt;&lt; "Dermatologist by rating:\n";
+    auto derm = clinic.available("Dermatologist", byRating);
+    for (auto s : derm) std::cout &lt;&lt; "  " &lt;&lt; s-&gt;id &lt;&lt; " " &lt;&lt; s-&gt;label() &lt;&lt; "\n";
+    check(derm.front()-&gt;provider-&gt;name == "Dr.Daring", "rating strategy");
+    std::cout &lt;&lt; "trending: " &lt;&lt; clinic.trending() &lt;&lt; "\n";
+
+    now = 5 * 60;
+    BookingService gym(60, 30, [&amp;now] { return now; });
+    gym.registerProvider("Yoga", "Yoga", 4.5);
+    std::vector&lt;std::string&gt; ids;
+    for (int h : {6, 7, 8, 18}) ids.push_back(gym.addSlot("Yoga", fmt(h * 60), fmt(h * 60 + 60), 2, 1));
+    gym.registerUser("Silvi", Tier::SILVER);
+    std::vector&lt;std::string&gt; mine;
+    for (int i = 0; i &lt; 3; i++) mine.push_back(gym.book("Silvi", ids[i]).id);
+    check(rejects([&amp;] { gym.book("Silvi", ids[3]); }), "SILVER quota is 3");
+    gym.cancel(mine[2]);
+    gym.book("Silvi", ids[3]);
+    now = 5 * 60 + 45;
+    check(rejects([&amp;] { gym.cancel(mine[0]); }), "cancel cutoff 30 min");
+    std::cout &lt;&lt; "All " &lt;&lt; checks &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -O2 main.cpp -o booking &amp;&amp; ./booking
+  rejected: slots are 30 mins only
+  rejected: Dr.Curious already has 09:30-10:00
+  [notify PatientB] waitlisted #1 for Dr.Curious 12:30-13:00
+PatientA B1 booked, PatientB B2 waitlisted
+  rejected: PatientA already has Dr.Curious 12:30-13:00 at that time
+  [notify PatientB] promoted from waitlist: Dr.Curious 12:30-13:00
+Dermatologist by rating:
+  S4 Dr.Daring 11:30-12:00
+  S3 Dr.Dreadful 12:30-13:00
+trending: Dr.Curious (1)
+  rejected: SILVER tier allows 3 bookings
+  rejected: too late: cancel at least 30 min before start
+All 8 checks passed</code></pre>
+    </div>
+  </div>

@@ -1,0 +1,222 @@
+
+        <h2>Deep dives</h2>
+
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the architecture (single owner per document + op log + broadcast) + deep dive 1 + the idea of OT from deep dive 2 is a passing SDE-1 answer. Deep dives 2-3 in detail (OT by hand, CRDT contrast) and 5 (scaling sockets, fencing) are expected at SDE-2. Deep dives 4 and 6 are good to know.</p></div>
+
+        <h3>1. Why naive approaches lose edits (must know)</h3>
+        <ul>
+          <li><b>Lock the document</b> while someone types: correct but nobody else can type. Fine for a wiki, not for live collaboration.</li>
+          <li><b>Last write wins on the whole document</b>: Alice's and Bob's full texts overwrite each other; one person's work vanishes.</li>
+          <li><b>Send raw positions and apply in arrival order</b>: "delete at 2" means a different letter on a copy where someone already inserted before position 2. The copies <b>diverge</b> silently. This is exactly the bug OT and CRDTs fix.</li>
+        </ul>
+
+        <h3>2. Operational Transformation, worked by hand (SDE-2)</h3>
+        <p>OT's core is one function: <code>transform(a, b)</code> = "rewrite operation a so it still means the same thing after operation b has already been applied". For single characters the rules fit on a napkin: if b inserted <i>before</i> a's position, shift a right by one; if b deleted before it, shift a left by one; if both deleted the same character, drop a; if both inserted at the same spot, break the tie consistently (e.g. lower user id goes first).</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 860 330" role="img" aria-label="Operational transformation example: insert X at 1 and delete at 2 converge to aXb">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="30">Alice</text>
+            <text class="label left" x="20" y="200">Bob</text>
+            <rect class="box" x="90" y="10" width="130" height="40"/><text class="label mono" x="155" y="36">"abc" rev 42</text><text class="label small mono" x="155" y="68">a=0 b=1 c=2</text>
+            <rect class="box" x="90" y="180" width="130" height="40"/><text class="label mono" x="155" y="206">"abc" rev 42</text><text class="label small mono" x="155" y="238">a=0 b=1 c=2</text>
+            <g data-step="1">
+              <path class="arrow" d="M220 30 L298 30"/>
+              <text class="label small" x="259" y="22">ins X @1</text>
+              <rect class="box client" x="305" y="10" width="130" height="40"/><text class="label mono" x="370" y="36">"aXbc"</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M220 200 L298 200"/>
+              <text class="label small" x="259" y="192">del @2</text>
+              <rect class="box client" x="305" y="180" width="130" height="40"/><text class="label mono" x="370" y="206">"ab"</text>
+            </g>
+            <g data-step="3">
+              <rect class="box svc" x="470" y="95" width="170" height="50"/>
+              <text class="label small" x="555" y="116">server: Alice first</text>
+              <text class="label small" x="555" y="134">ins X @1 = rev 43</text>
+              <path class="arrow dashed" d="M435 40 L480 95"/>
+              <path class="arrow dashed" d="M435 200 L480 145"/>
+              <text class="label small" x="555" y="168">Bob's del@2 (base 42) arrives</text>
+            </g>
+            <g data-step="4">
+              <rect class="box hot" x="470" y="230" width="170" height="70"/>
+              <text class="label small" x="555" y="254">transform(del@2, ins@1)</text>
+              <text class="label small" x="555" y="272">1 &lt; 2 so shift right</text>
+              <text class="label small" x="555" y="290">= del @3 = rev 44</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow ok" d="M640 120 Q700 40 705 30"/>
+              <rect class="box cache active" x="680" y="10" width="160" height="40"/><text class="label mono" x="760" y="36">"aXb" (del@3)</text>
+              <path class="arrow ok" d="M640 265 Q700 210 705 200"/>
+              <rect class="box cache active" x="680" y="180" width="160" height="40"/><text class="label mono" x="760" y="206">"aXb" (ins@1)</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Alice</b> inserts "X" at position 1 on her copy: "aXbc". She shows it at once and sends it with baseRev 42.</li>
+            <li><b>Bob</b>, at the same moment, deletes position 2 (the "c") on his copy: "ab". He also sends it with baseRev 42.</li>
+            <li><b>The server picks an order.</b> Alice's op arrives first and becomes revision 43. Bob's op says baseRev 42, so the server knows it missed revision 43.</li>
+            <li><b>Transform.</b> Alice inserted at 1, which is before Bob's position 2, so everything after it moved one place right. Bob's op becomes "delete at 3" and is stored as revision 44.</li>
+            <li><b>Converge.</b> Alice receives rev 44 = "delete at 3" and gets "aXb". Bob receives rev 43 = "insert X at 1" (his own pending delete was already applied; his client transforms the incoming insert against it - 1 &lt; 2, unchanged) and also gets "aXb".</li>
+          </ol>
+        </div>
+<pre><code class="language-python"># ot.py - minimal OT for single-character insert/delete. Run: python ot.py
+from dataclasses import dataclass, replace
+
+@dataclass
+class Op:
+    kind: str      # "ins" or "del"
+    pos: int
+    ch: str = ""
+    site: int = 0  # tie-breaker for two inserts at the same position
+
+def apply(doc, op):
+    if op.kind == "ins":
+        return doc[:op.pos] + op.ch + doc[op.pos:]
+    return doc[:op.pos] + doc[op.pos + 1:]
+
+def transform(a, b):
+    """Rewrite a so it can be applied AFTER b (both made on the same doc)."""
+    if b.kind == "ins":
+        # same position: a delete always shifts past the new char;
+        # the site tie-break is only for two inserts
+        if b.pos &lt; a.pos or (b.pos == a.pos and (a.kind == "del" or b.site &lt; a.site)):
+            return replace(a, pos=a.pos + 1)
+        return a
+    if b.pos &lt; a.pos:                     # b is a delete before a
+        return replace(a, pos=a.pos - 1)
+    if b.pos == a.pos and a.kind == "del":
+        return None                       # both deleted the same char
+    return a
+
+doc = "abc"
+alice = Op("ins", 1, "X", site=1)
+bob = Op("del", 2, site=2)
+at_alice = apply(apply(doc, alice), transform(bob, alice))
+at_bob = apply(apply(doc, bob), transform(alice, bob))
+print(at_alice, at_bob)
+
+# tie case: delete and insert at the SAME position
+alice = Op("del", 1, site=1)          # delete "b"
+bob = Op("ins", 1, "X", site=2)       # insert "X" before "b"
+at_alice = apply(apply(doc, alice), transform(bob, alice))
+at_bob = apply(apply(doc, bob), transform(alice, bob))
+print(at_alice, at_bob)</code></pre>
+<pre class="terminal"><code>$ python ot.py
+aXb aXb
+aXc aXc</code></pre>
+        <p>The second line is the tricky tie: a delete and an insert at the same position. The delete must always shift past the newly inserted character (otherwise Alice would delete Bob's "X" and the two copies would diverge as "aXc" vs "abc"). The site tie-break only decides the order of <i>two inserts</i>. Bugs like this are exactly why you use a proven library.</p>
+        <p><b>Why a central server makes OT practical.</b> With a server that totally orders operations, each client only has to transform incoming ops against its own few <i>pending</i> (unacknowledged) ops. The Google Wave OT whitepaper describes exactly this client-server model (derived from <b>Jupiter</b>, a 1990s Xerox PARC collaboration system that first used one central server to order OT operations): a client keeps at most one operation in flight and buffers the rest until the server acknowledges it, which keeps the state space small. Peer-to-peer OT without a server needs extra properties of <code>transform</code> that are notoriously hard to get right - several published algorithms were later shown to be wrong. (The famous one is <b>TP2</b>, "transformation property 2": transforming an op against two concurrent ops must give the same result whichever order you take them in. A central server sidesteps it because there is only one order.) <b>ShareDB</b>, which appears in the comparison table below, is an open-source Node.js OT server that follows this central-server model.</p>
+        <div class="callout warn"><p><b>Real OT is bigger than this toy.</b> Production ops are <i>ranges</i> ("retain 5, insert 'hello', retain 20, delete 3"), carry formatting attributes, and the transform must handle every pair of op types. Undo is the inverse of your own op, transformed over everything that happened since. Say "I would use a proven library (e.g. ShareDB's OT types) rather than write transform functions myself."</p></div>
+
+        <h3>3. CRDTs: give every character a name (SDE-2)</h3>
+        <p>A sequence CRDT stops using positions at all. Every inserted character gets a <b>unique, permanent ID</b>, typically <code>(clientId, counter)</code>, and records which character it was inserted after. Delete does not remove the character; it marks it as a <b><a href="{{BASE}}interview/glossary#tombstone">tombstone</a></b> (hidden but still there, so others' references to it still work). Because "insert after <code>alice:3</code>" and "delete <code>bob:7</code>" mean the same thing on every replica, operations <b>commute</b>: apply them in any order, any number of times, and every replica reaches the same result. No transform, no central ordering.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="CRDT: characters with unique IDs, a tombstone for deleted c, and a new X inserted after a">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="30">Every character carries an ID (clientId:counter) and points to its left neighbour</text>
+            <rect class="box ghost" x="20" y="60" width="100" height="70"/><text class="label small" x="70" y="90">START</text>
+            <rect class="box kafka" x="160" y="60" width="120" height="70"/><text class="label big" x="220" y="92">a</text><text class="label small" x="220" y="117">alice:1</text>
+            <rect class="box cache active" x="320" y="60" width="120" height="70"/><text class="label big" x="380" y="92">X</text><text class="label small" x="380" y="112">alice:4</text><text class="label small" x="380" y="126">after alice:1</text>
+            <rect class="box kafka" x="480" y="60" width="120" height="70"/><text class="label big" x="540" y="92">b</text><text class="label small" x="540" y="117">alice:2</text>
+            <rect class="box ghost" x="640" y="60" width="120" height="70"/><text class="label big muted" x="700" y="92">c</text><text class="label small" x="700" y="117">alice:3 tombstone</text>
+            <path class="arrow" d="M120 95 L153 95"/><path class="arrow" d="M280 95 L313 95"/><path class="arrow" d="M440 95 L473 95"/><path class="arrow" d="M600 95 L633 95"/>
+            <rect class="box client" x="140" y="170" width="300" height="56"/>
+            <text class="label small" x="290" y="193">Alice's op: insert "X" with id alice:4</text>
+            <text class="label small" x="290" y="212">after alice:1</text>
+            <rect class="box client" x="480" y="170" width="280" height="56"/>
+            <text class="label small" x="620" y="193">Bob's op: delete id alice:3</text>
+            <text class="label small" x="620" y="212">(mark tombstone; no positions)</text>
+            <path class="arrow dashed" d="M285 170 L370 135"/>
+            <path class="arrow dashed" d="M620 170 L690 135"/>
+            <circle class="packet" r="6"><animateMotion dur="2.8s" repeatCount="indefinite" path="M285 170 L370 135"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.8s" begin="1.4s" repeatCount="indefinite" path="M620 170 L690 135"/></circle>
+          </svg>
+          <figcaption>The same example as a CRDT. Neither op mentions a position, so they can be applied in either order on either replica. The visible text is "aXb"; the tombstoned "c" stays in the structure. If two people insert after the same character at once, a deterministic rule on the IDs decides who goes first.</figcaption>
+        </figure>
+        <p>You can watch a real CRDT do this. <a href="https://github.com/yjs/yjs" target="_blank" rel="noopener">Yjs</a> is a production CRDT used in many collaborative editors:</p>
+<pre><code class="language-bash">npm init -y &amp;&amp; npm i yjs@13.6.27</code></pre>
+<pre><code class="language-javascript">// merge.mjs - two replicas edit "offline", then exchange updates in any order
+import * as Y from 'yjs'
+const alice = new Y.Doc(), bob = new Y.Doc()
+alice.getText('t').insert(0, 'abc')
+Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice))   // both start with "abc"
+alice.getText('t').insert(1, 'X')                  // Alice, offline
+bob.getText('t').delete(2, 1)                      // Bob, offline: delete "c"
+Y.applyUpdate(alice, Y.encodeStateAsUpdate(bob))   // exchange in any order
+Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice))
+console.log('alice:', alice.getText('t').toString())
+console.log('bob:  ', bob.getText('t').toString())</code></pre>
+<pre class="terminal"><code>$ node merge.mjs
+alice: aXb
+bob:   aXb</code></pre>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>OT (central server)</th><th>CRDT</th></tr></thead>
+            <tbody>
+              <tr><td>Core idea</td><td>Positions + transform concurrent ops</td><td>Unique IDs per element; ops commute</td></tr>
+              <tr><td>Needs a central order?</td><td>Yes (practically)</td><td>No - works peer-to-peer and offline</td></tr>
+              <tr><td>Metadata cost</td><td>Small ops; document is plain text</td><td>IDs + tombstones per character (libraries compress runs heavily)</td></tr>
+              <tr><td>Long offline edits</td><td>Expensive: transform against every missed op</td><td>Natural: merge state on reconnect</td></tr>
+              <tr><td>Correctness risk</td><td>Transform functions are subtle; use proven libraries</td><td>Convergence is guaranteed by construction; "intent" anomalies (interleaving) still possible</td></tr>
+              <tr><td>Who uses it</td><td>Google Docs (central-server OT model), ShareDB</td><td>Yjs, Automerge; Figma uses a CRDT-inspired, server-authoritative design</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout interview"><p><b>The answer interviewers want:</b> "We already have a central server per document for permissions and persistence, so OT is a good fit and keeps the data small - that is the Google Docs model. If offline-first or peer-to-peer editing is a core requirement, I would use a CRDT like Yjs and keep the server as a relay and store." Picking with a reason beats reciting both.</p></div>
+        <div class="callout note"><p><b>You might confuse this with...</b></p><ul>
+          <li><b>OT vs CRDT:</b> OT keeps positions and <i>rewrites</i> concurrent ops so they still mean the same thing; a CRDT <i>names</i> every character so ops never need rewriting.</li>
+          <li><b>OT/CRDT vs locking:</b> locking prevents concurrency (only one editor at a time); OT and CRDTs allow it and merge afterwards.</li>
+          <li><b>Single owner vs a lock:</b> the owner session server is not a lock on typing - everyone types at once; the owner only decides the <i>order</i> of ops.</li>
+        </ul></div>
+        <div class="callout note"><p><b>Figma's take.</b> Figma's engineering blog explains they decided against OT as more complex than their problem needed. Their documents are trees of objects with properties, so they use a CRDT-inspired design where the server is still the authority: one server process per multiplayer document over WebSockets, last-writer-wins per object property, and <b>fractional indexing</b> to order children (a new item between positions 0.3 and 0.4 gets 0.35, so nothing else is renumbered). Clients apply their own edits immediately and ignore conflicting server updates for a property until their own change is acknowledged.</p></div>
+
+        <h3>4. Storage: op log, snapshots and compaction (good to know)</h3>
+        <p>Every accepted op is appended at (doc_id, rev) before it is acknowledged. A snapshot is written every ~1,000 ops or after the document goes idle, so loading never replays more than ~1,000 ops. Old ops can be <b>compacted</b>: keep fine-grained ops for recent history (e.g. 30 days), merge older ones into coarser versions ("version from 3 March, 14:00"), and move them to cold object storage. Version history then becomes "list of snapshots + ability to replay between them". For a CRDT, compaction also means <b>garbage-collecting tombstones</b> once every replica has seen the delete - which is hard when an offline replica might still reference them; Yjs and Automerge offer encodings and GC options for this.</p>
+
+        <h3>5. Scaling WebSockets and routing (SDE-2)</h3>
+        <ul>
+          <li><b>Separate gateways from session servers.</b> Gateways only hold sockets and forward frames; session servers hold document state. You can deploy session servers without dropping 3 million sockets.</li>
+          <li><b>Route by doc_id.</b> Either <a href="{{BASE}}interview/glossary#consistent-hashing">consistent hashing</a> of doc_id over session servers, or an explicit registry with leases (more control: you can move a hot doc, drain a server). Hello Interview's breakdown treats "how do we scale to millions of WebSocket connections?" as the first deep dive for this question.</li>
+          <li><b>Hot documents.</b> A company-wide document with thousands of viewers: let viewers subscribe through a pub/sub fan-out tier (read-only), and keep the editor count per document bounded, which real products do.</li>
+          <li><b>Reconnect storms.</b> When a gateway dies, its 100k clients reconnect at once. Clients use exponential backoff with jitter; the LB spreads them; session servers serve them from memory.</li>
+          <li><b>Failover correctness.</b> Two servers must never both think they own a document (split brain would create two revision 1043s). Use a lease with a <b><a href="{{BASE}}interview/glossary#fencing">fencing token</a></b>: the op log write is conditional on "rev = expected and owner epoch = mine", so a zombie old owner's writes are rejected. (Leases are explained from scratch in the story of <a href="{{BASE}}hld/d25">Distributed Job Scheduler</a>.) Why would an owner not know its lease expired? A <a href="{{BASE}}interview/glossary#gc-pause">GC pause</a>: the runtime (JVM, Go, .NET) stops all threads to reclaim memory, sometimes for seconds - like a process frozen by SIGSTOP. When it resumes it has no idea time passed. The job scheduler page shows the same trap.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A <b>fencing token</b> is just an <b>epoch number that only goes up</b>: every time ownership moves, the registry hands the new owner epoch + 1. Storage remembers the highest epoch it has seen and rejects any write carrying an older one - like a router ignoring hellos from a stale designated router that still advertises a lower sequence number, or OSPF dropping an LSA whose sequence number is older than the one in its database. <b>Where it breaks:</b> the check must live in the <b>storage</b> layer. If the op log does not compare the token on every write, the token is useless - a paused old owner that wakes up will still write, because nothing stops it.</p>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 250" role="img" aria-label="Old owner with stale epoch is fenced off; new owner loads snapshot and replays">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box down" x="20" y="30" width="200" height="70"/>
+            <text class="label" x="120" y="58">Old owner (epoch 7)</text>
+            <text class="label small bad" x="120" y="80">GC pause, lease expired</text>
+            <rect class="box queue" x="330" y="20" width="200" height="60"/>
+            <text class="label" x="430" y="46">Lease registry</text>
+            <text class="label small" x="430" y="66">d_9f2 -&gt; S2, epoch 8</text>
+            <rect class="box svc" x="20" y="160" width="200" height="70"/>
+            <text class="label" x="120" y="188">New owner S2 (epoch 8)</text>
+            <text class="label small" x="120" y="210">snapshot + replay</text>
+            <rect class="box db" x="640" y="90" width="200" height="80"/>
+            <text class="label" x="740" y="118">Op log</text>
+            <text class="label small" x="740" y="140">conditional append:</text>
+            <text class="label small" x="740" y="158">epoch &gt;= 8 and rev = next</text>
+            <path class="arrow bad" d="M220 65 L633 110"/>
+            <text class="label small bad" x="430" y="112">write epoch 7: REJECTED</text>
+            <path class="arrow ok" d="M220 195 L633 150"/>
+            <text class="label small ok" x="430" y="196">write epoch 8: OK</text>
+            <path class="arrow dashed" d="M330 60 L220 175"/>
+            <circle class="packet bad" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M220 65 L600 105"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2.6s" begin="1.3s" repeatCount="indefinite" path="M220 195 L640 150"/></circle>
+          </svg>
+          <figcaption>Fencing: the storage layer, not the servers' good behaviour, enforces "one owner". A paused old owner that wakes up cannot corrupt the order.</figcaption>
+        </figure>
+
+        <h3>6. Presence, cursors, offline and undo (good to know)</h3>
+        <ul>
+          <li><b>Presence and cursors</b> are ephemeral: kept in the session server's memory, broadcast at most every ~50-100 ms per user, never written to the op log. A cursor is a position too, so it must be transformed by incoming ops (OT) or anchored to a character ID (CRDT), or it jumps around.</li>
+          <li><b>Offline.</b> The client keeps a queue of unacknowledged ops with their baseRev in local storage. On reconnect it sends them; the server transforms them over everything that happened meanwhile. After a long offline period this can be thousands of transforms - one reason offline-first products choose CRDTs.</li>
+          <li><b>Undo</b> is "undo <i>my</i> last change", not the global last change: take the inverse of my op and transform it over everything applied after it.</li>
+          <li><b>Comments</b> are a separate service; their anchor is a range that is transformed like a cursor (or anchored to CRDT IDs), so the highlight follows the text.</li>
+          <li><b>Permissions</b> are checked when the socket opens and on every op (a viewer's op is rejected). Revoking access closes the session server's subscription for that user.</li>
+        </ul>
+      

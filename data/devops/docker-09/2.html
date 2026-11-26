@@ -1,0 +1,97 @@
+
+        <h2>Step 2: a safe runtime (the hardened docker run)</h2>
+        <p>Here is the "production" version of a <code>docker run</code>. Every flag maps to a kernel feature from the internals page. You will rarely type this by hand in real life (Compose files or Kubernetes manifests carry the same settings), but knowing each flag is what interviewers test.</p>
+<pre><code class="language-bash">docker run -d --name orders \
+  --user 10001:10001 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop=ALL \
+  --security-opt no-new-privileges \
+  --memory=512m --memory-swap=512m --cpus=1 --pids-limit=200 \
+  --init \
+  --restart=on-failure:5 \
+\
+  --log-driver=local --log-opt max-size=10m --log-opt max-file=3 \
+  -p 127.0.0.1:8080:8080 \
+  registry.example.com/shop/orders@sha256:7d3c0f19a2b4...</code></pre>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Flag</th><th>Kernel / Docker feature</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code>--user 10001:10001</code></td><td>process UID/GID</td><td>Without a user namespace, root in the container is UID 0 on the host. A non-root UID limits damage after an escape.</td></tr>
+              <tr><td><code>--read-only</code> + <code>--tmpfs /tmp</code></td><td>read-only overlay mount, RAM mount</td><td>Malware cannot drop files or modify binaries; the app gets a small writable scratch area.</td></tr>
+              <tr><td><code>--cap-drop=ALL</code></td><td>capabilities</td><td>Start from zero privileges. The app listens on 8080, so it needs none. (Adding one back with <code>--cap-add</code> only helps a root process: for a non-root UID Docker puts it in the bounding set, not the effective set, so the process still cannot use it.)</td></tr>
+              <tr><td><code>--security-opt no-new-privileges</code></td><td><code>PR_SET_NO_NEW_PRIVS</code></td><td>setuid binaries like <code>su</code> cannot raise privileges.</td></tr>
+              <tr><td>default seccomp + AppArmor/SELinux</td><td>syscall filter, LSM</td><td>On by default. The rule is: never pass <code>seccomp=unconfined</code> or <code>--privileged</code>.</td></tr>
+              <tr><td><code>--memory</code>, <code>--cpus</code>, <code>--pids-limit</code></td><td>cgroups</td><td>One bad container cannot starve the host or fork-bomb it. Setting <code>--memory-swap</code> equal to <code>--memory</code> means no swap.</td></tr>
+              <tr><td><code>--init</code></td><td>tini as PID 1</td><td>Forwards signals and reaps zombie child processes.</td></tr>
+              <tr><td><code>--restart=on-failure:5</code></td><td>dockerd restart manager</td><td>Bounded automatic restarts (back-off doubles from 100 ms).</td></tr>
+              <tr><td><code>HEALTHCHECK</code> in the Dockerfile</td><td>health check run by dockerd</td><td>Shows <code>healthy</code>/<code>unhealthy</code> in <code>docker ps</code>; Compose <code>service_healthy</code> waits on it. It is baked into the image above, so no flag is needed here.</td></tr>
+              <tr><td><code>--log-driver=local</code> / rotation</td><td>logging driver</td><td>The default json-file driver does <b>not</b> rotate; disks fill up.</td></tr>
+              <tr><td><code>-p 127.0.0.1:8080:8080</code></td><td>iptables DNAT</td><td>Plain <code>-p 8080:8080</code> listens on every interface (0.0.0.0 and [::]).</td></tr>
+              <tr><td><code>@sha256:...</code></td><td>content addressing</td><td>Runs exactly the bytes that were scanned and signed. Tags can move.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Careful with <code>--health-cmd</code>:</b> the <code>docker run --health-cmd</code> flag always runs its string through <code>/bin/sh -c</code> (it does not understand a JSON list). On a distroless or scratch image there is no shell, so the check can never pass and the container stays <code>unhealthy</code> forever. For shell-less images, put an exec-form <code>HEALTHCHECK CMD ["/bin","arg"]</code> in the Dockerfile instead.</p></div>
+
+        <h3>Check that the hardening is real</h3>
+<pre class="terminal"><code>$ docker exec orders sh -c 'id; touch /x'    # (works only if your image has a shell)
+uid=10001 gid=10001
+touch: /x: Read-only file system
+$ docker inspect --format '{{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.SecurityOpt}}' orders
+[ALL] [] true [no-new-privileges]
+$ docker inspect --format '{{.State.Health.Status}}' orders
+healthy</code></pre>
+        <p>The same knobs exist in Compose and Kubernetes. In Compose you write <code>read_only: true</code>, <code>cap_drop: [ALL]</code>, <code>security_opt: [no-new-privileges:true]</code>, <code>user: "10001"</code>. In a Kubernetes pod spec they live in <code>securityContext</code> (<code>runAsNonRoot</code>, <code>readOnlyRootFilesystem</code>, <code>allowPrivilegeEscalation: false</code>, <code>capabilities.drop: ["ALL"]</code>, <code>seccompProfile: RuntimeDefault</code>). The <a href="{{BASE}}devops/k8s-12">Kubernetes Security &amp; RBAC</a> page covers that side.</p>
+
+        <h3>Graceful shutdown in production: grace periods and preStop</h3>
+        <p>The PID 1 rules themselves (why shell-form <code>CMD</code> hides your app behind <code>/bin/sh</code>, why PID 1 has no default signal actions, and the fixes: exec form, a SIGTERM handler, <code>--init</code>) are taught once, on <a href="{{BASE}}devops/docker-03#cmd-entrypoint">page 03</a>; the operational side (<code>docker stop -t</code>, reading exit codes 137 and 143) is on <a href="{{BASE}}devops/docker-04#pid1">page 04</a>. This section is about what changes when an orchestrator, not you, does the stopping.</p>
+        <p>In production a stop is rarely one container on one host. It is a rolling update or a node drain, and the danger is not a slow stop but <b>dropped requests</b> while traffic is still being routed to a pod that is going away. Kubernetes stops a pod like this:</p>
+        <ol class="steps">
+          <li><strong>The pod is marked "Terminating".</strong> Two things then start <i>at the same time</i>: the pod is removed from the Service's endpoints (so kube-proxy and load balancers stop sending it new traffic), and the kubelet begins the shutdown.</li>
+          <li><strong>preStop hook runs first.</strong> If the container has a <code>lifecycle.preStop</code> hook, the kubelet runs it before any signal. A common one is just <code>sleep 5</code>: it gives the endpoint removal a few seconds to reach every node and load balancer.</li>
+          <li><strong>SIGTERM to PID 1.</strong> Your app stops accepting new connections, finishes the in-flight ones, closes DB and Kafka clients cleanly, and exits 0.</li>
+          <li><strong>Deadline, then SIGKILL.</strong> The whole budget is <code>terminationGracePeriodSeconds</code> (30 s by default), and it <b>includes</b> the preStop time. Anything still running at the deadline is SIGKILLed (exit 137).</li>
+        </ol>
+<pre><code class="language-yaml">spec:
+  terminationGracePeriodSeconds: 45     # preStop + drain must fit inside this
+  containers:
+    - name: orders
+      image: ghcr.io/acme/shop/orders@sha256:7d3c0f19...
+      lifecycle:
+        preStop:
+          sleep:
+            seconds: 5                  # built-in sleep action (Kubernetes 1.30+); older clusters use exec: ["sleep","5"]</code></pre>
+        <ul>
+          <li><b>Size the budget from measurements.</b> If your slowest request takes 20 s and preStop is 5 s, a 30 s grace period leaves almost no margin. Raise the grace period rather than cutting the drain.</li>
+          <li><b>Readiness should fail on SIGTERM.</b> Many frameworks flip the readiness endpoint to "not ready" as soon as SIGTERM arrives, which is a second signal to the load balancer to stop routing.</li>
+          <li><b>Zombies still matter.</b> If your app spawns helpers, run it under an init (<code>--init</code> in Docker, or <code>tini</code> / <code>dumb-init</code> as the image's entrypoint in Kubernetes, which has no <code>--init</code> flag). Yelp built dumb-init for exactly this.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>preStop plus a grace period is <b>graceful maintenance on a router</b>: before you reload a box you cost it out (raise the IGP metric, or send BGP graceful-shutdown so neighbours prefer other paths), wait for traffic to move away, and only then take it down. The preStop sleep is that "wait for the network to converge" step. <b>Where it breaks:</b> a routing protocol tells you when convergence is done; Kubernetes gives no signal that every load balancer and kube-proxy has removed the pod, so the sleep is a guess you size from measurements.</p>
+        </div>
+
+        <h3>Logs, disk and metrics</h3>
+        <p>Containers should log to stdout and stderr, and the platform should collect it. Do not write log files inside the container layer. In production a node agent (Fluent Bit, Vector, the cloud provider's agent) ships logs to Elasticsearch, Loki or a cloud log service. Shopify, an early large Docker user, chose a host-side logger subscribing to Docker events rather than an agent inside every container; the same "agent per node" pattern became a DaemonSet in Kubernetes.</p>
+        <p>Set the daemon defaults once in <code>/etc/docker/daemon.json</code>:</p>
+<pre><code class="language-json">{
+  "log-driver": "local",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true,
+  "no-new-privileges": true,
+  "icc": false,
+  "userns-remap": "default",
+  "metrics-addr": "127.0.0.1:9323"
+}</code></pre>
+        <p><code>live-restore</code> keeps containers running while dockerd restarts or upgrades (the shim from the internals page makes this possible). <code>icc: false</code> blocks container-to-container traffic on the default bridge (the legacy <code>--link</code> option is the only exception). Containers that must talk should join a user-defined network, which <code>icc</code> does not affect. <code>userns-remap</code> maps container root to an unprivileged range of host UIDs (note: the containerd image store, the default on fresh Engine 29 installs, is not used when userns-remap is on). <code>metrics-addr</code> exposes the daemon's Prometheus metrics. Restart dockerd after editing (<code>sudo systemctl restart docker</code>).</p>
+<pre class="terminal"><code>$ docker system df
+TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE
+Images          41        6         12.3GB    10.9GB (88%)
+Containers      9         6         312MB     2.1MB (0%)
+Local Volumes   14        4         3.8GB     2.2GB (57%)
+Build Cache     233       0         6.4GB     6.4GB
+$ docker builder prune --filter until=168h -f
+$ docker image prune -a --filter until=168h -f</code></pre>
+        <div class="callout warn"><p><b>Careful:</b> since Docker Engine 23 (API 1.42), <code>docker volume prune</code> and <code>docker system prune --volumes</code> remove only <b>anonymous</b> unused volumes. But <code>docker volume prune -a</code> (or <code>docker system prune -a --volumes</code> on older engines) can delete a database volume you forgot was not attached right now. On production hosts prune images and build cache on a schedule, and handle named volumes by hand.</p></div>
+      

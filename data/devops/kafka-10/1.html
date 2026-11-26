@@ -1,0 +1,111 @@
+
+        <h2>Why "just send JSON" eventually breaks</h2>
+        <p>Many teams start with JSON. It is readable and needs no tools. Then one day the orders team renames <code>amount</code> to <code>total</code> and ships on a Friday evening. The payment service, the analytics job and the search indexer all read <code>amount</code>, get nothing, and either crash or quietly write zeros. Kafka is happy the whole time, because to Kafka it is all just bytes.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="A producer changes a field name and three consumers break, because the broker does not check the content">
+            <rect class="box svc" x="20" y="110" width="150" height="70"/><text class="label" x="95" y="138">Orders service</text><text class="label small" x="95" y="160">v2: "total"</text>
+            <rect class="box kafka" x="300" y="110" width="170" height="70"/><text class="label" x="385" y="138">topic: orders</text><text class="label small" x="385" y="160">bytes, unchecked</text>
+            <rect class="box fail" x="600" y="30" width="180" height="56"/><text class="label" x="690" y="54">Payments</text><text class="label small bad" x="690" y="74">amount = null: crash</text>
+            <rect class="box fail" x="600" y="118" width="180" height="56"/><text class="label" x="690" y="142">Analytics</text><text class="label small bad" x="690" y="162">revenue = 0</text>
+            <rect class="box fail" x="600" y="206" width="180" height="56"/><text class="label" x="690" y="230">Search indexer</text><text class="label small bad" x="690" y="250">mapping error</text>
+            <path class="arrow" d="M170 145 L298 145"/>
+            <path class="arrow bad" d="M470 135 L598 60"/>
+            <path class="arrow bad" d="M470 145 L598 145"/>
+            <path class="arrow bad" d="M470 155 L598 232"/>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M170 145 L385 145 L598 60"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M170 145 L385 145 L598 145"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="2s" repeatCount="indefinite" path="M170 145 L385 145 L598 232"/></circle>
+            <text class="label small" x="385" y="215">The broker never looks inside a message.</text>
+          </svg>
+          <figcaption>Without a contract, a producer change breaks consumers it does not even know about. And because Kafka keeps data, old consumers may also have to read months of the old format during a replay.</figcaption>
+        </figure>
+
+        <p>A <strong>schema</strong> fixes this by writing the contract down: field names, types, which fields are optional, and default values. A <strong>registry</strong> makes the contract shared and versioned. A <strong>compatibility rule</strong> makes the contract enforceable: a producer that tries to register an incompatible change is refused <em>before</em> any bad message reaches the topic.</p>
+
+        <h3>The three formats you will meet</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>Avro</th><th>Protobuf</th><th>JSON Schema</th></tr></thead>
+            <tbody>
+              <tr><td>Wire format</td><td>Compact binary, no field names or tags</td><td>Compact binary with numbered field tags</td><td>Plain JSON text</td></tr>
+              <tr><td>Schema written in</td><td>JSON (<code>.avsc</code>)</td><td><code>.proto</code> IDL</td><td>JSON</td></tr>
+              <tr><td>Needs the writer's schema to read?</td><td>Yes (that is what the registry provides)</td><td>No; tags make it self-describing enough</td><td>No</td></tr>
+              <tr><td>Evolution rule of thumb</td><td>Add/remove fields only if they have defaults</td><td>Never reuse or renumber a tag; add new tags freely</td><td>Add optional properties; watch <code>additionalProperties</code></td></tr>
+              <tr><td>Typical home</td><td>Kafka/Hadoop data platforms, CDC (Debezium)</td><td>gRPC shops, polyglot microservices (Google style)</td><td>Teams that want readable payloads</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Avro (.avsc)">
+<pre><code class="language-json">{
+  "type": "record",
+  "name": "Order",
+  "namespace": "com.shop.events",
+  "fields": [
+    { "name": "id",     "type": "long" },
+    { "name": "name",   "type": "string" },
+    { "name": "amount", "type": "int" },
+    { "name": "coupon", "type": ["null", "string"], "default": null }
+  ]
+}</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Protobuf (.proto)">
+<pre><code class="language-go">syntax = "proto3";
+package shop.events;
+
+message Order {
+  int64  id     = 1;   // the number is the field's tag on the wire: never change or reuse it
+  string name   = 2;
+  int32  amount = 3;
+  optional string coupon = 4;
+  reserved 5;          // a field we deleted; its tag can never come back
+}</code></pre>
+          </div>
+          <div class="tab-panel" data-title="JSON Schema">
+<pre><code class="language-json">{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Order",
+  "type": "object",
+  "properties": {
+    "id":     { "type": "integer" },
+    "name":   { "type": "string" },
+    "amount": { "type": "integer" },
+    "coupon": { "type": ["string", "null"] }
+  },
+  "required": ["id", "name", "amount"]
+}</code></pre>
+          </div>
+        </div>
+
+        <h3>How small is binary, really? One record, counted by hand</h3>
+        <p>Take the record <code>{"id":42,"name":"Asha","amount":499}</code>. As compact JSON it is 36 bytes, because every message repeats the field names and writes numbers as text. In Avro, the schema already says "first a long, then a string, then an int", so only the values are written, using variable-length zig-zag integers:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Avro encoding of the record: 8 bytes for the values">
+            <text class="label small left" x="20" y="30">JSON (36 bytes): field names + digits as text</text>
+            <rect class="box ghost" x="20" y="40" width="760" height="36"/>
+            <text class="label mono" x="400" y="64">{"id":42,"name":"Asha","amount":499}</text>
+
+            <text class="label small left" x="20" y="110">Avro body (8 bytes): values only</text>
+            <rect class="box kafka solid" x="20" y="120" width="80" height="46"/><text class="label white mono" x="60" y="149">54</text>
+            <rect class="box svc" x="105" y="120" width="80" height="46"/><text class="label mono" x="145" y="149">08</text>
+            <rect class="box svc" x="190" y="120" width="80" height="46"/><text class="label mono" x="230" y="149">41</text>
+            <rect class="box svc" x="275" y="120" width="80" height="46"/><text class="label mono" x="315" y="149">73</text>
+            <rect class="box svc" x="360" y="120" width="80" height="46"/><text class="label mono" x="400" y="149">68</text>
+            <rect class="box svc" x="445" y="120" width="80" height="46"/><text class="label mono" x="485" y="149">61</text>
+            <rect class="box cache" x="530" y="120" width="80" height="46"/><text class="label mono" x="570" y="149">E6</text>
+            <rect class="box cache" x="615" y="120" width="80" height="46"/><text class="label mono" x="655" y="149">07</text>
+            <text class="label small" x="60" y="190">id 42</text>
+            <text class="label small" x="315" y="190">len 4 + "Asha"</text>
+            <text class="label small" x="612" y="190">amount 499</text>
+            <text class="label small muted" x="400" y="212">zig-zag: 42 -&gt; 84 = 0x54; length 4 -&gt; 8 = 0x08; 499 -&gt; 998 = varint E6 07</text>
+          </svg>
+          <figcaption>Avro writes 8 bytes of values. With Schema Registry's 5-byte header (next section) the message is 13 bytes instead of 36. Real savings depend on your data, and compression of batches narrows the gap, but parsing binary is also cheaper than parsing text.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Protobuf is basically <b>TLV</b> (type-length-value) encoding, the same idea as BGP path attributes, IS-IS TLVs or LLDP. A receiver that sees an unknown tag can skip it using the length, which is exactly why "add a new field with a new tag" is safe. Avro is more like a <b>fixed C struct sent with <code>#pragma pack</code></b>: tiny on the wire, but the reader must know the exact layout the writer used. That is why Avro needs a registry and Protobuf merely benefits from one.</p>
+        </div>
+      

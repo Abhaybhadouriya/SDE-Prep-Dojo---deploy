@@ -1,0 +1,164 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the three paths (sync scoring, streaming features, offline training), the latency budget and "rules + model" are a strong SDE-1 answer. Deep dives 1-4 are expected at SDE-2. 5-6 are what make an answer memorable.</p></div>
+
+        <h3>1. Streaming velocity features and the freshness gap (must know)</h3>
+        <p>A <b>velocity feature</b> counts or sums events for one key over a time window: "payments on card X in the last hour". Flink computes it by <b>keying</b> the stream by card (all events of a card go to the same Flink task, just like a Kafka key goes to one partition) and keeping a window per key in its state.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Sliding windows over a stream of card payments, with a burst of card-testing payments">
+            <line x1="40" y1="150" x2="770" y2="150" stroke="var(--svg-muted)" stroke-width="2"/>
+            <text class="label small" x="760" y="174">time</text>
+            <circle cx="90" cy="150" r="8" fill="var(--db)"/>
+            <circle cx="210" cy="150" r="8" fill="var(--db)"/>
+            <circle cx="330" cy="150" r="8" fill="var(--db)"/>
+            <circle cx="560" cy="150" r="8" fill="var(--bad)"/>
+            <circle cx="578" cy="150" r="8" fill="var(--bad)"/>
+            <circle cx="596" cy="150" r="8" fill="var(--bad)"/>
+            <circle cx="614" cy="150" r="8" fill="var(--bad)"/>
+            <circle cx="632" cy="150" r="8" fill="var(--bad)"/>
+            <circle cx="650" cy="150" r="8" fill="var(--bad)"/>
+            <text class="label small" x="605" y="128">card testing: many small payments</text>
+            <rect x="420" y="60" width="300" height="40" fill="none" stroke="var(--kafka)" stroke-width="3" rx="6">
+              <animate attributeName="x" values="60;420;60" dur="8s" repeatCount="indefinite"/>
+            </rect>
+            <text class="label small" x="400" y="48">sliding 1-hour window moves with time</text>
+            <rect class="box cache" x="60" y="195" width="300" height="50"/>
+            <text class="label small" x="210" y="225">Flink: per-card window -&gt; store</text>
+            <rect class="box hot" x="420" y="195" width="350" height="50"/>
+            <text class="label small" x="595" y="215">gap: Flink output lags a few seconds;</text>
+            <text class="label small" x="595" y="235">sync 60 s counter sees burst instantly</text>
+          </svg>
+          <figcaption>Normal payments (green) are spread out; a card-testing attack (red) fires many in seconds. The streaming window catches it, but a few seconds late, which is why the scorer also keeps a tiny synchronous counter for the last minute.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Event time vs processing time:</b> windows use the time the payment happened. A <b><a href="{{BASE}}interview/glossary#watermark">watermark</a></b> says "I believe all events up to time T have arrived", so Flink can close a window; late events within an allowed lateness update it.</li>
+          <li><b>The freshness gap:</b> the scorer publishes to Kafka, Flink consumes, aggregates and writes back; that is seconds end to end. A fraudster's tenth payment in 5 seconds may be scored before Flink has seen the first. Fix: the scorer updates a short synchronous counter itself (Redis sorted set or INCR per time bucket) on the request path, and Flink owns the longer windows.</li>
+          <li><b>Hot keys:</b> one big merchant produces a huge share of events, so the Flink task that owns its key becomes a bottleneck. Pre-aggregate per partition first (local combine), then merge; or split the key into sub-keys (<code>merchant#0..15</code>) and sum.</li>
+        </ul>
+        <p>Flink SQL for a 1-hour sliding (hop) window, updated every 10 seconds:</p>
+<pre><code class="language-sql">CREATE TABLE payments (
+  payment_id   STRING,
+  card_fp      STRING,
+  amount_minor BIGINT,
+  event_time   TIMESTAMP(3),
+  WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND   -- tolerate 5 s of disorder
+) WITH (
+  'connector' = 'kafka',
+  'topic' = 'payments',
+  'properties.bootstrap.servers' = 'kafka:9092',
+  'properties.group.id' = 'fraud-features',
+  'scan.startup.mode' = 'latest-offset',
+  'format' = 'json'
+);
+
+SELECT card_fp, window_end,
+       COUNT(*)          AS txn_count_1h,
+       SUM(amount_minor) AS amount_sum_1h
+FROM TABLE(
+  HOP(TABLE payments, DESCRIPTOR(event_time), INTERVAL '10' SECOND, INTERVAL '1' HOUR))
+GROUP BY card_fp, window_start, window_end;</code></pre>
+        <p><b>What this query costs.</b> Each event belongs to 3,600 s / 10 s = <b>360 overlapping windows</b>. Flink stores 10-second slices and combines them, so state is not copied 360 times - but the <i>output</i> is one new row per active card every 10 s, for an hour after its last payment. Every row is a write to the online feature store, and at the 10k/s peak that write fan-out is the real bottleneck. Batch and <a href="{{BASE}}interview/glossary#upsert">upsert</a> those writes, or switch to a <code>CUMULATE</code> window or an incremental per-card counter with 1-minute buckets if the store cannot absorb it. Naming this unprompted is a strong SDE-2 signal.</p>
+        <p>And the synchronous 60-second counter on the request path, using a Redis sorted set (score = timestamp in ms):</p>
+<pre class="terminal"><code>$ redis-cli ZADD win:card:fp_4111x 1795442711204 pay_8812     # = 2026-11-23T14:05:11.204Z (event_time of pay_8812)
+(integer) 1
+$ redis-cli ZREMRANGEBYSCORE win:card:fp_4111x 0 1795442651204   # = that time minus 60,000 ms
+(integer) 2
+$ redis-cli ZCARD win:card:fp_4111x
+(integer) 5
+$ redis-cli EXPIRE win:card:fp_4111x 120
+(integer) 1</code></pre>
+        <p>Add the payment, drop entries older than 60 s, count what remains (5 payments in the last minute), and set a TTL so idle cards cost nothing. In production you run these in one pipeline or Lua script so it is one round-trip.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Keying the stream by card is <b>ECMP flow hashing</b>: every packet of a flow goes to the same core, so per-flow state lives in one place without locks. A sliding-window counter is a <b>token-bucket policer per flow</b> in reverse: instead of allowing N per interval, you measure N per interval and raise an alarm. The watermark is like a <b>reassembly timeout</b>: how long you wait for out-of-order fragments before you decide. <b>Where it breaks:</b> ECMP picks a path only to keep packets in order, and re-hashing a flow costs nothing. Here the Kafka key also decides which worker <i>holds the state</i> (the card's counters), so changing the key or the partition count moves state, and the job must be restored from a savepoint to re-key it.</p>
+        </div>
+
+        <div class="eli5"><h4>Just enough ML (no magic)</h4>
+          <p>A <b>model</b> is just a function: feature vector in, fraud probability out. It is <b>learned</b> from labelled history (past payments marked "fraud" or "fine"), instead of being written by hand. <b>Gradient-boosted trees (GBDT)</b> = many small if-then trees ("amount &gt; 5,000 and card age &lt; 1 day?"), each one fixing the errors of the ones before, whose scores are added up - like a committee voting. A <b>DNN</b> (deep neural network) is a bigger, less explainable function of the same kind. A <b>z-score</b> = how many standard deviations a value sits above the user's normal (z = 3 means "very unusual for this user"). <b>Calibration</b> = adjusting outputs so a score of 0.8 really means "80% of payments with this score were fraud". <b>Drift</b> = fraudsters change behaviour, so the learned function slowly gets worse on new traffic. <b>Champion / challenger</b> = the live model (champion) runs while a new one (challenger) scores the same traffic in shadow, and replaces it only if it does better. <b>Down-sampling</b> = keeping only a fraction of the many "fine" examples in training, because fraud is so rare. The <b>area under the precision-recall curve</b> is one number that sums up precision vs recall across every possible threshold (higher is better).</p>
+        </div>
+        <div class="bridge"><h4>From your world</h4><p>Think of the model as a <b>learned ACL</b>: instead of an engineer writing "drop if rate &gt; X from new source", the thresholds and combinations are fitted automatically from past attack traffic. <b>Where it breaks:</b> an ACL does exactly what it says forever; a model is only as good as its training data, so when attackers change tactics (drift) it degrades silently and must be retrained and monitored.</p></div>
+        <h3>2. Training-serving skew and point-in-time correctness (must know)</h3>
+        <p><b>Training-serving skew</b> means the model sees different feature values in training than in production, so it performs worse live than in tests. Two classic causes:</p>
+        <ul>
+          <li><b>Two implementations:</b> data scientists compute "txn_count_1h" in a Spark notebook, engineers compute it in Flink, and the definitions differ slightly (inclusive vs exclusive window end, time zone, counting declined payments or not). Fix: define features once (a feature store such as Feast, or shared feature definitions) and log the exact feature values the scorer used, then train on those logs.</li>
+          <li><b>Leakage from the future:</b> when you build training data, a naive join takes today's value of "card's chargeback count", which includes the chargeback of the very payment you are labelling. The model learns to cheat. Fix: a <b>point-in-time join</b>: for each payment at time t, use only feature values that existed at time t.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Timeline showing payment at t, feature snapshots before and after, and the label arriving weeks later; only features before t are allowed">
+            <line x1="40" y1="120" x2="770" y2="120" stroke="var(--svg-muted)" stroke-width="2"/>
+            <rect class="box db" x="80" y="60" width="140" height="40"/>
+            <text class="label small" x="150" y="85">feature value @ t-1h</text>
+            <path class="arrow ok" d="M150 100 L150 116"/>
+            <rect class="box client" x="300" y="135" width="140" height="44"/>
+            <text class="label" x="370" y="162">payment @ t</text>
+            <line x1="370" y1="40" x2="370" y2="200" stroke="var(--kafka)" stroke-width="3" stroke-dasharray="6 4"/>
+            <text class="label small" x="370" y="34">cut-off: nothing after t</text>
+            <rect class="box fail" x="470" y="60" width="150" height="40"/>
+            <text class="label small" x="545" y="85">feature value @ t+3d</text>
+            <path class="arrow bad" d="M545 100 L545 116"/>
+            <rect class="box cache" x="630" y="135" width="140" height="44"/>
+            <text class="label small" x="700" y="155">label: chargeback</text>
+            <text class="label small" x="700" y="172">@ t + ~3 weeks</text>
+            <text class="label small ok" x="150" y="215">allowed in training row</text>
+            <text class="label small bad" x="545" y="215">leaks the future: forbidden</text>
+          </svg>
+          <figcaption>A training row for a payment at time t may only use feature values known at t. The label itself arrives weeks later and is attached afterwards. Feature stores implement this "as of" join for you.</figcaption>
+        </figure>
+
+        <h3>3. Labels: late, rare and biased (must know at SDE-2)</h3>
+        <ul>
+          <li><b>Late:</b> chargebacks can take weeks. So the newest weeks of data have incomplete labels. Train on data old enough to be mostly labelled, and use faster proxy signals (manual review results, customer "I didn't do this" reports) for recent data.</li>
+          <li><b>Rare:</b> with 1 fraud per 1,000, use metrics that ignore the easy majority: <b>precision</b> (of payments we blocked, how many were fraud?) and <b>recall</b> (of all fraud, how much did we catch?), and the area under the precision-recall curve. Down-sample good payments or weight fraud cases higher in training.</li>
+          <li><b>Pick thresholds by money, not by accuracy:</b> a false positive costs a lost sale and an angry customer; a false negative costs the fraud amount plus a chargeback fee. Different merchants and amounts deserve different thresholds, and CHALLENGE is the cheap middle option.</li>
+          <li><b>Selection bias (the subtle one):</b> payments you block never get a label, because they never happened. Over time the model only learns from what it let through. Fix: let a tiny random fraction of would-be-blocked low-amount payments go to CHALLENGE instead, to keep learning, and evaluate new models in shadow on all traffic.</li>
+        </ul>
+        <div class="callout interview"><p>Worked example to say out loud (illustrative numbers): "Out of 1,000,000 payments, about 1,000 are fraud. If my model flags 2,000 and 800 of them are fraud, precision is 40% and recall is 80%. I have blocked 1,200 good customers to stop 800 frauds. Whether that is good depends on average fraud loss vs the value of a good sale, so I would set the threshold, and use CHALLENGE instead of BLOCK in the grey zone."</p></div>
+
+        <h3>4. Fail-open vs fail-closed, and degraded modes (must know)</h3>
+        <ul>
+          <li><b>Fail-closed</b> (block when the scorer is down): safe from fraud, but every payment fails, which during a sale is a business outage.</li>
+          <li><b>Fail-open</b> (allow when down): payments keep flowing, but fraudsters who notice can exploit the gap.</li>
+          <li><b>Best answer: fail-open with guard rails.</b> The payment service keeps a small, local fallback policy that is refreshed every few minutes: block-lists, a cap on amount for new cards or new devices, and CHALLENGE above a threshold. Alert immediately, and track how much volume went through the fallback.</li>
+          <li><b>Partial failures:</b> if only the feature store is slow, score with the features you have (models should be trained with missing-value handling) and mark the decision "degraded". If only the model server is down, rules alone decide. Each dependency gets its own timeout inside the 100 ms budget, and a <a href="{{BASE}}interview/glossary#circuit-breaker">circuit breaker</a>.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the same question as <b>"what does the firewall do when its inspection engine crashes?"</b>: fail-open (bypass mode, like a hardware bypass NIC) or fail-closed. Networks usually pick per segment. Payments usually pick fail-open with a reduced, local rule set, like a line card that keeps forwarding on its last FIB when the control plane is gone. <b>Where it breaks:</b> a bypassed firewall costs only the inspection; a fail-open payment path costs real money that fraudsters can take on purpose. Attackers can try to <i>cause</i> the outage, so the fallback must keep amount caps and velocity limits, and fail-open must be time-boxed and loudly alerted.</p>
+        </div>
+
+        <h3>5. Rules that change in minutes: dynamic rules and shadow mode (should know)</h3>
+        <ul>
+          <li>Rules are data, not code: stored versioned in a DB, pushed to scorers (poll every few seconds, or via a compacted Kafka topic <code>fraud.rules</code> where the latest value per <code>rule_id</code> is the current version).</li>
+          <li>In Flink, rules that need streaming state use <b>broadcast state</b>: the rules stream is broadcast to every task, and each task applies the current rules to its keyed events. The Apache Flink blog series on a fraud detection case study shows exactly this, including choosing the grouping key per rule at runtime.</li>
+          <li><b>Shadow mode</b> for every new rule and model: evaluate it on live traffic, log what it <em>would</em> have done, compare against the current one, then promote. A bad rule ("block amount &gt; 100" with a missing zero) can block a whole country in seconds.</li>
+          <li>Champion / challenger: send a small percentage of traffic to the new model's decision, with automatic rollback if block rate or complaint rate jumps.</li>
+        </ul>
+
+        <h3>6. Fraud rings: graph features (good to know)</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Graph of accounts sharing devices and cards, showing a fraud ring cluster">
+            <circle cx="120" cy="70" r="28" fill="var(--client)" opacity="0.85"/><text class="label white" x="120" y="75">acct 1</text>
+            <circle cx="120" cy="190" r="28" fill="var(--client)" opacity="0.85"/><text class="label white" x="120" y="195">acct 2</text>
+            <circle cx="300" cy="130" r="30" fill="var(--bad)" opacity="0.9"/><text class="label white" x="300" y="135">device</text>
+            <circle cx="470" cy="60" r="28" fill="var(--client)" opacity="0.85"/><text class="label white" x="470" y="65">acct 3</text>
+            <circle cx="470" cy="200" r="28" fill="var(--client)" opacity="0.85"/><text class="label white" x="470" y="205">acct 4</text>
+            <circle cx="640" cy="130" r="30" fill="var(--queue)" opacity="0.9"/><text class="label white" x="640" y="135">card</text>
+            <line x1="148" y1="80" x2="272" y2="122" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="148" y1="180" x2="272" y2="138" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="330" y1="125" x2="442" y2="70" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="330" y1="135" x2="442" y2="190" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="498" y1="70" x2="612" y2="122" stroke="var(--svg-muted)" stroke-width="2"/>
+            <line x1="498" y1="190" x2="612" y2="138" stroke="var(--svg-muted)" stroke-width="2"/>
+            <circle class="packet bad" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M120 70 L300 130 L470 60 L640 130 L470 200 L300 130 L120 190"/></circle>
+            <text class="label small" x="720" y="40">one chargeback here</text>
+            <text class="label small" x="720" y="60">raises risk for all</text>
+            <text class="label small" x="720" y="80">connected accounts</text>
+          </svg>
+          <figcaption>Four "different" accounts share one device and one card. Individually each looks normal; together they form a ring. Graph features ("accounts within 2 hops of a known fraudster", "cards per device") catch this.</figcaption>
+        </figure>
+        <ul>
+          <li>Build the graph from shared identifiers: device, card fingerprint, phone, email, address, IP block.</li>
+          <li>Graph features are usually computed in batch or near-real-time jobs (connected components, counts of neighbours with fraud labels) and written to the online feature store like any other feature. Real-time graph queries on the scoring path are expensive; precompute.</li>
+          <li>Beware super-nodes: a public Wi-Fi IP or a shared office device links thousands of innocent users. Cap degrees or ignore known shared identifiers.</li>
+        </ul>
+      

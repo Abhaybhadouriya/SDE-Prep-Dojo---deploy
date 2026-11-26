@@ -1,0 +1,124 @@
+
+        <h2>Deep dives: the hard parts</h2>
+
+        <h3>7.1 Old-to-new sync without storing copies in the cloud</h3>
+        <p>In the Amazon SDE-2 round (selected, July 2025), the interviewer pushed on reducing storage, and the accepted answer was to stop keeping config files in the cloud and pull them straight from the old device during setup. Here is how to make that safe and fast.</p>
+        <ol class="steps">
+          <li><strong>Find the old device.</strong> After login, the new device lists the user's registered devices (device table by user_id) with online status from presence. The user picks one, or the system picks the most recent device of the same family.</li>
+          <li><strong>Pair.</strong> Both devices belong to the same account, which proves ownership. Add a short confirmation (a code shown on the new device and confirmed in the app, or a button press on the old one) so a stolen account token alone cannot pull settings.</li>
+          <li><strong>Key exchange.</strong> The new device sends its public key; the old device encrypts the settings bundle with it (an ECDH-derived key). The relay sees only ciphertext: end-to-end encryption, so Wi-Fi passwords never sit readable in our cloud.</li>
+          <li><strong>Transfer path.</strong> Prefer local (same Wi-Fi or Bluetooth) when both are in the same room; otherwise the cloud relay. Both carry the same encrypted bundle.</li>
+          <li><strong>Translate.</strong> A settings schema with a version and per-model capability map: the new device keeps what it supports, ignores the rest, and migrates old schema versions ("v3 do-not-disturb" to "v4 quiet hours").</li>
+          <li><strong>Parallelise the slow parts.</strong> While settings transfer, start firmware check, account linking and skill or app downloads. Settings themselves take milliseconds.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Decision: old device online then relay directly; offline then use snapshot fallback; neither then defaults and notify later">
+            <rect class="box client" x="20" y="90" width="140" height="56"/><text class="label" x="90" y="115">New device</text><text class="label small" x="90" y="134">needs settings</text>
+            <rect class="box plain" x="220" y="90" width="150" height="56"/><text class="label" x="295" y="115">Old device</text><text class="label small" x="295" y="134">online?</text>
+            <rect class="box ok" x="450" y="20" width="320" height="50"/><text class="label small" x="610" y="50">yes: pull live, E2E-encrypted relay, store nothing</text>
+            <rect class="box warn" x="450" y="92" width="320" height="50"/><text class="label small" x="610" y="122">no: last backup snapshot or non-default cloud copy</text>
+            <rect class="box fail" x="450" y="164" width="320" height="50"/><text class="label small" x="610" y="194">neither: defaults now, merge when old device returns</text>
+            <path class="arrow" d="M160 118 L212 118"/>
+            <path class="arrow ok" d="M370 105 L442 48"/>
+            <path class="arrow" d="M370 118 L442 117"/>
+            <path class="arrow bad" d="M370 132 L442 188"/>
+            <circle class="packet" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M160 118 L220 118 L370 105 L450 45"/></circle>
+          </svg>
+          <figcaption>Storage-light by default, with explicit fallbacks. Say all three branches; interviewers on device teams push hard on "what if it is offline?".</figcaption>
+        </figure>
+        <div class="proscons">
+          <div class="pros"><h5>Pull from old device</h5><ul><li>Almost zero cloud storage for settings.</li><li>Always the freshest settings, no sync lag.</li><li>Smaller attack surface: no long-lived copy of secrets.</li></ul></div>
+          <div class="cons"><h5>Costs</h5><ul><li>Fails when the old device is dead (the common "replacement" case), so a fallback is mandatory.</li><li>Needs both devices online at the same time.</li><li>Old firmware must speak the transfer protocol (version it).</li></ul></div>
+        </div>
+        <p><b>Middle ground to offer:</b> store only <em>non-default</em> settings in the cloud (a few KB per user, not 50 KB per device), deduplicated per user rather than per device, because most of a user's devices share the same preferences. That is a 10-100x storage cut while still covering the dead-device case.</p>
+
+        <h3>7.2 Keeping 10 devices in the same state</h3>
+        <p>Amazon SDE-2 (May 2025): "user turns off a light from one device; all other devices must reflect it." The core model is the one AWS IoT's Device Shadow uses: a JSON document per thing with <b>desired</b> and <b>reported</b> state, a <b>version</b> that increments on every update, and a computed <b>delta</b>.</p>
+        <ul>
+          <li><b>Who owns the truth?</b> For a physical light, the light (its hub) is the authority for <em>reported</em> state; other devices write <em>desired</em> state ("I want it off"). The UI on every device shows reported, with a spinner while desired and reported differ. For a pure preference (wake word, theme), the cloud document is the truth.</li>
+          <li><b>Versioned writes.</b> Each write carries <code>base_version</code>. The state service does a conditional write; on mismatch it returns 409 with the current value, and the device rebases. AWS IoT documents exactly this: an update with an old version gets an error and the client must resync.</li>
+          <li><b>Push.</b> After commit, publish to <code>users/{user_id}/state</code>. Gateways push to the user's connected devices. A device that receives version N+1 but has N-1 knows it missed N and calls <code>GET state?since=N-1</code>.</li>
+          <li><b>Offline catch-up.</b> On reconnect, the device sends its last version. If the change log still has it (30 days), send the changes; if not (410 Gone), send a full snapshot. The same pattern as Kafka consumers that fall behind retention.</li>
+          <li><b><a href="{{BASE}}interview/glossary#idempotent">Idempotency</a>.</b> <code>client_op_id</code> on every write so a retried "light off" after a dropped connection does not create a second version.</li>
+        </ul>
+        <h4>Conflicts</h4>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Strategy</th><th>Use for</th><th>Catch</th></tr></thead>
+            <tbody>
+              <tr><td>Reject and rebase (version check)</td><td>Online writes, most settings</td><td>User sees "changed elsewhere, updated"; needs connectivity.</td></tr>
+              <tr><td>Last-writer-wins per field, server timestamp or version</td><td>Offline edits to independent fields</td><td>Silently drops the older edit; use per-field, not per-document, so two different fields both survive.</td></tr>
+              <tr><td>Merge rules (union of lists)</td><td>Shopping list, routines list</td><td>Deletes need tombstones or they come back.</td></tr>
+              <tr><td><a href="{{BASE}}interview/glossary#crdt">CRDT</a></td><td>Counters, sets edited offline on many devices</td><td>More metadata; overkill for a light switch.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip"><p>Never use device clocks to decide "latest". A speaker with a wrong clock would win every conflict. Let the server assign versions (or use a hybrid logical clock).</p></div>
+
+        <h3>7.3 Scheduled backup: chunking, dedup and the thundering herd</h3>
+        <p>Amazon SDE-2 (July 2026, selected): back up device settings, files and media on a schedule and restore them on a new device. Apple (April 2026) asked a backup system with data integrity, scalability, multi-region replication, observability and resiliency.</p>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Incremental backup: split file into chunks, hash them, ask server which are missing, upload only missing, commit manifest">
+            <rect class="box client" x="10" y="30" width="200" height="60"/><text class="label" x="110" y="56">photo_2026.jpg</text><text class="label small" x="110" y="76">12 MB, one edit</text>
+            <g data-step="1">
+              <rect class="box plain" x="10" y="120" width="60" height="40"/><text class="label small" x="40" y="145">c1</text>
+              <rect class="box plain" x="80" y="120" width="60" height="40"/><text class="label small" x="110" y="145">c2</text>
+              <rect class="box hot" x="150" y="120" width="60" height="40"/><text class="label small" x="180" y="145">c3'</text>
+              <path class="arrow" d="M110 90 L110 114"/>
+              <text class="label small" x="110" y="185">content-defined chunks</text>
+            </g>
+            <g data-step="2">
+              <rect class="box svc" x="300" y="110" width="170" height="60"/><text class="label" x="385" y="135">POST missing</text><text class="label small" x="385" y="155">[h1, h2, h3']</text>
+              <path class="arrow" d="M210 140 L292 140"/>
+            </g>
+            <g data-step="3">
+              <rect class="box ok" x="300" y="200" width="170" height="44"/><text class="label small" x="385" y="227">missing: [h3'] only</text>
+              <path class="arrow" d="M385 170 L385 194"/>
+            </g>
+            <g data-step="4">
+              <rect class="box db" x="560" y="110" width="220" height="60"/><text class="label" x="670" y="135">Object store</text><text class="label small" x="670" y="155">PUT h3' via presigned URL</text>
+              <path class="arrow" d="M210 150 Q380 270 560 160"/>
+              <circle class="packet" r="6"><animateMotion dur="2.2s" repeatCount="indefinite" path="M210 150 Q380 270 560 160"/></circle>
+            </g>
+            <g data-step="5">
+              <rect class="box kafka" x="560" y="200" width="220" height="60"/><text class="label" x="670" y="225">Commit manifest</text><text class="label small" x="670" y="245">snapshot visible, refs +1</text>
+              <path class="arrow" d="M470 225 L552 228"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Chunk.</b> Split files into variable-size chunks using content-defined chunking (boundaries set by a rolling hash, around 1-4 MB on average). Inserting bytes near the start of a file changes only nearby chunks, unlike fixed-size blocks which shift every boundary after the edit.</li>
+            <li><b>Hash and ask.</b> SHA-256 each chunk. Send the list of hashes for changed files to the backup service.</li>
+            <li><b>Dedup.</b> The service checks its chunk index (scoped to this user) and answers with only the missing ones. Unchanged chunks cost nothing.</li>
+            <li><b>Upload direct.</b> The device uploads missing chunks straight to object storage with presigned URLs, resumable per chunk. The server verifies size and hash before accepting.</li>
+            <li><b>Commit.</b> Upload the encrypted manifest (file tree plus chunk lists) and commit. Only now is the snapshot restorable, and only now do chunk reference counts go up.</li>
+          </ol>
+        </div>
+        <ul>
+          <li><b>Scheduling without a server cron per device.</b> 10M devices cannot be scheduled by a central cron that calls each device. The device schedules itself (Android's Auto Backup, for example, runs when backup is enabled, at least 24 hours have passed, the device is idle and on Wi-Fi) with random jitter. The server protects itself with admission control: <code>POST /backups</code> can answer "retry after 40 min" when the ingest fleet is busy.</li>
+          <li><b>Dedup scope.</b> Per user is the safe default. Cross-user dedup saves more but lets an attacker learn "someone already has this file" and conflicts with end-to-end encryption (each user's key makes the same file look different). Mention convergent encryption as the trade-off, then choose per user.</li>
+          <li><b>What goes in a backup.</b> Only what does not already sync elsewhere: Apple's support pages say an iCloud backup holds information and settings that do not already sync to iCloud (photos syncing through iCloud Photos are left out). Same principle: settings that live in the state service (7.2) need no backup copy.</li>
+          <li><b>Retention and garbage collection.</b> Keep, say, the last 3 snapshots per device. Expiring a snapshot decrements chunk ref counts; a background mark-and-sweep deletes chunks at zero after a grace period. Never delete in the same transaction as the decrement: a concurrent backup may be about to reference that chunk.</li>
+        </ul>
+
+        <h3>7.4 Integrity, multi-region replication and observability (the Apple variant)</h3>
+        <ul>
+          <li><b>End-to-end checksums:</b> hash on the device, verify on upload, store the hash with the object, verify again on restore. Periodic <b>scrubbing</b> jobs re-read a sample of chunks and compare hashes, catching silent corruption (bit rot).</li>
+          <li><b>Atomic snapshots:</b> the manifest is the commit point; a snapshot with a missing chunk is a bug that scrubbing must find before the user does.</li>
+          <li><b>Replication:</b> object storage cross-region replication for chunks, plus metadata replication (global tables). Track <b>replication lag</b> and treat "snapshot committed in region A but chunks not yet in B" as a state: restore from B waits or reads from A.</li>
+          <li><b>Restore drills:</b> automatically restore a random sample of real backups into a sandbox and compare hashes. A backup you never restored is a hope, not a backup.</li>
+          <li><b>Metrics:</b> percent of devices with a successful backup in the last 24 h / 7 days, age of the oldest successful backup per device, bytes uploaded vs deduped, upload error rate by firmware version, restore time to "usable" and to "complete", replication lag, scrub failures.</li>
+        </ul>
+
+        <h3>7.5 Restore to a new device fast</h3>
+        <p>Order matters for the 1-5 minute target: (1) settings and account (KB, seconds), so the device is usable; (2) app list and small app data; (3) media in the background, most recent first, while on Wi-Fi. Apple's guidance after an iCloud restore is to stay on Wi-Fi so photos and videos can continue downloading: the device is usable before the restore is complete. Show two progress numbers: "ready" and "fully restored".</p>
+
+        <h3>7.6 The Nutanix variant: a database backup service</h3>
+        <p>Same skeleton, different source. Nutanix MTS-2/3 (March 2025) asked for a database backup service; the recruiter did not say whether it was HLD or LLD, and it was HLD.</p>
+        <ul>
+          <li><b>Full + incremental:</b> a periodic full backup (storage snapshot or <code>pg_basebackup</code>-style copy) plus continuous shipping of the write-ahead log (WAL / binlog) to object storage.</li>
+          <li><b>Consistency:</b> a backup must be crash-consistent at least: use the database's own snapshot mechanism or a storage-level snapshot taken at one instant, not a file copy while writes continue.</li>
+          <li><b>Point-in-time recovery:</b> restore the latest full before time T, replay logs up to T. RPO = how much log could be lost (seconds if shipped continuously); RTO = full restore time plus replay time.</li>
+          <li><b>Control plane:</b> policies (every 6 h full, log continuously, keep 30 days), a scheduler that spreads jobs across hosts, a job state machine (SCHEDULED, RUNNING, UPLOADING, VERIFIED, FAILED) with retries, and a catalog of restore points.</li>
+          <li><b>Verify:</b> restore into a scratch instance and run checks. Throttle backup I/O so it does not hurt production latency.</li>
+        </ul>
+      

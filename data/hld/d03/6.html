@@ -1,0 +1,127 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> For SDE-1, the architecture above plus priority topics, retries with a DLQ and a dedupe key is a solid answer. SDE-2: be ready for all five deep dives.</p></div>
+
+        <h3>Deep dive 1: OTPs must never wait behind campaigns (must know)</h3>
+        <p>If everything shares one queue, a 100M-message campaign puts 100M messages in front of the next OTP. At 30,000/s that is almost an hour of waiting. Fixes, in layers:</p>
+        <ul>
+          <li><b>Separate topics per priority</b> (<code>push.high</code>, <code>push.low</code>), with <b>separate consumer pools</b>. High-priority workers are always running and are never shared with campaigns.</li>
+          <li><b>Throttle campaigns on purpose:</b> the campaign sender releases messages at a controlled rate (for example spread over 2 hours), leaving provider quota for transactional traffic.</li>
+          <li><b>Separate provider accounts or quotas</b> where possible (a dedicated sender for OTP SMS, a different email IP pool for marketing so marketing spam reports do not hurt transactional email).</li>
+          <li><b>Time to live:</b> an OTP is useless after a few minutes. Carry <code>ttl_seconds</code> and drop expired messages instead of sending them late. The AWS Builders' Library post on <a href="https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/" target="_blank" rel="noopener">queue backlogs</a> explains why working through a stale backlog in FIFO order after an outage delays fresh requests, and why dropping expired work (or serving newest first) recovers faster.</li>
+        </ul>
+
+        <h3>Deep dive 2: exactly once is a lie; dedupe is the truth (must know)</h3>
+        <p>Kafka consumers are <b>at-least-once</b> by default: if a worker sends the push, then crashes before committing its offset, the next worker gets the same message again. Without protection, user 42 gets two pushes. The fix is an <b>idempotent consumer</b>: a sent log keyed by <code>(event_id, channel)</code>.</p>
+<pre><code class="language-python"># dedupe.py - claim, send, mark: a "sent log" with a unique key stops duplicates
+import sqlite3, time
+
+db = sqlite3.connect(":memory:")
+db.execute("""CREATE TABLE sent_log (
+    event_id   TEXT NOT NULL,
+    channel    TEXT NOT NULL,
+    user_id    INTEGER NOT NULL,
+    status     TEXT NOT NULL,          -- SENDING or SENT
+    claimed_at REAL NOT NULL,
+    PRIMARY KEY (event_id, channel))""")
+STUCK_AFTER = 30   # seconds: a SENDING row older than this means the worker died mid-send
+
+def provider_send(tag, user_id, text, crash=False):
+    if crash:
+        raise RuntimeError("worker crashed before the provider answered")
+    print(f"SEND  {tag} -&gt; user {user_id}: {text}")      # ... call APNs / FCM / SMS gateway here ...
+
+def send_once(event_id, channel, user_id, text, now, crash=False):
+    # 1. CLAIM: insert SENDING, or take over a SENDING row that is stuck (older than the timeout)
+    cur = db.execute("INSERT OR IGNORE INTO sent_log VALUES (?, ?, ?, 'SENDING', ?)",
+                     (event_id, channel, user_id, now))
+    if cur.rowcount == 0:
+        cur = db.execute("""UPDATE sent_log SET claimed_at = ? WHERE event_id = ? AND channel = ?
+                            AND status = 'SENDING' AND claimed_at &lt; ?""",
+                         (now, event_id, channel, now - STUCK_AFTER))
+        if cur.rowcount == 0:
+            print(f"skip  {event_id}/{channel}: already sent (or being sent)")
+            return
+        print(f"retry {event_id}/{channel}: stuck in SENDING, taking it over")
+    # 2. SEND
+    try:
+        provider_send(f"{event_id}/{channel}", user_id, text, crash)
+    except RuntimeError as e:
+        print(f"CRASH {event_id}/{channel}: {e}; row stays SENDING")
+        return
+    # 3. MARK
+    db.execute("UPDATE sent_log SET status = 'SENT' WHERE event_id = ? AND channel = ?",
+               (event_id, channel))
+
+# Kafka is at-least-once: after a consumer crash, the same records are delivered again.
+t = time.time()
+send_once("ord-981:shipped", "push", 42, "Your order has shipped", t)
+send_once("ord-981:shipped", "sms",  42, "Your order has shipped", t)
+send_once("ord-981:shipped", "push", 42, "Your order has shipped", t + 1)     # redelivered
+send_once("otp-5521", "sms", 77, "Your OTP is 482913", t, crash=True)         # dies mid-send
+send_once("otp-5521", "sms", 77, "Your OTP is 482913", t + 5)                 # too soon: skip
+send_once("otp-5521", "sms", 77, "Your OTP is 482913", t + 60)                # stuck: retry
+send_once("otp-5521", "sms", 77, "Your OTP is 482913", t + 61)                # now SENT: skip</code></pre>
+<pre class="terminal"><code>$ python dedupe.py
+SEND  ord-981:shipped/push -&gt; user 42: Your order has shipped
+SEND  ord-981:shipped/sms -&gt; user 42: Your order has shipped
+skip  ord-981:shipped/push: already sent (or being sent)
+CRASH otp-5521/sms: worker crashed before the provider answered; row stays SENDING
+skip  otp-5521/sms: already sent (or being sent)
+retry otp-5521/sms: stuck in SENDING, taking it over
+SEND  otp-5521/sms -&gt; user 77: Your OTP is 482913
+skip  otp-5521/sms: already sent (or being sent)</code></pre>
+        <p>In production the sent log is Redis (<code>SET sent:{event}:{channel} 1 NX EX 259200</code>, kept 3 days) or a table with a unique key. The code above already uses the production order, which interviewers probe: <b>claim, send, mark</b>. If you mark "sent" <i>before</i> calling the provider and then crash, the message is lost; if you mark <i>after</i>, a crash in between causes a duplicate. The usual answer (what <code>dedupe.py</code> does) is: store status <code>SENDING</code> first, call the provider, then set <code>SENT</code>. A redelivered message that finds <code>SENDING</code> older than a timeout is retried; you can see the OTP survive a crash in the output above. You accept a rare duplicate rather than a rare loss (for OTPs, a duplicate is safer than a missing code). Push providers also offer collapse keys (FCM <code>collapse_key</code>, APNs <code>apns-collapse-id</code>) so a phone shows only the latest of several similar notifications.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The sent log is the application's version of <b>TCP sequence numbers</b>: a retransmitted segment with a sequence number the receiver has already seen is not delivered to the app twice. Here <code>event_id</code> is the sequence number and the sent log is the receive window's memory. <i>Where it breaks:</i> a TCP receiver forgets old sequence numbers when the connection closes, and only one receiver ever sees them. The sent log must outlive crashes and be shared by every worker, so it lives in Redis or a database with a TTL instead of in one process's memory. See <a href="{{BASE}}devops/kafka-04">consumer groups and offset commits</a> for why redelivery happens.</p>
+        </div>
+
+        <h3>Deep dive 3: retries, backoff, DLQ and provider failover (must know)</h3>
+        <ul>
+          <li><b>Classify errors.</b> Temporary (timeout, HTTP 5xx, 429 throttling): retry. Permanent (bad token, invalid phone number, user unsubscribed): do not retry; fix data instead.</li>
+          <li><b>Do not block the partition.</b> If a worker sleeps 10 minutes waiting to retry, every message behind it in that partition waits too. Instead, publish the failed message to a <b>retry topic</b> (<code>push.retry.1m</code>, <code>push.retry.10m</code>) whose consumer waits until the message's due time, then re-sends. After N attempts, publish to <code>push.dlq</code> and alert.</li>
+          <li><b>Exponential backoff with jitter</b> on retries, so a provider recovering from an outage is not hit by everyone at once.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Retry ladder: main topic, retry after 1 minute, retry after 10 minutes, dead letter queue">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="22">The retry ladder (no partition is ever blocked)</text>
+            <rect class="box kafka solid" x="20" y="60" width="150" height="50"/><text class="label white" x="95" y="85">push.high</text>
+            <rect class="box k8s" x="220" y="60" width="140" height="50"/><text class="label" x="290" y="80">worker</text><text class="label small" x="290" y="98">send to FCM</text>
+            <rect class="box ghost" x="620" y="60" width="160" height="50"/><text class="label" x="700" y="85">FCM</text>
+            <rect class="box queue" x="220" y="160" width="140" height="50"/><text class="label" x="290" y="180">retry.1m</text><text class="label small" x="290" y="198">attempt 2</text>
+            <rect class="box queue" x="420" y="160" width="140" height="50"/><text class="label" x="490" y="180">retry.10m</text><text class="label small" x="490" y="198">attempt 3</text>
+            <rect class="box fail" x="620" y="160" width="160" height="50"/><text class="label bad" x="700" y="180">push.dlq</text><text class="label small" x="700" y="198">alert a human</text>
+            <path class="arrow" d="M170 85 L214 85"/>
+            <path class="arrow ok" d="M360 85 L614 85"/><text class="label ok" x="490" y="72">200 OK → mark SENT</text>
+            <path class="arrow bad" d="M290 110 L290 154"/><text class="label small" x="200" y="136">timeout / 5xx</text>
+            <path class="arrow bad" d="M360 185 L414 185"/>
+            <path class="arrow bad" d="M560 185 L614 185"/>
+            <path class="arrow dashed" d="M250 160 Q190 135 250 112"/>
+            <circle class="packet bad" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M170 85 L220 85 L290 110 L290 160 L360 185 L420 185 L560 185 L620 185"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M170 85 L360 85 L620 85"/></circle>
+          </svg>
+          <figcaption>Healthy messages (green) go straight to the provider. A failing message (red) steps down the ladder: a 1-minute retry topic, a 10-minute retry topic, then the dead-letter queue. The main topic keeps flowing the whole time.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Provider failover:</b> wrap each SMS vendor in a <b>circuit breaker</b>. If vendor A's error rate crosses a threshold, route OTPs to vendor B for a while, then probe A again. Keep two vendors for SMS and email; push has only APNs/FCM, so there you can only retry and queue.</li>
+          <li><b>Kafka 4.x option:</b> share groups ("queues for Kafka", KIP-932) became production-ready in Kafka 4.2 and gained a built-in DLQ for share groups in 4.4. They let many workers consume one partition with per-message acknowledgements, which suits "send and ack each notification" work. Classic consumer groups plus retry topics remain the common, well-understood answer in interviews.</li>
+        </ul>
+
+        <h3>Deep dive 4: campaigns to 100 million users (SDE-2)</h3>
+        <ul>
+          <li><b>Do not</b> make one API call per user from the marketing tool. Send one <code>POST /v1/campaigns</code> with a segment ID.</li>
+          <li>A <b>campaign planner</b> reads the segment in pages (user ID ranges) and publishes batches to <code>notif.requests</code> at a controlled rate. It records progress (last user ID done) so a crash resumes instead of restarting, which would double-send.</li>
+          <li><b>Time zones and quiet hours:</b> bucket users by time zone and release each bucket at its local send time; messages that fall into quiet hours are delayed to the end of the quiet period (via the scheduled/retry path) or dropped if they expire.</li>
+          <li><b>Frequency caps:</b> "no more than 3 promos per user per day" is a per-user counter (the <a href="{{BASE}}hld/d02">rate limiter</a> again, with a daily window) checked by the router.</li>
+          <li><b>Provider limits:</b> email providers and SMS gateways enforce sending rates per account; the channel workers pace themselves with a token bucket per provider.</li>
+        </ul>
+
+        <h3>Deep dive 5: device tokens and in-app inbox (good to know)</h3>
+        <ul>
+          <li><b>Token lifecycle:</b> the app registers its APNs/FCM token at startup (<code>PUT /v1/devices</code>). Tokens change after reinstalls and restores. When APNs answers <b>410</b> (reason <code>Unregistered</code>) or FCM returns an <code>UNREGISTERED</code> error, delete that token, or you keep paying to send to dead devices.</li>
+          <li><b>Multi-device:</b> a user with a phone and a tablet gets the push on both; the router sends one message per active token.</li>
+          <li><b>In-app inbox:</b> just a read of the notification log partition <code>(user_id, day)</code>, newest first, with an unread counter in Redis. For a live bell badge, push the update over the app's WebSocket/SSE connection if it is open (see <a href="{{BASE}}hld/d04">the chat design</a> for connection gateways).</li>
+        </ul>
+      

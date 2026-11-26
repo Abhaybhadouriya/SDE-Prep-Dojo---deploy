@@ -1,0 +1,138 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. The last-room race (double booking)</h3>
+        <p>One Deluxe room is left. Alice and Bob both read <code>total_reserved = 99</code> out of 100. Both add 1. Both write 100. Two people now hold one room. This is the classic <b>lost update</b>, and default isolation levels (READ COMMITTED, and even MySQL REPEATABLE READ) do not stop it if you read first and write later in application code.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Two transactions read 99 and both write 100: double booking">
+            <rect class="box client" x="20" y="30" width="140" height="50"/>
+            <text class="label" x="90" y="60">Alice tx</text>
+            <rect class="box client" x="20" y="170" width="140" height="50"/>
+            <text class="label" x="90" y="200">Bob tx</text>
+            <rect class="box db" x="330" y="95" width="160" height="60"/>
+            <text class="label" x="410" y="120">reserved = 99</text>
+            <text class="label small" x="410" y="140">total = 100</text>
+            <path class="arrow" d="M160 55 L322 110"/>
+            <path class="arrow" d="M160 195 L322 140"/>
+            <text class="label small" x="240" y="70">read 99</text>
+            <text class="label small" x="240" y="190">read 99</text>
+            <rect class="box fail" x="580" y="95" width="200" height="60"/>
+            <text class="label bad" x="680" y="120">both write 100</text>
+            <text class="label small" x="680" y="140">2 guests, 1 room</text>
+            <path class="arrow bad" d="M490 125 L572 125"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M160 55 L330 115 L490 125 L580 125"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="0.2s" repeatCount="indefinite" path="M160 195 L330 135 L490 125 L580 125"/></circle>
+          </svg>
+          <figcaption>Read-then-write in application code loses an update. Both transactions think they got the last room.</figcaption>
+        </figure>
+        <p>There are four standard fixes. ByteByteGo compares the first three. The fourth is the one most production systems end up with.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Option</th><th>How</th><th>Good when</th><th>Pain</th></tr></thead>
+            <tbody>
+              <tr><td><b>Pessimistic lock</b></td><td><code>SELECT ... FOR UPDATE</code> on the N night rows, then update</td><td>Very hot rows, short transactions</td><td>Blocks other bookers. Deadlocks if two stays lock nights in different order (always lock in date order). Do not hold the lock across a payment call.</td></tr>
+              <tr><td><b>Optimistic (version)</b></td><td>Read the version, then <code>UPDATE ... SET version=v+1 WHERE version=v</code>. Retry if 0 rows change.</td><td>Low contention. Hotel booking is ~3 TPS.</td><td>Many retries and a poor experience when everyone wants the same room. Prefer versions to timestamps, because clocks drift.</td></tr>
+              <tr><td><b>DB constraint</b></td><td><code>CHECK (total_reserved &lt;= total_inventory)</code> or a Postgres <code>EXCLUDE</code> range constraint</td><td>Any load. This is a last line of defence.</td><td>Not every database supports it, and constraints live outside code review.</td></tr>
+              <tr><td><b>Conditional atomic update</b></td><td>One statement: <code>UPDATE ... SET reserved = reserved + :n WHERE ... AND reserved + :n &lt;= cap</code>, then check that the row count = nights</td><td>The default choice</td><td>For multi-night stays you must check that <em>every</em> night succeeded, and roll back otherwise.</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">BEGIN;
+-- (expire stale holds for these nights first - see deep dive 2)
+UPDATE room_type_inventory
+   SET total_reserved = total_reserved + :rooms,
+       version        = version + 1
+ WHERE hotel_id = :h AND room_type_id = :rt
+   AND date &gt;= :checkin AND date &lt; :checkout
+   AND total_reserved + :rooms &lt;= FLOOR(total_inventory * 1.10);   -- 10% overbooking
+-- application: if affected_rows &lt;&gt; nights(:checkin, :checkout) then ROLLBACK (some night is full)
+INSERT INTO reservation (reservation_id, hotel_id, room_type_id, start_date, end_date, room_count, status, hold_expires_at)
+VALUES (:rid, :h, :rt, :checkin, :checkout, :rooms, 'HELD', now() + interval '10 minutes');
+COMMIT;</code></pre>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The conditional update is <b>compare-and-swap</b>, the same idea as <code>cmpxchg</code> or <code>atomic_add_unless()</code> in the kernel. You never read the value into a register, decide, and write it back without a lock. The optimistic version column is a <b>seqlock</b>: readers check that the sequence number did not change, and retry if it did.</p>
+        </div>
+
+        <h3>2. Holds, expiry and the state machine</h3>
+        <p>Between "Reserve" and "paid" the guest needs a few minutes. If we take the room only after payment, two people pay and one gets a refund, which is bad. If we take it at "Reserve" with no timeout, abandoned carts lock rooms forever, which is also bad. The answer is a <b>hold with an expiry</b>. Hello Interview's Ticketmaster breakdown uses 10 minutes.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Reservation state machine HELD to CONFIRMED, EXPIRED, CANCELLED, REFUNDED">
+            <rect class="box svc" x="20" y="90" width="130" height="50"/>
+            <text class="label" x="85" y="120">HELD</text>
+            <rect class="box highlight" x="260" y="20" width="160" height="50"/>
+            <text class="label" x="340" y="50">CONFIRMED</text>
+            <rect class="box fail" x="260" y="160" width="160" height="50"/>
+            <text class="label" x="340" y="190">EXPIRED / FAILED</text>
+            <rect class="box queue" x="530" y="20" width="120" height="50"/>
+            <text class="label" x="590" y="50">CANCELLED</text>
+            <rect class="box db" x="670" y="110" width="120" height="50"/>
+            <text class="label" x="730" y="140">REFUNDED</text>
+            <path class="arrow ok" d="M150 105 L252 50"/>
+            <text class="label small" x="190" y="62">paid</text>
+            <path class="arrow bad" d="M150 125 L252 185"/>
+            <text class="label small" x="185" y="175">TTL / decline</text>
+            <path class="arrow" d="M420 45 L522 45"/>
+            <text class="label small" x="470" y="38">guest</text>
+            <path class="arrow" d="M650 55 L715 102"/>
+            <path class="arrow dashed" d="M420 185 L560 185"/>
+            <text class="label small" x="600" y="190">counters released</text>
+            <circle class="packet" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M150 105 L260 45 L530 45 L650 55 L715 110"/></circle>
+          </svg>
+          <figcaption>A reservation's life. Only HELD and CONFIRMED consume inventory. Every arrow is a conditional update on the status column, so a late webhook cannot revive an expired hold.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Lazy expiry is the correctness rule. The sweeper is only housekeeping.</b> Hello Interview stresses that correctness must not depend on the sweeper running on time. Lazy expiry has two halves. On the <em>read</em> path, the availability query counts <code>status='HELD' AND hold_expires_at &lt; now()</code> as free, so guests see the room. On the <em>write</em> path, the booking transaction expires those holds inline before it touches the counters (SQL below), so the conditional UPDATE sees the real free count. A cron or delayed-queue job only tidies up nights that nobody is trying to book.</li>
+          <li><b>Redis lock variant.</b> <code>SET hold:{room}:{date} {user} NX EX 600</code> gives an atomic, self-expiring hold. But Redis is now a second source of truth. The database must still have a constraint, because Redis can fail over and lose a key.</li>
+          <li><b>The TTL lapses mid-payment.</b> Extend the hold when payment starts, and make the CONFIRM transition conditional (<code>WHERE status='HELD'</code>). If it loses, refund automatically. This rare case is cheaper than locking rooms for long.</li>
+        </ul>
+        <p>Here is the inline expiry that runs at the top of the booking transaction from deep dive 1. It flips overlapping stale holds to EXPIRED and gives their rooms back to the counters, all inside the same transaction:</p>
+<pre><code class="language-sql">BEGIN;
+-- 1. expire stale holds that overlap the requested nights
+WITH expired AS (
+  UPDATE reservation SET status = 'EXPIRED'
+   WHERE hotel_id = :h AND room_type_id = :rt
+     AND status = 'HELD' AND hold_expires_at &lt; now()
+     AND start_date &lt; :checkout AND end_date &gt; :checkin      -- overlaps our dates
+  RETURNING start_date, end_date, room_count
+)
+-- 2. give their rooms back, night by night (sum, because holds can share a night)
+UPDATE room_type_inventory i
+   SET total_reserved = i.total_reserved - x.rooms
+  FROM (SELECT d::date AS night, SUM(e.room_count) AS rooms
+          FROM expired e,
+               generate_series(e.start_date, e.end_date - 1, interval '1 day') AS d
+         GROUP BY d::date) x
+ WHERE i.hotel_id = :h AND i.room_type_id = :rt AND i.date = x.night;
+-- 3. now the conditional UPDATE + INSERT from deep dive 1
+COMMIT;</code></pre>
+        <p>Because the status flip is conditional (<code>WHERE status='HELD'</code>), only one actor wins it: the booking transaction, the sweeper, or the payment webhook. The counters are decremented exactly once. For the Airbnb <code>EXCLUDE</code> model, the same first step is <code>UPDATE booking SET status='EXPIRED' WHERE listing_id=:l AND status='HELD' AND hold_expires_at &lt; now() AND stay &amp;&amp; :stay</code>, run just before the INSERT, so the constraint no longer sees the stale hold.</p>
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> The per-night inventory row, the last-room race fixed by a conditional UPDATE inside one transaction, and holds with a TTL that the booking path expires itself are the interview-sufficient core. Deep dives 3-5 (idempotency internals, search vs booking consistency, hot hotels and sharding) are what an SDE-2 answer adds. Read them when you have time.</p></div>
+
+        <h3>3. Idempotency: the double-click and the retry storm</h3>
+        <p>Mobile networks drop responses. Users double-tap. Clients retry. The rule: <b>every write carries an idempotency key, and the server stores the outcome under that key</b>. Airbnb's payments team built a library called Orpheus for exactly this. Their write-up gives practical rules:</p>
+        <ol class="steps">
+          <li><strong>Split each request into pre-RPC, RPC and post-RPC.</strong> The database is written only before and after the external call, and never during it. No network calls run inside a database transaction.</li>
+          <li><strong>Take a lease on the key.</strong> Each request takes a row-level lock on its idempotency key, and the lease expires. Make the lease longer than the RPC timeout, so that a retry cannot run while the first try is still in flight.</li>
+          <li><strong>Classify errors.</strong> Treat 5xx and network errors as retryable, and 4xx validation errors as non-retryable. A wrong label either fails a request forever or causes a double payment.</li>
+          <li><strong>Read idempotency data from the primary, never a replica.</strong> With replica lag, a retry might not see the first success and could charge again. Airbnb shards this table by idempotency key, because the keys are high-cardinality and evenly spread.</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistake:</b> "We disable the button in JavaScript." That helps the experience, but a script, a retry or a second tab bypasses it. The server-side key is the real fix.</p></div>
+
+        <h3>4. Search vs booking consistency (and the cache)</h3>
+        <p>Search must answer "which of 50,000 Goa listings are free for these 3 nights, under Rs 8,000, with a pool" in about 200 ms. You cannot run that against the sharded inventory database. Instead:</p>
+        <ul>
+          <li><b>Index approximate availability</b> in Elasticsearch, for example a per-listing bitmap of free nights for the next 365 days. Feed it from CDC. Airbnb built SpinalTap for this: it tails MySQL binlogs, keeps per-row ordering, delivers at least once, and feeds search indexing among other uses.</li>
+          <li><b>Re-check on the detail page</b> against Redis, which is also fed by CDC or written after commit.</li>
+          <li><b>Make the final decision only in the database transaction.</b> Stale caches cause a "sorry, just booked" message, never a double booking. ByteByteGo calls this acceptable because the database validates.</li>
+        </ul>
+        <div class="callout tip"><p><b>OTA twist (Agoda, Expedia):</b> an aggregator does not own the inventory. Prices and availability come from supplier APIs, and suppliers enforce per-second request quotas. Agoda's PriceAggregator caches supplier answers per itinerary (hotel, check-in, check-out, adults, children, rooms). It spends its leftover quota pre-fetching the itineraries most likely to be booked before they expire. The cache TTL and the quota become the design.</p></div>
+
+        <h3>5. Hot inventory and sharding</h3>
+        <ul>
+          <li><b>Shard by hotel_id (or listing_id).</b> All nights of one stay live on one shard, so the booking transaction stays local. There is no 2PC.</li>
+          <li><b>A hot hotel</b> (New Year's Eve in Goa) is a hot shard. At 3 TPS per chain that is fine. For flash sales, put a <a href="{{BASE}}hld/p02">virtual waiting room</a> in front, or serialise per room type through a queue partition. See <a href="{{BASE}}hld/d09">flash sale</a>.</li>
+          <li><b>Calendar sync (iCal/channel manager).</b> Hosts list the same property on several sites. External calendars are pulled periodically, so there is a window in which a double booking <em>across</em> platforms can happen. Real systems accept it and handle it with policy and support.</li>
+          <li><b>Reservations and inventory in one service.</b> ByteByteGo deliberately keeps reservations and inventory in the same service and database, so that one ACID transaction covers both. Splitting them into microservices would force a <a href="{{BASE}}hld/p03">saga</a> with compensations, for little benefit.</li>
+        </ul>
+      

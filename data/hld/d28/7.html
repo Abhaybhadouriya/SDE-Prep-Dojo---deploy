@@ -1,0 +1,100 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <div class="cards">
+          <a class="card" href="{{BASE}}devops/kafka-09"><span class="card-icon">🔌</span><h3>Kafka Connect + Debezium</h3><p>Debezium is a set of Connect <i>source</i> connectors. Connect gives you workers, task rebalancing, offset storage and a REST API for free. Sinks (Elasticsearch, S3, JDBC) are Connect sink connectors too.</p></a>
+          <a class="card" href="{{BASE}}devops/kafka-02"><span class="card-icon">📨</span><h3>Kafka topics</h3><p>One topic per table, key = PK, RF 3, <code>min.insync.replicas=2</code>. Change topics keep 7 days for replay; "latest state" topics use compaction so a new consumer can rebuild a full table.</p></a>
+          <a class="card" href="{{BASE}}devops/k8s-10"><span class="card-icon">☸️</span><h3>Kubernetes + Strimzi</h3><p>Strimzi's <code>KafkaConnect</code> and <code>KafkaConnector</code> custom resources let you declare connectors in Git. Shopify ran its Connect workers as pods in Kubernetes.</p></a>
+          <a class="card" href="{{BASE}}devops/docker-07"><span class="card-icon">🐳</span><h3>Docker Compose locally</h3><p>A compose file with Postgres, one Kafka broker (KRaft), Connect with Debezium and a UI is enough to see CDC events on your laptop in ten minutes.</p></a>
+        </div>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Postgres setup">
+<pre><code class="language-sql">-- postgresql.conf (restart needed)
+--   wal_level = logical
+--   max_replication_slots = 10
+--   max_wal_senders = 10
+--   max_slot_wal_keep_size = 50GB     -- safety cap (Postgres 13+)
+
+CREATE ROLE debezium WITH LOGIN REPLICATION PASSWORD 'change-me-local-only';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO debezium;
+
+-- signal table: you insert "execute-snapshot" rows; Debezium writes its own
+-- snapshot-window open/close rows here, so it needs INSERT too
+CREATE TABLE public.debezium_signal (
+  id   VARCHAR(42)  PRIMARY KEY,
+  type VARCHAR(32)  NOT NULL,
+  data VARCHAR(2048)
+);
+GRANT INSERT ON public.debezium_signal TO debezium;
+
+-- a publication you create by hand is used as-is: add every new table to it yourself
+CREATE PUBLICATION dbz_publication
+  FOR TABLE public.orders, public.order_items, public.debezium_signal;</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Connector JSON">
+<pre><code class="language-json">{
+  "name": "shop-orders-cdc",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "debezium",
+    "database.password": "${file:/opt/kafka/secrets/pg.properties:password}",
+    "database.dbname": "shop",
+    "topic.prefix": "shop",
+    "plugin.name": "pgoutput",
+    "slot.name": "debezium_shop",
+    "publication.name": "dbz_publication",
+    "table.include.list": "public.orders,public.order_items,public.debezium_signal",
+    "snapshot.mode": "initial",
+    "heartbeat.interval.ms": "10000",
+    "signal.data.collection": "public.debezium_signal"
+  }
+}</code></pre>
+          </div>
+          <div class="tab-panel" data-title="Strimzi YAML">
+<pre><code class="language-yaml"># kafka.strimzi.io/v1 needs Strimzi 0.49+; older clusters use v1beta2
+# The KafkaConnect CR that runs this connector must enable the secrets provider:
+#   config.providers: secrets
+#   config.providers.secrets.class: io.strimzi.kafka.KubernetesSecretConfigProvider
+# and its service account needs an RBAC Role that can "get" the Secret pg-debezium.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: shop-orders-cdc
+  labels:
+    strimzi.io/cluster: cdc-connect      # the KafkaConnect cluster that runs it
+spec:
+  class: io.debezium.connector.postgresql.PostgresConnector
+  tasksMax: 1                            # one log = one task
+  config:
+    database.hostname: postgres.shop.svc
+    database.port: 5432
+    database.user: debezium
+    # read from the Kubernetes Secret shop/pg-debezium at runtime, never stored here
+    database.password: ${secrets:shop/pg-debezium:password}
+    database.dbname: shop
+    topic.prefix: shop
+    plugin.name: pgoutput
+    slot.name: debezium_shop
+    publication.name: dbz_publication
+    table.include.list: public.orders,public.order_items,public.debezium_signal
+    signal.data.collection: public.debezium_signal
+    heartbeat.interval.ms: 10000</code></pre>
+          </div>
+        </div>
+<pre class="terminal"><code>$ curl -s -X POST -H "Content-Type: application/json" \
+    --data @shop-orders-cdc.json http://localhost:8083/connectors
+$ curl -s http://localhost:8083/connectors/shop-orders-cdc/status
+{"name":"shop-orders-cdc","connector":{"state":"RUNNING","worker_id":"connect:8083"},
+ "tasks":[{"id":0,"state":"RUNNING","worker_id":"connect:8083"}],"type":"source"}
+
+$ psql -c "UPDATE orders SET status='SHIPPED' WHERE id=1042;"
+UPDATE 1
+$ kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic shop.public.orders --formatter-property print.key=true --from-beginning
+{"id":1042}	{"before":{"id":1042,"status":"PLACED",...},"after":{"id":1042,"status":"SHIPPED",...},"op":"u",...}</code></pre>
+        <p>(Kafka older than 4.2: use <code>--property print.key=true</code>; on 4.2+ that flag still works but prints a deprecation warning.) The output assumes the Connect worker sets <code>key.converter.schemas.enable=false</code> and <code>value.converter.schemas.enable=false</code>. With the default (<code>true</code>) the JSON converter wraps every key and value in a <code>{"schema": ..., "payload": ...}</code> envelope, so each message looks several times bigger - that is normal, not a bug.</p>
+        <div class="callout warn"><p><b>Careful:</b> never put the real database password in the connector JSON - it is readable through the REST API and lands in Git. Use a config provider (file, Kubernetes Secret, Vault) as above: the JSON uses the file provider, the <a href="{{BASE}}interview/glossary#strimzi">Strimzi</a> YAML uses the Kubernetes Secret provider. The password in the Postgres setup tab is a local-lab placeholder.</p></div>
+        <p>The full hands-on version of this, with an outbox table and a consumer, is the <a href="{{BASE}}devops/pipeline-index">ShopStream pipeline project</a>; see especially <a href="{{BASE}}devops/pipeline-01">Pipeline Architecture</a> and <a href="{{BASE}}devops/pipeline-02">Build It Locally</a>.</p>
+      

@@ -1,0 +1,58 @@
+
+        <h2>Step 1: a safe image</h2>
+        <p>The image is the easiest place to remove risk, because whatever is not in the image cannot be attacked. Five rules cover most of it.</p>
+        <ol class="steps">
+          <li><strong>Start small.</strong> Use a minimal base: <code>-slim</code> Debian images, Google's <a href="https://github.com/GoogleContainerTools/distroless" target="_blank" rel="noopener">distroless</a> images (no shell, no package manager), Docker Hardened Images (made free and Apache 2.0 licensed in December 2025), Chainguard images, or <code>scratch</code> for static binaries. Fewer packages means fewer CVEs (published security bugs) to patch.</li>
+          <li><strong>Multi-stage builds.</strong> Compile in a big "builder" stage, copy only the final artifact into a tiny runtime stage. Compilers and test tools never ship. A Go service typically drops from around 800 MB (the golang image) to under 20 MB.</li>
+          <li><strong>Run as a non-root user.</strong> Add <code>USER 10001</code> with a <em>numeric</em> UID. Kubernetes' <code>runAsNonRoot</code> check can only verify a number, not a name.</li>
+          <li><strong>No secrets in layers.</strong> Never <code>COPY</code> a key file, never pass tokens as <code>ARG</code> or <code>ENV</code>. Use BuildKit secret mounts (below).</li>
+          <li><strong>Pin versions.</strong> Pin the base image (by tag and, ideally, by <code>@sha256:</code> digest) so a rebuild today and next week start from the same bytes. Never deploy <code>:latest</code>; it is just a default tag name, not "the newest".</li>
+        </ol>
+
+        <h3>A hardened Dockerfile</h3>
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+# ---------- build stage ----------
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY . .
+ARG TARGETOS TARGETARCH
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/orders ./cmd/orders
+
+# ---------- runtime stage ----------
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/orders /orders
+USER 65532:65532
+EXPOSE 8080
+# exec form: runs the binary directly, no shell needed (distroless has none)
+HEALTHCHECK --interval=30s --timeout=3s CMD ["/orders","healthcheck"]
+ENTRYPOINT ["/orders"]</code></pre>
+        <p>Line by line: the builder stage caches Go modules with a BuildKit cache mount so CI does not re-download them each time. <code>FROM --platform=$BUILDPLATFORM</code> makes the build stage run on the CI machine's own CPU type, and <code>TARGETOS</code>/<code>TARGETARCH</code> tell the Go compiler which CPU to produce code for, so one Dockerfile cross-compiles for amd64 and arm64 without slow emulation. The <code>HEALTHCHECK</code> uses exec form (a JSON list), so Docker runs the binary directly; this matters because distroless has no <code>/bin/sh</code>. The runtime stage is distroless "static" with the built-in <code>nonroot</code> user (UID 65532). The <code>ENTRYPOINT</code> uses exec form, so the binary is PID 1 and receives SIGTERM directly. There is no shell, so an attacker who gets code execution also gets no <code>sh</code>, <code>curl</code> or package manager to play with.</p>
+<pre class="terminal"><code>$ docker build -t orders:1.4.2 .
+$ docker images orders
+REPOSITORY   TAG     IMAGE ID       CREATED          SIZE
+orders       1.4.2   7d3c0f19a2b4   12 seconds ago   9.8MB
+$ docker run --rm --entrypoint id orders:1.4.2
+docker: Error response from daemon: failed to create task for container: ... exec: "id": executable file not found in $PATH</code></pre>
+        <p>That last error is a feature: there is no <code>id</code> command to run, because there is nothing in the image except your binary and a few certificate and timezone files.</p>
+
+        <h3>Secrets during the build</h3>
+<pre><code class="language-dockerfile"># syntax=docker/dockerfile:1
+FROM node:22-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+# The token is mounted only for this RUN at /root/.npmrc (target=); without target= it would be at /run/secrets/npmrc.
+# It is never written to a layer.
+RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm ci --omit=dev
+COPY . .
+USER 10001
+CMD ["node", "server.js"]</code></pre>
+<pre class="terminal"><code>$ docker build --secret id=npmrc,src=$HOME/.npmrc -t web:2.0.1 .
+$ docker history --no-trunc web:2.0.1 | grep -c npm_
+0</code></pre>
+        <div class="callout danger"><p><b>Never do this:</b> <code>COPY id_rsa /root/.ssh/</code> and then <code>RUN rm /root/.ssh/id_rsa</code> in a later step. The key is still inside the earlier layer, and anyone who can pull the image can extract it with <code>docker save</code> and <code>tar</code>. Same for <code>ARG NPM_TOKEN</code>: build args show up in <code>docker history</code>. Uber's engineering blog on their Makisu builder describes exactly this problem (secrets kept in layers even after deletion) as one reason they built a new tool.</p></div>
+        <p>For runtime secrets (database passwords, API keys), do not bake them into the image at all. Mount them as files at start time: Docker or Compose <code>secrets:</code>, a tmpfs mount, or in Kubernetes a Secret volume, ideally fed from a vault. Environment variables are convenient but leak easily: they show in <code>docker inspect</code>, in crash dumps and in child processes. <a href="https://shopify.engineering/docker-at-shopify-how-we-built-containers-that-power-over-100-000-online-shops" target="_blank" rel="noopener">Shopify</a> called secrets the "most unexpectedly complex" part of their move to Docker. See <a href="{{BASE}}devops/k8s-07">ConfigMaps &amp; Secrets</a> for how Kubernetes does it.</p>
+      

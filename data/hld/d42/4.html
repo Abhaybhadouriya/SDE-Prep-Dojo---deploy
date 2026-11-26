@@ -1,0 +1,91 @@
+
+        <h2>Data model</h2>
+        <p>Split each email into three parts with very different shapes. This is the single most important storage decision.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Part</th><th>Size</th><th>Access</th><th>Where it lives</th></tr></thead>
+            <tbody>
+              <tr><td>Metadata (from, subject, date, snippet, flags, labels, thread id)</td><td>~1 KB</td><td>Read on every inbox list, updated often (read, label, move)</td><td>Wide-column store partitioned by <code>user_id</code> (Bigtable / HBase / Cassandra style)</td></tr>
+              <tr><td>Body (raw MIME text, HTML)</td><td>tens of KB</td><td>Written once, read when opened, never edited</td><td>Object store or a body column, compressed, keyed by message id</td></tr>
+              <tr><td>Attachments</td><td>up to 25 MB</td><td>Written once, read rarely</td><td>Object store, content-addressed by hash, cold tier after months</td></tr>
+              <tr><td>Search index</td><td>a fraction of text</td><td>Written on delivery, read on search</td><td>Per-user inverted index (separate cluster)</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre><code class="language-sql">-- CQL-style tables. Partition key in the first ( ), clustering after.
+CREATE TABLE folders_by_user (
+  user_id     bigint,
+  folder_id   text,            -- 'inbox','sent','trash' or a label id
+  name        text,
+  unread      counter,
+  PRIMARY KEY ((user_id), folder_id));
+
+CREATE TABLE messages_by_folder (       -- the inbox list query
+  user_id     bigint,
+  folder_id   text,
+  message_id  timeuuid,        -- time-ordered id: newest first for free
+  thread_id   bigint,
+  from_addr   text,
+  subject     text,
+  snippet     text,            -- first ~100 chars, avoids reading the body
+  is_read     boolean,
+  has_attach  boolean,
+  PRIMARY KEY ((user_id, folder_id), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+
+CREATE TABLE messages_by_id (           -- open one message
+  user_id     bigint,
+  message_id  timeuuid,
+  rfc_msg_id  text,            -- the Message-ID header, used for threading + dedupe
+  labels      set&lt;text&gt;,
+  body_ref    text,            -- object-store key of the MIME body
+  attachments list&lt;frozen&lt;attachment&gt;&gt;,  -- name, size, sha256, blob key
+  PRIMARY KEY ((user_id), message_id));
+
+CREATE TABLE threads_by_user (
+  user_id bigint, thread_id bigint, message_id timeuuid,
+  PRIMARY KEY ((user_id, thread_id), message_id));</code></pre>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="One incoming email splits into metadata rows in a wide-column DB, a body object, an attachment blob shared by hash, and a search index entry">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="110" width="140" height="60"/>
+            <text class="label" x="90" y="136">Incoming</text>
+            <text class="label small" x="90" y="156">MIME email</text>
+            <rect class="box svc" x="220" y="110" width="140" height="60"/>
+            <text class="label" x="290" y="136">Splitter</text>
+            <text class="label small" x="290" y="156">parse MIME</text>
+            <rect class="box db" x="450" y="20" width="320" height="50"/>
+            <text class="label" x="610" y="42">Metadata rows (user_id partition)</text>
+            <text class="label small" x="610" y="60">small, hot, updated often</text>
+            <rect class="box queue" x="450" y="85" width="320" height="50"/>
+            <text class="label" x="610" y="107">Body object (compressed)</text>
+            <text class="label small" x="610" y="125">write once, read on open</text>
+            <rect class="box docker" x="450" y="150" width="320" height="50"/>
+            <text class="label" x="610" y="172">Attachment blob, key = sha256</text>
+            <text class="label small" x="610" y="190">1 copy even for 10,000 recipients</text>
+            <rect class="box cache" x="450" y="215" width="320" height="50"/>
+            <text class="label" x="610" y="237">Search index (per user)</text>
+            <text class="label small" x="610" y="255">updated async</text>
+            <path class="arrow" d="M160 140 L212 140"/>
+            <path class="arrow" d="M360 130 L442 45"/>
+            <path class="arrow" d="M360 135 L442 110"/>
+            <path class="arrow" d="M360 145 L442 175"/>
+            <path class="arrow flow" d="M360 155 L442 240"/>
+          </svg>
+          <figcaption>One email, four homes. The metadata database stays small and fast because the heavy bytes live elsewhere.</figcaption>
+        </figure>
+
+        <h3>Why not plain SQL? Why not plain Cassandra?</h3>
+        <ul>
+          <li><b>Relational (MySQL / Postgres):</b> great for small rows and secondary indexes. Poor at 50 KB+ values and at 400k writes/s spread over a billion tiny "tables" (one per user). Facebook tried MySQL for Messages and found it performed badly on long-tail data as indexes grew.</li>
+          <li><b>Cassandra:</b> scales writes beautifully, but it is eventually consistent by default. Facebook rejected it for Messages in 2010 because its consistency model was hard to fit (a read/unread flag that flips back is a visible bug). You can use quorum reads and writes, but you pay latency.</li>
+          <li><b>What big providers do:</b> Gmail sits on Google's own Bigtable-family storage; Facebook Messages chose HBase (strong per-row consistency on HDFS); Microsoft Exchange runs its own ESE database replicated in software; Fastmail runs Cyrus IMAP stores. The common theme: <b>a single writer (primary) per mailbox</b>, so each mailbox is strongly consistent, and many mailboxes per machine.</li>
+          <li><b>Read and unread at NoSQL scale:</b> wide-column stores cannot do <code>WHERE is_read = false</code> cheaply. The ByteByteGo chapter denormalises into separate <code>read_emails</code> and <code>unread_emails</code> tables (mark read = delete from one, insert into the other) and keeps an unread counter per folder.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Think of each mailbox as a small file system owned by one process. "One primary per mailbox" is like one kernel thread owning a socket's receive queue: no locks between writers, because there is only one writer. Replicas get the change log, much like a standby route processor that replays the active one's state updates.</p>
+        </div>
+        <p>More on picking stores: <a href="{{BASE}}hld/hld-08">choosing storage</a> and <a href="{{BASE}}hld/hld-07">data modeling and indexing</a>. The Dynamo-style option is in <a href="{{BASE}}hld/d32">key-value store</a>.</p>
+      

@@ -1,0 +1,113 @@
+
+        <h2>Interview: how to drive the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min: clarify.</strong> Key (user/API key/IP), rules, where it runs, hard vs soft, scale. Write "500k checks/s, 10M keys".</li>
+          <li><strong>5-8 min: estimate.</strong> ~1 GB of state, throughput-bound, ~1 ms budget.</li>
+          <li><strong>8-18 min: algorithms.</strong> Compare all four in one table; pick token bucket; draw the bucket.</li>
+          <li><strong>18-28 min: architecture.</strong> Gateway, rules cache, sharded Redis, Lua script, 429 + headers.</li>
+          <li><strong>28-40 min: deep dives.</strong> Races, fail open/closed, hot keys, multi-region.</li>
+          <li><strong>40-45 min: wrap-up.</strong> Monitoring (429 rate per rule, limiter latency, Redis errors), dark launch, kill switch.</li>
+        </ol>
+        <div class="callout warn"><p><b>Common mistakes:</b> designing only the algorithm and never the distributed state; GET-then-SET races; a fixed window without mentioning the boundary burst; forgetting what happens when Redis dies; returning 500 or 503 for per-client limits; not telling the client when to retry; a global cross-region counter on every request.</p></div>
+
+        <h3>The 60-second answer</h3>
+        <div class="callout interview"><p>"I would put the limiter in the API gateway, keyed by API key or user ID, with rules loaded from config into memory. The algorithm is a token bucket: capacity for bursts, a refill rate for the long-run limit, and only two numbers per key. Because there are many gateway pods, the bucket state lives in a sharded Redis cluster, and each check is one Lua script call that refills and spends atomically, so there are no races. That adds about a millisecond. Rejected requests get a 429 with Retry-After. If Redis is unavailable, API quotas fail open with an alarm, while security limits like login fail closed. For very hot keys or multiple regions, I enforce locally and sync counts asynchronously, accepting a small overshoot."</p></div>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Amazon,Google,Atlassian">
+          <summary>Compare token bucket, leaky bucket, fixed window and sliding window.</summary>
+          <div class="answer">
+            <p>Token bucket: tokens refill at rate r up to capacity B; each request spends one. Allows bursts up to B, long-run rate r, two numbers of state. Leaky bucket: a queue drains at a fixed rate; smooth output but bursts wait. Fixed window: one counter per window; cheap but allows up to 2x the limit across a boundary. Sliding log: exact but stores every timestamp. Sliding counter: weights the previous window by overlap; two counters, near-exact. I default to token bucket for API quotas.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use one table with columns: state, burst behaviour, accuracy. Then pick one with a reason linked to the requirements.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Draw the fixed-window boundary problem.</li><li>Which one does NGINX use?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Stripe,Uber">
+          <summary>You have 50 gateway servers. How do they share one limit per user?</summary>
+          <div class="answer">
+            <p>Keep the counter state outside the gateways in a shared, fast store: a Redis cluster sharded by the limit key. Each check is a single atomic operation: <code>INCR</code> for fixed windows, or a Lua script for token buckets that refills and spends in one step. The gateways stay stateless and scale freely. For extreme rates, gateways lease batches of tokens and spend them locally.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "the state must be shared", then "and updates must be atomic", then the specific Redis mechanism.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not sticky load balancing so each user always hits one gateway?</li><li>What is the latency cost?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Atlassian,Stripe,Amazon">
+          <summary>Redis is down. What happens to your API?</summary>
+          <div class="answer">
+            <p>For normal API quotas we fail open: the limiter call has a tight timeout (a few ms) and a circuit breaker; on failure the request is allowed and an alert fires. The API stays up, just temporarily unlimited. As a safety net each gateway runs a coarse local bucket (limit ÷ pods) so a runaway client is still slowed. For security-sensitive limits (login attempts, OTP sends) we fail closed. Redis itself runs with replicas and automatic failover to keep the window short.</p>
+            <div class="approach"><h5>How to answer</h5><p>State the principle (a protection layer must not become the outage), then the per-rule exception, then the fallback.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which real company fails open? (Stripe, in its rate limiter post.)</li><li>How do you test this before it happens?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Google,Amazon">
+          <summary>Two requests for the same user arrive at two gateways at the same moment with one token left. What stops both from passing?</summary>
+          <div class="answer">
+            <p>Atomicity on the store. If gateways do GET then SET, both read 1 and both pass: a lost update. Redis executes each command and each Lua script to completion before the next on that shard, so putting the refill-check-spend logic in one script means one call sees 1 token and spends it, and the other sees 0 and is rejected. For a fixed window, <code>INCR</code> then compare is enough because INCR itself is atomic.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the race (lost update), then the guarantee you rely on (single-threaded command execution per shard).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Would a distributed lock work? Why is it a bad idea here?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="2" data-topic="hld" data-company="Microsoft,Amazon">
+          <summary>What status code and headers do you return when a client is limited?</summary>
+          <div class="answer">
+            <p>429 Too Many Requests (RFC 6585), with <code>Retry-After</code> (seconds) and quota headers: the IETF draft <code>RateLimit-Policy</code>/<code>RateLimit</code> or the common <code>X-RateLimit-Limit/Remaining/Reset</code>. 503 is for server-side overload (load shedding), not per-client limits. Clients should back off with jitter and honour Retry-After.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give the code, the headers, and the 429 vs 503 distinction in one breath.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Should a 429 count against the client's quota?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Google">
+          <summary>How would you rate-limit across three regions?</summary>
+          <div class="answer">
+            <p>Avoid a global synchronous counter: a cross-region round trip on every request is far too slow. Instead each region enforces locally with its own Redis, and regions exchange counts asynchronously (every second or so), subtracting what others have used. During the sync gap a client spraying all regions can exceed the limit slightly. If that is unacceptable, split the quota statically per region, or route each customer to a home region for metered calls.</p>
+            <div class="approach"><h5>How to answer</h5><p>Present it as a CAP-style choice: latency and availability vs exactness. Say what overshoot you accept and why.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if a customer pays per call and overshoot costs you money?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Stripe">
+          <summary>One enterprise customer sends 50,000 requests per second. Your Redis shard for that key is melting. Fix it.</summary>
+          <div class="answer">
+            <p>That is a hot key. Options: (1) token leasing, where each gateway pod takes 100-1,000 tokens at a time from Redis and spends them locally, so Redis sees one call per batch instead of per request; (2) split the bucket into N sub-keys with limit ÷ N each, spread over shards, picking one at random; (3) give the customer a dedicated limiter tier or local limits. Leasing trades a little accuracy (unused leased tokens) for huge load reduction.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the hot key, then reduce calls per request (leasing) or spread the key (splitting).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens to leased tokens when a pod dies?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,security" data-company="Microsoft,Flipkart,PhonePe">
+          <summary>Design rate limiting for a login or OTP endpoint. What changes?</summary>
+          <div class="answer">
+            <p>The key changes: limit per username/phone number (to stop guessing one account) and per IP/device (to stop one attacker spraying many accounts). Limits are small and strict, so an exact sliding log is affordable. Fail closed if the store is down. Add increasing lockout times, CAPTCHA after a few failures, and alerts. For OTP sends, also cap per phone per day to stop SMS-pumping fraud, which costs real money per message.</p>
+            <div class="approach"><h5>How to answer</h5><p>Contrast with the API quota design: different key, exact algorithm, fail closed.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>An attacker uses 10,000 IPs. Now what?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon,Atlassian">
+          <summary>How do you change a limit without a deploy, and how do you roll out a new limiter safely?</summary>
+          <div class="answer">
+            <p>Rules live in a config store (a config service, database or ConfigMap). Gateways cache them in memory and refresh by watch/push or polling every few seconds. New rules are first dark-launched: the limiter computes and logs "would have rejected" without enforcing, and you check that only the intended clients would be hit. Then enforce, with a kill switch per rule. Stripe describes exactly this dark-launch and kill-switch practice.</p>
+            <div class="approach"><h5>How to answer</h5><p>Config path, then safe rollout, then emergency off switch.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A bad rule just rejected 40% of traffic. How fast can you undo it?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,networking" data-company="Cisco,Microsoft">
+          <summary>You come from networking. How is this different from a QoS policer?</summary>
+          <div class="answer">
+            <p>The algorithm is the same: a token bucket with CIR as the refill rate and CBS as the burst. The difference is state placement. A policer keeps its bucket in one device's memory and updates it per packet in hardware. A distributed limiter has many stateless gateways and must keep the bucket in a shared store reached over the network, so it must handle atomicity across machines, network latency, store failure (fail open/closed) and multi-region consistency. Rejecting is policing; queueing (for example to Kafka) is shaping.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use your background as a strength: one sentence of "same algorithm", then the three new problems distribution adds.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What is the distributed equivalent of a two-rate three-colour marker?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: after a deploy, 15% of good customers get 429s</h4>
+          <div class="situation">A new gateway version shipped an hour ago. Support tickets say "we are under our limit but get 429". Limiter dashboards show Redis healthy.</div>
+          <div class="bad">Weak answer: "Raise all the limits until the complaints stop."</div>
+          <div class="good">Strong answer: "First, roll back or flip the kill switch to stop the harm. Then find what changed in the key: maybe the new version reads the client IP from the load balancer instead of <code>X-Forwarded-For</code>, so all customers behind one LB address now share one bucket; or the key now includes something that collapses many users into one. Compare the distinct key count before and after. Add a test for key extraction and dark-launch the next version."</div>
+          <div class="followups">Follow-ups: Which metric would have caught this in the canary? How do you make sure a rollback is safe if the bucket key format changed?</div>
+        </div>
+      

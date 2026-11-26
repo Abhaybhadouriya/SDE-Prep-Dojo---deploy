@@ -1,0 +1,991 @@
+<h3>Python</h3>
+  <ul class="file-roles"><li><code>meeting_scheduler.py</code>: the whole model; <code>bisect</code> keeps each room sorted.</li><li><code>main.py</code>: demo driver.</li><li><code>test_meeting_scheduler.py</code>: 9 unit tests, including one-winner-per-slot under threads and the opposite-lock-order test.</li></ul>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="meeting_scheduler.py">
+<pre><code class="language-python">"""Meeting room and calendar scheduler - Python version of the Java design.
+
+Rooms keep a sorted list of bookings (bisect) and one lock each; people keep their own list and lock.
+The scheduler locks participants in user-id order, then the room, so two requests can never deadlock.
+"""
+from __future__ import annotations
+
+import bisect
+import itertools
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Callable, Iterable, Protocol
+
+
+class NoRoomAvailableError(Exception): pass
+class ConflictError(Exception): pass
+class NotFoundError(Exception): pass
+
+
+@dataclass(frozen=True, order=True)
+class TimeSlot:
+    """Half-open [start, end): 10:00-11:00 does not clash with 11:00-12:00."""
+    start: datetime
+    end: datetime
+
+    def __post_init__(self):
+        if self.end &lt;= self.start:
+            raise ValueError(f"end must be after start: {self.start} .. {self.end}")
+
+    def overlaps(self, other: "TimeSlot") -&gt; bool:
+        return self.start &lt; other.end and other.start &lt; self.end
+
+    def shift(self, d: timedelta) -&gt; "TimeSlot":
+        return TimeSlot(self.start + d, self.end + d)
+
+    def __str__(self):
+        return f"{self.start:%Y-%m-%d %H:%M}-{self.end:%H:%M}"
+
+
+@dataclass(frozen=True)
+class User:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class Room:
+    id: str
+    name: str
+    capacity: int
+    floor: int
+
+
+class MeetingStatus(Enum):
+    SCHEDULED = "SCHEDULED"
+    CANCELLED = "CANCELLED"
+
+
+class Rsvp(Enum):
+    PENDING = "PENDING"
+    ACCEPTED = "ACCEPTED"
+    DECLINED = "DECLINED"
+
+
+# ---- recurrence (Strategy as a plain function: first slot -&gt; all occurrences)
+Recurrence = Callable[[TimeSlot], list]
+
+
+def no_repeat(first: TimeSlot) -&gt; list:
+    return [first]
+
+
+def every(step: timedelta, count: int) -&gt; Recurrence:
+    if not 1 &lt;= count &lt;= 52:
+        raise ValueError("count must be 1..52")
+    return lambda first: [first.shift(step * i) for i in range(count)]
+
+
+def daily(count: int) -&gt; Recurrence: return every(timedelta(days=1), count)
+def weekly(count: int) -&gt; Recurrence: return every(timedelta(days=7), count)
+
+
+@dataclass
+class Meeting:
+    id: str
+    title: str
+    organizer: User
+    participants: tuple
+    room: Room
+    slots: tuple
+    status: MeetingStatus = MeetingStatus.SCHEDULED
+    rsvp: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        for u in self.participants:
+            self.rsvp[u.id] = Rsvp.ACCEPTED if u == self.organizer else Rsvp.PENDING
+
+    def __str__(self):
+        extra = f" (x{len(self.slots)})" if len(self.slots) &gt; 1 else ""
+        return f"{self.id} '{self.title}' in {self.room.name} {self.slots[0]}{extra}"
+
+
+@dataclass(frozen=True)
+class Busy:
+    slot: TimeSlot
+    meeting_id: str
+
+
+class RoomCalendar:
+    """Bookings of one room, sorted by start. Bookings never overlap, so check only the two neighbours."""
+
+    def __init__(self, room: Room):
+        self.room = room
+        self._starts: list = []       # sorted start times
+        self._items: list = []        # Busy, same order
+        self.lock = threading.Lock()
+
+    def _free_locked(self, s: TimeSlot) -&gt; bool:
+        i = bisect.bisect_right(self._starts, s.start)       # first booking starting after s.start
+        if i &gt; 0 and self._items[i - 1].slot.end &gt; s.start:   # the one starting at or before s
+            return False
+        return i == len(self._items) or self._items[i].slot.start &gt;= s.end
+
+    def is_free(self, s: TimeSlot) -&gt; bool:
+        with self.lock:
+            return self._free_locked(s)
+
+    def try_reserve_all(self, slots: Iterable[TimeSlot], meeting_id: str) -&gt; bool:
+        slots = list(slots)
+        with self.lock:
+            if not all(self._free_locked(s) for s in slots):
+                return False              # all or nothing
+            for s in slots:
+                i = bisect.bisect_right(self._starts, s.start)
+                self._starts.insert(i, s.start)
+                self._items.insert(i, Busy(s, meeting_id))
+            return True
+
+    def release(self, meeting_id: str) -&gt; None:
+        with self.lock:
+            keep = [(st, b) for st, b in zip(self._starts, self._items) if b.meeting_id != meeting_id]
+            self._starts = [st for st, _ in keep]
+            self._items = [b for _, b in keep]
+
+    def on(self, day: datetime) -&gt; list:
+        lo, hi = day, day + timedelta(days=1)
+        with self.lock:
+            return [b for b in self._items if lo &lt;= b.slot.start &lt; hi]
+
+
+class UserCalendar:
+    """A person's meetings. People may double-book if the policy allows, so this is a plain list."""
+
+    def __init__(self, user: User):
+        self.user = user
+        self.items: list = []
+        self.lock = threading.Lock()
+
+    def clashes_locked(self, slots) -&gt; bool:
+        return any(b.slot.overlaps(s) for b in self.items for s in slots)
+
+    def between(self, lo: datetime, hi: datetime) -&gt; list:
+        with self.lock:
+            return [b for b in self.items if b.slot.start &lt; hi and b.slot.end &gt; lo]
+
+
+# ---- room selection strategies
+class RoomSelectionStrategy(Protocol):
+    name: str
+    def rank(self, rooms: list, attendees: int) -&gt; list: ...
+
+
+class BestFitCapacity:
+    name = "best-fit capacity"
+
+    def rank(self, rooms, attendees):
+        return sorted(rooms, key=lambda r: (r.capacity, r.id))
+
+
+class NearestFloor:
+    def __init__(self, floor: int):
+        self.floor = floor
+        self.name = f"nearest floor to {floor}"
+
+    def rank(self, rooms, attendees):
+        return sorted(rooms, key=lambda r: (abs(r.floor - self.floor), r.capacity, r.id))
+
+
+class ConflictPolicy(Enum):
+    ALLOW = "ALLOW"
+    REJECT = "REJECT"
+
+
+class NotificationService:
+    """Observer: records (and optionally prints) the messages it would send."""
+
+    def __init__(self, echo: bool = False):
+        self.sent: list = []
+        self.echo = echo
+        self._lock = threading.Lock()
+
+    def _send(self, text: str):
+        with self._lock:
+            self.sent.append(text)
+        if self.echo:
+            print("    [notify]", text)
+
+    def on_scheduled(self, m: Meeting):
+        for u in m.participants:
+            if u != m.organizer:
+                self._send(f"to {u.name}: invite {m.id} '{m.title}' {m.slots[0]} in {m.room.name}")
+
+    def on_cancelled(self, m: Meeting):
+        for u in m.participants:
+            if u != m.organizer:
+                self._send(f"to {u.name}: cancelled {m.id}")
+
+    def on_rsvp(self, m: Meeting, who: User, status: Rsvp):
+        self._send(f"to {m.organizer.name}: {who.name} {status.value} {m.id}")
+
+
+class MeetingScheduler:
+    def __init__(self, strategy, policy: ConflictPolicy = ConflictPolicy.REJECT):
+        self.strategy = strategy
+        self.policy = policy
+        self._rooms: dict = {}
+        self._users: dict = {}
+        self._meetings: dict = {}
+        self._listeners: list = []
+        self._ids = itertools.count(1)
+        self._id_lock = threading.Lock()
+        self._registry_lock = threading.Lock()
+
+    def add_room(self, r: Room):
+        with self._registry_lock:
+            if r.id in self._rooms:
+                raise ValueError(f"duplicate room {r.id}")
+            self._rooms[r.id] = RoomCalendar(r)
+
+    def add_user(self, u: User):
+        with self._registry_lock:
+            if u.id in self._users:
+                raise ValueError(f"duplicate user {u.id}")
+            self._users[u.id] = UserCalendar(u)
+
+    def add_listener(self, listener):
+        self._listeners.append(listener)
+
+    def _user(self, uid: str) -&gt; UserCalendar:
+        cal = self._users.get(uid)
+        if cal is None:
+            raise NotFoundError(f"no user {uid}")
+        return cal
+
+    def _next_id(self) -&gt; str:
+        with self._id_lock:
+            return f"M{next(self._ids)}"
+
+    def schedule(self, title: str, organizer: str, slot: TimeSlot, invite: Iterable[str] = (),
+                 repeat: Recurrence = no_repeat, room_id: str | None = None) -&gt; Meeting:
+        if not title.strip():
+            raise ValueError("title required")
+        ids = list(dict.fromkeys([organizer, *invite]))      # organizer first, no duplicates
+        people = [self._user(i) for i in ids]
+        occ = sorted(repeat(slot))
+        if room_id is not None:
+            rc = self._rooms.get(room_id)
+            if rc is None:
+                raise NotFoundError(f"no room {room_id}")
+            if rc.room.capacity &lt; len(people):
+                raise NoRoomAvailableError(f"{rc.room.name} seats {rc.room.capacity}, need {len(people)}")
+            candidates = [rc.room]
+        else:
+            candidates = self.strategy.rank([rc.room for rc in self._rooms.values()
+                                             if rc.room.capacity &gt;= len(people)], len(people))
+        locked = sorted(people, key=lambda c: c.user.id)      # one global lock order: no deadlock
+        mid = self._next_id()
+        meeting = None
+        for c in locked:
+            c.lock.acquire()
+        try:
+            if self.policy is ConflictPolicy.REJECT:
+                for c in locked:
+                    if c.clashes_locked(occ):
+                        raise ConflictError(f"{c.user.name} is busy at {slot}")
+            for r in candidates:
+                if self._rooms[r.id].try_reserve_all(occ, mid):
+                    for c in locked:
+                        c.items.extend(Busy(s, mid) for s in occ)
+                        c.items.sort(key=lambda b: b.slot)
+                    meeting = Meeting(mid, title, people[0].user, tuple(c.user for c in locked), r, tuple(occ))
+                    self._meetings[mid] = meeting
+                    break
+        finally:
+            for c in reversed(locked):
+                c.lock.release()
+        if meeting is None:
+            suffix = f" x{len(occ)}" if len(occ) &gt; 1 else ""
+            raise NoRoomAvailableError(f"no room for {len(people)} at {slot}{suffix}")
+        for listener in self._listeners:       # notify outside the locks
+            listener.on_scheduled(meeting)
+        return meeting
+
+    def cancel(self, meeting_id: str, by_user: str) -&gt; None:
+        m = self._meetings.get(meeting_id)
+        if m is None:
+            raise NotFoundError(f"no meeting {meeting_id}")
+        if m.organizer.id != by_user:
+            raise PermissionError(f"only the organizer can cancel {meeting_id}")
+        if self._meetings.pop(meeting_id, None) is None:       # a racing cancel lost
+            raise NotFoundError(f"already cancelled {meeting_id}")
+        m.status = MeetingStatus.CANCELLED
+        self._rooms[m.room.id].release(meeting_id)
+        for u in m.participants:
+            cal = self._users[u.id]
+            with cal.lock:
+                cal.items = [b for b in cal.items if b.meeting_id != meeting_id]
+        for listener in self._listeners:
+            listener.on_cancelled(m)
+
+    def respond(self, meeting_id: str, user_id: str, status: Rsvp) -&gt; None:
+        m = self._meetings.get(meeting_id)
+        if m is None:
+            raise NotFoundError(f"no meeting {meeting_id}")
+        if user_id not in m.rsvp:
+            raise ValueError(f"{user_id} is not invited to {meeting_id}")
+        m.rsvp[user_id] = status
+        for listener in self._listeners:
+            listener.on_rsvp(m, self._user(user_id).user, status)
+
+    def available_rooms(self, slot: TimeSlot, attendees: int) -&gt; list:
+        free = [rc.room for rc in self._rooms.values() if rc.room.capacity &gt;= attendees and rc.is_free(slot)]
+        return self.strategy.rank(free, attendees)
+
+    def room_schedule(self, room_id: str, day: datetime) -&gt; list:
+        return self._rooms[room_id].on(day)
+
+    def find_free_slots(self, user_ids, lo: datetime, hi: datetime, length: timedelta) -&gt; list:
+        busy = sorted(b.slot for uid in user_ids for b in self._user(uid).between(lo, hi))
+        free, cursor = [], lo
+        for b in busy:
+            if b.start &gt; cursor and cursor + length &lt;= b.start:
+                free.append(TimeSlot(cursor, b.start))
+            cursor = max(cursor, b.end)
+        if cursor &lt; hi and cursor + length &lt;= hi:
+            free.append(TimeSlot(cursor, hi))
+        return free
+
+    def get(self, meeting_id: str):
+        return self._meetings.get(meeting_id)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver: the same story as Java Main, with simple asserts."""
+from datetime import datetime, timedelta
+
+from meeting_scheduler import (BestFitCapacity, ConflictError, MeetingScheduler, NearestFloor, NoRoomAvailableError,
+                               NotFoundError, NotificationService, Room, Rsvp, TimeSlot, User, weekly)
+
+DAY = datetime(2026, 11, 24)          # a Tuesday
+
+
+def at(h, m=0):
+    return DAY.replace(hour=h, minute=m)
+
+
+def slot(h1, m1, h2, m2):
+    return TimeSlot(at(h1, m1), at(h2, m2))
+
+
+def expect(err, fn, what):
+    try:
+        fn()
+    except err as e:
+        print("  rejected as expected:", e)
+        return
+    raise AssertionError(f"expected {err.__name__}: {what}")
+
+
+def main():
+    s = MeetingScheduler(BestFitCapacity())
+    notifier = NotificationService(echo=True)
+    s.add_listener(notifier)
+    s.add_room(Room("R1", "Focus", 4, 1))
+    s.add_room(Room("R2", "Huddle", 6, 2))
+    s.add_room(Room("R3", "Board", 20, 3))
+    for n in ["alice", "bob", "chen", "dev", "eva", "fay"]:
+        s.add_user(User(n, n))
+
+    print("== 1. book with", s.strategy.name, "==")
+    review = s.schedule("Design review", "alice", slot(10, 0, 11, 0), invite=["bob", "chen"])
+    print(" ", review)
+    assert review.room.id == "R1"
+    standup = s.schedule("Standup", "dev", slot(10, 30, 11, 0), invite=["eva"])
+    print(" ", standup)
+    assert standup.room.id == "R2"
+
+    print("== 2. overlaps and the half-open boundary ==")
+    expect(NoRoomAvailableError, lambda: s.schedule("Sync", "fay", slot(10, 30, 11, 30), room_id="R1"), "overlap")
+    retro = s.schedule("Retro", "eva", slot(11, 0, 12, 0), room_id="R1")
+    print(" ", retro, " (starts exactly when the review ends: allowed)")
+    expect(ConflictError, lambda: s.schedule("Hiring", "dev", slot(10, 15, 10, 45), invite=["chen"]), "chen busy")
+    expect(ValueError, lambda: slot(12, 0, 11, 0), "end before start")
+
+    print("== 3. weekly recurring meeting, all-or-nothing per room ==")
+    wk3 = DAY + timedelta(weeks=2)
+    s.schedule("Offsite prep", "dev", TimeSlot(wk3.replace(hour=15), wk3.replace(hour=16)), room_id="R1")
+    expect(NoRoomAvailableError,
+           lambda: s.schedule("1:1", "alice", slot(15, 0, 15, 30), invite=["bob"], repeat=weekly(4), room_id="R1"),
+           "week 3 clashes")
+    assert len(s.room_schedule("R1", DAY)) == 2
+    one = s.schedule("1:1", "alice", slot(15, 0, 15, 30), invite=["bob"], repeat=weekly(4))
+    print(" ", one, "-&gt;", [str(x) for x in one.slots])
+    assert one.room.id == "R2" and len(one.slots) == 4
+
+    print("== 4. RSVP ==")
+    s.respond(review.id, "bob", Rsvp.ACCEPTED)
+    s.respond(review.id, "chen", Rsvp.DECLINED)
+    expect(ValueError, lambda: s.respond(review.id, "eva", Rsvp.ACCEPTED), "not invited")
+
+    print("== 5. find a free time for alice + bob, 09:00-16:00, 30 min ==")
+    free = s.find_free_slots(["alice", "bob"], at(9), at(16), timedelta(minutes=30))
+    print("  free:", [str(x) for x in free])
+    assert free == [slot(9, 0, 10, 0), slot(11, 0, 15, 0), slot(15, 30, 16, 0)]
+
+    print("== 6. cancel ==")
+    expect(PermissionError, lambda: s.cancel(review.id, "bob"), "not organizer")
+    s.cancel(review.id, "alice")
+    expect(NotFoundError, lambda: s.cancel(review.id, "alice"), "double cancel")
+    print(" ", s.schedule("Sync", "eva", slot(10, 0, 10, 30), room_id="R1"))
+
+    print("== 7. switch strategy at runtime ==")
+    s.strategy = NearestFloor(3)
+    coffee = s.schedule("Coffee", "chen", slot(13, 0, 13, 30))
+    print(f"  {s.strategy.name}: {coffee}")
+    assert coffee.room.id == "R3"
+    s.strategy = BestFitCapacity()
+    print("  rooms free 13:00-13:30 for 2:", [r.name for r in s.available_rooms(slot(13, 0, 13, 30), 2)])
+    print("ALL DEMO ASSERTS PASSED; notifications sent:", len(notifier.sent))
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_meeting_scheduler.py">
+<pre><code class="language-python">import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+from meeting_scheduler import (BestFitCapacity, ConflictError, ConflictPolicy, MeetingScheduler, NoRoomAvailableError,
+                               NotFoundError, NotificationService, Room, TimeSlot, User, daily, weekly)
+
+D = datetime(2026, 11, 24)
+
+
+def ts(h1, m1, h2, m2, day=D):
+    return TimeSlot(day.replace(hour=h1, minute=m1), day.replace(hour=h2, minute=m2))
+
+
+class SchedulerTest(unittest.TestCase):
+    def make(self, *rooms, users=10, policy=ConflictPolicy.REJECT):
+        s = MeetingScheduler(BestFitCapacity(), policy)
+        for r in rooms or (Room("R1", "Focus", 4, 1), Room("R2", "Huddle", 6, 2)):
+            s.add_room(r)
+        for i in range(users):
+            s.add_user(User(f"u{i}", f"u{i}"))
+        return s
+
+    def test_touching_slots_do_not_overlap(self):
+        self.assertFalse(ts(10, 0, 11, 0).overlaps(ts(11, 0, 12, 0)))
+        self.assertTrue(ts(10, 0, 11, 0).overlaps(ts(10, 59, 11, 30)))
+        self.assertTrue(ts(10, 0, 12, 0).overlaps(ts(10, 30, 11, 0)))     # containment
+
+    def test_overlap_in_same_room_fails_other_room_works(self):
+        s = self.make()
+        s.schedule("a", "u0", ts(10, 0, 11, 0), room_id="R1")
+        with self.assertRaises(NoRoomAvailableError):
+            s.schedule("b", "u1", ts(10, 30, 11, 30), room_id="R1")
+        self.assertEqual(s.schedule("b", "u1", ts(10, 30, 11, 30), room_id="R2").room.id, "R2")
+
+    def test_best_fit_picks_smallest_room(self):
+        s = self.make(Room("big", "Big", 20, 1), Room("small", "Small", 3, 1))
+        self.assertEqual(s.schedule("a", "u0", ts(9, 0, 10, 0), invite=["u1"]).room.id, "small")
+        self.assertEqual(s.schedule("b", "u2", ts(9, 0, 10, 0), invite=["u3", "u4", "u5"]).room.id, "big")
+
+    def test_participant_conflict_policy(self):
+        strict = self.make()
+        strict.schedule("a", "u0", ts(9, 0, 10, 0), invite=["u1"])
+        with self.assertRaises(ConflictError):
+            strict.schedule("b", "u2", ts(9, 30, 10, 30), invite=["u1"])
+        loose = self.make(policy=ConflictPolicy.ALLOW)
+        loose.schedule("a", "u0", ts(9, 0, 10, 0), invite=["u1"])
+        self.assertIsNotNone(loose.schedule("b", "u2", ts(9, 30, 10, 30), invite=["u1"]))
+
+    def test_recurring_is_all_or_nothing(self):
+        s = self.make(Room("R1", "Only", 4, 1))
+        s.schedule("block", "u9", ts(9, 0, 10, 0, D + timedelta(days=2)))
+        with self.assertRaises(NoRoomAvailableError):
+            s.schedule("daily", "u0", ts(9, 0, 9, 15), repeat=daily(5))
+        self.assertEqual(s.room_schedule("R1", D), [])          # nothing half-booked
+        self.assertEqual(len(s.schedule("weekly", "u0", ts(9, 0, 9, 15), repeat=weekly(3)).slots), 3)
+
+    def test_cancel_frees_room_and_notifies(self):
+        s = self.make()
+        n = NotificationService()
+        s.add_listener(n)
+        m = s.schedule("a", "u0", ts(9, 0, 10, 0), invite=["u1"], room_id="R1")
+        with self.assertRaises(PermissionError):
+            s.cancel(m.id, "u1")
+        s.cancel(m.id, "u0")
+        with self.assertRaises(NotFoundError):
+            s.cancel(m.id, "u0")
+        self.assertTrue(s.available_rooms(ts(9, 0, 10, 0), 2))
+        self.assertIn("to u1: cancelled " + m.id, n.sent)
+
+    def test_free_slots_merge_overlapping_busy(self):
+        s = self.make(policy=ConflictPolicy.ALLOW)
+        s.schedule("a", "u0", ts(9, 0, 10, 0))
+        s.schedule("b", "u1", ts(9, 30, 11, 0))
+        s.schedule("c", "u1", ts(11, 10, 11, 20))       # gap 11:00-11:10 is too short for 15 min
+        free = s.find_free_slots(["u0", "u1"], D.replace(hour=8), D.replace(hour=12), timedelta(minutes=15))
+        self.assertEqual(free, [ts(8, 0, 9, 0), ts(11, 20, 12, 0)])
+
+    def test_concurrent_same_room_one_winner(self):
+        s = self.make(users=50)
+        start = threading.Event()
+
+        def book(i):
+            start.wait()
+            try:
+                return s.schedule("race", f"u{i}", ts(9, 0, 10, 0), room_id="R1")
+            except NoRoomAvailableError:
+                return None
+
+        with ThreadPoolExecutor(8) as pool:
+            futs = [pool.submit(book, i) for i in range(50)]
+            start.set()
+            won = [f.result() for f in futs if f.result()]
+        self.assertEqual(len(won), 1)
+
+    def test_no_deadlock_with_opposite_lock_orders(self):
+        s = self.make(Room("R", "R", 4, 1), Room("Q", "Q", 4, 1))
+
+        def book(k):
+            a, b = ("u0", "u1") if k % 2 == 0 else ("u1", "u0")
+            st = D + timedelta(minutes=5 * k)
+            s.schedule("pair", a, TimeSlot(st, st + timedelta(minutes=5)), invite=[b])
+
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(book, range(100), timeout=10))
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+<pre class="terminal"><code>$ python main.py
+== 1. book with best-fit capacity ==
+    [notify] to bob: invite M1 'Design review' 2026-11-24 10:00-11:00 in Focus
+    [notify] to chen: invite M1 'Design review' 2026-11-24 10:00-11:00 in Focus
+  M1 'Design review' in Focus 2026-11-24 10:00-11:00
+    [notify] to eva: invite M2 'Standup' 2026-11-24 10:30-11:00 in Huddle
+  M2 'Standup' in Huddle 2026-11-24 10:30-11:00
+== 2. overlaps and the half-open boundary ==
+  rejected as expected: no room for 1 at 2026-11-24 10:30-11:30
+  M4 'Retro' in Focus 2026-11-24 11:00-12:00  (starts exactly when the review ends: allowed)
+  rejected as expected: chen is busy at 2026-11-24 10:15-10:45
+  rejected as expected: end must be after start: 2026-11-24 12:00:00 .. 2026-11-24 11:00:00
+== 3. weekly recurring meeting, all-or-nothing per room ==
+  rejected as expected: no room for 2 at 2026-11-24 15:00-15:30 x4
+    [notify] to bob: invite M8 '1:1' 2026-11-24 15:00-15:30 in Huddle
+  M8 '1:1' in Huddle 2026-11-24 15:00-15:30 (x4) -&gt; ['2026-11-24 15:00-15:30', '2026-12-01 15:00-15:30', '2026-12-08 15:00-15:30', '2026-12-15 15:00-15:30']
+== 4. RSVP ==
+    [notify] to alice: bob ACCEPTED M1
+    [notify] to alice: chen DECLINED M1
+  rejected as expected: eva is not invited to M1
+== 5. find a free time for alice + bob, 09:00-16:00, 30 min ==
+  free: ['2026-11-24 09:00-10:00', '2026-11-24 11:00-15:00', '2026-11-24 15:30-16:00']
+== 6. cancel ==
+  rejected as expected: only the organizer can cancel M1
+    [notify] to bob: cancelled M1
+    [notify] to chen: cancelled M1
+  rejected as expected: no meeting M1
+  M9 'Sync' in Focus 2026-11-24 10:00-10:30
+== 7. switch strategy at runtime ==
+  nearest floor to 3: M10 'Coffee' in Board 2026-11-24 13:00-13:30
+  rooms free 13:00-13:30 for 2: ['Focus', 'Huddle']
+ALL DEMO ASSERTS PASSED; notifications sent: 8</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output: tests">
+<pre class="terminal"><code>$ python -m unittest -v test_meeting_scheduler
+test_best_fit_picks_smallest_room (test_meeting_scheduler.SchedulerTest.test_best_fit_picks_smallest_room) ... ok
+test_cancel_frees_room_and_notifies (test_meeting_scheduler.SchedulerTest.test_cancel_frees_room_and_notifies) ... ok
+test_concurrent_same_room_one_winner (test_meeting_scheduler.SchedulerTest.test_concurrent_same_room_one_winner) ... ok
+test_free_slots_merge_overlapping_busy (test_meeting_scheduler.SchedulerTest.test_free_slots_merge_overlapping_busy) ... ok
+test_no_deadlock_with_opposite_lock_orders (test_meeting_scheduler.SchedulerTest.test_no_deadlock_with_opposite_lock_orders) ... ok
+test_overlap_in_same_room_fails_other_room_works (test_meeting_scheduler.SchedulerTest.test_overlap_in_same_room_fails_other_room_works) ... ok
+test_participant_conflict_policy (test_meeting_scheduler.SchedulerTest.test_participant_conflict_policy) ... ok
+test_recurring_is_all_or_nothing (test_meeting_scheduler.SchedulerTest.test_recurring_is_all_or_nothing) ... ok
+test_touching_slots_do_not_overlap (test_meeting_scheduler.SchedulerTest.test_touching_slots_do_not_overlap) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.014s
+
+OK</code></pre>
+    </div>
+  </div>
+  <h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: abstract base classes as interfaces (a vtable is the ops table you know from C), <code>std::map</code> with <code>upper_bound</code> for the neighbour check, a <code>std::function</code> for recurrence.</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>ALL 12 CHECKS PASSED (notifications: 6)</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Meeting room scheduler in C++14. Time is "minutes since day 0 00:00" to keep the code short.
+// Windows (MinGW g++ 6.3): g++ -std=c++14 -Wall -O2 main.cpp -o meeting
+// Linux (real locks + a 50-thread race): g++ -std=c++14 -Wall -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o meeting
+// Locks: one per user (taken in sorted-name order), then one per room; a registry lock only for lookups.
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: a real std::mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). MinGW.org g++ 6.3 (win32 thread model) has no
+// std::mutex and -pthread fails to link there, so the default build uses a no-op Mutex with the same
+// lock()/unlock(): the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+#include &lt;thread&gt;
+typedef std::mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+using namespace std;
+
+static string fmt(long t) {
+    char b[32];
+    snprintf(b, sizeof b, "day%ld %02ld:%02ld", t / 1440, (t % 1440) / 60, t % 60);
+    return b;
+}
+static long at(int day, int h, int m) { return day * 1440L + h * 60 + m; }
+
+struct TimeSlot {                       // half-open [start, end)
+    long start, end;
+    TimeSlot(long s, long e) : start(s), end(e) {
+        if (e &lt;= s) throw invalid_argument("end must be after start");
+    }
+    bool overlaps(const TimeSlot&amp; o) const { return start &lt; o.end &amp;&amp; o.start &lt; end; }
+    string str() const { return fmt(start) + "-" + fmt(end).substr(fmt(end).size() - 5); }
+};
+
+struct Room { string id, name; int capacity, floor; };
+
+struct NoRoom : runtime_error { using runtime_error::runtime_error; };
+struct Conflict : runtime_error { using runtime_error::runtime_error; };
+
+// Bookings in one room never overlap, so compare a new slot only with its two neighbours.
+class RoomCalendar {
+    map&lt;long, pair&lt;long, string&gt;&gt; byStart_;   // start -&gt; (end, meetingId), guarded by m_
+    mutable Mutex m_;
+    bool freeLocked(const TimeSlot&amp; s) const {
+        auto next = byStart_.upper_bound(s.start);                 // first start &gt; s.start
+        if (next != byStart_.begin()) {
+            auto prev = std::prev(next);                           // start &lt;= s.start
+            if (prev-&gt;second.first &gt; s.start) return false;
+        }
+        return next == byStart_.end() || next-&gt;first &gt;= s.end;
+    }
+public:
+    Room room;
+    explicit RoomCalendar(Room r) : room(r) {}
+    bool isFree(const TimeSlot&amp; s) const { LockGuard g(m_); return freeLocked(s); }
+    bool tryReserveAll(const vector&lt;TimeSlot&gt;&amp; slots, const string&amp; id) {
+        LockGuard g(m_);                                           // check and claim under one lock
+        for (auto&amp; s : slots) if (!freeLocked(s)) return false;    // all or nothing
+        for (auto&amp; s : slots) byStart_[s.start] = make_pair(s.end, id);
+        return true;
+    }
+    void release(const string&amp; id) {
+        LockGuard g(m_);
+        for (auto it = byStart_.begin(); it != byStart_.end();)
+            it = (it-&gt;second.second == id) ? byStart_.erase(it) : std::next(it);
+    }
+    size_t size() const { LockGuard g(m_); return byStart_.size(); }
+};
+
+struct RoomSelectionStrategy {               // a vtable = an ops table of function pointers
+    virtual ~RoomSelectionStrategy() {}
+    virtual vector&lt;Room&gt; rank(vector&lt;Room&gt; rooms) const = 0;
+    virtual string name() const = 0;
+};
+struct BestFitCapacity : RoomSelectionStrategy {
+    vector&lt;Room&gt; rank(vector&lt;Room&gt; r) const override {
+        sort(r.begin(), r.end(), [](const Room&amp; a, const Room&amp; b) {
+            return a.capacity != b.capacity ? a.capacity &lt; b.capacity : a.id &lt; b.id; });
+        return r;
+    }
+    string name() const override { return "best-fit capacity"; }
+};
+struct NearestFloor : RoomSelectionStrategy {
+    int floor;
+    explicit NearestFloor(int f) : floor(f) {}
+    vector&lt;Room&gt; rank(vector&lt;Room&gt; r) const override {
+        int f = floor;
+        sort(r.begin(), r.end(), [f](const Room&amp; a, const Room&amp; b) {
+            int da = abs(a.floor - f), db = abs(b.floor - f);
+            return da != db ? da &lt; db : a.capacity &lt; b.capacity; });
+        return r;
+    }
+    string name() const override { return "nearest floor to " + to_string(floor); }
+};
+
+using Recurrence = function&lt;vector&lt;TimeSlot&gt;(const TimeSlot&amp;)&gt;;
+static Recurrence weekly(int n) {
+    return [n](const TimeSlot&amp; f) {
+        vector&lt;TimeSlot&gt; v;
+        for (int i = 0; i &lt; n; i++) v.push_back(TimeSlot(f.start + i * 7 * 1440L, f.end + i * 7 * 1440L));
+        return v;
+    };
+}
+static Recurrence once() { return [](const TimeSlot&amp; f) { return vector&lt;TimeSlot&gt;{f}; }; }
+
+struct Meeting { string id, title, organizer; vector&lt;string&gt; people; Room room; vector&lt;TimeSlot&gt; slots; };
+
+struct MeetingListener {
+    virtual ~MeetingListener() {}
+    virtual void onScheduled(const Meeting&amp; m) = 0;
+    virtual void onCancelled(const Meeting&amp; m) = 0;
+};
+struct Notifier : MeetingListener {
+    int sent = 0;
+    void onScheduled(const Meeting&amp; m) override {
+        for (auto&amp; p : m.people) if (p != m.organizer) { printf("    [notify] to %s: invite %s\n", p.c_str(), m.id.c_str()); sent++; }
+    }
+    void onCancelled(const Meeting&amp; m) override {
+        for (auto&amp; p : m.people) if (p != m.organizer) { printf("    [notify] to %s: cancelled %s\n", p.c_str(), m.id.c_str()); sent++; }
+    }
+};
+
+// Takes several user locks in the order given (callers pass sorted names) and releases them in reverse.
+struct OrderedLocks {
+    vector&lt;Mutex*&gt; ms;
+    explicit OrderedLocks(vector&lt;Mutex*&gt; v) : ms(std::move(v)) { for (Mutex* m : ms) m-&gt;lock(); }
+    ~OrderedLocks() { for (auto it = ms.rbegin(); it != ms.rend(); ++it) (*it)-&gt;unlock(); }
+};
+
+class MeetingScheduler {
+    struct User { Mutex m; vector&lt;pair&lt;TimeSlot, string&gt;&gt; busy; };   // busy guarded by m
+    vector&lt;unique_ptr&lt;RoomCalendar&gt;&gt; rooms_;
+    map&lt;string, unique_ptr&lt;User&gt;&gt; users_;
+    map&lt;string, Meeting&gt; meetings_;
+    vector&lt;MeetingListener*&gt; listeners_;
+    const RoomSelectionStrategy* strategy_;
+    long nextId_ = 0;
+    Mutex reg_;                     // guards the maps above, strategy_ and nextId_; held only briefly
+    vector&lt;User*&gt; usersSorted(const vector&lt;string&gt;&amp; names) {          // names must be sorted
+        LockGuard g(reg_);
+        vector&lt;User*&gt; out;
+        for (auto&amp; n : names) {
+            auto it = users_.find(n);
+            if (it == users_.end()) throw invalid_argument("no user " + n);
+            out.push_back(it-&gt;second.get());
+        }
+        return out;
+    }
+    static vector&lt;Mutex*&gt; mutexes(const vector&lt;User*&gt;&amp; us) { vector&lt;Mutex*&gt; v; for (User* u : us) v.push_back(&amp;u-&gt;m); return v; }
+public:
+    explicit MeetingScheduler(const RoomSelectionStrategy* s) : strategy_(s) {}
+    void setStrategy(const RoomSelectionStrategy* s) { LockGuard g(reg_); strategy_ = s; }
+    void addRoom(Room r) { LockGuard g(reg_); rooms_.emplace_back(new RoomCalendar(r)); }
+    void addUser(const string&amp; u) { LockGuard g(reg_); if (!users_.count(u)) users_[u].reset(new User()); }
+    void addListener(MeetingListener* l) { LockGuard g(reg_); listeners_.push_back(l); }
+    RoomCalendar&amp; room(const string&amp; id) {
+        LockGuard g(reg_);
+        for (auto&amp; r : rooms_) if (r-&gt;room.id == id) return *r;
+        throw invalid_argument("no room " + id);
+    }
+
+    Meeting schedule(const string&amp; title, const string&amp; org, TimeSlot slot, vector&lt;string&gt; invite,
+                     Recurrence rep, const string&amp; roomId = "") {
+        set&lt;string&gt; uniq(invite.begin(), invite.end());
+        uniq.insert(org);
+        vector&lt;string&gt; people(uniq.begin(), uniq.end());     // sorted = the global lock order
+        vector&lt;User*&gt; us = usersSorted(people);
+        vector&lt;TimeSlot&gt; occ = rep(slot);
+        vector&lt;Room&gt; cands;
+        const RoomSelectionStrategy* strategy;
+        string id;
+        vector&lt;MeetingListener*&gt; ls;
+        {
+            LockGuard g(reg_);
+            for (auto&amp; r : rooms_)
+                if (r-&gt;room.capacity &gt;= (int)people.size() &amp;&amp; (roomId.empty() || r-&gt;room.id == roomId)) cands.push_back(r-&gt;room);
+            strategy = strategy_;
+            ls = listeners_;
+        }
+        cands = strategy-&gt;rank(cands);
+        Meeting m;
+        {
+            OrderedLocks held(mutexes(us));              // every attendee, in name order: no deadlock
+            for (size_t i = 0; i &lt; people.size(); i++)
+                for (auto&amp; b : us[i]-&gt;busy)
+                    for (auto&amp; s : occ)
+                        if (b.first.overlaps(s)) throw Conflict(people[i] + " is busy at " + slot.str());
+            { LockGuard g(reg_); id = "M" + to_string(++nextId_); }   // reg_ is a leaf lock
+            bool booked = false;
+            for (auto&amp; r : cands) {
+                if (room(r.id).tryReserveAll(occ, id)) { // room lock is taken inside, after the user locks
+                    for (User* u : us) for (auto&amp; s : occ) u-&gt;busy.push_back(make_pair(s, id));
+                    m = Meeting{id, title, org, people, r, occ};
+                    booked = true;
+                    break;
+                }
+            }
+            if (!booked) throw NoRoom("no room for " + to_string(people.size()) + " at " + slot.str());
+        }
+        { LockGuard g(reg_); meetings_.insert(make_pair(id, m)); }
+        for (auto* l : ls) l-&gt;onScheduled(m);           // call out with no lock held
+        return m;
+    }
+
+
+    void cancel(const string&amp; id, const string&amp; by) {
+        Meeting m;
+        vector&lt;MeetingListener*&gt; ls;
+        {
+            LockGuard g(reg_);
+            auto it = meetings_.find(id);
+            if (it == meetings_.end()) throw invalid_argument("no meeting " + id);
+            if (it-&gt;second.organizer != by) throw logic_error("only the organizer can cancel " + id);
+            m = it-&gt;second;
+            meetings_.erase(it);                     // exactly one cancel wins
+            ls = listeners_;
+        }
+        vector&lt;User*&gt; us = usersSorted(m.people);   // m.people is sorted
+        {
+            OrderedLocks held(mutexes(us));
+            room(m.room.id).release(id);
+            for (User* u : us)
+                u-&gt;busy.erase(remove_if(u-&gt;busy.begin(), u-&gt;busy.end(),
+                                        [&amp;](const pair&lt;TimeSlot, string&gt;&amp; b) { return b.second == id; }), u-&gt;busy.end());
+        }
+        for (auto* l : ls) l-&gt;onCancelled(m);
+    }
+
+    vector&lt;TimeSlot&gt; findFree(const vector&lt;string&gt;&amp; users, long from, long to, long len) {
+        vector&lt;string&gt; sorted(users.begin(), users.end());
+        sort(sorted.begin(), sorted.end());
+        sorted.erase(unique(sorted.begin(), sorted.end()), sorted.end());
+        vector&lt;User*&gt; us = usersSorted(sorted);
+        vector&lt;TimeSlot&gt; busy;
+        {
+            OrderedLocks held(mutexes(us));
+            for (User* u : us) for (auto&amp; b : u-&gt;busy) if (b.first.start &lt; to &amp;&amp; b.first.end &gt; from) busy.push_back(b.first);
+        }
+        sort(busy.begin(), busy.end(), [](const TimeSlot&amp; a, const TimeSlot&amp; b) { return a.start &lt; b.start; });
+        vector&lt;TimeSlot&gt; out;
+        long cur = from;
+        for (auto&amp; b : busy) {
+            if (b.start &gt; cur &amp;&amp; cur + len &lt;= b.start) out.push_back(TimeSlot(cur, b.start));
+            cur = max(cur, b.end);
+        }
+        if (cur &lt; to &amp;&amp; cur + len &lt;= to) out.push_back(TimeSlot(cur, to));
+        return out;
+    }
+};
+
+static int checks = 0;
+static void check(bool ok, const char* what) {
+    if (!ok) { printf("FAILED: %s\n", what); exit(1); }
+    checks++;
+}
+
+int main() {
+    BestFitCapacity bestFit;
+    NearestFloor floor3(3);
+    Notifier notifier;
+    MeetingScheduler s(&amp;bestFit);
+    s.addListener(&amp;notifier);
+    s.addRoom({"R1", "Focus", 4, 1});
+    s.addRoom({"R2", "Huddle", 6, 2});
+    s.addRoom({"R3", "Board", 20, 3});
+    for (auto u : {"alice", "bob", "chen", "dev", "eva", "fay"}) s.addUser(u);
+
+    printf("== 1. book with %s ==\n", "best-fit capacity");
+    Meeting review = s.schedule("Design review", "alice", TimeSlot(at(1, 10, 0), at(1, 11, 0)), {"bob", "chen"}, once());
+    printf("  %s in %s %s\n", review.id.c_str(), review.room.name.c_str(), review.slots[0].str().c_str());
+    check(review.room.id == "R1", "smallest room that fits");
+    Meeting standup = s.schedule("Standup", "dev", TimeSlot(at(1, 10, 30), at(1, 11, 0)), {"eva"}, once());
+    check(standup.room.id == "R2", "Focus busy, so Huddle");
+
+    printf("== 2. overlap and boundary ==\n");
+    try { s.schedule("Sync", "fay", TimeSlot(at(1, 10, 30), at(1, 11, 30)), {}, once(), "R1"); check(false, "overlap must fail"); }
+    catch (const NoRoom&amp; e) { printf("  rejected as expected: %s\n", e.what()); checks++; }
+    Meeting retro = s.schedule("Retro", "eva", TimeSlot(at(1, 11, 0), at(1, 12, 0)), {}, once(), "R1");
+    check(retro.room.id == "R1", "touching slots are fine");
+    try { s.schedule("Hiring", "dev", TimeSlot(at(1, 10, 15), at(1, 10, 45)), {"chen"}, once()); check(false, "conflict"); }
+    catch (const Conflict&amp; e) { printf("  rejected as expected: %s\n", e.what()); checks++; }
+
+    printf("== 3. weekly x4, all-or-nothing ==\n");
+    s.schedule("Offsite prep", "dev", TimeSlot(at(15, 15, 0), at(15, 16, 0)), {}, once(), "R1");
+    size_t before = s.room("R1").size();
+    try { s.schedule("1:1", "alice", TimeSlot(at(1, 15, 0), at(1, 15, 30)), {"bob"}, weekly(4), "R1"); check(false, "week 3 clash"); }
+    catch (const NoRoom&amp; e) { printf("  rejected as expected: %s\n", e.what()); checks++; }
+    check(s.room("R1").size() == before, "nothing half-booked");
+    Meeting one = s.schedule("1:1", "alice", TimeSlot(at(1, 15, 0), at(1, 15, 30)), {"bob"}, weekly(4));
+    printf("  %s in %s x%d\n", one.id.c_str(), one.room.name.c_str(), (int)one.slots.size());
+    check(one.room.id == "R2" &amp;&amp; one.slots.size() == 4, "series moves to Huddle");
+
+    printf("== 4. free time for alice + bob, 09:00-16:00, 30 min ==\n");
+    vector&lt;TimeSlot&gt; fr = s.findFree({"alice", "bob"}, at(1, 9, 0), at(1, 16, 0), 30);
+    for (auto&amp; f : fr) printf("  free %s\n", f.str().c_str());
+    check(fr.size() == 3 &amp;&amp; fr[1].start == at(1, 11, 0) &amp;&amp; fr[1].end == at(1, 15, 0), "two busy blocks removed");
+
+    printf("== 5. cancel, then rebook ==\n");
+    s.cancel(review.id, "alice");
+    Meeting sync = s.schedule("Sync", "eva", TimeSlot(at(1, 10, 0), at(1, 10, 30)), {}, once(), "R1");
+    check(sync.room.id == "R1", "freed slot rebooked");
+
+    printf("== 6. strategy switch ==\n");
+    s.setStrategy(&amp;floor3);
+    Meeting coffee = s.schedule("Coffee", "chen", TimeSlot(at(1, 13, 0), at(1, 13, 30)), {}, once());
+    printf("  %s: %s in %s\n", floor3.name().c_str(), coffee.id.c_str(), coffee.room.name.c_str());
+    check(coffee.room.id == "R3", "nearest floor 3 is Board");
+#ifdef HAVE_STD_MUTEX
+    printf("== 7. 50 threads, one room, one slot (the Java race) ==\n");
+    {
+        MeetingScheduler race(&amp;bestFit);
+        race.addRoom({"Q1", "Quiet", 2, 1});
+        for (int i = 0; i &lt; 50; i++) race.addUser("u" + to_string(100 + i));
+        Mutex m; int won = 0, lost = 0;
+        vector&lt;thread&gt; ts;
+        for (int i = 0; i &lt; 50; i++)
+            ts.emplace_back([&amp;, i] {
+                bool ok = true;
+                try { race.schedule("grab", "u" + to_string(100 + i), TimeSlot(at(2, 9, 0), at(2, 10, 0)), {}, once()); }
+                catch (const NoRoom&amp;) { ok = false; }
+                LockGuard g(m); (ok ? won : lost)++;
+            });
+        for (auto&amp; t : ts) t.join();
+        printf("  booked %d, refused %d\n", won, lost);
+        check(won == 1 &amp;&amp; lost == 49 &amp;&amp; race.room("Q1").size() == 1, "exactly one winner");
+    }
+#endif
+    printf("ALL %d CHECKS PASSED (notifications: %d)\n", checks, notifier.sent);
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -O2 main.cpp -o meeting &amp;&amp; ./meeting
+== 1. book with best-fit capacity ==
+    [notify] to bob: invite M1
+    [notify] to chen: invite M1
+  M1 in Focus day1 10:00-11:00
+    [notify] to eva: invite M2
+== 2. overlap and boundary ==
+  rejected as expected: no room for 1 at day1 10:30-11:30
+  rejected as expected: chen is busy at day1 10:15-10:45
+== 3. weekly x4, all-or-nothing ==
+  rejected as expected: no room for 2 at day1 15:00-15:30
+    [notify] to bob: invite M7
+  M7 in Huddle x4
+== 4. free time for alice + bob, 09:00-16:00, 30 min ==
+  free day1 09:00-10:00
+  free day1 11:00-15:00
+  free day1 15:30-16:00
+== 5. cancel, then rebook ==
+    [notify] to bob: cancelled M1
+    [notify] to chen: cancelled M1
+== 6. strategy switch ==
+  nearest floor to 3: M9 in Board
+ALL 11 CHECKS PASSED (notifications: 6)</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it runs 11 of Java's 22 checks (12 in the Linux <code>-DHAVE_STD_MUTEX</code> build, measured): no RSVP decline check, no 50-thread race for 3 rooms and no 200-meeting deadlock test; find-a-time, recurrence, cancel and the strategy switch are all there.</p></div>
+
+  <p>Read the demo output against the picture at the top. Step 1 puts a 3-person review in Focus (4 seats) because best-fit prefers the smallest room. Step 2 shows the half-open rule: Retro at 11:00 sits right after the review. Step 3 is the all-or-nothing series: blocked in Focus by week 3, booked in Huddle for all four weeks. Note that meeting ids skip numbers (M3, M5...): an id is taken before the attempt, and failed attempts do not give it back. That is fine for ids; never do it for invoice numbers.</p>

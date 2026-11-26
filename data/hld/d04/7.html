@@ -1,0 +1,94 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Kubernetes cluster with gateway pods, chat service pods, and Kafka topics feeding push, fan-out and analytics workers">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="560" height="280"/>
+            <text class="zone-label" x="26" y="32">Kubernetes cluster (one per region)</text>
+            <rect class="box svc" x="30" y="55" width="160" height="56"/>
+            <text class="label" x="110" y="76">gateway pods</text>
+            <text class="label small" x="110" y="97">long-lived sockets</text>
+            <rect class="box k8s" x="220" y="55" width="160" height="56"/>
+            <text class="label" x="300" y="76">chat-svc pods</text>
+            <text class="label small" x="300" y="97">HPA on CPU</text>
+            <rect class="box kafka" x="410" y="55" width="140" height="56"/>
+            <text class="label" x="480" y="76">Kafka</text>
+            <text class="label small" x="480" y="97">key = chat_id</text>
+            <rect class="box queue" x="220" y="150" width="160" height="50"/>
+            <text class="label small" x="300" y="175">group fan-out workers</text>
+            <rect class="box queue" x="410" y="150" width="140" height="50"/>
+            <text class="label small" x="480" y="175">push workers</text>
+            <rect class="box queue" x="410" y="225" width="140" height="50"/>
+            <text class="label small" x="480" y="250">analytics sink</text>
+            <path class="arrow" d="M190 83 L213 83"/>
+            <path class="arrow kafka" d="M380 83 L403 83"/>
+            <path class="arrow kafka" d="M440 111 L340 147"/>
+            <path class="arrow kafka" d="M480 111 L480 143"/>
+            <path class="arrow kafka" d="M540 111 L540 218"/>
+            <rect class="box db" x="620" y="55" width="220" height="56"/>
+            <text class="label" x="730" y="76">Cassandra / Scylla</text>
+            <text class="label small" x="730" y="97">StatefulSet or managed</text>
+            <rect class="box cache" x="620" y="150" width="220" height="50"/>
+            <text class="label small" x="730" y="175">Redis: sessions, presence</text>
+            <rect class="box plain" x="620" y="225" width="220" height="50"/>
+            <text class="label small" x="730" y="250">APNs / FCM (external)</text>
+            <path class="arrow" d="M380 70 L613 70"/>
+            <path class="arrow" d="M550 175 L613 175"/>
+            <path class="arrow" d="M550 190 L613 245"/>
+            <circle class="packet" r="5"><animateMotion dur="2.5s" repeatCount="indefinite" path="M190 83 L220 83 L410 83 L480 111 L480 150"/></circle>
+          </svg>
+          <figcaption>Kafka is the shock absorber for everything that does not need to happen before the sender's ack: group fan-out, push notifications, analytics, abuse signals.</figcaption>
+        </figure>
+        <h3>Kafka</h3>
+        <ul>
+          <li><b>Not on the 1:1 hot path</b> in our default design: the sender wants one tick in milliseconds, so the chat service writes to the store and pushes to the gateway directly. Some designs do put Kafka in the middle (write to Kafka, then consumers persist and deliver), which gives a durable buffer and replay at the cost of a few extra milliseconds.</li>
+          <li><b>Topics</b>: <code>chat-events</code> keyed by <code>chat_id</code> (so one chat's events stay in one partition, in order - see <a href="{{BASE}}devops/kafka-02">Topics, Partitions, Offsets</a>), <code>offline-push</code> keyed by <code>user_id</code>, <code>receipts</code>, <code>presence</code> (short retention, lossy is fine).</li>
+          <li><b>Consumers</b> are idempotent: a push worker that crashes and re-reads the same offset must not send two notifications - keep a short-lived "sent" key per <code>(user, msg_id)</code>. See <a href="{{BASE}}devops/kafka-06">Delivery Semantics</a> and <a href="{{BASE}}hld/d03">Notification System</a>.</li>
+        </ul>
+        <h3>Kubernetes</h3>
+        <p>Gateways are the unusual workload: each pod holds hundreds of thousands of long-lived connections, so killing a pod is expensive. Settings that matter:</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: chat-gateway
+spec:
+  replicas: 300
+  strategy:
+    rollingUpdate: { maxUnavailable: 1, maxSurge: 5 }   # replace very slowly
+  selector:
+    matchLabels: { app: chat-gateway }
+  template:
+    metadata:
+      labels: { app: chat-gateway }       # the PodDisruptionBudget below selects this label
+    spec:
+      terminationGracePeriodSeconds: 600   # time to drain sockets politely
+      containers:
+      - name: gateway
+        image: registry.example.com/chat-gateway:2.14.0
+        ports: [{ containerPort: 8443 }]
+        lifecycle:
+          preStop:
+            exec: { command: ["/bin/gateway", "drain", "--over=540s"] }  # ask clients to reconnect elsewhere, gradually
+        readinessProbe:
+          httpGet: { path: /ready, port: 8080 }
+        resources:
+          requests: { cpu: "4", memory: "16Gi" }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: chat-gateway-pdb }
+spec:
+  maxUnavailable: 1
+  selector: { matchLabels: { app: chat-gateway } }</code></pre>
+        <ul>
+          <li>Expose gateways with a <b>layer-4</b> load balancer (Service <code>type: LoadBalancer</code> backed by an NLB), because WebSocket is a long TCP stream; see <a href="{{BASE}}devops/k8s-05">Services &amp; Networking</a>.</li>
+          <li>Autoscale gateways on <b>open connections per pod</b> (a custom metric), not CPU - an idle socket costs memory, not CPU.</li>
+          <li>Chat service and workers are ordinary stateless Deployments with an HPA. Cassandra and Kafka run as StatefulSets or operators (for example Strimzi for Kafka - see <a href="{{BASE}}devops/kafka-11">Kafka on K8s</a>), or as managed services.</li>
+        </ul>
+        <h3>Docker</h3>
+        <p>Every service ships as a small image (multi-stage build, non-root user, see <a href="{{BASE}}devops/docker-03">Writing a Dockerfile</a>). For local development, one <code>docker compose</code> file can run gateway + chat service + Redis + a single-node Cassandra + Kafka so you can test reconnect storms on your laptop (<a href="{{BASE}}devops/docker-07">Docker Compose</a>).</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Draining a gateway is like taking a router out of service gracefully: you raise the OSPF cost or set BGP graceful-shutdown so traffic moves away before you reboot, instead of yanking the cable. <code>preStop</code> + a long <code>terminationGracePeriodSeconds</code> is the Kubernetes way to do it. <i>Where it breaks:</i> an OSPF cost-out moves stateless packets instantly; a gateway's WebSockets are stateful, so every client must reconnect and resync, which is why the drain is spread over minutes to avoid a reconnect storm.</p>
+        </div>
+      

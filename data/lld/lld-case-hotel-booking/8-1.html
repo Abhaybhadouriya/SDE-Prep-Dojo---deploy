@@ -1,0 +1,1195 @@
+<h3>Python</h3>
+  <ul class="file-roles"><li><code>hotel_booking.py</code>: the whole model; a <code>threading.Lock</code> per hotel guards its inventory, one registry lock guards the maps.</li><li><code>main.py</code>: the same demo as Java.</li><li><code>test_hotel_booking.py</code>: ten unit tests, including 20 threads racing for 3 rooms.</li></ul>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="hotel_booking.py">
+<pre><code class="language-python">"""Hotel booking: inventory by night, holds with a TTL, pricing Strategy + Decorators, cancellation policies."""
+from __future__ import annotations
+
+import itertools
+import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
+from enum import Enum
+from typing import Callable, Dict, List
+
+
+class RoomType(Enum):
+    SINGLE = "SINGLE"
+    DOUBLE = "DOUBLE"
+    SUITE = "SUITE"
+
+
+class BookingStatus(Enum):
+    HELD = "HELD"
+    CONFIRMED = "CONFIRMED"
+    CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+
+
+ALLOWED = {
+    BookingStatus.HELD: {BookingStatus.CONFIRMED, BookingStatus.CANCELLED, BookingStatus.EXPIRED},
+    BookingStatus.CONFIRMED: {BookingStatus.CANCELLED},
+    BookingStatus.CANCELLED: set(),                 # terminal
+    BookingStatus.EXPIRED: set(),                   # terminal
+}
+
+
+class BookingError(Exception):
+    pass
+
+
+def money(paise: int) -&gt; str:
+    return f"{paise // 100}.{paise % 100:02d}"
+
+
+@dataclass(frozen=True)
+class DateRange:
+    """Half-open stay [check_in, check_out): the guest sleeps check_in .. check_out - 1."""
+    check_in: date
+    check_out: date
+
+    def __post_init__(self) -&gt; None:
+        if self.check_out &lt;= self.check_in:
+            raise BookingError("check-out must be after check-in")
+
+    def nights(self) -&gt; int:
+        return (self.check_out - self.check_in).days
+
+    def each_night(self) -&gt; List[date]:
+        return [self.check_in + timedelta(days=i) for i in range(self.nights())]
+
+    def __str__(self) -&gt; str:
+        return f"{self.check_in}..{self.check_out}"
+
+
+# ---------- pricing: Strategy, with Decorators that stack rules ----------
+
+class PricingStrategy(ABC):
+    @abstractmethod
+    def price(self, rate: int, stay: DateRange, rooms: int) -&gt; int: ...
+
+
+class BaseRatePricing(PricingStrategy):
+    def price(self, rate: int, stay: DateRange, rooms: int) -&gt; int:
+        return rate * stay.nights() * rooms
+
+
+class WeekendSurcharge(PricingStrategy):
+    """Adds `percent` of the nightly rate for every Friday and Saturday night."""
+
+    def __init__(self, inner: PricingStrategy, percent: int) -&gt; None:
+        self.inner, self.percent = inner, percent
+
+    def price(self, rate: int, stay: DateRange, rooms: int) -&gt; int:
+        extra = sum(rate * self.percent // 100 for n in stay.each_night() if n.weekday() in (4, 5))
+        return self.inner.price(rate, stay, rooms) + extra * rooms
+
+
+class LongStayDiscount(PricingStrategy):
+    """Takes `percent` off the whole stay when it is at least `min_nights` long."""
+
+    def __init__(self, inner: PricingStrategy, min_nights: int, percent: int) -&gt; None:
+        self.inner, self.min_nights, self.percent = inner, min_nights, percent
+
+    def price(self, rate: int, stay: DateRange, rooms: int) -&gt; int:
+        p = self.inner.price(rate, stay, rooms)
+        return p * (100 - self.percent) // 100 if stay.nights() &gt;= self.min_nights else p
+
+
+# ---------- cancellation: another Strategy, chosen per hotel ----------
+
+class CancellationPolicy(ABC):
+    @abstractmethod
+    def refund(self, booking: "Booking", now: datetime) -&gt; int: ...
+
+
+class FlexibleCancellation(CancellationPolicy):
+    """Free until `hours_before` hours before check-in (14:00); after that the first night is kept."""
+    CHECK_IN_TIME = time(14, 0)
+
+    def __init__(self, hours_before: int) -&gt; None:
+        self.hours_before = hours_before
+
+    def refund(self, booking: "Booking", now: datetime) -&gt; int:
+        deadline = datetime.combine(booking.stay.check_in, self.CHECK_IN_TIME) - timedelta(hours=self.hours_before)
+        if now &lt; deadline:
+            return booking.price
+        return booking.price - booking.price // booking.stay.nights()
+
+
+class NonRefundable(CancellationPolicy):
+    def refund(self, booking: "Booking", now: datetime) -&gt; int:
+        return 0
+
+
+# ---------- entities ----------
+
+class Inventory:
+    """Counts per (room type, night). The owning Hotel's lock guards it."""
+
+    def __init__(self) -&gt; None:
+        self.total: Dict[RoomType, int] = {}
+        self.taken: Dict[RoomType, Dict[date, int]] = {}
+
+    def add_room(self, t: RoomType) -&gt; None:
+        self.total[t] = self.total.get(t, 0) + 1
+
+    def free(self, t: RoomType, stay: DateRange) -&gt; int:
+        cap = self.total.get(t, 0)
+        per_night = self.taken.get(t, {})
+        return min(cap - per_night.get(n, 0) for n in stay.each_night())
+
+    def take(self, t: RoomType, stay: DateRange, rooms: int) -&gt; None:
+        per_night = self.taken.setdefault(t, {})
+        for n in stay.each_night():
+            per_night[n] = per_night.get(n, 0) + rooms
+
+    def release(self, t: RoomType, stay: DateRange, rooms: int) -&gt; None:
+        per_night = self.taken[t]
+        for n in stay.each_night():
+            per_night[n] -= rooms
+            if per_night[n] == 0:
+                del per_night[n]
+
+
+@dataclass(frozen=True)
+class Room:
+    number: str
+    type: RoomType
+
+
+class Hotel:
+    def __init__(self, id: str, name: str, city: str, pricing: PricingStrategy,
+                 cancellation: CancellationPolicy) -&gt; None:
+        self.id, self.name, self.city = id, name, city
+        self.pricing, self.cancellation = pricing, cancellation
+        self.rooms: List[Room] = []
+        self.rates: Dict[RoomType, int] = {}
+        self.inventory = Inventory()
+        self.lock = threading.Lock()                 # one lock per hotel
+
+    def add_room(self, number: str, t: RoomType) -&gt; "Hotel":
+        self.rooms.append(Room(number, t))
+        self.inventory.add_room(t)
+        return self
+
+    def rate(self, t: RoomType, paise_per_night: int) -&gt; "Hotel":
+        self.rates[t] = paise_per_night
+        return self
+
+
+@dataclass
+class Booking:
+    id: str
+    guest: str
+    hotel: Hotel
+    type: RoomType
+    stay: DateRange
+    rooms: int
+    price: int
+    hold_expires_at: datetime
+    status: BookingStatus = BookingStatus.HELD     # guarded by hotel.lock
+    payment_ref: str = ""
+
+    def move_to(self, nxt: BookingStatus) -&gt; None:
+        if nxt not in ALLOWED[self.status]:
+            raise BookingError(f"{self.id}: cannot go from {self.status.value} to {nxt.value}")
+        self.status = nxt
+
+    def __str__(self) -&gt; str:
+        return (f"{self.id} {self.status.value} {self.hotel.id} {self.type.value} x{self.rooms} "
+                f"{self.stay} price={money(self.price)}")
+
+
+@dataclass(frozen=True)
+class Offer:
+    hotel: Hotel
+    type: RoomType
+    free: int
+    price: int
+
+    def __str__(self) -&gt; str:
+        return f"{self.hotel.id} {self.hotel.name:&lt;10} {self.type.value} free={self.free} price={money(self.price)}"
+
+
+class FakeClock:
+    def __init__(self, start: datetime) -&gt; None:
+        self.t = start
+
+    def now(self) -&gt; datetime:
+        return self.t
+
+    def advance_minutes(self, m: int) -&gt; None:
+        self.t += timedelta(minutes=m)
+
+
+# ---------- the facade ----------
+
+class BookingService:
+    HOLD_TTL = timedelta(minutes=15)
+
+    def __init__(self, clock) -&gt; None:
+        self.clock = clock
+        self.hotels: Dict[str, Hotel] = {}
+        self.bookings: Dict[str, Booking] = {}
+        self.listeners: List[Callable[[Booking], None]] = []
+        self._seq = itertools.count(1)
+        self._registry = threading.Lock()            # guards the two dicts and the id counter
+
+    def add_listener(self, fn: Callable[[Booking], None]) -&gt; None:
+        self.listeners.append(fn)
+
+    def add_hotel(self, h: Hotel) -&gt; Hotel:
+        with self._registry:
+            if h.id in self.hotels:
+                raise BookingError(f"duplicate hotel {h.id}")
+            self.hotels[h.id] = h
+        return h
+
+    def search(self, city: str, t: RoomType, stay: DateRange, rooms: int) -&gt; List[Offer]:
+        self.expire_holds()
+        out = []
+        for h in list(self.hotels.values()):
+            if h.city.lower() != city.lower() or t not in h.rates:
+                continue
+            with h.lock:
+                free = h.inventory.free(t, stay)
+            if free &gt;= rooms:
+                out.append(Offer(h, t, free, h.pricing.price(h.rates[t], stay, rooms)))
+        return sorted(out, key=lambda o: (o.price, o.hotel.id))
+
+    def hold(self, guest: str, hotel_id: str, t: RoomType, stay: DateRange, rooms: int) -&gt; Booking:
+        if rooms &lt; 1:
+            raise BookingError("rooms must be &gt;= 1")
+        h = self._hotel(hotel_id)
+        if t not in h.rates:
+            raise BookingError(f"{hotel_id} has no {t.value} rooms")
+        self.expire_holds()
+        with h.lock:                                 # check and take under one lock
+            free = h.inventory.free(t, stay)
+            if free &lt; rooms:
+                raise BookingError(f"{hotel_id} has {free} {t.value} free for {stay}, wanted {rooms}")
+            h.inventory.take(t, stay, rooms)
+            with self._registry:
+                b = Booking(f"B{next(self._seq)}", guest, h, t, stay, rooms,
+                            h.pricing.price(h.rates[t], stay, rooms), self.clock.now() + self.HOLD_TTL)
+                self.bookings[b.id] = b
+            return b
+
+    def confirm(self, booking_id: str, payment_ref: str) -&gt; Booking:
+        """Called after the payment gateway says OK. Idempotent for the same payment reference."""
+        b = self.booking(booking_id)
+        expired_now = False
+        with b.hotel.lock:
+            if b.status is BookingStatus.CONFIRMED and b.payment_ref == payment_ref:
+                return b
+            if b.status is BookingStatus.HELD and self.clock.now() &gt;= b.hold_expires_at:
+                self._expire_locked(b)               # the sweep has not run yet: expire it now
+                expired_now = True
+            else:
+                b.move_to(BookingStatus.CONFIRMED)   # raises unless HELD
+                b.payment_ref = payment_ref
+        self._publish(b)
+        if expired_now:
+            raise BookingError(f"{b.id}: hold expired, refund the payment")
+        return b
+
+    def cancel(self, booking_id: str) -&gt; int:
+        """Returns the refund in paise (0 for an unpaid hold)."""
+        b = self.booking(booking_id)
+        with b.hotel.lock:
+            paid = b.status is BookingStatus.CONFIRMED
+            refund = b.hotel.cancellation.refund(b, self.clock.now()) if paid else 0
+            b.move_to(BookingStatus.CANCELLED)       # raises if already CANCELLED or EXPIRED
+            b.hotel.inventory.release(b.type, b.stay, b.rooms)
+        self._publish(b)
+        return refund
+
+    def expire_holds(self) -&gt; int:
+        """Lazy sweep: release every hold whose 15 minutes are over."""
+        now = self.clock.now()
+        expired = []
+        with self._registry:
+            candidates = list(self.bookings.values())
+        for b in candidates:
+            if b.status is not BookingStatus.HELD or now &lt; b.hold_expires_at:
+                continue
+            with b.hotel.lock:
+                if b.status is BookingStatus.HELD:   # re-check under the lock
+                    self._expire_locked(b)
+                    expired.append(b)
+        for b in sorted(expired, key=lambda x: int(x.id[1:])):
+            self._publish(b)
+        return len(expired)
+
+    def _expire_locked(self, b: Booking) -&gt; None:
+        b.move_to(BookingStatus.EXPIRED)
+        b.hotel.inventory.release(b.type, b.stay, b.rooms)
+
+    def _publish(self, b: Booking) -&gt; None:          # always called outside the hotel lock
+        for fn in self.listeners:
+            fn(b)
+
+    def _hotel(self, hotel_id: str) -&gt; Hotel:
+        h = self.hotels.get(hotel_id)
+        if h is None:
+            raise BookingError(f"unknown hotel {hotel_id}")
+        return h
+
+    def booking(self, booking_id: str) -&gt; Booking:
+        b = self.bookings.get(booking_id)
+        if b is None:
+            raise BookingError(f"unknown booking {booking_id}")
+        return b</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver: python main.py   (tests: python -m unittest test_hotel_booking)"""
+import threading
+from datetime import date, datetime
+
+from hotel_booking import (BaseRatePricing, BookingError, BookingService, BookingStatus, DateRange, FakeClock,
+                           FlexibleCancellation, Hotel, LongStayDiscount, NonRefundable, RoomType, WeekendSurcharge,
+                           money)
+
+passed = 0
+
+
+def check(ok: bool, what: str) -&gt; None:
+    global passed
+    if not ok:
+        raise AssertionError("FAILED: " + what)
+    passed += 1
+
+
+def stay(a: str, b: str) -&gt; DateRange:
+    return DateRange(date.fromisoformat(a), date.fromisoformat(b))
+
+
+def show(offers) -&gt; None:
+    for o in offers:
+        print(f"  {o}")
+
+
+def expect_reject(fn) -&gt; None:
+    global passed
+    try:
+        fn()
+    except BookingError as e:
+        print(f"  rejected: {e}")
+        passed += 1
+        return
+    check(False, "should have been rejected")
+
+
+def main() -&gt; None:
+    clock = FakeClock(datetime(2026, 11, 23, 10, 0))
+    svc = BookingService(clock)
+    svc.add_listener(lambda b: print(f"  [notify] {b.id} {b.status.value}"))
+
+    svc.add_hotel(Hotel("H1", "Sea View", "Goa", WeekendSurcharge(BaseRatePricing(), 20), FlexibleCancellation(48))
+                  .add_room("101", RoomType.DOUBLE).add_room("102", RoomType.DOUBLE).add_room("201", RoomType.SUITE)
+                  .rate(RoomType.DOUBLE, 400000).rate(RoomType.SUITE, 900000))
+    svc.add_hotel(Hotel("H2", "Hill Top", "Goa", LongStayDiscount(BaseRatePricing(), 7, 10), NonRefundable())
+                  .add_room("1", RoomType.DOUBLE).rate(RoomType.DOUBLE, 350000))
+
+    xmas = stay("2026-12-18", "2026-12-21")          # Fri, Sat, Sun nights
+    print(f"== 1. Search Goa, DOUBLE x1, {xmas} ({xmas.nights()} nights)")
+    offers = svc.search("Goa", RoomType.DOUBLE, xmas, 1)
+    show(offers)
+    check(len(offers) == 2 and offers[0].hotel.id == "H2", "cheapest first")
+    check(offers[1].price == 1360000, "H1: 3 x 4000 + 20% on Fri and Sat = 13600")
+
+    print("== 2. Alice holds 2 DOUBLE at H1")
+    alice = svc.hold("alice", "H1", RoomType.DOUBLE, xmas, 2)
+    print(f"  {alice} hold until {alice.hold_expires_at:%Y-%m-%d %H:%M}")
+    check(alice.price == 2720000, "two rooms cost twice")
+
+    print("== 3. Search again: H1 has no DOUBLE left for those nights")
+    offers = svc.search("Goa", RoomType.DOUBLE, xmas, 1)
+    show(offers)
+    check(len(offers) == 1, "held rooms are not on sale")
+
+    print("== 4. Bob wants H1 DOUBLE 2026-12-20..2026-12-22 (overlaps one night)")
+    expect_reject(lambda: svc.hold("bob", "H1", RoomType.DOUBLE, stay("2026-12-20", "2026-12-22"), 1))
+
+    print("== 5. Bob books H1 DOUBLE 2026-12-21..2026-12-23 (starts on Alice's check-out day)")
+    bob = svc.hold("bob", "H1", RoomType.DOUBLE, stay("2026-12-21", "2026-12-23"), 1)
+    svc.confirm(bob.id, "PAY-501")
+    print(f"  {bob}")
+    check(bob.status is BookingStatus.CONFIRMED, "half-open ranges: back-to-back stays fit")
+
+    print("== 6. Alice pays")
+    svc.confirm(alice.id, "PAY-778")
+    print(f"  {alice} payment={alice.payment_ref}")
+    svc.confirm(alice.id, "PAY-778")
+    print(f"  confirm again with the same payment ref: {alice.id} {alice.status.value} (idempotent)")
+    check(alice.status is BookingStatus.CONFIRMED, "retry is a no-op")
+
+    print("== 7. Carol holds the SUITE and walks away")
+    carol = svc.hold("carol", "H1", RoomType.SUITE, xmas, 1)
+    print(f"  {carol}")
+    check(carol.price == 3060000, "suite 3 x 9000 + 2 x 1800")
+    clock.advance_minutes(16)
+    print("  ... 16 minutes later")
+    n = svc.expire_holds()
+    print(f"  expired holds: {n}")
+    check(n == 1 and carol.status is BookingStatus.EXPIRED, "hold released after 15 minutes")
+    expect_reject(lambda: svc.confirm(carol.id, "PAY-900"))
+    check(len(svc.search("Goa", RoomType.SUITE, xmas, 1)) == 1, "suite is back on sale")
+
+    print("== 8. Alice cancels three weeks early (flexible policy)")
+    refund = svc.cancel(alice.id)
+    print(f"  refund={money(refund)}")
+    check(refund == alice.price, "full refund before the deadline")
+    offers = svc.search("Goa", RoomType.DOUBLE, xmas, 2)
+    show(offers)
+    check(len(offers) == 1 and offers[0].free == 2, "both rooms free again")
+
+    print("== 9. Dev books H1 for tomorrow and cancels late")
+    dev = svc.hold("dev", "H1", RoomType.DOUBLE, stay("2026-11-24", "2026-11-26"), 1)
+    svc.confirm(dev.id, "PAY-610")
+    refund = svc.cancel(dev.id)
+    print(f"  {dev} refund={money(refund)}")
+    check(refund == 400000, "inside 48 h: first night kept")
+
+    print("== 10. Eve books H2 for 7 nights (long-stay discount, non-refundable)")
+    eve = svc.hold("eve", "H2", RoomType.DOUBLE, stay("2027-01-01", "2027-01-08"), 1)
+    svc.confirm(eve.id, "PAY-720")
+    refund = svc.cancel(eve.id)
+    print(f"  {eve} refund={money(refund)}")
+    check(eve.price == 2205000 and refund == 0, "7 x 3500 - 10%, nothing back")
+    expect_reject(lambda: svc.cancel(eve.id))
+
+    print("== 11. Bad input")
+    expect_reject(lambda: stay("2026-12-21", "2026-12-18"))
+    expect_reject(lambda: svc.hold("x", "H1", RoomType.DOUBLE, xmas, 0))
+    expect_reject(lambda: svc.hold("x", "H9", RoomType.DOUBLE, xmas, 1))
+    expect_reject(lambda: svc.hold("x", "H2", RoomType.SUITE, xmas, 1))
+
+    print("== 12. 8 guests race for H2's only DOUBLE")
+    race = stay("2027-02-05", "2027-02-07")
+    go = threading.Event()
+    wins, losses, count_lock = [0], [0], threading.Lock()
+
+    def attempt(guest: str) -&gt; None:
+        go.wait()
+        try:
+            svc.hold(guest, "H2", RoomType.DOUBLE, race, 1)
+            with count_lock:
+                wins[0] += 1
+        except BookingError:
+            with count_lock:
+                losses[0] += 1
+
+    threads = [threading.Thread(target=attempt, args=(f"g{i}",)) for i in range(8)]
+    for t in threads:
+        t.start()
+    go.set()
+    for t in threads:
+        t.join()
+    print(f"  winners={wins[0]} rejected={losses[0]}")
+    check(wins[0] == 1 and losses[0] == 7, "exactly one hold wins")
+
+    print(f"All {passed} checks passed")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_hotel_booking.py">
+<pre><code class="language-python">import threading
+import unittest
+from datetime import date, datetime
+
+from hotel_booking import (BaseRatePricing, BookingError, BookingService, BookingStatus, DateRange, FakeClock,
+                           FlexibleCancellation, Hotel, LongStayDiscount, NonRefundable, RoomType, WeekendSurcharge)
+
+
+def stay(a, b):
+    return DateRange(date.fromisoformat(a), date.fromisoformat(b))
+
+
+def fresh(doubles=2):
+    clock = FakeClock(datetime(2026, 11, 23, 10, 0))
+    svc = BookingService(clock)
+    h = Hotel("H1", "Sea View", "Goa", WeekendSurcharge(BaseRatePricing(), 20), FlexibleCancellation(48))
+    for i in range(doubles):
+        h.add_room(str(100 + i), RoomType.DOUBLE)
+    svc.add_hotel(h.rate(RoomType.DOUBLE, 400000))
+    return svc, clock
+
+
+class HotelBookingTest(unittest.TestCase):
+    def test_half_open_ranges_share_the_changeover_day(self):
+        svc, _ = fresh(doubles=1)
+        svc.hold("a", "H1", RoomType.DOUBLE, stay("2026-12-18", "2026-12-21"), 1)
+        svc.hold("b", "H1", RoomType.DOUBLE, stay("2026-12-21", "2026-12-23"), 1)   # fits
+        with self.assertRaises(BookingError):
+            svc.hold("c", "H1", RoomType.DOUBLE, stay("2026-12-20", "2026-12-22"), 1)
+
+    def test_free_is_minimum_over_nights(self):
+        svc, _ = fresh(doubles=2)
+        svc.hold("a", "H1", RoomType.DOUBLE, stay("2026-12-19", "2026-12-20"), 1)    # one busy night
+        offers = svc.search("goa", RoomType.DOUBLE, stay("2026-12-18", "2026-12-22"), 1)
+        self.assertEqual(offers[0].free, 1)
+
+    def test_pricing_decorators(self):
+        r = stay("2026-12-18", "2026-12-21")                                       # Fri Sat Sun
+        self.assertEqual(WeekendSurcharge(BaseRatePricing(), 20).price(400000, r, 1), 1360000)
+        week = stay("2027-01-01", "2027-01-08")
+        self.assertEqual(LongStayDiscount(BaseRatePricing(), 7, 10).price(350000, week, 1), 2205000)
+        both = LongStayDiscount(WeekendSurcharge(BaseRatePricing(), 20), 7, 10)    # decorators stack
+        self.assertEqual(both.price(100000, week, 1), (700000 + 2 * 20000) * 90 // 100)
+
+    def test_hold_expires_and_releases(self):
+        svc, clock = fresh(doubles=1)
+        r = stay("2026-12-18", "2026-12-21")
+        b = svc.hold("a", "H1", RoomType.DOUBLE, r, 1)
+        clock.advance_minutes(14)
+        self.assertEqual(svc.expire_holds(), 0)
+        clock.advance_minutes(1)                                                   # exactly 15 min: expired
+        self.assertEqual(svc.expire_holds(), 1)
+        self.assertIs(b.status, BookingStatus.EXPIRED)
+        svc.hold("b", "H1", RoomType.DOUBLE, r, 1)                                 # room is back
+
+    def test_confirm_after_ttl_without_sweep_is_rejected(self):
+        svc, clock = fresh(doubles=1)
+        b = svc.hold("a", "H1", RoomType.DOUBLE, stay("2026-12-18", "2026-12-21"), 1)
+        clock.advance_minutes(20)
+        with self.assertRaises(BookingError):
+            svc.confirm(b.id, "PAY-1")
+        self.assertIs(b.status, BookingStatus.EXPIRED)
+
+    def test_confirm_is_idempotent_per_payment_ref(self):
+        svc, _ = fresh()
+        b = svc.hold("a", "H1", RoomType.DOUBLE, stay("2026-12-18", "2026-12-21"), 1)
+        events = []
+        svc.add_listener(lambda x: events.append(x.status))
+        svc.confirm(b.id, "PAY-1")
+        svc.confirm(b.id, "PAY-1")
+        self.assertEqual(events, [BookingStatus.CONFIRMED])                        # notified once
+        with self.assertRaises(BookingError):
+            svc.confirm(b.id, "PAY-2")                                             # different payment: error
+
+    def test_cancellation_policies(self):
+        svc, clock = fresh()
+        early = svc.hold("a", "H1", RoomType.DOUBLE, stay("2026-12-18", "2026-12-21"), 1)
+        svc.confirm(early.id, "P1")
+        self.assertEqual(svc.cancel(early.id), early.price)
+        late = svc.hold("b", "H1", RoomType.DOUBLE, stay("2026-11-24", "2026-11-26"), 1)
+        svc.confirm(late.id, "P2")
+        self.assertEqual(svc.cancel(late.id), 400000)                              # first night kept
+        unpaid = svc.hold("c", "H1", RoomType.DOUBLE, stay("2026-12-01", "2026-12-02"), 1)
+        self.assertEqual(svc.cancel(unpaid.id), 0)
+        with self.assertRaises(BookingError):
+            svc.cancel(unpaid.id)                                                  # terminal state
+
+    def test_non_refundable(self):
+        clock = FakeClock(datetime(2026, 11, 23, 10, 0))
+        svc = BookingService(clock)
+        svc.add_hotel(Hotel("H2", "Hill Top", "Goa", BaseRatePricing(), NonRefundable())
+                      .add_room("1", RoomType.DOUBLE).rate(RoomType.DOUBLE, 350000))
+        b = svc.hold("a", "H2", RoomType.DOUBLE, stay("2027-01-01", "2027-01-03"), 1)
+        svc.confirm(b.id, "P")
+        self.assertEqual(svc.cancel(b.id), 0)
+
+    def test_bad_input(self):
+        svc, _ = fresh()
+        with self.assertRaises(BookingError):
+            stay("2026-12-21", "2026-12-21")
+        with self.assertRaises(BookingError):
+            svc.hold("x", "H1", RoomType.DOUBLE, stay("2026-12-18", "2026-12-19"), 0)
+        with self.assertRaises(BookingError):
+            svc.hold("x", "H1", RoomType.SUITE, stay("2026-12-18", "2026-12-19"), 1)
+        with self.assertRaises(BookingError):
+            svc.cancel("B999")
+
+    def test_concurrent_holds_never_overbook(self):
+        svc, _ = fresh(doubles=3)
+        r = stay("2027-02-05", "2027-02-07")
+        go, wins, lock = threading.Event(), [], threading.Lock()
+
+        def attempt(i):
+            go.wait()
+            try:
+                b = svc.hold(f"g{i}", "H1", RoomType.DOUBLE, r, 1)
+                with lock:
+                    wins.append(b.id)
+            except BookingError:
+                pass
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(20)]
+        for t in threads:
+            t.start()
+        go.set()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(wins), 3)
+        self.assertEqual(len(set(wins)), 3)                                        # unique ids
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Run: <code>python main.py</code> then <code>python -m unittest -v test_hotel_booking</code></p>
+<pre class="terminal"><code>== 1. Search Goa, DOUBLE x1, 2026-12-18..2026-12-21 (3 nights)
+  H2 Hill Top   DOUBLE free=1 price=10500.00
+  H1 Sea View   DOUBLE free=2 price=13600.00
+== 2. Alice holds 2 DOUBLE at H1
+  B1 HELD H1 DOUBLE x2 2026-12-18..2026-12-21 price=27200.00 hold until 2026-11-23 10:15
+== 3. Search again: H1 has no DOUBLE left for those nights
+  H2 Hill Top   DOUBLE free=1 price=10500.00
+== 4. Bob wants H1 DOUBLE 2026-12-20..2026-12-22 (overlaps one night)
+  rejected: H1 has 0 DOUBLE free for 2026-12-20..2026-12-22, wanted 1
+== 5. Bob books H1 DOUBLE 2026-12-21..2026-12-23 (starts on Alice's check-out day)
+  [notify] B2 CONFIRMED
+  B2 CONFIRMED H1 DOUBLE x1 2026-12-21..2026-12-23 price=8000.00
+== 6. Alice pays
+  [notify] B1 CONFIRMED
+  B1 CONFIRMED H1 DOUBLE x2 2026-12-18..2026-12-21 price=27200.00 payment=PAY-778
+  confirm again with the same payment ref: B1 CONFIRMED (idempotent)
+== 7. Carol holds the SUITE and walks away
+  B3 HELD H1 SUITE x1 2026-12-18..2026-12-21 price=30600.00
+  ... 16 minutes later
+  [notify] B3 EXPIRED
+  expired holds: 1
+  rejected: B3: cannot go from EXPIRED to CONFIRMED
+== 8. Alice cancels three weeks early (flexible policy)
+  [notify] B1 CANCELLED
+  refund=27200.00
+  H1 Sea View   DOUBLE free=2 price=27200.00
+== 9. Dev books H1 for tomorrow and cancels late
+  [notify] B4 CONFIRMED
+  [notify] B4 CANCELLED
+  B4 CANCELLED H1 DOUBLE x1 2026-11-24..2026-11-26 price=8000.00 refund=4000.00
+== 10. Eve books H2 for 7 nights (long-stay discount, non-refundable)
+  [notify] B5 CONFIRMED
+  [notify] B5 CANCELLED
+  B5 CANCELLED H2 DOUBLE x1 2027-01-01..2027-01-08 price=22050.00 refund=0.00
+  rejected: B5: cannot go from CANCELLED to CANCELLED
+== 11. Bad input
+  rejected: check-out must be after check-in
+  rejected: rooms must be &gt;= 1
+  rejected: unknown hotel H9
+  rejected: H2 has no SUITE rooms
+== 12. 8 guests race for H2's only DOUBLE
+  winners=1 rejected=7
+All 21 checks passed</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output: tests">
+<pre class="terminal"><code>test_bad_input (test_hotel_booking.HotelBookingTest.test_bad_input) ... ok
+test_cancellation_policies (test_hotel_booking.HotelBookingTest.test_cancellation_policies) ... ok
+test_concurrent_holds_never_overbook (test_hotel_booking.HotelBookingTest.test_concurrent_holds_never_overbook) ... ok
+test_confirm_after_ttl_without_sweep_is_rejected (test_hotel_booking.HotelBookingTest.test_confirm_after_ttl_without_sweep_is_rejected) ... ok
+test_confirm_is_idempotent_per_payment_ref (test_hotel_booking.HotelBookingTest.test_confirm_is_idempotent_per_payment_ref) ... ok
+test_free_is_minimum_over_nights (test_hotel_booking.HotelBookingTest.test_free_is_minimum_over_nights) ... ok
+test_half_open_ranges_share_the_changeover_day (test_hotel_booking.HotelBookingTest.test_half_open_ranges_share_the_changeover_day) ... ok
+test_hold_expires_and_releases (test_hotel_booking.HotelBookingTest.test_hold_expires_and_releases) ... ok
+test_non_refundable (test_hotel_booking.HotelBookingTest.test_non_refundable) ... ok
+test_pricing_decorators (test_hotel_booking.HotelBookingTest.test_pricing_decorators) ... ok
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.069s
+
+OK</code></pre>
+    </div>
+  </div>
+  <h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: abstract base classes as interfaces (a vtable is the ops table you know from C); dates as day numbers with no library.</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>All 21 checks passed</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Hotel booking in C++14: same design as the Java and Python versions.
+// Windows (MinGW g++ 6.3): g++ -std=c++14 -O2 -o main main.cpp &amp;&amp; ./main
+// Linux (real locks):      g++ -std=c++14 -O2 -pthread -DHAVE_STD_MUTEX -o main main.cpp &amp;&amp; ./main
+// Locks: one mutex per hotel guards its inventory and its bookings' status (like Java's per-hotel lock);
+// the service registry lock is a leaf, held only for map lookups and inserts.
+#include &lt;algorithm&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;sstream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: a real std::mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). MinGW.org g++ 6.3 (win32 thread model) has no
+// std::mutex and -pthread fails to link there, so the default build uses a no-op Mutex with the same
+// lock()/unlock(): the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+// ---------- dates: a day number (days since 1970-01-01) and minutes since the epoch ----------
+static long daysFromCivil(int y, int m, int d) {          // proleptic Gregorian calendar
+    y -= m &lt;= 2;
+    long era = (y &gt;= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m + (m &gt; 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+static void civilFromDays(long z, int&amp; y, int&amp; m, int&amp; d) {
+    z += 719468;
+    long era = (z &gt;= 0 ? z : z - 146096) / 146097;
+    long doe = z - era * 146097;
+    long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long mp = (5 * doy + 2) / 153;
+    d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    m = (int)(mp &lt; 10 ? mp + 3 : mp - 9);
+    y = (int)(yoe + era * 400 + (m &lt;= 2));
+}
+static long parseDay(const std::string&amp; s) {               // "2026-12-18"
+    return daysFromCivil(std::stoi(s.substr(0, 4)), std::stoi(s.substr(5, 2)), std::stoi(s.substr(8, 2)));
+}
+static std::string dayStr(long day) {
+    int y, m, d; civilFromDays(day, y, m, d);
+    char buf[16]; std::snprintf(buf, sizeof buf, "%04d-%02d-%02d", y, m, d);
+    return buf;
+}
+static int weekday(long day) { return (int)(((day % 7) + 10) % 7); }   // 0 = Monday ... 4 = Friday, 5 = Saturday
+typedef long long Minutes;                                    // minutes since 1970-01-01 00:00
+static std::string timeStr(Minutes t) {
+    long day = (long)(t / 1440); int mins = (int)(t % 1440);
+    char buf[8]; std::snprintf(buf, sizeof buf, "%02d:%02d", mins / 60, mins % 60);
+    return dayStr(day) + " " + buf;
+}
+static std::string money(long long paise) {
+    long long cents = paise % 100;                      // no %lld: old MinGW printf does not know it
+    return std::to_string(paise / 100) + (cents &lt; 10 ? ".0" : ".") + std::to_string(cents);
+}
+
+// ---------- model ----------
+enum class RoomType { SINGLE, DOUBLE, SUITE };
+static const char* name(RoomType t) { return t == RoomType::SINGLE ? "SINGLE" : t == RoomType::DOUBLE ? "DOUBLE" : "SUITE"; }
+
+enum class Status { HELD, CONFIRMED, CANCELLED, EXPIRED };
+static const char* name(Status s) {
+    switch (s) { case Status::HELD: return "HELD"; case Status::CONFIRMED: return "CONFIRMED";
+                 case Status::CANCELLED: return "CANCELLED"; default: return "EXPIRED"; }
+}
+static bool canMove(Status from, Status to) {
+    if (from == Status::HELD) return to == Status::CONFIRMED || to == Status::CANCELLED || to == Status::EXPIRED;
+    if (from == Status::CONFIRMED) return to == Status::CANCELLED;
+    return false;                                            // CANCELLED and EXPIRED are terminal
+}
+
+struct BookingError : std::runtime_error { explicit BookingError(const std::string&amp; m) : std::runtime_error(m) {} };
+
+struct DateRange {                                           // half-open [checkIn, checkOut)
+    long checkIn, checkOut;
+    DateRange(long in, long out) : checkIn(in), checkOut(out) {
+        if (out &lt;= in) throw BookingError("check-out must be after check-in");
+    }
+    int nights() const { return (int)(checkOut - checkIn); }
+    std::string str() const { return dayStr(checkIn) + ".." + dayStr(checkOut); }
+};
+
+struct Booking;
+
+// ---------- pricing: Strategy with Decorators ----------
+struct PricingStrategy {
+    virtual ~PricingStrategy() {}
+    virtual long long price(long long rate, const DateRange&amp; stay, int rooms) const = 0;
+};
+struct BaseRatePricing : PricingStrategy {
+    long long price(long long rate, const DateRange&amp; s, int rooms) const override { return rate * s.nights() * rooms; }
+};
+struct WeekendSurcharge : PricingStrategy {
+    std::unique_ptr&lt;PricingStrategy&gt; inner; int percent;
+    WeekendSurcharge(std::unique_ptr&lt;PricingStrategy&gt; in, int pct) : inner(std::move(in)), percent(pct) {}
+    long long price(long long rate, const DateRange&amp; s, int rooms) const override {
+        long long extra = 0;
+        for (long n = s.checkIn; n &lt; s.checkOut; ++n)
+            if (weekday(n) == 4 || weekday(n) == 5) extra += rate * percent / 100;
+        return inner-&gt;price(rate, s, rooms) + extra * rooms;
+    }
+};
+struct LongStayDiscount : PricingStrategy {
+    std::unique_ptr&lt;PricingStrategy&gt; inner; int minNights, percent;
+    LongStayDiscount(std::unique_ptr&lt;PricingStrategy&gt; in, int minN, int pct) : inner(std::move(in)), minNights(minN), percent(pct) {}
+    long long price(long long rate, const DateRange&amp; s, int rooms) const override {
+        long long p = inner-&gt;price(rate, s, rooms);
+        return s.nights() &gt;= minNights ? p * (100 - percent) / 100 : p;
+    }
+};
+
+// ---------- cancellation policies ----------
+struct CancellationPolicy {
+    virtual ~CancellationPolicy() {}
+    virtual long long refund(const Booking&amp; b, Minutes now) const = 0;
+};
+
+// ---------- inventory: counts per (type, night) ----------
+class Inventory {
+    std::map&lt;RoomType, int&gt; total_;
+    std::map&lt;RoomType, std::map&lt;long, int&gt;&gt; taken_;
+public:
+    void addRoom(RoomType t) { total_[t]++; }
+    int free(RoomType t, const DateRange&amp; s) const {
+        auto it = total_.find(t);
+        int cap = it == total_.end() ? 0 : it-&gt;second, mn = cap;
+        auto tk = taken_.find(t);
+        for (long n = s.checkIn; n &lt; s.checkOut; ++n) {
+            int used = 0;
+            if (tk != taken_.end()) { auto u = tk-&gt;second.find(n); if (u != tk-&gt;second.end()) used = u-&gt;second; }
+            mn = std::min(mn, cap - used);
+        }
+        return mn;
+    }
+    void take(RoomType t, const DateRange&amp; s, int rooms) { for (long n = s.checkIn; n &lt; s.checkOut; ++n) taken_[t][n] += rooms; }
+    void release(RoomType t, const DateRange&amp; s, int rooms) {
+        auto&amp; per = taken_[t];
+        for (long n = s.checkIn; n &lt; s.checkOut; ++n) if ((per[n] -= rooms) == 0) per.erase(n);
+    }
+};
+
+struct Hotel {
+    std::string id, name, city;
+    std::unique_ptr&lt;PricingStrategy&gt; pricing;
+    std::unique_ptr&lt;CancellationPolicy&gt; cancellation;
+    std::vector&lt;std::pair&lt;std::string, RoomType&gt;&gt; rooms;
+    std::map&lt;RoomType, long long&gt; rates;
+    Mutex mu;                                                // guards inventory + status of this hotel's bookings
+    Inventory inventory;
+    Hotel(std::string i, std::string n, std::string c, std::unique_ptr&lt;PricingStrategy&gt; p, std::unique_ptr&lt;CancellationPolicy&gt; cp)
+        : id(std::move(i)), name(std::move(n)), city(std::move(c)), pricing(std::move(p)), cancellation(std::move(cp)) {}
+    Hotel&amp; addRoom(const std::string&amp; no, RoomType t) { rooms.push_back({no, t}); inventory.addRoom(t); return *this; }
+    Hotel&amp; rate(RoomType t, long long paise) { rates[t] = paise; return *this; }
+};
+
+struct Booking {
+    std::string id, guest;
+    Hotel* hotel;
+    RoomType type;
+    DateRange stay;
+    int rooms;
+    long long price;
+    Minutes holdExpiresAt;
+    Status status = Status::HELD;
+    std::string paymentRef;
+    Booking(std::string i, std::string g, Hotel* h, RoomType t, DateRange s, int r, long long p, Minutes exp)
+        : id(std::move(i)), guest(std::move(g)), hotel(h), type(t), stay(s), rooms(r), price(p), holdExpiresAt(exp) {}
+    void moveTo(Status next) {
+        if (!canMove(status, next)) throw BookingError(id + ": cannot go from " + name(status) + " to " + name(next));
+        status = next;
+    }
+    std::string str() const {
+        return id + " " + name(status) + " " + hotel-&gt;id + " " + name(type) + " x" + std::to_string(rooms) + " "
+             + stay.str() + " price=" + money(price);
+    }
+};
+
+struct FlexibleCancellation : CancellationPolicy {
+    int hoursBefore;
+    explicit FlexibleCancellation(int h) : hoursBefore(h) {}
+    long long refund(const Booking&amp; b, Minutes now) const override {
+        Minutes deadline = (Minutes)b.stay.checkIn * 1440 + 14 * 60 - (Minutes)hoursBefore * 60;   // check-in at 14:00
+        if (now &lt; deadline) return b.price;
+        return b.price - b.price / b.stay.nights();
+    }
+};
+struct NonRefundable : CancellationPolicy {
+    long long refund(const Booking&amp;, Minutes) const override { return 0; }
+};
+
+struct Offer { Hotel* hotel; RoomType type; int free; long long price; };
+static std::string str(const Offer&amp; o) {
+    char buf[128];
+    std::snprintf(buf, sizeof buf, "%s %-10s %s free=%d price=%s", o.hotel-&gt;id.c_str(), o.hotel-&gt;name.c_str(),
+                  name(o.type), o.free, money(o.price).c_str());
+    return buf;
+}
+
+// ---------- the facade ----------
+class BookingService {
+    std::map&lt;std::string, std::unique_ptr&lt;Hotel&gt;&gt; hotels_;
+    std::map&lt;std::string, std::unique_ptr&lt;Booking&gt;&gt; bookings_;
+    std::vector&lt;std::function&lt;void(const Booking&amp;)&gt;&gt; listeners_;
+    int seq_ = 0;
+    const Minutes&amp; clock_;
+    static const Minutes HOLD_TTL = 15;
+    Mutex reg_;                                              // hotels_, bookings_, listeners_, seq_
+
+    void publish(const Booking&amp; b) {                         // called with no lock held
+        std::vector&lt;std::function&lt;void(const Booking&amp;)&gt;&gt; ls;
+        { LockGuard g(reg_); ls = listeners_; }
+        for (auto&amp; l : ls) l(b);
+    }
+    // caller holds b.hotel-&gt;mu
+    void expireLocked(Booking&amp; b) { b.moveTo(Status::EXPIRED); b.hotel-&gt;inventory.release(b.type, b.stay, b.rooms); }
+    Hotel&amp; hotel(const std::string&amp; id) {
+        LockGuard g(reg_);
+        auto it = hotels_.find(id);
+        if (it == hotels_.end()) throw BookingError("unknown hotel " + id);
+        return *it-&gt;second;
+    }
+public:
+    explicit BookingService(const Minutes&amp; clock) : clock_(clock) {}
+    void addListener(std::function&lt;void(const Booking&amp;)&gt; l) { LockGuard g(reg_); listeners_.push_back(std::move(l)); }
+    Hotel&amp; addHotel(std::unique_ptr&lt;Hotel&gt; h) {
+        LockGuard g(reg_);
+        if (hotels_.count(h-&gt;id)) throw BookingError("duplicate hotel " + h-&gt;id);
+        Hotel&amp; ref = *h; hotels_[h-&gt;id] = std::move(h); return ref;
+    }
+    Booking&amp; booking(const std::string&amp; id) {
+        LockGuard g(reg_);
+        auto it = bookings_.find(id);
+        if (it == bookings_.end()) throw BookingError("unknown booking " + id);
+        return *it-&gt;second;
+    }
+
+    std::vector&lt;Offer&gt; search(const std::string&amp; city, RoomType t, const DateRange&amp; s, int rooms) {
+        expireHolds();
+        std::vector&lt;Offer&gt; out;
+        std::vector&lt;Hotel*&gt; hs;
+        { LockGuard g(reg_); for (auto&amp; kv : hotels_) hs.push_back(kv.second.get()); }
+        for (Hotel* hp : hs) {
+            Hotel&amp; h = *hp;
+            if (h.city != city || !h.rates.count(t)) continue;
+            LockGuard g(h.mu);                                 // a consistent read of this hotel's counts
+            int free = h.inventory.free(t, s);
+            if (free &gt;= rooms) out.push_back({&amp;h, t, free, h.pricing-&gt;price(h.rates[t], s, rooms)});
+        }
+        std::sort(out.begin(), out.end(), [](const Offer&amp; a, const Offer&amp; b) {
+            return a.price != b.price ? a.price &lt; b.price : a.hotel-&gt;id &lt; b.hotel-&gt;id; });
+        return out;
+    }
+
+    Booking&amp; hold(const std::string&amp; guest, const std::string&amp; hotelId, RoomType t, const DateRange&amp; s, int rooms) {
+        if (rooms &lt; 1) throw BookingError("rooms must be &gt;= 1");
+        Hotel&amp; h = hotel(hotelId);
+        if (!h.rates.count(t)) throw BookingError(hotelId + " has no " + name(t) + " rooms");
+        expireHolds();
+        LockGuard g(h.mu);                                     // check and take in one critical section
+        int free = h.inventory.free(t, s);
+        if (free &lt; rooms)
+            throw BookingError(hotelId + " has " + std::to_string(free) + " " + name(t) + " free for " + s.str()
+                               + ", wanted " + std::to_string(rooms));
+        h.inventory.take(t, s, rooms);
+        LockGuard r(reg_);                                     // hotel -&gt; registry: reg_ is always the inner lock
+        std::string id = "B" + std::to_string(++seq_);
+        bookings_[id].reset(new Booking(id, guest, &amp;h, t, s, rooms, h.pricing-&gt;price(h.rates[t], s, rooms), clock_ + HOLD_TTL));
+        return *bookings_[id];
+    }
+
+    Booking&amp; confirm(const std::string&amp; id, const std::string&amp; paymentRef) {
+        Booking&amp; b = booking(id);
+        bool expiredNow = false;
+        {
+            LockGuard g(b.hotel-&gt;mu);                           // one winner: confirm vs expiry vs cancel
+            if (b.status == Status::CONFIRMED &amp;&amp; b.paymentRef == paymentRef) return b;
+            if (b.status == Status::HELD &amp;&amp; clock_ &gt;= b.holdExpiresAt) { expireLocked(b); expiredNow = true; }
+            else { b.moveTo(Status::CONFIRMED); b.paymentRef = paymentRef; }
+        }
+        publish(b);
+        if (expiredNow) throw BookingError(b.id + ": hold expired, refund the payment");
+        return b;
+    }
+
+    long long cancel(const std::string&amp; id) {
+        Booking&amp; b = booking(id);
+        long long refund;
+        {
+            LockGuard g(b.hotel-&gt;mu);
+            refund = b.status == Status::CONFIRMED ? b.hotel-&gt;cancellation-&gt;refund(b, clock_) : 0;
+            b.moveTo(Status::CANCELLED);
+            b.hotel-&gt;inventory.release(b.type, b.stay, b.rooms);
+        }
+        publish(b);
+        return refund;
+    }
+
+    int expireHolds() {
+        std::vector&lt;Booking*&gt; all, expired;
+        { LockGuard g(reg_); for (auto&amp; kv : bookings_) all.push_back(kv.second.get()); }
+        for (Booking* bp : all) {
+            Booking&amp; b = *bp;
+            LockGuard g(b.hotel-&gt;mu);
+            if (b.status == Status::HELD &amp;&amp; clock_ &gt;= b.holdExpiresAt) { expireLocked(b); expired.push_back(&amp;b); }
+        }
+        std::sort(expired.begin(), expired.end(), [](Booking* a, Booking* b) {
+            return std::stoi(a-&gt;id.substr(1)) &lt; std::stoi(b-&gt;id.substr(1)); });
+        for (Booking* b : expired) publish(*b);
+        return (int)expired.size();
+    }
+};
+
+// ---------- demo driver with checks ----------
+static int passed = 0;
+static void check(bool ok, const std::string&amp; what) {
+    if (!ok) { std::cout &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    passed++;
+}
+static DateRange stay(const std::string&amp; a, const std::string&amp; b) { return DateRange(parseDay(a), parseDay(b)); }
+static void show(const std::vector&lt;Offer&gt;&amp; v) { for (auto&amp; o : v) std::cout &lt;&lt; "  " &lt;&lt; str(o) &lt;&lt; "\n"; }
+static void expectReject(const std::function&lt;void()&gt;&amp; f) {
+    try { f(); } catch (const BookingError&amp; e) { std::cout &lt;&lt; "  rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; passed++; return; }
+    check(false, "should have been rejected");
+}
+template &lt;class T, class... A&gt; static std::unique_ptr&lt;T&gt; make(A&amp;&amp;... a) { return std::unique_ptr&lt;T&gt;(new T(std::forward&lt;A&gt;(a)...)); }
+
+int main() {
+    Minutes clock = (Minutes)parseDay("2026-11-23") * 1440 + 10 * 60;
+    BookingService svc(clock);
+    svc.addListener([](const Booking&amp; b) { std::cout &lt;&lt; "  [notify] " &lt;&lt; b.id &lt;&lt; " " &lt;&lt; name(b.status) &lt;&lt; "\n"; });
+
+    svc.addHotel(make&lt;Hotel&gt;("H1", "Sea View", "Goa", make&lt;WeekendSurcharge&gt;(make&lt;BaseRatePricing&gt;(), 20),
+                             make&lt;FlexibleCancellation&gt;(48)))
+        .addRoom("101", RoomType::DOUBLE).addRoom("102", RoomType::DOUBLE).addRoom("201", RoomType::SUITE)
+        .rate(RoomType::DOUBLE, 400000).rate(RoomType::SUITE, 900000);
+    svc.addHotel(make&lt;Hotel&gt;("H2", "Hill Top", "Goa", make&lt;LongStayDiscount&gt;(make&lt;BaseRatePricing&gt;(), 7, 10),
+                             make&lt;NonRefundable&gt;()))
+        .addRoom("1", RoomType::DOUBLE).rate(RoomType::DOUBLE, 350000);
+
+    DateRange xmas = stay("2026-12-18", "2026-12-21");
+    std::cout &lt;&lt; "== 1. Search Goa, DOUBLE x1, " &lt;&lt; xmas.str() &lt;&lt; " (" &lt;&lt; xmas.nights() &lt;&lt; " nights)\n";
+    auto offers = svc.search("Goa", RoomType::DOUBLE, xmas, 1);
+    show(offers);
+    check(offers.size() == 2 &amp;&amp; offers[0].hotel-&gt;id == "H2", "cheapest first");
+    check(offers[1].price == 1360000, "weekend surcharge");
+
+    std::cout &lt;&lt; "== 2. Alice holds 2 DOUBLE at H1\n";
+    Booking&amp; alice = svc.hold("alice", "H1", RoomType::DOUBLE, xmas, 2);
+    std::cout &lt;&lt; "  " &lt;&lt; alice.str() &lt;&lt; " hold until " &lt;&lt; timeStr(alice.holdExpiresAt) &lt;&lt; "\n";
+    check(alice.price == 2720000, "two rooms cost twice");
+
+    std::cout &lt;&lt; "== 3. Search again: H1 has no DOUBLE left for those nights\n";
+    offers = svc.search("Goa", RoomType::DOUBLE, xmas, 1);
+    show(offers);
+    check(offers.size() == 1, "held rooms are not on sale");
+
+    std::cout &lt;&lt; "== 4. Bob wants H1 DOUBLE 2026-12-20..2026-12-22 (overlaps one night)\n";
+    expectReject([&amp;] { svc.hold("bob", "H1", RoomType::DOUBLE, stay("2026-12-20", "2026-12-22"), 1); });
+
+    std::cout &lt;&lt; "== 5. Bob books H1 DOUBLE 2026-12-21..2026-12-23 (starts on Alice's check-out day)\n";
+    Booking&amp; bob = svc.hold("bob", "H1", RoomType::DOUBLE, stay("2026-12-21", "2026-12-23"), 1);
+    svc.confirm(bob.id, "PAY-501");
+    std::cout &lt;&lt; "  " &lt;&lt; bob.str() &lt;&lt; "\n";
+    check(bob.status == Status::CONFIRMED, "back-to-back stays fit");
+
+    std::cout &lt;&lt; "== 6. Alice pays\n";
+    svc.confirm(alice.id, "PAY-778");
+    std::cout &lt;&lt; "  " &lt;&lt; alice.str() &lt;&lt; " payment=" &lt;&lt; alice.paymentRef &lt;&lt; "\n";
+    svc.confirm(alice.id, "PAY-778");
+    std::cout &lt;&lt; "  confirm again with the same payment ref: " &lt;&lt; alice.id &lt;&lt; " " &lt;&lt; name(alice.status) &lt;&lt; " (idempotent)\n";
+    check(alice.status == Status::CONFIRMED, "retry is a no-op");
+
+    std::cout &lt;&lt; "== 7. Carol holds the SUITE and walks away\n";
+    Booking&amp; carol = svc.hold("carol", "H1", RoomType::SUITE, xmas, 1);
+    std::cout &lt;&lt; "  " &lt;&lt; carol.str() &lt;&lt; "\n";
+    check(carol.price == 3060000, "suite price");
+    clock += 16;
+    std::cout &lt;&lt; "  ... 16 minutes later\n";
+    int n = svc.expireHolds();
+    std::cout &lt;&lt; "  expired holds: " &lt;&lt; n &lt;&lt; "\n";
+    check(n == 1 &amp;&amp; carol.status == Status::EXPIRED, "hold released");
+    expectReject([&amp;] { svc.confirm(carol.id, "PAY-900"); });
+    check(svc.search("Goa", RoomType::SUITE, xmas, 1).size() == 1, "suite back on sale");
+
+    std::cout &lt;&lt; "== 8. Alice cancels three weeks early (flexible policy)\n";
+    long long refund = svc.cancel(alice.id);
+    std::cout &lt;&lt; "  refund=" &lt;&lt; money(refund) &lt;&lt; "\n";
+    check(refund == alice.price, "full refund");
+    offers = svc.search("Goa", RoomType::DOUBLE, xmas, 2);
+    show(offers);
+    check(offers.size() == 1 &amp;&amp; offers[0].free == 2, "both rooms free again");
+
+    std::cout &lt;&lt; "== 9. Dev books H1 for tomorrow and cancels late\n";
+    Booking&amp; dev = svc.hold("dev", "H1", RoomType::DOUBLE, stay("2026-11-24", "2026-11-26"), 1);
+    svc.confirm(dev.id, "PAY-610");
+    refund = svc.cancel(dev.id);
+    std::cout &lt;&lt; "  " &lt;&lt; dev.str() &lt;&lt; " refund=" &lt;&lt; money(refund) &lt;&lt; "\n";
+    check(refund == 400000, "first night kept");
+
+    std::cout &lt;&lt; "== 10. Eve books H2 for 7 nights (long-stay discount, non-refundable)\n";
+    Booking&amp; eve = svc.hold("eve", "H2", RoomType::DOUBLE, stay("2027-01-01", "2027-01-08"), 1);
+    svc.confirm(eve.id, "PAY-720");
+    refund = svc.cancel(eve.id);
+    std::cout &lt;&lt; "  " &lt;&lt; eve.str() &lt;&lt; " refund=" &lt;&lt; money(refund) &lt;&lt; "\n";
+    check(eve.price == 2205000 &amp;&amp; refund == 0, "long stay, non-refundable");
+    expectReject([&amp;] { svc.cancel(eve.id); });
+
+    std::cout &lt;&lt; "== 11. Bad input\n";
+    expectReject([&amp;] { stay("2026-12-21", "2026-12-18"); });
+    expectReject([&amp;] { svc.hold("x", "H1", RoomType::DOUBLE, xmas, 0); });
+    expectReject([&amp;] { svc.hold("x", "H9", RoomType::DOUBLE, xmas, 1); });
+    expectReject([&amp;] { svc.hold("x", "H2", RoomType::SUITE, xmas, 1); });
+
+    std::cout &lt;&lt; "== 12. 8 guests ask for H2's only DOUBLE (one after another in this build)\n";
+    DateRange race = stay("2027-02-05", "2027-02-07");
+    int wins = 0, losses = 0;
+    for (int i = 0; i &lt; 8; ++i) {
+        try { svc.hold("g" + std::to_string(i), "H2", RoomType::DOUBLE, race, 1); ++wins; }
+        catch (const BookingError&amp;) { ++losses; }
+    }
+    std::cout &lt;&lt; "  winners=" &lt;&lt; wins &lt;&lt; " rejected=" &lt;&lt; losses &lt;&lt; "\n";
+    check(wins == 1 &amp;&amp; losses == 7, "exactly one hold wins");
+
+    std::cout &lt;&lt; "All " &lt;&lt; passed &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+      <p>Build: <code>g++ -std=c++14 -Wall -O2 -o main main.cpp &amp;&amp; ./main</code></p>
+<pre class="terminal"><code>== 1. Search Goa, DOUBLE x1, 2026-12-18..2026-12-21 (3 nights)
+  H2 Hill Top   DOUBLE free=1 price=10500.00
+  H1 Sea View   DOUBLE free=2 price=13600.00
+== 2. Alice holds 2 DOUBLE at H1
+  B1 HELD H1 DOUBLE x2 2026-12-18..2026-12-21 price=27200.00 hold until 2026-11-23 10:15
+== 3. Search again: H1 has no DOUBLE left for those nights
+  H2 Hill Top   DOUBLE free=1 price=10500.00
+== 4. Bob wants H1 DOUBLE 2026-12-20..2026-12-22 (overlaps one night)
+  rejected: H1 has 0 DOUBLE free for 2026-12-20..2026-12-22, wanted 1
+== 5. Bob books H1 DOUBLE 2026-12-21..2026-12-23 (starts on Alice's check-out day)
+  [notify] B2 CONFIRMED
+  B2 CONFIRMED H1 DOUBLE x1 2026-12-21..2026-12-23 price=8000.00
+== 6. Alice pays
+  [notify] B1 CONFIRMED
+  B1 CONFIRMED H1 DOUBLE x2 2026-12-18..2026-12-21 price=27200.00 payment=PAY-778
+  confirm again with the same payment ref: B1 CONFIRMED (idempotent)
+== 7. Carol holds the SUITE and walks away
+  B3 HELD H1 SUITE x1 2026-12-18..2026-12-21 price=30600.00
+  ... 16 minutes later
+  [notify] B3 EXPIRED
+  expired holds: 1
+  rejected: B3: cannot go from EXPIRED to CONFIRMED
+== 8. Alice cancels three weeks early (flexible policy)
+  [notify] B1 CANCELLED
+  refund=27200.00
+  H1 Sea View   DOUBLE free=2 price=27200.00
+== 9. Dev books H1 for tomorrow and cancels late
+  [notify] B4 CONFIRMED
+  [notify] B4 CANCELLED
+  B4 CANCELLED H1 DOUBLE x1 2026-11-24..2026-11-26 price=8000.00 refund=4000.00
+== 10. Eve books H2 for 7 nights (long-stay discount, non-refundable)
+  [notify] B5 CONFIRMED
+  [notify] B5 CANCELLED
+  B5 CANCELLED H2 DOUBLE x1 2027-01-01..2027-01-08 price=22050.00 refund=0.00
+  rejected: B5: cannot go from CANCELLED to CANCELLED
+== 11. Bad input
+  rejected: check-out must be after check-in
+  rejected: rooms must be &gt;= 1
+  rejected: unknown hotel H9
+  rejected: H2 has no SUITE rooms
+== 12. 8 guests ask for H2's only DOUBLE (one after another in this build)
+  winners=1 rejected=7
+All 21 checks passed</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> nothing in behaviour: the same 21 checks and the same 43-line demo as Java, measured. On MinGW the per-hotel lock is a no-op, so its 8-thread race runs sequentially there; the Linux <code>-DHAVE_STD_MUTEX</code> build runs it on real threads (compiled and run, same output).</p></div>
+
+  <p>Read the demo against the calendar picture at the top. Step 4 rejects Bob for 20..22 because the night of the 20th is Alice's; step 5 accepts 21..23 because the 21st is her check-out morning. Step 1's price is the decorator at work: 3 nights at 4000 plus 20% on Friday and Saturday is 13600. Step 9 is the flexible policy after its deadline: the stay starts tomorrow, the 48-hour window has passed, so the hotel keeps the first night (4000 of 8000).</p>

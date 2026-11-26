@@ -1,0 +1,81 @@
+
+        <h2>Security filters: capabilities, seccomp, LSMs, user namespaces</h2>
+        <p>Namespaces and cgroups do not stop a process from <em>asking</em> the kernel to do dangerous things, like loading a kernel module or rebooting the host. Four more layers handle that. Every system call from a container passes through them.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="System calls pass seccomp, capability and LSM checks before reaching the kernel">
+            <rect class="box svc" x="20" y="90" width="130" height="70"/>
+            <text class="label" x="85" y="115">container</text>
+            <text class="label small" x="85" y="138">process</text>
+            <rect class="box queue" x="200" y="70" width="140" height="110"/>
+            <text class="label" x="270" y="100">seccomp</text>
+            <text class="label small" x="270" y="124">BPF filter on</text>
+            <text class="label small" x="270" y="144">syscall number</text>
+            <rect class="box cache" x="380" y="70" width="140" height="110"/>
+            <text class="label" x="450" y="100">capabilities</text>
+            <text class="label small" x="450" y="124">is this privilege</text>
+            <text class="label small" x="450" y="144">in CapEff?</text>
+            <rect class="box db" x="560" y="70" width="110" height="110"/>
+            <text class="label" x="615" y="100">LSM</text>
+            <text class="label small" x="615" y="124">AppArmor or</text>
+            <text class="label small" x="615" y="144">SELinux</text>
+            <rect class="box docker solid" x="700" y="40" width="80" height="170"/>
+            <text class="label white" x="740" y="125">kernel</text>
+            <path class="arrow" d="M150 125 L196 125"/>
+            <path class="arrow" d="M340 125 L376 125"/>
+            <path class="arrow" d="M520 125 L556 125"/>
+            <path class="arrow" d="M670 125 L696 125"/>
+            <text class="label ok" x="440" y="210">read(), write(), accept(): allowed all the way</text>
+            <text class="label bad" x="270" y="34">reboot(), kexec_load(): EPERM</text>
+            <circle class="packet ok" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M150 125 L700 125"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M150 110 L230 110 L230 50 L150 50 L150 110"/></circle>
+          </svg>
+          <figcaption>Green: a normal call passes every gate. Red: a blocked call is bounced back by the seccomp filter with "Operation not permitted" before the kernel ever runs it.</figcaption>
+        </figure>
+
+        <h3>Capabilities: root cut into pieces</h3>
+        <p>Since Linux 2.2, the all-powerful root has been split into about 40 separate <strong>capabilities</strong> (see <a href="https://man7.org/linux/man-pages/man7/capabilities.7.html" target="_blank" rel="noopener">capabilities(7)</a>). <code>CAP_NET_BIND_SERVICE</code> lets you bind ports below 1024, <code>CAP_NET_ADMIN</code> lets you change routes and interfaces, <code>CAP_SYS_ADMIN</code> is a huge bag that includes <code>mount()</code>. Docker keeps only 14 by default (the list lives in moby's <a href="https://github.com/moby/moby/blob/master/daemon/pkg/oci/caps/defaults.go" target="_blank" rel="noopener">defaults.go</a>): CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP, SETPCAP, NET_BIND_SERVICE, SYS_CHROOT, KILL, AUDIT_WRITE. So "root in a container" is already weaker than real root.</p>
+<pre class="terminal"><code>$ docker run --rm alpine grep Cap /proc/self/status
+CapInh:	0000000000000000
+CapPrm:	00000000a80425fb
+CapEff:	00000000a80425fb
+CapBnd:	00000000a80425fb
+CapAmb:	0000000000000000
+$ capsh --decode=00000000a80425fb
+0x00000000a80425fb=cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap
+$ docker run --rm --cap-drop=ALL alpine grep CapEff /proc/self/status
+CapEff:	0000000000000000
+$ docker run --rm alpine ip link add dummy0 type dummy
+ip: RTNETLINK answers: Operation not permitted
+$ docker run --rm --cap-add=NET_ADMIN alpine ip link add dummy0 type dummy &amp;&amp; echo ok
+ok</code></pre>
+
+        <h3>seccomp: an ACL on system calls</h3>
+        <p><strong>seccomp</strong> (secure computing mode) lets a process install a small BPF program that the kernel runs on every system call, before doing any work. Docker's default profile is an allowlist that blocks around 44 of the 300+ system calls, including <code>reboot</code>, <code>kexec_load</code>, <code>init_module</code>, <code>mount</code>, <code>keyctl</code>, <code>bpf</code> and others that have been sources of kernel exploits. Details are in the <a href="https://docs.docker.com/engine/security/seccomp/" target="_blank" rel="noopener">Docker seccomp doc</a>.</p>
+<pre class="terminal"><code>$ docker run --rm alpine grep '^Seccomp:' /proc/self/status
+Seccomp:	2
+$ docker run --rm --security-opt seccomp=unconfined alpine grep '^Seccomp:' /proc/self/status
+Seccomp:	0
+$ docker info --format '{{.SecurityOptions}}'
+[name=apparmor name=seccomp,profile=builtin name=cgroupns]</code></pre>
+        <p><code>2</code> means "filter mode is on"; <code>0</code> means no filter. You never want <code>unconfined</code> in production.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p><b>seccomp is an ACL on the syscall table; capabilities are CLI privilege levels.</b> A seccomp profile is a match-action list keyed on the syscall number (and sometimes arguments), just like an ingress ACL keyed on the 5-tuple, with a default action. Capabilities are like splitting "enable" mode into fine-grained RBAC roles: you can let a user change interface descriptions without letting them reload the box.</p>
+          <p><b>Where it breaks:</b> an ACL can look deep into headers; seccomp only sees the syscall number and the raw register arguments. It cannot follow a pointer, so it cannot filter on a file name passed to <code>open()</code> or a path in <code>mount()</code>. That is why path-based rules live in an LSM (AppArmor, SELinux), not in seccomp.</p>
+        </div>
+
+        <h3>LSMs and user namespaces</h3>
+        <ul>
+          <li><strong>AppArmor</strong> (Ubuntu, Debian) or <strong>SELinux</strong> (RHEL, Fedora) are Linux Security Modules. Docker loads a profile called <code>docker-default</code> on AppArmor systems that, for example, denies writes to most of <code>/proc</code> and <code>/sys</code>. On SELinux, bind mounts need <code>:z</code> or <code>:Z</code> to get the right label.</li>
+          <li><strong>User namespaces</strong> map UIDs. With <code>userns-remap</code> or rootless Docker, UID 0 in the container becomes, for example, UID 100000 on the host (ranges come from <code>/etc/subuid</code> and <code>/etc/subgid</code>). If the process escapes, it lands as a nobody. This is off by default in Docker, which is why "root in the container is root on the host" is the honest default answer. More on this in <a href="{{BASE}}devops/docker-09">Production, Security &amp; CI</a>.</li>
+        </ul>
+<pre class="terminal"><code>$ cat /proc/$PID/uid_map            # default Docker: no remapping
+         0          0 4294967295
+$ cat /proc/$PID_REMAPPED/uid_map   # with userns-remap
+         0     100000      65536</code></pre>
+        <p>Read a <code>uid_map</code> line as "inside-start, outside-start, count". The first line says UID 0 inside is UID 0 outside: no protection. The second says inside 0..65535 is outside 100000..165535.</p>
+
+        <div class="callout danger"><p><b>Real escapes:</b> In <b>CVE-2019-5736</b> a malicious container overwrote the host's <code>runc</code> binary through <code>/proc/self/exe</code> and became root on the host; runc now clones itself into a sealed memfd before entering a container. In <b>CVE-2024-21626</b> ("Leaky Vessels", January 2024) a <code>WORKDIR</code> ordering bug leaked a host file descriptor; fixed in runc 1.1.12. Lesson: patch the runtime, not only your images. Both stories are explained by Palo Alto Unit 42 and Snyk (links in Resources).</p></div>
+      

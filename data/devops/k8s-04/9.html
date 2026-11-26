@@ -1,0 +1,32 @@
+
+        <h2>Internals and production lessons</h2>
+        <div class="chips"><span class="chip warn">Deep dive (platform teams)</span></div>
+        <h3>What the Deployment controller actually loops over</h3>
+        <ol class="steps">
+          <li><strong>Hash the template.</strong> It computes a hash of <code>spec.template</code> and looks for a ReplicaSet whose <code>pod-template-hash</code> label matches. None? Create one with 0 replicas.</li>
+          <li><strong>Do the arithmetic.</strong> Count available pods across all its ReplicaSets, then scale the new one up by at most <code>replicas + maxSurge - total</code> and old ones down by at most <code>available - (replicas - maxUnavailable)</code>.</li>
+          <li><strong>Wait for readiness.</strong> It only proceeds when new pods become <i>available</i> (Ready for <code>minReadySeconds</code>). That is why a broken readiness probe "stalls" a rollout rather than breaking the whole app: old pods stay.</li>
+          <li><strong>Report progress.</strong> It updates the <code>Progressing</code> condition. If no progress happens within <code>progressDeadlineSeconds</code> (default 600), it sets <code>reason: ProgressDeadlineExceeded</code>. It does <b>not</b> roll back by itself; your CD pipeline must read that and act.</li>
+          <li><strong>Clean up.</strong> It keeps the newest <code>revisionHistoryLimit</code> (default 10) old ReplicaSets and lets garbage collection remove the rest. Deleting the Deployment deletes its ReplicaSets and pods through <b>ownerReferences</b> (cascading deletion).</li>
+        </ol>
+<pre class="terminal"><code>$ kubectl set image deployment/web web=nginx:does-not-exist
+$ kubectl get pods -l app=web
+NAME                   READY   STATUS             RESTARTS   AGE
+web-84c5d9f6b7-6x2vq   1/1     Running            0          9m
+web-84c5d9f6b7-c8wlm   1/1     Running            0          9m
+web-84c5d9f6b7-pq7zn   1/1     Running            0          9m
+web-7b9f8d5c4d-hh2km   0/1     ImagePullBackOff   0          45s
+
+$ kubectl rollout undo deployment/web
+deployment.apps/web rolled back</code></pre>
+        <p>Notice how <code>maxUnavailable: 0</code> saved us: the broken pod never became Ready, so no old pod was removed. Users saw nothing. With <code>maxUnavailable: 1</code> (or the 25% default on 4 or more replicas) one old pod would already have been killed and the Deployment would be running below full capacity. On our 3 replicas the 25% default rounds down to 0, so it would also have been safe here.</p>
+
+        <h3>Real-world lessons</h3>
+        <ul>
+          <li><b>Automatic rollback signals.</b> Uber's migration write-up describes a rollback rule of "more than 10% of pods restarting 5 or more times", and notes that disabled health checks hid crash loops (see <a href="https://www.uber.com/blog/migrating-ubers-compute-platform-to-kubernetes-a-technical-journey/" target="_blank" rel="noopener">Uber engineering blog</a>). Lesson: a rollout tool is only as good as the health signal you feed it.</li>
+          <li><b>Progressive delivery.</b> Tools such as <a href="https://argoproj.github.io/rollouts/" target="_blank" rel="noopener">Argo Rollouts</a> and <a href="https://flagger.app/" target="_blank" rel="noopener">Flagger</a> replace the Deployment's simple arithmetic with steps like "5% for 10 minutes, check error rate in Prometheus, then 25%..." and roll back automatically.</li>
+          <li><b>Selector is immutable.</b> In <code>apps/v1</code> you cannot change <code>spec.selector</code> after creation. Renaming the app label means a new Deployment.</li>
+          <li><b><a href="{{BASE}}interview/glossary#hpa">HPA</a> owns replicas.</b> If an autoscaler (HPA, see <a href="{{BASE}}devops/k8s-09">Scheduling &amp; Autoscaling</a>) manages the Deployment, remove <code>replicas</code> from your YAML. Otherwise every <code>kubectl apply</code> resets the count to the file's number, and you may suddenly shrink from 40 pods to 3 at peak.</li>
+          <li><b>Kafka consumers are a classic Deployment.</b> Every new consumer pod triggers a consumer-group rebalance. A rolling update of 30 consumers can cause 30+ rebalances; cooperative rebalancing and static membership reduce the pain. On Kafka 4.x, set <code>group.protocol=consumer</code> (KIP-848). The broker then assigns partitions incrementally, with no group-wide stop-the-world rebalance, so rolling updates and <a href="{{BASE}}interview/glossary#keda">KEDA</a> scale events barely pause consumption. See <a href="{{BASE}}devops/kafka-04">Kafka consumer groups</a> and <a href="{{BASE}}devops/pipeline-04">Deploying the pipeline on K8s</a>.</li>
+        </ul>
+      

@@ -1,0 +1,188 @@
+
+        <h2>The solution ladder: naive to best</h2>
+        <p>We climb five rungs. Each rung fixes the thing that broke on the rung below.</p>
+
+        <h3>Rung 1: do it inside the request (synchronous)</h3>
+        <p>The API server receives "make my report", does all the work, and replies with the file. Simple, and fine for work under about a second.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 230" role="img" aria-label="Synchronous request held open while a long job runs, until the load balancer times out">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="80" width="130" height="64"/>
+            <text class="label" x="85" y="104">Browser</text>
+            <text class="label small" x="85" y="126">waiting...</text>
+            <rect class="box svc" x="230" y="80" width="140" height="64"/>
+            <text class="label" x="300" y="104">Load balancer</text>
+            <text class="label small" x="300" y="126">timeout 60 s</text>
+            <rect class="box svc" x="450" y="80" width="140" height="64"/>
+            <text class="label" x="520" y="104">API server</text>
+            <text class="label small" x="520" y="126">thread busy</text>
+            <rect class="box db" x="660" y="80" width="120" height="64"/>
+            <text class="label" x="720" y="104">Database</text>
+            <text class="label small" x="720" y="126">big scan</text>
+            <path class="arrow" d="M150 112 L222 112"/>
+            <path class="arrow" d="M370 112 L442 112"/>
+            <path class="arrow" d="M590 112 L652 112"/>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M150 112 L450 112 L660 112"/></circle>
+            <rect class="box fail" x="200" y="168" width="420" height="44"/>
+            <text class="label bad" x="410" y="190">At 60 s the LB gives up: 504, work wasted</text>
+            <text class="label small" x="400" y="40">One request = one thread + one connection held for the whole job</text>
+          </svg>
+          <figcaption>Rung 1. The connection, the thread and the user are all stuck for the full duration. The dot keeps moving but never comes back.</figcaption>
+        </figure>
+        <p><b>When it breaks:</b> (1) the load balancer or the browser times out first; (2) each waiting request pins a thread and a connection, so 200 people exporting reports can starve the server that also serves logins; (3) the user hits refresh, which starts the job <i>again</i>; (4) if the server restarts mid-job, the work is gone and nobody knows.</p>
+
+        <h3>Rung 2: fire a background thread on the same server</h3>
+        <p>Reply "202 Accepted" right away and start a thread in the same process to do the work. The user is no longer blocked.</p>
+        <p><b>When it breaks:</b> the job lives only in that server's memory. A deploy, a crash or an autoscaler scale-in kills it silently. There is no shared place to ask "what is the status of job 42?", because another API server cannot see the thread. Slow jobs and fast requests still fight for the same CPU and memory, so a burst of exports slows checkout. You cannot scale "report capacity" without scaling the whole web tier.</p>
+
+        <h3>Rung 3: job table + queue + worker pool (the core pattern)</h3>
+        <p>Split the system in two. The <b>API tier</b> only validates, records and enqueues. A separate <b>worker tier</b> does the slow work. They talk through two things: a <b>durable queue</b> (who should work on what next) and a <b>job table</b> (the truth about each job: status, progress, result location). Click through the flow.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 340" role="img" aria-label="Asynchronous job flow: API writes job, enqueues, returns job id; worker pulls, runs, writes result; client polls or is notified">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="40" width="130" height="60"/>
+            <text class="label" x="85" y="62">Client</text>
+            <text class="label small" x="85" y="84">app / browser</text>
+            <rect class="box svc" x="240" y="40" width="140" height="60"/>
+            <text class="label" x="310" y="62">API server</text>
+            <text class="label small" x="310" y="84">fast, stateless</text>
+            <rect class="box db" x="240" y="250" width="140" height="60"/>
+            <text class="label" x="310" y="272">Job table</text>
+            <text class="label small" x="310" y="294">status, result_url</text>
+            <rect class="box queue" x="470" y="40" width="130" height="60"/>
+            <text class="label" x="535" y="62">Queue</text>
+            <text class="label small" x="535" y="84">SQS / Kafka</text>
+            <rect class="box k8s" x="650" y="40" width="130" height="60"/>
+            <text class="label" x="715" y="62">Worker pool</text>
+            <text class="label small" x="715" y="84">N processes</text>
+            <rect class="box cache" x="650" y="250" width="130" height="60"/>
+            <text class="label" x="715" y="272">Blob store</text>
+            <text class="label small" x="715" y="294">S3: the output</text>
+
+            <g data-step="1">
+              <path class="arrow" d="M150 60 L232 60"/>
+              <text class="label small" x="192" y="48">POST /reports</text>
+            </g>
+            <g data-step="2">
+              <path class="arrow" d="M310 100 L310 242"/>
+              <text class="label small" x="368" y="175">INSERT status=QUEUED</text>
+              <path class="arrow" d="M380 60 L462 60"/>
+              <text class="label small" x="421" y="48">enqueue id</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow" d="M240 86 L158 86"/>
+              <text class="label ok" x="195" y="122">202 + job_id</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow" d="M600 70 L642 70"/>
+              <path class="arrow" d="M650 100 L388 262"/>
+              <text class="label small" x="560" y="160">status=RUNNING, 40%...</text>
+            </g>
+            <g data-step="5">
+              <path class="arrow" d="M715 100 L715 242"/>
+              <text class="label small" x="760" y="175">PUT file</text>
+              <path class="arrow" d="M650 285 L388 285"/>
+              <text class="label small" x="520" y="275">DONE + result_url</text>
+            </g>
+            <g data-step="6">
+              <path class="arrow" d="M85 100 L85 200 L232 270"/>
+              <text class="label small" x="120" y="215">GET /jobs/42</text>
+              <text class="label ok" x="120" y="236">or webhook / push</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Request.</b> The client asks for the slow thing, ideally with an <b>idempotency key</b> so a double-click does not create two jobs.</li>
+            <li><b>Record, then enqueue.</b> The API writes a job row (<code>QUEUED</code>) and puts the job ID on a durable queue. Store the job first so it can never be "on the queue but unknown".</li>
+            <li><b>Answer fast.</b> The API returns <code>202 Accepted</code> with the job ID and a status URL, in milliseconds. The connection is free.</li>
+            <li><b>Work.</b> A free worker pulls the job, marks it <code>RUNNING</code>, and updates progress as it goes.</li>
+            <li><b>Finish.</b> Big outputs go to a blob store; the job row gets <code>DONE</code> and a pointer (URL) to the result, never the bytes themselves.</li>
+            <li><b>Tell the user.</b> The client polls <code>GET /jobs/42</code>, or the system pushes: SSE/WebSocket, a mobile push, an email, or a webhook to a partner server.</li>
+          </ol>
+        </div>
+
+        <p>Now each tier scales on its own. Web servers scale with request rate. Workers scale with <b>queue depth</b> or <b>age of the oldest message</b>. Heavy work can run on different hardware (GPUs for transcoding, big-memory boxes for reports) without touching the web tier. And the queue absorbs bursts: 10,000 jobs can arrive in a minute while 50 workers chew through them.</p>
+
+<pre><code class="language-json">// POST /v1/reports   Idempotency-Key: 7f1c...   -&gt;  202 Accepted
+{ "job_id": "job_42", "status": "QUEUED", "status_url": "/v1/jobs/job_42" }
+
+// GET /v1/jobs/job_42   (poll every 2-5 s, or long-poll)
+{ "job_id": "job_42", "status": "RUNNING", "progress": 0.4, "attempt": 1 }
+
+// later
+{ "job_id": "job_42", "status": "SUCCEEDED",
+  "result_url": "https://files.example.com/r/job_42.pdf?sig=...", "expires_in": 3600 }</code></pre>
+
+<pre><code class="language-sql">CREATE TABLE jobs (
+  job_id          TEXT PRIMARY KEY,
+  owner_id        TEXT NOT NULL,
+  type            TEXT NOT NULL,          -- 'report', 'transcode', ...
+  idempotency_key TEXT UNIQUE,            -- dedupe client retries
+  status          TEXT NOT NULL,          -- QUEUED | RUNNING | SUCCEEDED | FAILED | CANCELLED
+  attempt         INT  NOT NULL DEFAULT 0,
+  progress        REAL,
+  lease_owner     TEXT,                   -- which worker holds it
+  lease_until     TIMESTAMPTZ,            -- heartbeat pushes this forward
+  result_url      TEXT,
+  error           TEXT,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+
+        <h3>Rung 4: make it survive crashes - leases, heartbeats, retries, DLQ</h3>
+        <p>Rung 3 still has a hole. A worker pulls job 42 and then the machine loses power. Who notices? The answer is a <b><a href="{{BASE}}interview/glossary#lease">lease</a></b>: when a worker takes a job, the job becomes invisible to everyone else for a limited time only. If the worker finishes, it deletes (acks) the job. If it dies, the lease runs out and the job reappears for another worker.</p>
+        <p>Amazon SQS calls this the <b>visibility timeout</b>. Its documentation gives the numbers: the default is 30 seconds, you can extend it per message with <code>ChangeMessageVisibility</code>, and the total cannot go past 12 hours from the first receive. For long or unpredictable work AWS recommends a <b><a href="{{BASE}}interview/glossary#heartbeat">heartbeat</a></b>: while the job is still running, the worker keeps extending the timeout a little at a time, instead of setting one huge timeout up front. A huge timeout means a dead worker's job sits invisible for hours.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Visibility timeout: a job taken by a crashed worker reappears in the queue after the lease expires and is picked up by another worker">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone queue" x="20" y="30" width="250" height="240"/>
+            <text class="zone-label" x="36" y="54">Queue</text>
+            <rect class="box queue" x="45" y="80" width="200" height="44"/>
+            <text class="label" x="145" y="102">job 42 (visible)</text>
+            <rect class="box ghost" x="45" y="150" width="200" height="44"/>
+            <text class="label muted" x="145" y="172">job 42 (invisible, leased)</text>
+            <text class="label small" x="145" y="226">lease = 30 s, extended</text>
+            <text class="label small" x="145" y="246">by heartbeats</text>
+
+            <rect class="box fail" x="530" y="40" width="230" height="60"/>
+            <text class="label bad" x="645" y="62">Worker A</text>
+            <text class="label small" x="645" y="84">crashed at 40%</text>
+            <rect class="box k8s" x="530" y="200" width="230" height="60"/>
+            <text class="label" x="645" y="222">Worker B</text>
+            <text class="label small" x="645" y="244">picks it up after lease expires</text>
+
+            <path class="arrow" d="M245 95 L522 70"/>
+            <text class="label small" x="390" y="66">1. receive</text>
+            <path class="arrow" d="M245 172 L400 172"/>
+            <text class="label small" x="460" y="150">2. no heartbeat</text>
+            <text class="label small" x="460" y="168">3. lease expires</text>
+            <path class="arrow" d="M245 110 L522 225"/>
+            <text class="label small" x="390" y="200">4. receive again</text>
+
+            <circle class="packet" r="6"><animateMotion dur="6s" repeatCount="indefinite" path="M245 100 L530 70 L530 70 L245 172 L245 110 L530 228"/></circle>
+          </svg>
+          <figcaption>The lease is the safety net. A dead worker cannot hold a job forever, because the lease runs out and the job is handed to someone else. The dot is job 42 taking that trip on a loop.</figcaption>
+        </figure>
+
+        <p>Leases bring the next problem: <b>the same job can run twice</b>. Worker A may only be slow (a long GC pause, a network blip), not dead. Its lease expires, Worker B starts, then A wakes up and also finishes. SQS says it plainly: delivery is <a href="{{BASE}}interview/glossary#at-least-once">at-least-once</a>, and even the visibility timeout does not guarantee a message is never delivered twice. So the rule is: <b>every job handler must be <a href="{{BASE}}interview/glossary#idempotent">idempotent</a></b> (safe to run twice). Dropbox's task framework (ATF) says the same about its task functions. Three ways to get there:</p>
+        <ol class="steps">
+          <li><strong>Deterministic output names.</strong> Write the result to <code>s3://reports/job_42.pdf</code>, not a random name. A second run just overwrites the same object.</li>
+          <li><strong>Conditional state changes.</strong> <code>UPDATE jobs SET status='SUCCEEDED' WHERE job_id=? AND status='RUNNING' AND lease_owner=?</code>. Only the worker that still owns the lease can finish the job. This is a <b>fencing</b> check.</li>
+          <li><strong>Dedupe side effects.</strong> For "send email" or "charge card", record the job ID (or an <a href="{{BASE}}interview/glossary#idempotency-key">idempotency key</a>) with the side effect, and skip it if it is already there.</li>
+        </ol>
+        <p>Dropbox adds a nice trick for the "slow, not dead" case: an ATF executor sends heartbeats while running, and if three heartbeats in a row fail it <b>kills itself</b>. The heartbeat timeout on the server side is set longer than that window, so the task is only handed to a new executor after the old one has surely stopped.</p>
+
+        <p><b>Retries with backoff.</b> Most failures are temporary (a dependency is down for 20 seconds). Retry, but wait longer each time and add random jitter so a thousand failed jobs do not all retry in the same second. Temporal's default activity retry policy is a good reference: first retry after 1 s, multiply by 2.0 each time, cap the wait at 100 s, and no attempt limit by default.</p>
+        <p><b>Dead-letter queue.</b> Some jobs will never succeed - a corrupt file, a bug for one input. These are <b>poison messages</b>. Without a limit they loop forever and burn worker time. SQS uses a <b>redrive policy</b> with <code>maxReceiveCount</code>: after a message has been received that many times without being deleted, it moves to the DLQ. The AWS Builders' Library advice is to alarm on <i>any</i> message in a DLQ, because it means a bug, and to redrive the messages back after the fix. One gotcha from the SQS docs: for standard queues the expiry clock keeps the original enqueue time, so set the DLQ retention longer than the source queue's, or messages vanish before you look.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A visibility timeout is a <b>retransmission timer</b>. TCP does not know if a segment was lost or just slow, so when the timer fires it resends, and the receiver must cope with duplicates using sequence numbers. Here, the queue does not know if the worker died or is just slow, so it redelivers, and your handler copes with duplicates using the job ID. The worker heartbeat is a <b>watchdog</b> on an HA control card: miss three kicks and you are considered dead, and the standby takes over. The "kill yourself after three missed heartbeats" rule is exactly STONITH from clustering: make sure the old owner is really gone before the new one acts.</p>
+        </div>
+
+        <h3>Rung 5: many steps, hours long - use a workflow engine</h3>
+        <p>Some "jobs" are really a chain: upload, then scan for viruses, then transcode into 4 resolutions in parallel, then make thumbnails, then publish, then notify followers. If step 4 fails after 30 minutes, you do not want to redo steps 1-3. You could build this from queues, a state column per step and lots of glue code. Or you use a <b>durable execution</b> engine like <b>Temporal</b> or <b>AWS Step Functions</b>.</p>
+        <p>Temporal's docs describe the idea: the workflow is ordinary code, and every completed step (an <b>activity</b>) is recorded in an <b>event history</b>. If the worker running the workflow crashes, a new worker re-runs the code from the start and <b>replays</b> the history: finished activities return their recorded results instead of running again, so the workflow continues exactly where it stopped. Executions can run for days or years. The price: workflow code must be deterministic (no reading the clock or random numbers directly), and you run or rent another piece of infrastructure. SQS also hints at this rung: if a task needs more than the 12-hour visibility limit, AWS suggests Step Functions or splitting the task into smaller steps. The full story of <a href="{{BASE}}interview/glossary#saga">sagas</a> and compensation is on <a href="{{BASE}}hld/p03">Multi-step Processes</a>.</p>
+        <div class="callout tip"><p><b>Rule of thumb:</b> one step, minutes long, retry-safe: queue + workers (rung 4). Several dependent steps, hours long, needs "resume where it stopped" or human approval in the middle: workflow engine (rung 5). Say both, and pick based on the question.</p></div>
+      

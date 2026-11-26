@@ -1,0 +1,563 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java is split by concern: model and listener types, the rules, one auction, the house, and a demo driver with checks. Python and C++14 follow the same design. The Java <code>Main</code> runs both Flipkart samples, the preferred-buyer bonus, an English auction, the deadline, the errors, a real timer and an 8-thread race.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java: Model.java">
+<pre><code class="language-java">import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** A registered buyer. pastAuctions counts closed auctions the buyer took part in (for "preferred"). */
+final class Buyer {
+    final String name;
+    private final AtomicInteger pastAuctions = new AtomicInteger();
+    Buyer(String name) { this.name = name; }
+    int pastAuctions() { return pastAuctions.get(); }
+    void recordParticipation() { pastAuctions.incrementAndGet(); }
+    boolean isPreferred() { return pastAuctions.get() &gt; 2; }   // "more than 2 auctions in the past"
+}
+
+final class Seller {
+    final String name;
+    Seller(String name) { this.name = name; }
+}
+
+/** One live bid. Immutable: an update replaces the object. seq orders bids for "who bid first". */
+final class Bid {
+    final String buyer;
+    final long amount;      // whole rupees
+    final long seq;
+    Bid(String buyer, long amount, long seq) { this.buyer = buyer; this.amount = amount; this.seq = seq; }
+    @Override public String toString() { return buyer + "@" + amount; }
+}
+
+enum AuctionStatus { OPEN, CLOSED }
+
+/** What close() returns. winner is empty when nobody wins. */
+final class AuctionResult {
+    final String auctionId;
+    final Optional&lt;Bid&gt; winner;
+    final long sellerProfitPaise;
+    AuctionResult(String auctionId, Optional&lt;Bid&gt; winner, long sellerProfitPaise) {
+        this.auctionId = auctionId; this.winner = winner; this.sellerProfitPaise = sellerProfitPaise;
+    }
+    @Override public String toString() {
+        return auctionId + ": " + winner.map(b -&gt; "winner " + b.buyer + " at " + b.amount).orElse("no winner")
+                + ", seller profit " + Money.format(sellerProfitPaise);
+    }
+}
+
+/** Observer: everything is a default no-op so a listener overrides only what it needs. */
+interface AuctionListener {
+    default void onBid(String auctionId, Bid bid) {}
+    default void onOutbid(String auctionId, String buyer, long newHighest) {}
+    default void onWithdraw(String auctionId, String buyer) {}
+    default void onClosed(AuctionResult result) {}
+}
+
+final class Money {
+    private Money() {}
+    /** paise -&gt; "-12.40" */
+    static String format(long paise) {
+        String sign = paise &lt; 0 ? "-" : "";
+        long p = Math.abs(paise);
+        return String.format("%s%d.%02d", sign, p / 100, p % 100);
+    }
+}
+
+class AuctionException extends RuntimeException {
+    private static final long serialVersionUID = 1L;
+    AuctionException(String msg) { super(msg); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Rules.java">
+<pre><code class="language-java">import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.function.Predicate;
+
+/**
+ * Strategy: the rules of one auction type. validate() runs under the auction's lock with the
+ * current best bid, so "must beat the highest bid" is checked and applied atomically.
+ */
+interface AuctionRules {
+    void validate(long amount, long low, long high, Optional&lt;Bid&gt; currentBest);
+    Optional&lt;Bid&gt; pickWinner(Collection&lt;Bid&gt; bids, Predicate&lt;String&gt; isPreferred);
+    boolean allowsWithdraw();
+    default Optional&lt;Bid&gt; best(Collection&lt;Bid&gt; bids) { return Optional.empty(); }
+    String name();
+}
+
+/** Flipkart "FooBar": sealed bids in [low, high]; winner = highest amount that only one buyer bid. */
+final class HighestUniqueBidRules implements AuctionRules {
+    @Override public void validate(long amount, long low, long high, Optional&lt;Bid&gt; currentBest) {
+        if (amount &lt; low || amount &gt; high)
+            throw new AuctionException("bid " + amount + " outside limits [" + low + ", " + high + "]");
+    }
+
+    @Override public Optional&lt;Bid&gt; pickWinner(Collection&lt;Bid&gt; bids, Predicate&lt;String&gt; isPreferred) {
+        TreeMap&lt;Long, List&lt;Bid&gt;&gt; byAmount = new TreeMap&lt;&gt;();
+        for (Bid b : bids) byAmount.computeIfAbsent(b.amount, k -&gt; new ArrayList&lt;&gt;()).add(b);
+        for (Map.Entry&lt;Long, List&lt;Bid&gt;&gt; e : byAmount.descendingMap().entrySet()) {
+            List&lt;Bid&gt; same = e.getValue();
+            if (same.size() == 1) return Optional.of(same.get(0));
+            // Bonus rule: on a tie, exactly one preferred buyer wins; otherwise fall to the next amount.
+            List&lt;Bid&gt; preferred = new ArrayList&lt;&gt;();
+            for (Bid b : same) if (isPreferred.test(b.buyer)) preferred.add(b);
+            if (preferred.size() == 1) return Optional.of(preferred.get(0));
+        }
+        return Optional.empty();
+    }
+
+    @Override public boolean allowsWithdraw() { return true; }
+    @Override public String name() { return "highest-unique"; }
+}
+
+/** English (open, ascending) auction: each bid must beat the current best by minIncrement. */
+final class EnglishAuctionRules implements AuctionRules {
+    private final long minIncrement;
+    EnglishAuctionRules(long minIncrement) { this.minIncrement = minIncrement; }
+
+    @Override public void validate(long amount, long low, long high, Optional&lt;Bid&gt; currentBest) {
+        long floor = currentBest.map(b -&gt; b.amount + minIncrement).orElse(low);
+        if (amount &lt; floor) throw new AuctionException("bid " + amount + " must be at least " + floor);
+        if (amount &gt; high) throw new AuctionException("bid " + amount + " above cap " + high);
+    }
+
+    @Override public Optional&lt;Bid&gt; pickWinner(Collection&lt;Bid&gt; bids, Predicate&lt;String&gt; isPreferred) {
+        return best(bids);
+    }
+
+    @Override public Optional&lt;Bid&gt; best(Collection&lt;Bid&gt; bids) {
+        Bid top = null;
+        for (Bid b : bids)
+            if (top == null || b.amount &gt; top.amount || (b.amount == top.amount &amp;&amp; b.seq &lt; top.seq)) top = b;
+        return Optional.ofNullable(top);
+    }
+
+    @Override public boolean allowsWithdraw() { return false; }   // open bids are binding
+    @Override public String name() { return "english+" + minIncrement; }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Auction.java">
+<pre><code class="language-java">import java.time.Clock;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Predicate;
+
+/**
+ * One auction. All state changes happen under one per-auction lock, so bids on different
+ * auctions never contend. Methods return what happened; the caller notifies listeners
+ * AFTER the lock is released (never call foreign code while holding a lock).
+ */
+final class Auction {
+    /** What a successful bid did: the stored bid, and who (if anyone) lost the lead. */
+    static final class BidOutcome {
+        final Bid bid; final String outbid;
+        BidOutcome(Bid bid, String outbid) { this.bid = bid; this.outbid = outbid; }
+    }
+
+    final String id;
+    final Seller seller;
+    final long low, high, participationCost;   // rupees
+    final AuctionRules rules;
+    private final Clock clock;
+    private final Instant endsAt;                  // null = closed by hand only
+
+    private final ReentrantLock lock = new ReentrantLock();
+    private AuctionStatus status = AuctionStatus.OPEN;
+    private final Map&lt;String, Bid&gt; live = new LinkedHashMap&lt;&gt;();       // buyer -&gt; current bid
+    private final Set&lt;String&gt; participants = new LinkedHashSet&lt;&gt;();    // paid the participation cost
+    private final List&lt;Bid&gt; history = new ArrayList&lt;&gt;();
+    private long nextSeq = 1;
+    private AuctionResult result;
+
+    Auction(String id, Seller seller, long low, long high, long participationCost,
+            AuctionRules rules, Clock clock, Instant endsAt) {
+        if (low &lt;= 0 || high &lt; low) throw new AuctionException("bad bid limits [" + low + ", " + high + "]");
+        if (participationCost &lt; 0) throw new AuctionException("negative participation cost");
+        this.id = id; this.seller = seller; this.low = low; this.high = high;
+        this.participationCost = participationCost; this.rules = rules; this.clock = clock; this.endsAt = endsAt;
+    }
+
+    /** create = true for CREATE_BID (must not exist), false for UPDATE_BID (must exist). */
+    BidOutcome bid(String buyer, long amount, boolean create) {
+        lock.lock();
+        try {
+            ensureOpen();
+            Bid mine = live.get(buyer);
+            if (create &amp;&amp; mine != null) throw new AuctionException(buyer + " already bid on " + id + "; use update");
+            if (!create &amp;&amp; mine == null) throw new AuctionException(buyer + " has no bid on " + id + " to update");
+            Optional&lt;Bid&gt; best = rules.best(live.values());
+            rules.validate(amount, low, high, best);
+            Bid b = new Bid(buyer, amount, nextSeq++);
+            live.put(buyer, b);
+            participants.add(buyer);
+            history.add(b);
+            String outbid = best.isPresent() &amp;&amp; !best.get().buyer.equals(buyer) ? best.get().buyer : null;
+            return new BidOutcome(b, outbid);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    void withdraw(String buyer) {
+        lock.lock();
+        try {
+            ensureOpen();
+            if (!rules.allowsWithdraw()) throw new AuctionException(rules.name() + " bids cannot be withdrawn");
+            if (live.remove(buyer) == null) throw new AuctionException(buyer + " has no bid on " + id);
+            // participants keeps the buyer: the participation cost is not refunded.
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Idempotent: the first caller (timer or user) closes; later callers get null. */
+    AuctionResult close(Predicate&lt;String&gt; isPreferred) {
+        lock.lock();
+        try {
+            if (status == AuctionStatus.CLOSED) return null;
+            status = AuctionStatus.CLOSED;
+            Optional&lt;Bid&gt; winner = rules.pickWinner(live.values(), isPreferred);
+            long share = participants.size() * participationCost * 20;          // 20% of cost, in paise
+            long profit = winner.map(w -&gt; w.amount * 100 + share - (low + high) * 50).orElse(share);
+            result = new AuctionResult(id, winner, profit);
+            return result;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private void ensureOpen() {
+        if (status != AuctionStatus.OPEN) throw new AuctionException("auction " + id + " is closed");
+        // The deadline is checked here too, so a late timer can never let a late bid in.
+        if (endsAt != null &amp;&amp; !clock.instant().isBefore(endsAt))
+            throw new AuctionException("auction " + id + " ended at " + endsAt);
+    }
+
+    AuctionStatus status() { lock.lock(); try { return status; } finally { lock.unlock(); } }
+    Instant endsAt() { return endsAt; }
+    Optional&lt;AuctionResult&gt; result() { lock.lock(); try { return Optional.ofNullable(result); } finally { lock.unlock(); } }
+    Set&lt;String&gt; participants() { lock.lock(); try { return new LinkedHashSet&lt;&gt;(participants); } finally { lock.unlock(); } }
+    List&lt;Bid&gt; history() { lock.lock(); try { return Collections.unmodifiableList(new ArrayList&lt;&gt;(history)); } finally { lock.unlock(); } }
+    Optional&lt;Bid&gt; best() { lock.lock(); try { return rules.best(live.values()); } finally { lock.unlock(); } }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: AuctionHouse.java">
+<pre><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Mediator + facade. Buyers and sellers never hold references to each other or to auctions:
+ * every request goes through the house, which validates who is asking, delegates to the
+ * auction and then tells the listeners (Observer) what happened.
+ */
+final class AuctionHouse implements AutoCloseable {
+    private final Map&lt;String, Buyer&gt; buyers = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Seller&gt; sellers = new ConcurrentHashMap&lt;&gt;();
+    private final Map&lt;String, Auction&gt; auctions = new ConcurrentHashMap&lt;&gt;();
+    private final List&lt;AuctionListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private final Clock clock;
+    private final ScheduledExecutorService timer;
+
+    AuctionHouse(Clock clock) {
+        this.clock = clock;
+        this.timer = Executors.newSingleThreadScheduledExecutor(r -&gt; {
+            Thread t = new Thread(r, "auction-timer");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    void addListener(AuctionListener l) { listeners.add(l); }
+
+    void addBuyer(String name) {
+        if (buyers.putIfAbsent(name, new Buyer(name)) != null) throw new AuctionException("buyer exists: " + name);
+    }
+
+    void addSeller(String name) {
+        if (sellers.putIfAbsent(name, new Seller(name)) != null) throw new AuctionException("seller exists: " + name);
+    }
+
+    /** duration == null means the auction is closed by hand. */
+    Auction createAuction(String id, long low, long high, long cost, String sellerName,
+                          AuctionRules rules, Duration duration) {
+        Seller s = sellers.get(sellerName);
+        if (s == null) throw new AuctionException("unknown seller " + sellerName);
+        Instant endsAt = duration == null ? null : clock.instant().plus(duration);
+        Auction a = new Auction(id, s, low, high, cost, rules, clock, endsAt);
+        if (auctions.putIfAbsent(id, a) != null) throw new AuctionException("auction exists: " + id);
+        if (duration != null)
+            timer.schedule(() -&gt; close(id), duration.toMillis(), TimeUnit.MILLISECONDS);
+        return a;
+    }
+
+    Bid createBid(String buyer, String auctionId, long amount) { return bid(buyer, auctionId, amount, true); }
+    Bid updateBid(String buyer, String auctionId, long amount) { return bid(buyer, auctionId, amount, false); }
+
+    private Bid bid(String buyer, String auctionId, long amount, boolean create) {
+        requireBuyer(buyer);
+        Auction.BidOutcome out = auction(auctionId).bid(buyer, amount, create);
+        for (AuctionListener l : listeners) {                 // outside the auction lock
+            l.onBid(auctionId, out.bid);
+            if (out.outbid != null) l.onOutbid(auctionId, out.outbid, out.bid.amount);
+        }
+        return out.bid;
+    }
+
+    void withdrawBid(String buyer, String auctionId) {
+        requireBuyer(buyer);
+        auction(auctionId).withdraw(buyer);
+        for (AuctionListener l : listeners) l.onWithdraw(auctionId, buyer);
+    }
+
+    /** Manual close or timer close; only the first one wins. Returns the (single) result. */
+    AuctionResult close(String auctionId) {
+        Auction a = auction(auctionId);
+        AuctionResult r = a.close(name -&gt; buyers.get(name).isPreferred());
+        if (r == null) return a.result().orElseThrow(IllegalStateException::new);   // already closed
+        for (String p : a.participants()) buyers.get(p).recordParticipation();
+        for (AuctionListener l : listeners) l.onClosed(r);
+        return r;
+    }
+
+    String profit(String sellerName, String auctionId) {
+        Auction a = auction(auctionId);
+        if (!a.seller.name.equals(sellerName)) throw new AuctionException(sellerName + " does not own " + auctionId);
+        return a.result().map(r -&gt; Money.format(r.sellerProfitPaise))
+                .orElseThrow(() -&gt; new AuctionException(auctionId + " is still open"));
+    }
+
+    Buyer buyer(String name) { return buyers.get(name); }
+
+    Auction auction(String id) {
+        Auction a = auctions.get(id);
+        if (a == null) throw new AuctionException("unknown auction " + id);
+        return a;
+    }
+
+    private void requireBuyer(String name) {
+        if (!buyers.containsKey(name)) throw new AuctionException("unknown buyer " + name);
+    }
+
+    @Override public void close() { timer.shutdownNow(); }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java: Main.java">
+<pre><code class="language-java">import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/** Demo driver + checks. Run: javac -d out *.java &amp;&amp; java -cp out Main */
+public class Main {
+    static int passed = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        passed++;
+    }
+
+    static void expectError(Runnable r, String what) {
+        try { r.run(); } catch (AuctionException e) { System.out.println("  rejected: " + e.getMessage()); passed++; return; }
+        throw new AssertionError("FAILED (no error): " + what);
+    }
+
+    /** A clock the test moves by hand, so deadlines are deterministic. */
+    static final class ManualClock extends Clock {
+        private volatile Instant now;
+        ManualClock(Instant start) { now = start; }
+        void advance(Duration d) { now = now.plus(d); }
+        @Override public Instant instant() { return now; }
+        @Override public ZoneId getZone() { return ZoneOffset.UTC; }
+        @Override public Clock withZone(ZoneId z) { return this; }
+    }
+
+    /** Observer that prints results and keeps a per-buyer inbox of "you were outbid" messages. */
+    static final class Notifier implements AuctionListener {
+        final List&lt;String&gt; inbox = new ArrayList&lt;&gt;();
+        final AtomicInteger closedEvents = new AtomicInteger();
+        @Override public synchronized void onOutbid(String a, String buyer, long newHighest) {
+            inbox.add(buyer + ": outbid on " + a + " (now " + newHighest + ")");
+        }
+        @Override public void onClosed(AuctionResult r) {
+            closedEvents.incrementAndGet();
+            System.out.println("  [notify] " + r);
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        ManualClock clock = new ManualClock(Instant.parse("2026-11-24T10:00:00Z"));
+        AuctionHouse house = new AuctionHouse(clock);
+        Notifier notifier = new Notifier();
+        house.addListener(notifier);
+        AuctionRules unique = new HighestUniqueBidRules();
+
+        System.out.println("== Test case 1 (Flipkart statement) ==");
+        for (String b : new String[] {"buyer1", "buyer2", "buyer3"}) house.addBuyer(b);
+        house.addSeller("seller1");
+        house.createAuction("A1", 10, 50, 1, "seller1", unique, null);
+        house.createBid("buyer1", "A1", 17);
+        house.createBid("buyer2", "A1", 15);
+        house.updateBid("buyer2", "A1", 19);
+        house.createBid("buyer3", "A1", 19);
+        AuctionResult r1 = house.close("A1");
+        check(r1.winner.get().buyer.equals("buyer1"), "A1 winner is buyer1 (19 is not unique)");
+        check(house.profit("seller1", "A1").equals("-12.40"), "A1 profit 17 + 3*0.2*1 - 30 = -12.40");
+        System.out.println("  profit(seller1, A1) = " + house.profit("seller1", "A1"));
+
+        System.out.println("== Test case 2 ==");
+        house.addSeller("seller2");
+        house.createAuction("A2", 5, 20, 2, "seller2", unique, null);
+        expectError(() -&gt; house.createBid("buyer3", "A2", 25), "25 is above the highest limit 20");
+        house.createBid("buyer2", "A2", 5);
+        house.withdrawBid("buyer2", "A2");
+        AuctionResult r2 = house.close("A2");
+        check(!r2.winner.isPresent(), "A2 has no winner");
+        check(house.profit("seller2", "A2").equals("0.40"), "A2 profit only from participation: 1*0.2*2");
+        System.out.println("  profit(seller2, A2) = " + house.profit("seller2", "A2"));
+
+        System.out.println("== Bonus: preferred buyer breaks a tie ==");
+        house.addBuyer("pat"); house.addBuyer("quinn"); house.addBuyer("rae");
+        for (int i = 3; i &lt;= 5; i++) {                     // pat takes part in 3 auctions
+            house.createAuction("A" + i, 10, 100, 1, "seller1", unique, null);
+            house.createBid("pat", "A" + i, 10 + i);
+            house.close("A" + i);
+        }
+        check(house.buyer("pat").isPreferred(), "pat has 3 past auctions -&gt; preferred");
+        house.createAuction("A6", 10, 100, 1, "seller1", unique, null);
+        house.createBid("pat", "A6", 40);
+        house.createBid("quinn", "A6", 40);
+        house.createBid("rae", "A6", 30);
+        check(house.close("A6").winner.get().buyer.equals("pat"), "tie at 40 goes to the only preferred buyer");
+
+        System.out.println("== English auction: outbid notifications, binding bids ==");
+        house.createAuction("E1", 100, 200, 0, "seller2", new EnglishAuctionRules(10), Duration.ofHours(1));
+        house.createBid("quinn", "E1", 100);
+        house.createBid("rae", "E1", 150);
+        expectError(() -&gt; house.updateBid("quinn", "E1", 155), "must beat 150 by the increment 10");
+        house.updateBid("quinn", "E1", 160);
+        expectError(() -&gt; house.withdrawBid("quinn", "E1"), "English bids are binding");
+        check(notifier.inbox.size() == 2, "two outbid messages: " + notifier.inbox);
+        notifier.inbox.forEach(m -&gt; System.out.println("  inbox " + m));
+
+        System.out.println("== Deadline: a late bid fails even before the timer fires ==");
+        clock.advance(Duration.ofMinutes(61));
+        expectError(() -&gt; house.updateBid("rae", "E1", 200), "E1 ended at 11:00");
+        AuctionResult e1 = house.close("E1");
+        check(e1.winner.get().buyer.equals("quinn") &amp;&amp; e1.winner.get().amount == 160, "E1 won by quinn at 160");
+        check(house.close("E1") == e1, "close is idempotent: same result object");
+        int closedBefore = notifier.closedEvents.get();
+        house.close("E1");
+        check(notifier.closedEvents.get() == closedBefore, "second close does not notify again");
+
+        System.out.println("== Errors ==");
+        expectError(() -&gt; house.createBid("mallory", "A1", 20), "unknown buyer");
+        expectError(() -&gt; house.createBid("rae", "A1", 20), "A1 is closed");
+        house.createAuction("A7", 10, 50, 1, "seller1", unique, null);
+        expectError(() -&gt; house.updateBid("rae", "A7", 20), "update before create");
+        house.createBid("rae", "A7", 20);
+        expectError(() -&gt; house.createBid("rae", "A7", 21), "create twice");
+        expectError(() -&gt; house.profit("seller2", "A7"), "seller2 does not own A7");
+        expectError(() -&gt; house.profit("seller1", "A7"), "A7 still open");
+        house.close();
+
+        System.out.println("== Timer closes the auction (real clock) ==");
+        try (AuctionHouse live = new AuctionHouse(Clock.systemUTC())) {
+            CountDownLatch closed = new CountDownLatch(1);
+            live.addListener(new AuctionListener() {
+                @Override public void onClosed(AuctionResult r) { System.out.println("  [timer] " + r); closed.countDown(); }
+            });
+            live.addSeller("s"); live.addBuyer("x"); live.addBuyer("y");
+            live.createAuction("T1", 10, 100, 5, "s", unique, Duration.ofMillis(150));
+            live.createBid("x", "T1", 30);
+            live.createBid("y", "T1", 40);
+            check(closed.await(2, TimeUnit.SECONDS), "timer closed T1");
+            check(live.auction("T1").status() == AuctionStatus.CLOSED, "T1 status CLOSED");
+            check(live.profit("s", "T1").equals("-13.00"), "T1 profit 40 + 2*0.2*5 - (10+100)/2 = -13.00");
+        }
+
+        System.out.println("== Concurrency: 8 threads race on one English auction ==");
+        try (AuctionHouse h = new AuctionHouse(Clock.systemUTC())) {
+            h.addSeller("s");
+            Auction race = h.createAuction("R1", 1, 1_000_000, 0, "s", new EnglishAuctionRules(5), null);
+            int threads = 8;
+            AtomicInteger accepted = new AtomicInteger(), rejected = new AtomicInteger();
+            List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+            CountDownLatch start = new CountDownLatch(1);
+            for (int t = 0; t &lt; threads; t++) {
+                String name = "bot" + t;
+                h.addBuyer(name);
+                ts.add(new Thread(() -&gt; {
+                    try { start.await(); } catch (InterruptedException e) { return; }
+                    for (int i = 0; i &lt; 500; i++) {
+                        long next = race.best().map(b -&gt; b.amount + 5).orElse(1L);   // read, then try to beat it
+                        try {
+                            if (race.history().stream().anyMatch(b -&gt; b.buyer.equals(name))) h.updateBid(name, "R1", next);
+                            else h.createBid(name, "R1", next);
+                            accepted.incrementAndGet();
+                        } catch (AuctionException e) { rejected.incrementAndGet(); }  // someone beat us first
+                    }
+                }));
+            }
+            ts.forEach(Thread::start);
+            start.countDown();
+            for (Thread t : ts) t.join();
+            List&lt;Bid&gt; log = race.history();
+            boolean increasing = true;
+            for (int i = 1; i &lt; log.size(); i++) increasing &amp;= log.get(i).amount &gt;= log.get(i - 1).amount + 5;
+            AuctionResult rr = h.close("R1");
+            check(log.size() == accepted.get(), "every accepted bid is in the log exactly once");
+            check(increasing, "accepted bids strictly increase by &gt;= 5 (no lost update)");
+            check(rr.winner.get().amount == log.get(log.size() - 1).amount, "winner = last accepted bid");
+            System.out.println("  accepted " + accepted.get() + ", rejected as stale " + rejected.get()
+                    + ", winner " + rr.winner.get());
+        }
+        System.out.println("checks passed: " + passed);
+    }
+}</code></pre>
+    </div>
+  </div>
+  

@@ -1,0 +1,445 @@
+
+  <h2>Run it: Java, C++ and Python</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-singleton-immutability/</code>, followed by its real output: the singleton idioms, immutable values with defensive copies, and a copy-on-write config swapped through one reference.</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">// Thread-safe singletons, immutability and copy-on-write. Java 21.
+// Build and run:  javac SafePublicationDemo.java &amp;&amp; java SafePublicationDemo
+import java.util.ArrayList;
+import java.util.ConcurrentModificationException;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+
+public class SafePublicationDemo {
+
+    static final AtomicInteger constructed = new AtomicInteger();
+
+    // ---- BROKEN: double-checked locking WITHOUT volatile (shown for teaching, never use) ----
+    static class BrokenDcl {
+        private static BrokenDcl instance;          // not volatile: the bug
+        private int port;
+        private BrokenDcl() { port = 8080; }
+        static BrokenDcl get() {
+            if (instance == null) {                 // 1st check, no lock: may see a half-built object
+                synchronized (BrokenDcl.class) {
+                    if (instance == null) instance = new BrokenDcl();
+                }
+            }
+            return instance;
+        }
+    }
+
+    // ---- FIX 1: DCL with volatile ----
+    static class VolatileDcl {
+        private static volatile VolatileDcl instance;
+        private final int port;
+        private VolatileDcl() { constructed.incrementAndGet(); port = 8080; }
+        static VolatileDcl get() {
+            VolatileDcl local = instance;           // one volatile read on the fast path
+            if (local == null) {
+                synchronized (VolatileDcl.class) {
+                    local = instance;
+                    if (local == null) instance = local = new VolatileDcl();
+                }
+            }
+            return local;
+        }
+    }
+
+    // ---- FIX 2: initialization-on-demand holder ----
+    static class HolderSingleton {
+        private HolderSingleton() { constructed.incrementAndGet(); }
+        private static class Holder { static final HolderSingleton INSTANCE = new HolderSingleton(); }
+        static HolderSingleton get() { return Holder.INSTANCE; }   // class init runs once, under a JVM lock
+    }
+
+    // ---- FIX 3: enum ----
+    enum EnumSingleton {
+        INSTANCE;
+        EnumSingleton() { constructed.incrementAndGet(); }
+    }
+
+    // ---- Immutable value object ----
+    record Money(long paise, String currency) {
+        Money {                                    // compact constructor validates once
+            if (paise &lt; 0) throw new IllegalArgumentException("negative");
+            if (currency == null || currency.length() != 3) throw new IllegalArgumentException("currency");
+        }
+        Money plus(Money o) {                      // "modify" = return a new object
+            if (!currency.equals(o.currency)) throw new IllegalArgumentException("mixed currency");
+            return new Money(paise + o.paise, currency);
+        }
+    }
+
+    // ---- Immutable class with a collection: defensive copies in and out ----
+    static final class Route {
+        private final String id;
+        private final List&lt;String&gt; stops;
+        Route(String id, List&lt;String&gt; stops) {
+            this.id = id;
+            this.stops = List.copyOf(stops);        // copy in: caller's list can change later, ours cannot
+        }
+        List&lt;String&gt; stops() { return stops; }     // already unmodifiable, safe to hand out
+        Route withStop(String s) {
+            List&lt;String&gt; next = new ArrayList&lt;&gt;(stops);
+            next.add(s);
+            return new Route(id, next);
+        }
+    }
+
+    // ---- Copy-on-write config: readers never lock, writers swap a new immutable snapshot ----
+    record Config(int version, Map&lt;String, String&gt; values) {
+        Config { values = Map.copyOf(values); }
+        Config with(String k, String v) {
+            Map&lt;String, String&gt; m = new HashMap&lt;&gt;(values);
+            m.put(k, v);
+            return new Config(version + 1, m);
+        }
+    }
+    static final class ConfigStore {
+        private final AtomicReference&lt;Config&gt; current = new AtomicReference&lt;&gt;(new Config(0, Map.of()));
+        Config snapshot() { return current.get(); }                    // one volatile read, no lock
+        void put(String k, String v) { current.updateAndGet(c -&gt; c.with(k, v)); }   // CAS loop, retries on clash
+    }
+
+    static int distinct(Supplier&lt;Object&gt; s) throws InterruptedException {
+        Set&lt;Object&gt; seen = ConcurrentHashMap.newKeySet();
+        CountDownLatch go = new CountDownLatch(1);
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 32; i++) ts.add(Thread.ofPlatform().start(() -&gt; {
+            try { go.await(); } catch (InterruptedException e) { return; }
+            seen.add(s.get());
+        }));
+        go.countDown();
+        for (Thread t : ts) t.join();
+        return seen.size();
+    }
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("BrokenDcl compiles and usually 'works' on x86: port=" + BrokenDcl.get().port
+                + " (the bug is a reordering the JMM allows, not something a quick test proves)");
+        System.out.println("volatile DCL distinct objects = " + distinct(VolatileDcl::get));
+        System.out.println("holder distinct objects       = " + distinct(HolderSingleton::get));
+        System.out.println("enum distinct objects         = " + distinct(() -&gt; EnumSingleton.INSTANCE));
+        System.out.println("constructors run in total     = " + constructed.get() + " (expect 3: one per idiom)");
+
+        Money a = new Money(10_000, "INR");
+        Money b = a.plus(new Money(2_500, "INR"));
+        System.out.println("Money a=" + a.paise() + " b=" + b.paise() + " (a unchanged)");
+
+        List&lt;String&gt; mine = new ArrayList&lt;&gt;(List.of("BLR", "HYD"));
+        Route r = new Route("R1", mine);
+        mine.add("DEL");                              // caller mutates its own list afterwards
+        System.out.println("route stops after caller edit = " + r.stops() + " (still 2: we copied)");
+        try { r.stops().add("PUNE"); } catch (UnsupportedOperationException e) {
+            System.out.println("route.stops().add -&gt; UnsupportedOperationException (cannot mutate)");
+        }
+        System.out.println("withStop gives a new route: " + r.withStop("PUNE").stops());
+
+        ConfigStore store = new ConfigStore();
+        AtomicBoolean torn = new AtomicBoolean();
+        AtomicBoolean stop = new AtomicBoolean();
+        Thread reader = Thread.ofPlatform().start(() -&gt; {
+            while (!stop.get()) {
+                Config c = store.snapshot();
+                if (c.version() != c.values().size()) torn.set(true);   // invariant of every snapshot
+            }
+        });
+        List&lt;Thread&gt; writers = new ArrayList&lt;&gt;();
+        for (int w = 0; w &lt; 4; w++) {
+            final int id = w;
+            writers.add(Thread.ofPlatform().start(() -&gt; {
+                for (int i = 0; i &lt; 250; i++) store.put("k" + id + "-" + i, "v");
+            }));
+        }
+        for (Thread t : writers) t.join();
+        stop.set(true);
+        reader.join();
+        Config fin = store.snapshot();
+        System.out.println("COW config: version=" + fin.version() + " keys=" + fin.values().size()
+                + " (expect 1000, no lost update), reader saw a torn snapshot = " + torn.get());
+
+        List&lt;String&gt; plain = new ArrayList&lt;&gt;(List.of("a", "b"));
+        try {
+            for (String s : plain) if (s.equals("a")) plain.add("c");
+        } catch (ConcurrentModificationException e) {
+            System.out.println("ArrayList: add during iteration -&gt; ConcurrentModificationException");
+        }
+        List&lt;Runnable&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+        AtomicInteger calls = new AtomicInteger();
+        listeners.add(calls::incrementAndGet);
+        listeners.add(calls::incrementAndGet);
+        for (Runnable l : listeners) { l.run(); listeners.add(calls::incrementAndGet); }  // iterates the old snapshot
+        System.out.println("CopyOnWriteArrayList: iterated 2 listeners while adding, now size=" + listeners.size()
+                + ", calls=" + calls.get());
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out SafePublicationDemo.java &amp;&amp; java -cp out SafePublicationDemo
+BrokenDcl compiles and usually 'works' on x86: port=8080 (the bug is a reordering the JMM allows, not something a quick test proves)
+volatile DCL distinct objects = 1
+holder distinct objects       = 1
+enum distinct objects         = 1
+constructors run in total     = 3 (expect 3: one per idiom)
+Money a=10000 b=12500 (a unchanged)
+route stops after caller edit = [BLR, HYD] (still 2: we copied)
+route.stops().add -&gt; UnsupportedOperationException (cannot mutate)
+withStop gives a new route: [BLR, HYD, PUNE]
+COW config: version=1000 keys=1000 (expect 1000, no lost update), reader saw a torn snapshot = false
+ArrayList: add during iteration -&gt; ConcurrentModificationException
+CopyOnWriteArrayList: iterated 2 listeners while adding, now size=4, calls=2</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Thread-safe one-time init and copy-on-write snapshots in C++14.
+// Build and run:  g++ -std=c++14 -O2 -Wall -pthread once.cpp -o once &amp;&amp; ./once
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+#include &lt;atomic&gt;
+#include &lt;cstdio&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;set&gt;
+#include &lt;string&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+std::atomic&lt;int&gt; built(0);
+
+// 1. Meyers singleton: C++11 guarantees a function-local static is initialised once ("magic statics").
+struct Registry {
+    static Registry&amp; get() { static Registry r; return r; }
+    Registry(const Registry&amp;) = delete;
+    Registry&amp; operator=(const Registry&amp;) = delete;
+private:
+    Registry() { ++built; }
+};
+
+// 2. std::call_once: one-time init of something that is not a local static (like pthread_once).
+struct Driver { int irq; };
+std::once_flag driver_once;
+Driver* driver = nullptr;
+Driver&amp; get_driver() {
+    std::call_once(driver_once, [] { driver = new Driver{42}; ++built; });
+    return *driver;
+}
+
+// 3. DCL done right in C++: an atomic pointer with acquire/release ordering.
+struct Cache { int size = 128; };
+std::atomic&lt;Cache*&gt; cache_ptr(nullptr);
+std::mutex cache_mu;
+Cache* get_cache() {
+    Cache* p = cache_ptr.load(std::memory_order_acquire);   // pairs with the release store
+    if (!p) {
+        std::lock_guard&lt;std::mutex&gt; g(cache_mu);
+        p = cache_ptr.load(std::memory_order_relaxed);
+        if (!p) {
+            p = new Cache();                                // fully build first ...
+            ++built;
+            cache_ptr.store(p, std::memory_order_release);  // ... then publish
+        }
+    }
+    return p;
+}
+
+// 4. Copy-on-write config: readers grab a shared_ptr&lt;const Config&gt;, writers swap in a new one.
+//    std::atomic_load/atomic_store on shared_ptr exist since C++11 (C++20 adds atomic&lt;shared_ptr&gt;).
+struct Config {
+    int version;
+    std::map&lt;std::string, std::string&gt; values;
+};
+std::shared_ptr&lt;const Config&gt; current = std::make_shared&lt;const Config&gt;(Config{0, {}});
+std::mutex writer_mu;   // writers serialise among themselves; readers never take it
+
+std::shared_ptr&lt;const Config&gt; snapshot() { return std::atomic_load(&amp;current); }
+void put(const std::string&amp; k, const std::string&amp; v) {
+    std::lock_guard&lt;std::mutex&gt; g(writer_mu);
+    auto old = std::atomic_load(&amp;current);
+    auto next = std::make_shared&lt;Config&gt;(*old);   // copy ...
+    next-&gt;values[k] = v;                          // ... modify the copy ...
+    next-&gt;version = old-&gt;version + 1;
+    std::atomic_store(&amp;current, std::shared_ptr&lt;const Config&gt;(next));   // ... publish
+}
+
+int main() {
+    std::vector&lt;std::thread&gt; ts;
+    std::mutex seen_mu;
+    std::set&lt;const void*&gt; seen;
+    for (int i = 0; i &lt; 16; ++i)
+        ts.emplace_back([&amp;] {
+            const void* a = &amp;Registry::get();
+            const void* b = &amp;get_driver();
+            const void* c = get_cache();
+            std::lock_guard&lt;std::mutex&gt; g(seen_mu);
+            seen.insert(a); seen.insert(b); seen.insert(c);
+        });
+    for (auto&amp; t : ts) t.join();
+    ts.clear();
+    std::printf("distinct objects = %zu (expect 3), constructions = %d (expect 3)\n", seen.size(), built.load());
+
+    std::atomic&lt;bool&gt; stop(false), torn(false);
+    std::thread reader([&amp;] {
+        while (!stop) {
+            auto c = snapshot();                              // the old snapshot stays alive while we hold it
+            if (c-&gt;version != static_cast&lt;int&gt;(c-&gt;values.size())) torn = true;
+        }
+    });
+    for (int w = 0; w &lt; 4; ++w)
+        ts.emplace_back([w] { for (int i = 0; i &lt; 250; ++i) put("k" + std::to_string(w) + "-" + std::to_string(i), "v"); });
+    for (auto&amp; t : ts) t.join();
+    stop = true;
+    reader.join();
+    auto fin = snapshot();
+    std::printf("COW config version = %d, keys = %zu (expect 1000), torn snapshot seen = %s\n",
+                fin-&gt;version, fin-&gt;values.size(), torn ? "yes" : "no");
+    delete driver;
+    delete cache_ptr.load();
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread once.cpp -o once &amp;&amp; ./once
+distinct objects = 3 (expect 3), constructions = 3 (expect 3)
+COW config version = 1000, keys = 1000 (expect 1000), torn snapshot seen = no</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Thread-safe singleton, immutable values and copy-on-write config in Python 3.11.
+Run:  python immutability.py
+"""
+import threading
+from dataclasses import dataclass, FrozenInstanceError, replace
+from types import MappingProxyType
+
+
+class Settings:
+    """Double-checked singleton. In CPython the GIL hides most reordering, but the lock is still
+    needed: two threads can both pass the first check before either assigns."""
+    _instance = None
+    _lock = threading.Lock()
+    built = 0
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    obj = super().__new__(cls)
+                    Settings.built += 1
+                    cls._instance = obj
+        return cls._instance
+
+
+@dataclass(frozen=True)
+class Money:
+    paise: int
+    currency: str
+
+    def __post_init__(self):
+        if self.paise &lt; 0 or len(self.currency) != 3:
+            raise ValueError("bad money")
+
+    def plus(self, other: "Money") -&gt; "Money":
+        return replace(self, paise=self.paise + other.paise)
+
+
+@dataclass(frozen=True)
+class Config:
+    version: int
+    values: MappingProxyType          # read-only view over a private dict copy
+
+    @staticmethod
+    def empty():
+        return Config(0, MappingProxyType({}))
+
+    def with_(self, k, v):
+        d = dict(self.values)
+        d[k] = v
+        return Config(self.version + 1, MappingProxyType(d))
+
+
+class ConfigStore:
+    def __init__(self):
+        self._current = Config.empty()
+        self._write = threading.Lock()
+
+    def snapshot(self):
+        return self._current            # a single reference read: atomic in CPython
+
+    def put(self, k, v):
+        with self._write:               # writers serialise; readers never lock
+            self._current = self._current.with_(k, v)
+
+
+def main():
+    seen = set()
+    guard = threading.Lock()
+
+    def grab():
+        s = Settings()
+        with guard:
+            seen.add(id(s))
+
+    ts = [threading.Thread(target=grab) for _ in range(32)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    print("singleton distinct =", len(seen), "built =", Settings.built)
+
+    a = Money(10_000, "INR")
+    b = a.plus(Money(2_500, "INR"))
+    try:
+        a.paise = 1
+    except FrozenInstanceError:
+        print("frozen dataclass: assignment raises FrozenInstanceError")
+    print("a =", a.paise, "b =", b.paise)
+
+    store = ConfigStore()
+    stop = threading.Event()
+    torn = []
+
+    def reader():
+        while not stop.is_set():
+            c = store.snapshot()
+            if c.version != len(c.values):
+                torn.append(c.version)
+
+    r = threading.Thread(target=reader)
+    r.start()
+    ws = [threading.Thread(target=lambda w=w: [store.put(f"k{w}-{i}", "v") for i in range(250)]) for w in range(4)]
+    for t in ws:
+        t.start()
+    for t in ws:
+        t.join()
+    stop.set()
+    r.join()
+    fin = store.snapshot()
+    print("COW config version =", fin.version, "keys =", len(fin.values), "torn =", bool(torn))
+    try:
+        fin.values["x"] = "y"
+    except TypeError:
+        print("MappingProxyType: item assignment raises TypeError")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python immutability.py
+singleton distinct = 1 built = 1
+frozen dataclass: assignment raises FrozenInstanceError
+a = 10000 b = 12500
+COW config version = 1000 keys = 1000 torn = False
+MappingProxyType: item assignment raises TypeError</code></pre>
+    </div>
+  </div>

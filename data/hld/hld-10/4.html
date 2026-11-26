@@ -1,0 +1,75 @@
+
+        <h2>Transactional outbox and CDC</h2>
+        <p>The <strong>transactional outbox</strong> removes the dual write. In the <em>same local database transaction</em> that changes business data, the service inserts the event into an <code>outbox</code> table. Either both rows commit or neither does. A separate <strong>relay</strong> later reads the outbox and publishes to the broker, retrying until the broker acknowledges.</p>
+<pre><code class="language-sql">BEGIN;
+  INSERT INTO orders (id, user_id, total, status)
+       VALUES ('o-17', 'u-9', 499.00, 'PENDING');
+  INSERT INTO outbox (id, aggregatetype, aggregateid, type, payload)
+       VALUES ('7f3c...e1', 'Order', 'o-17', 'OrderCreated',
+               '{"orderId":"o-17","total":499.00}');
+COMMIT;</code></pre>
+        <p>The column names above are the ones Debezium's outbox router expects: <code>aggregatetype</code> picks the topic (Order events go to an <code>OrderEvents</code>-style topic), <code>aggregateid</code> becomes the Kafka message key so all events for one order land in one partition in order, and <code>id</code> is a unique event id consumers use to drop duplicates.</p>
+
+        <figure class="diagram zoomable">
+          <svg viewBox="0 0 900 300" role="img" aria-label="Outbox relayed by CDC into Kafka and consumers">
+            
+            <rect class="box svc" x="20" y="120" width="130" height="56"/><text class="label" x="85" y="145">Order service</text><text class="label small" x="85" y="165">1 local tx</text>
+            <rect class="zone db" x="185" y="40" width="210" height="220"/>
+            <text class="zone-label" x="199" y="62">Orders DB</text>
+            <rect class="box db" x="205" y="80" width="170" height="44"/><text class="label" x="290" y="107">orders</text>
+            <rect class="box db highlight" x="205" y="140" width="170" height="44"/><text class="label" x="290" y="167">outbox</text>
+            <rect class="box ghost" x="205" y="200" width="170" height="44"/><text class="label small" x="290" y="227">WAL / binlog</text>
+            <rect class="box queue" x="440" y="190" width="130" height="56"/><text class="label" x="505" y="215">Debezium</text><text class="label small" x="505" y="235">Kafka Connect</text>
+            <rect class="box kafka" x="610" y="120" width="120" height="56"/><text class="label" x="670" y="145">Kafka</text><text class="label small" x="670" y="165">key = order id</text>
+            <rect class="box svc" x="770" y="40" width="115" height="44"/><text class="label" x="827" y="67">Inventory</text>
+            <rect class="box svc" x="770" y="126" width="115" height="44"/><text class="label" x="827" y="153">Search</text>
+            <rect class="box svc" x="770" y="212" width="115" height="44"/><text class="label" x="827" y="239">Email</text>
+            <path class="arrow" d="M150 140 L199 104"/><path class="arrow" d="M150 156 L199 162"/>
+            <path class="arrow dashed" d="M375 222 L434 220"/>
+            <path class="arrow" d="M570 205 L604 165"/>
+            <path class="arrow" d="M730 135 L764 64"/><path class="arrow" d="M730 148 L764 148"/><path class="arrow" d="M730 162 L764 230"/>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M85 148 L290 162 L290 222 L505 218 L670 148 L827 62"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="4s" begin="2s" repeatCount="indefinite" path="M85 148 L290 162 L290 222 L505 218 L670 148 L827 234"/></circle>
+          </svg>
+          <figcaption>The service writes only to its own database. Debezium tails the transaction log, turns each outbox insert into a Kafka record keyed by the aggregate id, and consumers process it at least once.</figcaption>
+        </figure>
+
+        <h3>Two ways to run the relay</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th></th><th>Polling publisher</th><th>Log-based CDC (Debezium, DynamoDB Streams, Cosmos change feed)</th></tr></thead>
+            <tbody>
+              <tr><td>How</td><td><code>SELECT * FROM outbox WHERE sent = false ORDER BY id LIMIT 100</code>, publish, mark sent</td><td>Read the DB's replication log (Postgres WAL via logical decoding, MySQL binlog)</td></tr>
+              <tr><td>Latency</td><td>Poll interval (hundreds of ms to seconds)</td><td>Near real time</td></tr>
+              <tr><td>DB load</td><td>Extra queries and updates</td><td>Low: reuses replication</td></tr>
+              <tr><td>Complexity</td><td>Tiny; works with any DB</td><td>Connector cluster, replication slots, snapshots, schema handling</td></tr>
+              <tr><td>Cleanup</td><td>Delete sent rows</td><td>Debezium trick: insert and delete the outbox row in the same transaction; the log keeps the insert, the table stays empty</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout tip"><p><b>Worked estimate (rule of thumb, round numbers).</b></p>
+          <ol class="steps">
+            <li><strong>Rate.</strong> 5,000 orders per second, one event each, so 5,000 outbox rows per second.</li>
+            <li><strong>Per day.</strong> 5,000 x 86,400 s = about 432 million rows a day. At about 1 KB per row (payload plus columns) that is about 430 GB a day of outbox data.</li>
+            <li><strong>Table growth.</strong> If you never clean up, the table grows 430 GB a day, so delete sent rows within minutes (or use Debezium's insert-then-delete trick so the table stays empty and only the WAL carries the rows). Even with cleanup, the WAL or binlog must keep those 430 GB a day until the relay has read them.</li>
+            <li><strong>Polling relay.</strong> To keep up, poll interval x batch size must exceed the rate: every 100 ms you must fetch and publish about 500 rows, then mark them sent and later delete them. Each event is now written three times (insert, update, delete) and the poll query runs 10 times a second against a hot table.</li>
+            <li><strong>When to switch.</strong> Somewhere in the low thousands of events per second (a judgement call, not a hard limit), that extra write and query load starts to hurt the primary, and log-based CDC such as Debezium wins: it reads the WAL that is written anyway and adds no queries. Below a few hundred per second, a simple poller is fine and easier to run.</li>
+          </ol>
+        </div>
+        <p>Both relays are <b>at-least-once</b>: if the relay crashes after publishing but before recording its progress, it publishes again on restart. Microsoft's Cosmos DB outbox example shows exactly this (restart from the last checkpoint) and removes the duplicates with the broker's duplicate detection on a message id. In general, consumers must be idempotent (below).</p>
+
+        <h3>CDC beyond the outbox</h3>
+        <p><strong>Change data capture</strong> means streaming every insert, update and delete from a database's log to other systems. Even without an outbox table, CDC replaces many dual writes: keep Elasticsearch, a cache or a data warehouse in sync from the primary database instead of having the app write to both. The flow in ByteByteGo's guide is: transaction log, source connector (Debezium), Kafka, sink connector, target store.</p>
+        <div class="stats">
+          <div class="stat"><b>100+</b><span>MySQL shards at Shopify</span></div>
+          <div class="stat"><b>~150</b><span>Debezium connectors on 12 K8s pods</span></div>
+          <div class="stat"><b>65k-100k</b><span>records/s over BFCM 2020</span></div>
+          <div class="stat"><b>&lt; 10 s</b><span>p99 MySQL to Kafka</span></div>
+        </div>
+        <p>(p99 in the stats means the 99th-percentile latency: the time that 99 of 100 records beat; 1 in 100 is slower.) Shopify moved to log-based CDC because their older query-based polling could run only hourly, missed hard deletes, missed intermediate states of rows that changed twice between polls, and depended on an unreliable <code>updated_at</code> column. Their hard parts were snapshots (initial <code>SELECT *</code> with read locks), records bigger than Kafka's 1 MB default, and breaking schema changes leaking to consumers who are now coupled to internal tables.</p>
+        <div class="callout warn"><p><b>Raw CDC vs outbox:</b> raw table CDC tells consumers <em>what</em> changed, not <em>why</em>, and couples them to your schema. Hello Interview makes the same point: CDC fits "consumers need a copy of the data" (search index, warehouse, migration), not "consumers need to react to a business intent" (send the shipped email). For intent, publish explicit domain events through an outbox - which can still be relayed by CDC. The full pipeline is design <a href="{{BASE}}hld/d28">d28 CDC Data Pipeline</a>.</p></div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Debezium reading the binlog is a replication client, exactly like a MySQL replica or a <code>tcpdump</code> on the database's own change stream. A Postgres replication slot is a ring buffer with a reader that must keep up: if the connector stops consuming, the slot pins WAL segments and the primary's disk fills - the same failure as a stuck consumer never advancing a DMA ring's tail pointer.</p>
+        </div>
+      

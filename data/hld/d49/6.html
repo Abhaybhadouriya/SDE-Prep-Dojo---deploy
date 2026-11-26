@@ -1,0 +1,105 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Keeping search fresh without melting the index</h3>
+        <p>An inverted index is built from immutable <b>segments</b>. Lucene (under Elasticsearch and Solr) cannot change one field in place: an update is a <b>delete + re-insert</b> of the whole document, and the old copy is removed only when segments merge. Elasticsearch makes new writes searchable at each <b>refresh</b>, by default every 1 second (for indices searched in the last 30 s). So a price that changes 50 times a day on 160M listings means a storm of whole-document rewrites, merges and cache invalidations.</p>
+        <p>Flipkart hit this exactly. Their 2016 talk lists the costs: a block-join update rewrites the product plus all its listings; every delete+add is streamed to all replicas; soft commits create many tiny segments and blow away filter caches. Their fix was to <b>split the data by how fast it changes</b>:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Static attributes go to the inverted index; dynamic attributes go to an in-memory NRT store fed by Kafka">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box kafka" x="20" y="100" width="140" height="60"/>
+            <text class="label" x="90" y="124">Kafka</text>
+            <text class="label small" x="90" y="145">all changes</text>
+            <rect class="box svc" x="220" y="30" width="200" height="60"/>
+            <text class="label" x="320" y="54">Slow lane</text>
+            <text class="label small" x="320" y="75">title, brand: ~10-100/s</text>
+            <rect class="box svc" x="220" y="170" width="200" height="60"/>
+            <text class="label" x="320" y="194">Fast lane</text>
+            <text class="label small" x="320" y="215">price, stock: up to 10K/s</text>
+            <rect class="box cache" x="490" y="30" width="290" height="60"/>
+            <text class="label" x="635" y="54">Inverted index (segments)</text>
+            <text class="label small" x="635" y="75">commit, replicate, reopen</text>
+            <rect class="box cache" x="490" y="170" width="290" height="60"/>
+            <text class="label" x="635" y="194">In-memory NRT forward store</text>
+            <text class="label small" x="635" y="215">doc -&gt; price, inStock bits</text>
+            <path class="arrow" d="M160 120 L212 70"/>
+            <path class="arrow" d="M160 140 L212 195"/>
+            <path class="arrow" d="M420 60 L482 60"/>
+            <path class="arrow" d="M420 200 L482 200"/>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M160 120 L220 60 L420 60 L490 60"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="1.2s" repeatCount="indefinite" path="M160 140 L220 200 L420 200 L490 200"/></circle>
+            <text class="label small" x="635" y="130">query reads both, joined by doc id</text>
+          </svg>
+          <figcaption>Two lanes. Rarely-changing text is indexed normally; price and stock are stored in a separate in-memory structure that is updated in place and consulted at query time for filters, sorts and facets.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Fast lane details (Flipkart):</b> every serving node runs a Kafka consumer that updates its in-memory NRT store. Because the store is not persisted, a starting node <b>bootstraps from Redis</b> and then resumes Kafka from a checkpointed offset. They reported ~50K real-time updates/s across ~150 signals and about <b>2x fewer out-of-stock products shown</b>.</li>
+          <li><b>Lookup speed matters:</b> their naive per-document lookup took ~10 s for ~1M lookups; mapping Lucene doc ids to compact NRT ids cut it to ~100 ms. Matches can be ~1M documents at p99, so per-match cost is everything.</li>
+          <li><b>Filtering choice:</b> a post-filter checks live values per result (exact but slower) vs cached bitsets per filter value like <code>Availability:T</code> (fast but briefly inconsistent). Offer both and pick per use.</li>
+          <li><b>Ordering and idempotency:</b> Sherlock processes updates idempotently and, where order matters, calls back the source for the latest value. Our version: every event carries a <code>version</code>; apply only if newer.</li>
+        </ul>
+        <div class="callout warn"><p><b>Careful:</b> never trust the search index for the final stock decision. The index may lag by seconds. The product page fetches offers live, and checkout reserves inventory against the inventory service (<a href="{{BASE}}hld/d11">d11</a>, <a href="{{BASE}}hld/d09">d09</a>).</p></div>
+
+        <h3>2. Scatter-gather, ranking and facets</h3>
+        <p>A query goes to <b>every shard</b> (documents are sharded by product id, not by word, so each shard has its own small inverted index). Each shard returns its top K; the coordinator merges. Costs grow with shard count, so keep shards in the 10-50 GB band rather than making hundreds of tiny ones.</p>
+        <ul>
+          <li><b>Two-phase ranking:</b> phase 1 is cheap text relevance (BM25) plus static boosts, run on every match. Phase 2 is an ML model on the top few hundred, using features like click-through rate, conversion, price competitiveness and rating. This is how you afford ML on 40K queries/s.</li>
+          <li><b>Facets</b> are counts per attribute value across all matches. Engines compute them from <b>doc values</b>, a column-oriented per-field store (Hello Interview's ES deep dive explains why columnar beats rows for this). The category schema registry decides which attributes are facetable, so you do not facet on free text.</li>
+          <li><b>Facets with fresh data:</b> Flipkart wrote a custom facet component so counts like "in stock only" used the NRT store.</li>
+          <li><b>Pagination:</b> deep page 500 forces every shard to return 10,000 hits. Cap depth (nobody reads page 500) and use cursors ("search after" the last sort key).</li>
+        </ul>
+
+        <h3>3. Ratings and reviews: CQRS for a 1000:1 read ratio</h3>
+        <p>Flipkart's RnR team describes the write flow at a few hundred RPS and reads at a few hundred thousand, with read latency needing ~10 ms vs ~300 ms for writes. That ratio screams <b>CQRS</b> (command query responsibility segregation): one model for writes, other models built for reads.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Reviews written to MySQL, moderated via Kafka, then materialised to KV views and a rating summary">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="120" height="56"/>
+            <text class="label" x="80" y="52">Buyer</text>
+            <text class="label small" x="80" y="72">POST review</text>
+            <rect class="box db" x="180" y="30" width="130" height="56"/>
+            <text class="label" x="245" y="52">MySQL</text>
+            <text class="label small" x="245" y="72">write model</text>
+            <rect class="box kafka" x="350" y="30" width="130" height="56"/>
+            <text class="label" x="415" y="52">Kafka</text>
+            <text class="label small" x="415" y="72">review events</text>
+            <rect class="box svc" x="520" y="30" width="260" height="56"/>
+            <text class="label" x="650" y="52">Moderation (ML + humans)</text>
+            <text class="label small" x="650" y="72">then ML ranking of reviews</text>
+            <rect class="box cache" x="350" y="150" width="200" height="70"/>
+            <text class="label" x="450" y="176">KV read views</text>
+            <text class="label small" x="450" y="198">top-10 per product, pages</text>
+            <rect class="box cache" x="580" y="150" width="200" height="70"/>
+            <text class="label" x="680" y="176">Rating summary</text>
+            <text class="label small" x="680" y="198">count, sum, histogram</text>
+            <rect class="box client" x="20" y="160" width="160" height="56"/>
+            <text class="label" x="100" y="182">Shoppers</text>
+            <text class="label small" x="100" y="202">~100K+ reads/s</text>
+            <path class="arrow" d="M140 58 L172 58"/>
+            <path class="arrow" d="M310 58 L342 58"/>
+            <path class="arrow" d="M480 58 L512 58"/>
+            <path class="arrow" d="M600 86 L470 142"/>
+            <path class="arrow" d="M680 86 L680 142"/>
+            <path class="arrow" d="M342 188 L188 188"/>
+            <circle class="packet alt" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M350 188 L180 188"/></circle>
+          </svg>
+          <figcaption>Write once to the relational store; moderate asynchronously; materialise read-optimised views. Flipkart served reads from Aerospike (review bodies) and Redis (sorted structures).</figcaption>
+        </figure>
+        <ul>
+          <li><b>Rating summary</b> is a tiny per-product row: <code>count</code>, <code>sum</code>, and a 5-bucket histogram. Each approved review is an event that increments it. Average = sum / count, computed on read. Use the event's review id to make the increment idempotent (store "applied up to" per product, or a set of applied ids for recent events). For a viral product, batch increments in the stream job (see <a href="{{BASE}}hld/d39">Distributed Counter</a>).</li>
+          <li><b>Do not rank by raw average:</b> a 5.0 from 2 reviews should not beat 4.6 from 20,000. Use a Bayesian average: <code>(C*m + sum) / (C + count)</code> where <code>m</code> is the category mean and <code>C</code> a prior weight.</li>
+          <li><b>Sort and filter reviews</b> (most helpful, newest, by aspect like "battery"): Flipkart first used Redis sorted sets per (product, sort order); this grew to about <b>half a terabyte</b>. They then replaced 36-byte string UUID review ids with a <b>per-product integer review number</b> (~2 bytes with variable-length encoding, a 94% reduction), de-duplicated translated text, and ended with a working set under 100 GB that fit an in-process LFU cache (Caffeine) with <b>over 95% hit rate</b> at peak.</li>
+          <li><b>Only verified buyers</b> can review: the write API checks the <code>orderId</code> against orders; one review per (user, product) via a unique key, which also makes retries idempotent.</li>
+        </ul>
+
+        <h3>4. Flexible schema evolution</h3>
+        <p>When the "mobiles" category adds <code>refresh_rate_hz</code>, you bump the category schema version. Old products are valid (field optional). The indexer reads the schema registry to map the new attribute into a typed search field and, if it is a facet, a doc-values field. Adding a new field in Elasticsearch is cheap; <b>changing</b> a field's type is not, so you reindex into a new index and swap an alias (blue/green indexing). Plan a full reindex path from the start: Flipkart lists "a robust mechanism to completely refresh/reconcile data" as a key focus area, because streaming pipelines drift.</p>
+
+        <h3>5. Sale-day traffic</h3>
+        <ul>
+          <li><b>Result cache</b> on normalised query + filters, TTL of seconds to a minute; stale stock is fixed by the NRT layer and live offer checks.</li>
+          <li><b>Product page cache</b> for hot products, with request coalescing so 100K people opening one phone page cause one backend fetch (<a href="{{BASE}}hld/p04">Scaling Reads</a>).</li>
+          <li><b>Graceful degradation:</b> under overload, drop the ML re-rank or expensive facets before dropping searches.</li>
+          <li><b>Pre-scale</b> search replicas before Big Billion Days; replicas are the throughput lever.</li>
+        </ul>
+      

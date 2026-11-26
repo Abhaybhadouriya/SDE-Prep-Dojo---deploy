@@ -1,0 +1,56 @@
+
+        <h2>Data model</h2>
+        <p>Several small stores, each chosen for its access pattern.</p>
+<pre><code class="language-sql">-- Preferences and device tokens: read on every send, small, key lookups -&gt; KV store + cache
+user_prefs(user_id PK, prefs_json, quiet_start, quiet_end, tz, updated_at)
+device_tokens(user_id, device_id, platform /* ios|android|web */, token, app_version,
+              last_seen_at, PRIMARY KEY (user_id, device_id))
+
+-- Templates: few, read-mostly -&gt; SQL + in-memory cache in the workers
+templates(template_id, version, channel, locale, body, dlt_template_id /* India SMS */,
+          PRIMARY KEY (template_id, version, channel, locale))
+
+-- Notification log: 1B rows/day, write-heavy, read by user and time -&gt; wide-column (Cassandra)
+-- partition = (user_id, day bucket) keeps partitions bounded; cluster by time, newest first
+notifications(user_id, day, created_at, notification_id, channel, category, template_id,
+              params, status /* queued|sent|delivered|failed|dropped */, provider_msg_id,
+              PRIMARY KEY ((user_id, day), created_at, notification_id))
+  WITH CLUSTERING ORDER BY (created_at DESC)
+
+-- Dedupe / sent log: "was (event, channel) already sent?" -&gt; unique key, TTL a few days
+sent_log(event_id, channel, status, PRIMARY KEY (event_id, channel))   -- or Redis SET NX EX</code></pre>
+        <p><b>Why NoSQL for the log?</b> <i>"It is an append-mostly log of 1 billion rows a day, always read as 'this user's recent notifications', so a wide-column store partitioned by user and day gives cheap writes and a single-partition read for the inbox."</i> Preferences could be SQL or KV; they are tiny and heavily cached. See <a href="{{BASE}}hld/hld-07">data modeling and indexing</a>.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Kafka topics split by channel and priority with consumer pools">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="22">Topics are part of the data model</text>
+            <rect class="box svc" x="20" y="100" width="140" height="60"/>
+            <text class="label" x="90" y="122">router</text>
+            <text class="label small" x="90" y="143">prefs + template</text>
+            <rect class="zone kafka" x="210" y="40" width="300" height="210"/>
+            <text class="zone-label" x="222" y="58">Kafka</text>
+            <rect class="box kafka solid" x="230" y="68" width="260" height="34"/><text class="label white" x="360" y="85">push.high  (OTP, payments)</text>
+            <rect class="box kafka" x="230" y="108" width="260" height="34"/><text class="label" x="360" y="125">push.low  (campaigns)</text>
+            <rect class="box kafka solid" x="230" y="148" width="260" height="34"/><text class="label white" x="360" y="165">sms.high</text>
+            <rect class="box kafka" x="230" y="188" width="260" height="34"/><text class="label small" x="360" y="205">email.low ... + retry / DLQ topics</text>
+            <rect class="box k8s" x="560" y="64" width="220" height="42"/><text class="label small" x="670" y="85">push-high workers (always warm)</text>
+            <rect class="box k8s" x="560" y="112" width="220" height="34"/><text class="label small" x="670" y="129">push-low workers (throttled)</text>
+            <rect class="box k8s" x="560" y="152" width="220" height="34"/><text class="label small" x="670" y="169">sms workers</text>
+            <rect class="box k8s" x="560" y="192" width="220" height="34"/><text class="label small" x="670" y="209">email workers</text>
+            <path class="arrow" d="M160 130 L224 85"/>
+            <path class="arrow" d="M160 130 L224 125"/>
+            <path class="arrow" d="M160 130 L224 165"/>
+            <path class="arrow" d="M160 130 L224 205"/>
+            <path class="arrow" d="M490 85 L554 85"/>
+            <path class="arrow" d="M490 125 L554 129"/>
+            <path class="arrow" d="M490 165 L554 169"/>
+            <path class="arrow" d="M490 205 L554 209"/>
+            <circle class="packet gold" r="6"><animateMotion dur="1.2s" repeatCount="indefinite" path="M160 130 L230 85 L490 85 L560 85"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="4s" repeatCount="indefinite" path="M160 130 L230 125 L490 125 L560 129"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="4s" begin="1s" repeatCount="indefinite" path="M160 130 L230 125 L490 125 L560 129"/></circle>
+            <circle class="packet" r="5"><animateMotion dur="4s" begin="2s" repeatCount="indefinite" path="M160 130 L230 125 L490 125 L560 129"/></circle>
+          </svg>
+          <figcaption>One topic per channel and priority. High-priority topics have their own always-running worker pools, so a backlog on <code>push.low</code> (the slow, crowded dots) cannot delay an OTP on <code>push.high</code> (the fast gold dot).</figcaption>
+        </figure>
+      

@@ -1,0 +1,60 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Tool</th><th>Where</th><th>Detail</th></tr></thead>
+            <tbody>
+              <tr><td><b>Kafka</b></td><td>Between scheduler and workers</td><td>Durable buffer for spikes; topics per priority; key = <code>tenant_id</code> so one tenant's runs keep order if needed. Retry topics with increasing delays and a DLQ. Kafka has no built-in "deliver later", so the <em>scheduler</em> holds the delay and Kafka only carries due work. Kafka 4.2+ share groups (Queues for Kafka) let many workers read the same partition with per-record acknowledgement, a natural fit for a work queue. Note: share groups give up per-partition ordering (records are acquired and redelivered individually), so use them for independent jobs and classic consumer groups where one tenant's runs must stay ordered. Share groups are new, so run the latest 4.2.x patch release and read its notes. See <a href="{{BASE}}devops/kafka-04">consumer groups</a>.</td></tr>
+              <tr><td><b>Kafka</b></td><td>Slack's real lesson</td><td>Slack's job queue ran on Redis; when Redis ran out of memory it lost jobs. They put Kafka in front of Redis as a durable write buffer and only committed the Kafka offset after the job was safely in Redis.</td></tr>
+              <tr><td><b>Kubernetes</b></td><td>Worker pools</td><td>Deployments per priority, autoscaled by KEDA on consumer lag. <code>terminationGracePeriodSeconds</code> long enough for a job to finish, plus a <code>preStop</code> hook that stops pulling new work.</td></tr>
+              <tr><td><b>Kubernetes</b></td><td>Scheduler pods</td><td>A Deployment of N pods competing for shard leases (the same Lease objects that <code>kube-scheduler</code> and controllers use for leader election in <code>coordination.k8s.io</code>).</td></tr>
+              <tr><td><b>Kubernetes</b></td><td>The built-in mini scheduler</td><td><code>CronJob</code> creates <code>Job</code>s that run pods. Fine for tens of cluster-internal crons, not for 100 M runs/day: each run is a whole pod, and the CronJob controller is one control loop per cluster.</td></tr>
+              <tr><td><b>Docker</b></td><td>Job packaging and local test</td><td>Container targets: the job is an image, so "run job" means "start a pod from this image". Locally, <code>docker compose</code> with Postgres + one Kafka broker + a worker reproduces the whole flow. See <a href="{{BASE}}devops/pipeline-02">build it locally</a>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Here is a real Kubernetes CronJob with the settings that matter. It is also a great mini-lesson in scheduler semantics:</p>
+<pre><code class="language-yaml">apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-report
+spec:
+  schedule: "0 2 * * *"            # 02:00 every day
+  timeZone: "Asia/Kolkata"         # GA since Kubernetes 1.27
+  concurrencyPolicy: Forbid        # Allow (default) | Forbid | Replace
+  startingDeadlineSeconds: 300     # if we missed the start by &gt; 5 min, skip it
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 4              # default is 6 retries
+      activeDeadlineSeconds: 3600  # kill it after 1 hour
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: report
+            image: ghcr.io/example/report:1.4.2
+            args: ["--date", "yesterday"]</code></pre>
+<pre class="terminal"><code>$ kubectl apply -f nightly-report.yaml
+cronjob.batch/nightly-report created
+$ kubectl get cronjob nightly-report
+NAME             SCHEDULE    TIMEZONE       SUSPEND   ACTIVE   LAST SCHEDULE   AGE
+nightly-report   0 2 * * *   Asia/Kolkata   False     0        &lt;none&gt;          8s
+$ kubectl create job --from=cronjob/nightly-report manual-run-1
+job.batch/manual-run-1 created
+$ kubectl get jobs
+NAME           STATUS     COMPLETIONS   DURATION   AGE
+manual-run-1   Complete   1/1           14s        20s</code></pre>
+        <div class="callout warn"><p><b>Gotcha from the CronJob docs:</b> if the controller was down and more than 100 schedules were missed (and <code>startingDeadlineSeconds</code> is not set), it does not start the job and logs an error instead. Also, the docs warn that a CronJob may occasionally create two Jobs or none for one schedule, so <b>jobs must be idempotent</b> even here. That is the same lesson as our big design.</p></div>
+        <p>And the Kafka topics for the design:</p>
+<pre class="terminal"><code>$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic jobs.high --partitions 32 --replication-factor 3 --config min.insync.replicas=2
+Created topic jobs.high.
+$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic jobs.retry.1m --partitions 16 --replication-factor 3
+Created topic jobs.retry.1m.
+$ kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group workers-high
+GROUP         TOPIC      PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG   CONSUMER-ID ...
+workers-high  jobs.high  0          918231          918240          9     worker-7f9c...
+workers-high  jobs.high  1          917004          917004          0     worker-2ab1...</code></pre>
+      

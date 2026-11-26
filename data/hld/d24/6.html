@@ -1,0 +1,114 @@
+
+        <h2>Deep dives</h2>
+
+        <div class="callout tip"><p><b>Stop here for SDE-1:</b> the architecture above (metadata vs block servers, content-addressed 4 MB blocks, commit with parentRev) + deep dive 1 (chunking and dedup) + long-poll notification from deep dive 3 is a passing SDE-1 answer. Resumable parallel upload, conflicts, block-store internals and safe GC (deep dives 2, 4, 5) are expected at SDE-2.</p></div>
+        <h3>1. Chunking, hashing and dedup - try it yourself</h3>
+        <p>Content addressing means identical bytes produce identical names. Make a 10 MB file of zeros, split it into 4 MB blocks, and hash them: two blocks are byte-for-byte identical, so they get the same hash and would be stored <b>once</b>.</p>
+<pre><code class="language-bash">head -c 10485760 /dev/zero &gt; big.bin          # 10 MiB file
+split -b 4M -d big.bin blk_                   # blk_00 blk_01 (4 MiB) blk_02 (2 MiB)
+sha256sum blk_*</code></pre>
+<pre class="terminal"><code>$ sha256sum blk_*
+bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8  blk_00
+bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8  blk_01
+5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee  blk_02</code></pre>
+        <p>Now change one byte in the middle (byte 5,000,000 falls in the second block) and hash again. Only that block's hash changes - so only 4 MB of a 10 MB file would be uploaded:</p>
+<pre><code class="language-bash">printf 'X' | dd of=big.bin bs=1 seek=5000000 conv=notrunc
+split -b 4M -d big.bin blk_ &amp;&amp; sha256sum blk_*</code></pre>
+<pre class="terminal"><code>$ sha256sum blk_*
+bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8  blk_00
+ddd263d1b440219165699747d3c9d3334597cdd657695a0855777c148b8335b2  blk_01
+5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee  blk_02</code></pre>
+        <p><b>The weakness of fixed-size blocks:</b> <i>insert</i> one byte at the very start and every block boundary shifts, so every hash changes. Two fixes: (1) <b>content-defined chunking</b> - cut where a rolling hash of the last ~48 bytes matches a pattern (Rabin fingerprinting), so boundaries follow the content and an insert only changes nearby chunks (used by backup tools); (2) keep fixed blocks but send an <b>rsync-style delta</b> of a changed block against the old one. Dropbox's post says it uses compression and rsync on block transfers.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 260" role="img" aria-label="Fixed-size chunking shifts all boundaries after an insert; content-defined chunking only changes one chunk">
+            <text class="label left" x="20" y="26">Fixed 4 MB blocks: insert 1 byte at the front</text>
+            <rect class="box" x="20" y="40" width="190" height="36"/><text class="label small" x="115" y="58">A</text>
+            <rect class="box" x="214" y="40" width="190" height="36"/><text class="label small" x="309" y="58">B</text>
+            <rect class="box" x="408" y="40" width="190" height="36"/><text class="label small" x="503" y="58">C</text>
+            <rect class="box fail" x="20" y="84" width="190" height="36"/><text class="label small bad" x="115" y="102">A' (shifted)</text>
+            <rect class="box fail" x="214" y="84" width="190" height="36"/><text class="label small bad" x="309" y="102">B' (shifted)</text>
+            <rect class="box fail" x="408" y="84" width="190" height="36"/><text class="label small bad" x="503" y="102">C' (shifted)</text>
+            <text class="label small bad left" x="620" y="102">all 3 re-uploaded</text>
+            <text class="label left" x="20" y="152">Content-defined chunks: cut where a rolling hash matches</text>
+            <rect class="box kafka" x="20" y="166" width="150" height="36"/><text class="label small" x="95" y="184">A</text>
+            <rect class="box kafka" x="174" y="166" width="230" height="36"/><text class="label small" x="289" y="184">B</text>
+            <rect class="box kafka" x="408" y="166" width="190" height="36"/><text class="label small" x="503" y="184">C</text>
+            <rect class="box hot" x="20" y="210" width="156" height="36"/><text class="label small" x="98" y="228">A' (changed)</text>
+            <rect class="box kafka" x="180" y="210" width="230" height="36"/><text class="label small" x="295" y="228">B (same)</text>
+            <rect class="box kafka" x="414" y="210" width="190" height="36"/><text class="label small" x="509" y="228">C (same)</text>
+            <text class="label small ok left" x="620" y="228">only A' re-uploaded</text>
+            <circle class="packet gold" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M20 228 L176 228"/></circle>
+          </svg>
+          <figcaption>Fixed-size blocks are simple and fast to index; content-defined chunking survives inserts. For an interview, say fixed 4 MB (what Dropbox documents) and name content-defined (rolling-hash) chunking as the improvement for insert-heavy files.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The rolling hash in content-defined chunking is the same family of trick as a rolling CRC or the rsync weak checksum: slide a window one byte at a time and update the hash in O(1) instead of recomputing. You have probably used the idea for pattern matching in packet payloads. <b>Where it breaks:</b> here the goal is choosing <i>stable cut points</i>, not detecting errors.</p>
+        </div>
+        <div class="callout note"><p><b>You might confuse this with...</b> Some articles shorten content-defined chunking to "CDC". On this site <b>CDC always means <a href="{{BASE}}interview/glossary#cdc">Change Data Capture</a></b> (streaming database changes, as in the <a href="{{BASE}}hld/d28">CDC Pipeline</a> design). Here we always write "content-defined" or "rolling-hash" chunking.</p></div>
+        <div class="callout warn"><p><b>Dedup across users has a privacy edge.</b> If uploading a file is "instant" whenever someone else already has the same bytes, an attacker can test whether a specific file exists anywhere in the system. Common mitigations: dedup only within a user or team, or always make the client prove it has the bytes. Mentioning this trade-off unprompted is an SDE-2 signal.</p></div>
+
+        <h3>2. Large files and flaky networks: resumable, parallel upload</h3>
+        <ul>
+          <li>A 50 GB file is 12,800 independent 4 MB blocks. Upload several in parallel (e.g. 4-8 at a time) to fill the pipe.</li>
+          <li>Each block upload is idempotent and verified by hash, so a dropped connection only costs the in-flight block. After a crash or reboot the client simply re-runs commit: "need blocks" tells it exactly what is still missing - <b>the server is the checkpoint</b>.</li>
+          <li>Hash on the client while reading the file, and re-check on the server; reject a block whose bytes do not match its claimed hash (protects against corruption and tampering).</li>
+          <li>Throttle bandwidth on the client and back off on 429 / 503 with jitter, so a million clients reconnecting after an outage do not flatten the block servers.</li>
+          <li>With pre-signed S3 URLs the same logic uses S3 multipart upload: parts are uploaded independently and the object is assembled at the end.</li>
+        </ul>
+
+        <h3>3. Telling devices about changes without polling them to death</h3>
+        <p>Each device keeps a <b>cursor</b> (the last JID it has seen) per namespace. It holds one idle <b>long-poll</b> HTTP request to a notification server: the server holds the request open until something changes in one of those namespaces (or a timeout of about a minute), then answers <code>changes: true</code>. The device then calls <code>list(cursor)</code> to get the actual rows. The notification is a doorbell; the journal is the parcel.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 240" role="img" aria-label="Short polling versus long polling with a cursor">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone" x="12" y="12" width="410" height="216"/>
+            <text class="zone-label" x="24" y="34">Short polling every 1 s</text>
+            <rect class="box client" x="30" y="60" width="100" height="44"/><text class="label small" x="80" y="82">device</text>
+            <rect class="box svc" x="300" y="60" width="100" height="44"/><text class="label small" x="350" y="82">metaserver</text>
+            <path class="arrow" d="M130 74 L293 74"/><path class="arrow" d="M293 92 L130 92"/>
+            <text class="label small" x="215" y="126">"anything?" "no" "anything?" "no" ...</text>
+            <text class="label small bad" x="215" y="160">100M devices = ~100M req/s of "no"</text>
+            <text class="label small" x="215" y="190">and up to 1 s extra latency</text>
+            <circle class="packet bad" r="5"><animateMotion dur="1s" repeatCount="indefinite" path="M130 74 L300 74 L300 92 L130 92"/></circle>
+
+            <rect class="zone kafka" x="438" y="12" width="410" height="216"/>
+            <text class="zone-label" x="450" y="34">Long poll + cursor</text>
+            <rect class="box client" x="456" y="60" width="100" height="44"/><text class="label small" x="506" y="82">device</text>
+            <rect class="box queue" x="726" y="60" width="104" height="44"/><text class="label small" x="778" y="82">notifier</text>
+            <path class="arrow" d="M556 74 L719 74"/>
+            <text class="label small" x="640" y="62">wait(cursor 1003)</text>
+            <path class="arrow ok" d="M719 92 L556 92"/>
+            <text class="label small ok" x="640" y="110">changes: true</text>
+            <text class="label small" x="640" y="150">then list(1003) -&gt; rows 1004..1007</text>
+            <text class="label small ok" x="640" y="180">requests ~ real change rate</text>
+            <circle class="packet ok" r="5"><animateMotion dur="5s" repeatCount="indefinite" keyPoints="0;0;1" keyTimes="0;0.8;1" calcMode="linear" path="M719 92 L556 92"/></circle>
+          </svg>
+          <figcaption>Short polling wastes requests and adds latency; long polling (or a WebSocket / server-sent events) sends a signal only when something changes. The cursor makes the follow-up <code>list</code> return exactly what the device missed - even after a week offline.</figcaption>
+        </figure>
+        <p>The notification tier holds hundreds of millions of mostly idle connections, so it is built like a chat gateway: many connections per server, subscriptions by namespace (a pub/sub fan-out from the commit path), and cheap reconnects. Because the signal carries no data, a lost notification is harmless: the next long-poll or a periodic safety <code>list</code> catches up from the cursor. Mobile apps often rely on push notifications (APNs / FCM) instead of holding a connection.</p>
+
+        <h3>4. Conflicts: when two devices edit the same file</h3>
+        <p>The laptop and the phone both start from version 41 and both save. The laptop commits first and becomes 42. The phone's commit says <code>parentRev: 41</code>; the server is at 42, so it rejects it. For arbitrary binary files there is no safe automatic merge (unlike text, see <a href="{{BASE}}hld/d23">Collaborative Editor</a>), so the client downloads 42 as the main file and saves its own edit next to it as <b>"report (conflicted copy).pdf"</b>. The user decides. This is <b>optimistic concurrency</b>: no locks, cheap in the common case, explicit when a conflict happens. Alternatives: lock files while open (Office-style co-authoring does its own merge), or last-writer-wins (simple but silently loses data - say why you reject it).</p>
+        <div class="callout note"><p><b>Moves and renames are harder than edits.</b> Dropbox's "Rewriting the heart of our sync engine" post explains that the old engine represented a move as a delete plus an add and lacked a stable file identifier that survived moves, which caused problems at scale. The rewrite (Nucleus) gave files stable IDs, put almost all logic on one deterministic control thread, and fuzzes it with seeded random simulation tests. Lesson for interviews: the <i>client</i> sync engine is half the system.</p></div>
+
+        <h3>5. Storing exabytes: the block store</h3>
+        <p>You can say "S3" and move on - Dropbox started on S3. At their scale they built <b>Magic Pocket</b>. From the "Inside the Magic Pocket" post: blocks are named by SHA-256 and grouped into <b>buckets</b> (blocks uploaded around the same time), buckets live in <b>volumes</b> across several machines, either replicated or <b>erasure-coded</b> (EC: split data into pieces plus parity pieces spread across machines, like RAID-5/6 but across servers - a few pieces can be lost and rebuilt, for roughly 1.5x storage instead of 3x for three full copies); a <b>cell</b> holds around 50 PB of raw data; storage machines (OSDs, "object storage devices" - servers full of disks) can hold over a petabyte each; every block is stored in at least two separate geographic zones; and a large sharded MySQL <b>Block Index</b> maps hash to cell and bucket. New uploads are replicated first and later erasure-coded to save space.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 220" role="img" aria-label="Block to bucket to volume to cell hierarchy, replicated in two zones">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box cache" x="20" y="80" width="110" height="56"/><text class="label" x="75" y="102">Block</text><text class="label small" x="75" y="122">sha256, 4 MB</text>
+            <rect class="box queue" x="170" y="80" width="120" height="56"/><text class="label" x="230" y="102">Bucket</text><text class="label small" x="230" y="122">uploaded together</text>
+            <rect class="box db" x="330" y="80" width="140" height="56"/><text class="label" x="400" y="102">Volume</text><text class="label small" x="400" y="122">replicated or EC</text>
+            <rect class="box svc" x="510" y="80" width="140" height="56"/><text class="label" x="580" y="102">Cell</text><text class="label small" x="580" y="122">~50 PB raw</text>
+            <path class="arrow" d="M130 108 L163 108"/><path class="arrow" d="M290 108 L323 108"/><path class="arrow" d="M470 108 L503 108"/>
+            <rect class="box k8s" x="690" y="30" width="150" height="56"/><text class="label" x="765" y="52">Zone A</text><text class="label small" x="765" y="72">copy 1</text>
+            <rect class="box k8s" x="690" y="130" width="150" height="56"/><text class="label" x="765" y="152">Zone B</text><text class="label small" x="765" y="172">copy 2 (async)</text>
+            <path class="arrow" d="M650 100 L683 62"/><path class="arrow dashed" d="M650 116 L683 155"/>
+            <text class="label small" x="330" y="180">Block Index (sharded MySQL): hash -&gt; cell, bucket, checksum</text>
+            <circle class="packet" r="6"><animateMotion dur="3.4s" repeatCount="indefinite" path="M75 108 L230 108 L400 108 L580 108 L690 60"/></circle>
+          </svg>
+          <figcaption>The hierarchy exists because 4 MB is too small a unit to move around when a disk dies or data is erasure-coded; buckets and volumes are the units of repair. Summarised from Dropbox's Magic Pocket post.</figcaption>
+        </figure>
+        <p><b>Garbage collection.</b> Blocks are shared by many file versions and users, so you cannot delete a block when one file is deleted. Keep a reference count (or periodically <b>mark-and-sweep</b>: walk every live blocklist and mark the blocks it uses, then sweep away blocks nobody marked), honour version-history retention, and only then delete. Get this wrong and you delete someone else's data - so be conservative and delayed.</p>
+      

@@ -1,0 +1,29 @@
+
+        <h2>Try it: turn on failures and watch the routes</h2>
+        <p>The enricher has two demo knobs. Put them in <code>.env</code> (or set them in your shell) and recreate the enricher:</p>
+<pre><code class="language-bash"># 20 % of price lookups "time out"
+echo "TRANSIENT_FAIL_RATE=0.2" &gt;&gt; .env
+docker compose up -d enricher
+python loadgen/loadgen.py --rps 20 --seconds 60 --bad 0.05
+
+# Watch where records go
+curl -s localhost:9090/api/v1/query --data-urlencode 'query=sum by (outcome) (rate(shopstream_enricher_records_total[1m]))'
+docker compose logs -f retry-worker</code></pre>
+<pre class="terminal"><code>$ docker compose logs -f retry-worker
+retry-worker-1  | ... INFO  retry-worker retried key=b'C-17' attempt=1
+retry-worker-1  | ... INFO  retry-worker retried key=b'C-03' attempt=2
+retry-worker-1  | ... INFO  retry-worker retried key=b'C-17' attempt=2</code></pre>
+        <p>In <a href="{{BASE}}interview/glossary#grafana">Grafana</a> (<code>localhost:3000</code>) the <b>Enricher outcomes per second</b> panel splits into three lines: <code>enriched</code> (most), <code>retry</code> (about a fifth of lookups, and more as retries also fail), and <code>dlq</code> (the 5 % unknown products, plus the unlucky orders that failed four retries in a row). In kafka-ui (<code>localhost:8080</code>), open <code>orders.retry</code> and look at the message headers: you will see <code>attempt</code> climb.</p>
+        <p>Set it back with <code>TRANSIENT_FAIL_RATE=0.0</code> and <code>docker compose up -d enricher</code> again.</p>
+        <h3>Try it: a schema change that is safe, and one that is not</h3>
+        <p>Send an order with an extra optional field the code has never heard of:</p>
+<pre><code class="language-bash">curl -s -X POST localhost:8000/orders -H "content-type: application/json" \
+  -d '{"customer_id":"C-77","items":[{"product_id":"P-100","quantity":1}],"coupon":"DIWALI10"}'</code></pre>
+        <p>The order is accepted, but look in kafka-ui at <code>orders.created</code>: there is no <code>coupon</code>. The order-api's Pydantic model ignores unknown fields, so the event it builds never has one. That is the first lesson: <b>every hop decides what to do with fields it does not know</b>. Now write the field straight into the topic, as a newer producer would:</p>
+<pre><code class="language-bash">echo 'C-77|{"order_id":"cpn-1","customer_id":"C-77","created_at":"2026-11-23T10:00:00+00:00","items":[{"product_id":"P-100","quantity":1}],"coupon":"DIWALI10"}' | \
+  docker compose exec -T kafka-1 /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server kafka-1:19092 --topic orders.created \
+  --property parse.key=true --property key.separator='|'</code></pre>
+        <p>The enricher builds its output with <code>{**order, ...}</code>, so <code>coupon</code> passes straight through to <code>orders.enriched</code>; the sink writes only the columns it knows and ignores it. Adding an optional field is safe. Now imagine a producer <em>renames</em> <code>items</code> to <code>lines</code>: the enricher's "missing field items" check sends every new order to the DLQ. That is why the rule is "add optional fields, never rename or change a type", and why real systems put a Schema Registry check in CI.</p>
+        <div class="callout tip"><p><b>Experiment:</b> scale the enricher to 3 (<code>docker compose up -d --scale enricher=3</code>). Each replica gets its own container hostname, so its own <code>transactional.id</code>. Look at the logs for <code>assigned</code> and <code>revoked</code> lines: with the <code>cooperative-sticky</code> strategy only the partitions that move are revoked.</p></div>
+      

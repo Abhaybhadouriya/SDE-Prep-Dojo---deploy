@@ -1,0 +1,153 @@
+
+        <h2>Data model: the four algorithms are four data models</h2>
+        <p>Each algorithm stores something different per key. Pick the algorithm and you have picked the data model.</p>
+
+        <h3>1. Token bucket (our default)</h3>
+        <p>Store <code>{tokens, last_refill_ts}</code> per key. On each request: add <code>(now - last) × rate</code> tokens (up to the capacity), then spend one if available. Allows short bursts up to the capacity; long-run rate equals the refill rate. Used by Stripe (in Redis) and by AWS API Gateway throttling.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Token bucket: tokens drip in at a fixed rate, each request takes one, empty bucket means 429">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="22">Token bucket: capacity 10, refill 1 token every 6 s</text>
+            <!-- refill tap -->
+            <rect class="box svc" x="330" y="40" width="140" height="40"/>
+            <text class="label small" x="400" y="60">refill: rate r</text>
+            <!-- bucket -->
+            <path class="arrow none" d="M320 110 L340 250 L460 250 L480 110"/>
+            <text class="label small" x="530" y="120">capacity B = 10</text>
+            <rect class="cell filled" x="352" y="216" width="24" height="24"/>
+            <rect class="cell filled" x="380" y="216" width="24" height="24"/>
+            <rect class="cell filled" x="408" y="216" width="24" height="24"/>
+            <rect class="cell filled" x="364" y="188" width="24" height="24"/>
+            <rect class="cell filled" x="392" y="188" width="24" height="24"/>
+            <rect class="cell new" x="420" y="188" width="24" height="24"/>
+            <circle class="packet gold" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M400 80 L400 180"/></circle>
+            <!-- requests -->
+            <rect class="box client" x="30" y="150" width="140" height="50"/>
+            <text class="label" x="100" y="170">requests</text>
+            <text class="label small" x="100" y="189">each costs 1</text>
+            <path class="arrow" d="M170 175 L314 205"/>
+            <circle class="packet" r="6"><animateMotion dur="1.5s" repeatCount="indefinite" path="M170 175 L340 210 L480 210 L620 160"/></circle>
+            <!-- outcomes -->
+            <rect class="box db" x="620" y="140" width="160" height="44"/>
+            <text class="label ok" x="700" y="162">token? → allow</text>
+            <rect class="box fail" x="620" y="220" width="160" height="44"/>
+            <text class="label bad" x="700" y="242">empty → 429</text>
+            <path class="arrow" d="M480 200 L614 165"/>
+            <path class="arrow bad" d="M480 230 L614 240"/>
+          </svg>
+          <figcaption>Gold dots are tokens arriving at rate r. Each request (blue dot) takes one token. A full bucket lets a client burst up to B requests at once; an empty bucket means wait.</figcaption>
+        </figure>
+
+        <h3>2. Leaky bucket</h3>
+        <p>A FIFO queue per key that drains at a fixed rate. Requests that find the queue full are rejected. Output is perfectly smooth, which protects a fragile backend, but a burst waits in line and adds latency. NGINX's <code>limit_req</code> is a leaky bucket (its <code>burst</code> sets the queue size, and <code>nodelay</code> serves queued requests at once while still counting them).</p>
+
+        <h3>3. Fixed window counter</h3>
+        <p>Store one integer per key per window: <code>INCR rl:{key}:{minute}</code> and set a 60-second TTL only on the first request of the window. Simplest and cheapest. Flaw: a client can send 100 at 12:00:59 and 100 more at 12:01:00: <b>200 requests in 2 seconds</b> with a 100/minute limit.</p>
+<pre class="terminal"><code>$ redis-cli
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379(TX)&gt; INCR rl:k_8f2:202611231405
+QUEUED
+127.0.0.1:6379(TX)&gt; EXPIRE rl:k_8f2:202611231405 60 NX
+QUEUED
+127.0.0.1:6379(TX)&gt; EXEC
+1) (integer) 1
+2) (integer) 1</code></pre>
+        <p>The first reply is the new count for this minute; the second means the 60-second TTL was set. <code>NX</code> (Redis 7+) means "set the TTL only if the key has none yet", so later requests in the same minute do not keep pushing the expiry forward. On older Redis, use the pattern from the Redis <code>INCR</code> docs: run <code>EXPIRE</code> only when <code>INCR</code> returned 1. If the count is above the limit, reject.</p>
+
+        <h3>4. Sliding window log and sliding window counter</h3>
+        <p><b>Log:</b> keep every request timestamp in a Redis sorted set; drop entries older than the window (<code>ZREMRANGEBYSCORE</code>), count the rest (<code>ZCARD</code>). Exact, but memory grows with the limit (80 GB in our estimate). <b>Counter (approximation):</b> keep only this window's count and the previous window's count, and weight the previous one by how much of it still overlaps the sliding window. Cloudflare described this approach in its post "Counting things, a lot of different things": two numbers per key, and very close to exact.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Fixed window allows a double burst at the boundary; sliding window counter weights the previous window">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label title" x="400" y="22">Limit: 100 per minute</text>
+            <!-- timeline -->
+            <line class="arrow" x1="40" y1="150" x2="770" y2="150"/>
+            <text class="label small" x="80" y="172">12:00:00</text>
+            <text class="label small" x="400" y="172">12:01:00</text>
+            <text class="label small" x="720" y="172">12:02:00</text>
+            <line class="arrow none dashed" x1="400" y1="50" x2="400" y2="150"/>
+            <rect class="zone" x="80" y="60" width="320" height="80"/>
+            <text class="zone-label" x="92" y="78">window A</text>
+            <rect class="zone" x="400" y="60" width="320" height="80"/>
+            <text class="zone-label" x="412" y="78">window B</text>
+            <!-- bursts -->
+            <rect class="box fail" x="360" y="100" width="38" height="38"/>
+            <text class="label small" x="379" y="119">100</text>
+            <rect class="box fail" x="402" y="100" width="38" height="38"/>
+            <text class="label small" x="421" y="119">100</text>
+            <text class="label bad" x="400" y="200">fixed window: both bursts allowed = 200 in 2 s</text>
+            <!-- sliding window -->
+            <path class="arrow ok" d="M88 230 L408 230"/>
+            <text class="label ok" x="400" y="248">sliding counter at 12:01:01 ≈ 100 × (59/60) + 0 ≈ 98 → only ~2 more allowed</text>
+          </svg>
+          <figcaption>The fixed window resets at the minute line, so a client can spend a full quota on each side of it. The sliding counter looks back a full minute from "now", estimating the old window's share by overlap.</figcaption>
+        </figure>
+
+        <h3>Run all four on the same traffic</h3>
+        <p>Ten requests at second 59 and ten more at second 61, with a limit of 10 per 60 seconds:</p>
+<pre><code class="language-python"># limiters.py - compare four rate limiting algorithms on the same traffic
+import math
+from collections import deque
+
+LIMIT, WINDOW = 10, 60.0
+
+class FixedWindow:
+    def __init__(self): self.win, self.count = None, 0
+    def allow(self, t):
+        w = math.floor(t / WINDOW)
+        if w != self.win: self.win, self.count = w, 0
+        if self.count &lt; LIMIT: self.count += 1; return True
+        return False
+
+class SlidingLog:
+    def __init__(self): self.log = deque()
+    def allow(self, t):
+        while self.log and self.log[0] &lt;= t - WINDOW: self.log.popleft()
+        if len(self.log) &lt; LIMIT: self.log.append(t); return True
+        return False
+
+class SlidingCounter:              # Cloudflare-style approximation
+    def __init__(self): self.win, self.cur, self.prev = None, 0, 0
+    def allow(self, t):
+        w = math.floor(t / WINDOW)
+        if w != self.win:
+            self.prev = self.cur if self.win == w - 1 else 0
+            self.win, self.cur = w, 0
+        overlap = 1 - (t % WINDOW) / WINDOW
+        if self.prev * overlap + self.cur &lt; LIMIT: self.cur += 1; return True
+        return False
+
+class TokenBucket:
+    def __init__(self, capacity=LIMIT, rate=LIMIT / WINDOW):
+        self.cap, self.rate, self.tokens, self.last = capacity, rate, capacity, 0.0
+    def allow(self, t):
+        self.tokens = min(self.cap, self.tokens + (t - self.last) * self.rate)
+        self.last = t
+        if self.tokens &gt;= 1: self.tokens -= 1; return True
+        return False
+
+burst = [59.0] * 10 + [61.0] * 10          # straddles the minute boundary
+for cls in (FixedWindow, SlidingLog, SlidingCounter, TokenBucket):
+    lim = cls()
+    ok = sum(lim.allow(t) for t in burst)
+    print(f"{cls.__name__:15s} allowed {ok:2d} of {len(burst)} requests within 2 seconds")</code></pre>
+<pre class="terminal"><code>$ python limiters.py
+FixedWindow     allowed 20 of 20 requests within 2 seconds
+SlidingLog      allowed 10 of 20 requests within 2 seconds
+SlidingCounter  allowed 11 of 20 requests within 2 seconds
+TokenBucket     allowed 10 of 20 requests within 2 seconds</code></pre>
+        <p>The fixed window lets through <b>double</b> the limit. The sliding log is exact. The sliding counter allows one extra (its estimate of the old window is 10 × 59/60 ≈ 9.83, just under 10): that is the "approximate" in "approximation". The token bucket is exact here too, and it is the only one with an explicit, tunable burst.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Algorithm</th><th>State per key</th><th>Bursts</th><th>Accuracy</th><th>Used by</th></tr></thead>
+            <tbody>
+              <tr><td>Token bucket</td><td>2 numbers</td><td>Allowed up to B (tunable)</td><td class="yes">Good</td><td>Stripe, AWS API Gateway</td></tr>
+              <tr><td>Leaky bucket</td><td>Queue or 2 numbers</td><td>Smoothed (queued)</td><td class="yes">Good, adds delay</td><td>NGINX <code>limit_req</code></td></tr>
+              <tr><td>Fixed window</td><td>1 counter</td><td class="no">2x at boundary</td><td class="no">Weak</td><td>Quick quotas</td></tr>
+              <tr><td>Sliding log</td><td>All timestamps</td><td>None</td><td class="yes">Exact</td><td>Low-volume security limits</td></tr>
+              <tr><td>Sliding counter</td><td>2 counters</td><td>Nearly none</td><td class="yes">Very close</td><td>Cloudflare</td></tr>
+            </tbody>
+          </table>
+        </div>
+      

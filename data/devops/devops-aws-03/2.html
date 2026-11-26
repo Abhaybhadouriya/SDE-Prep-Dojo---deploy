@@ -1,0 +1,113 @@
+
+  <h2>Who may do what: private by default, Block Public Access, IAM vs bucket policies</h2>
+  <div class="callout note"><p>New to IAM roles and policy evaluation? Read <a href="{{BASE}}devops/devops-aws-02#iam">IAM in 10 minutes</a> first.</p></div>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span><span class="chip warn">Top real-world mistake</span></div>
+  <p>Every bucket and object starts <b>private</b>: only the account that owns it can touch it. Access is then opened up deliberately with policies. There are three places a permission can live:</p>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Mechanism</th><th>Attached to</th><th>Answers</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><b>IAM identity policy</b></td><td>a user, group or role</td><td>"What may <i>this principal</i> do, across all resources?"</td><td>Your own services: "the uploader role may PutObject on <code>dojo-uploads/*</code>"</td></tr>
+        <tr><td><b>Bucket policy</b> (resource policy)</td><td>the bucket</td><td>"Who may do what <i>to this bucket</i>?"</td><td>Cross-account access, guard rails for everyone (deny non-TLS, require a <a href="{{BASE}}interview/glossary#vpc">VPC</a> endpoint, require KMS)</td></tr>
+        <tr><td><b>ACLs</b> (legacy)</td><td>bucket or object</td><td>Coarse grants to accounts or groups</td><td>Nothing new. Since April 2023 new buckets have ACLs disabled ("Bucket owner enforced") - keep it that way</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p><b>Block Public Access (BPA)</b> is a set of four switches (at account and bucket level) that override everything else: even if someone writes a policy granting <code>"Principal": "*"</code>, BPA blocks or ignores it. New buckets have all four switches on since April 2023. Leave them on for every bucket that is not a deliberate public website, and serve public content through CloudFront with Origin Access Control instead.</p>
+  <p>Here is how S3 decides on one request. Click through it:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 330" role="img" aria-label="S3 authorization: authenticate, look for explicit deny, apply Block Public Access, look for an allow, otherwise implicit deny">
+      <rect class="box client" x="20" y="20" width="160" height="60"/>
+      <text class="label" x="100" y="46">GET request</text>
+      <text class="label small" x="100" y="66">SigV4 signed</text>
+      <g data-step="1">
+        <rect class="box svc" x="230" y="20" width="160" height="60"/>
+        <text class="label" x="310" y="46">who is it?</text>
+        <text class="label small" x="310" y="66">role/uploader</text>
+        <path class="arrow" d="M180 50 L225 50"/>
+      </g>
+      <g data-step="2">
+        <rect class="box warn" x="440" y="20" width="160" height="60"/>
+        <text class="label" x="520" y="46">explicit Deny?</text>
+        <text class="label small" x="520" y="66">any policy</text>
+        <path class="arrow" d="M390 50 L435 50"/>
+        <rect class="box fail" x="640" y="20" width="140" height="60"/>
+        <text class="label small bad" x="710" y="55">yes: 403, stop</text>
+        <path class="arrow bad" d="M600 50 L635 50"/>
+      </g>
+      <g data-step="3">
+        <rect class="box warn" x="440" y="130" width="160" height="60"/>
+        <text class="label" x="520" y="156">Block Public</text>
+        <text class="label small" x="520" y="176">Access filter</text>
+        <path class="arrow" d="M520 80 L520 125"/>
+        <text class="label small left" x="610" y="166">public grants ignored</text>
+      </g>
+      <g data-step="4">
+        <rect class="box k8s" x="230" y="130" width="160" height="60"/>
+        <text class="label" x="310" y="156">any Allow?</text>
+        <text class="label small" x="310" y="176">IAM or bucket policy</text>
+        <path class="arrow" d="M440 160 L395 160"/>
+        <rect class="box ok" x="230" y="240" width="160" height="60"/>
+        <text class="label small ok" x="310" y="275">yes: 200 OK</text>
+        <path class="arrow ok" d="M310 190 L310 235"/>
+      </g>
+      <g data-step-only="5">
+        <rect class="box fail ring" x="20" y="240" width="170" height="60"/>
+        <text class="label small bad" x="105" y="266">no Allow anywhere:</text>
+        <text class="label small bad" x="105" y="286">implicit deny, 403</text>
+        <path class="arrow bad" d="M230 175 L150 235"/>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li><b>Request.</b> Every call is signed with Signature Version 4 using the caller's credentials (an <a href="{{BASE}}interview/glossary#iam-role">IAM role</a> on EC2/ECS/EKS, never long-lived keys in code). An unsigned request is "anonymous".</li>
+      <li><b>Identify.</b> S3 works out the principal - here the role <code>uploader</code> - and gathers every policy that applies: the role's IAM policies, the bucket policy, any Organizations SCP/RCP, and the VPC endpoint policy if the call came through one.</li>
+      <li><b>Explicit deny wins.</b> If any of those policies has a matching <code>"Effect": "Deny"</code>, the answer is 403 immediately. Nothing can override an explicit deny - this is why guard-rail policies are written as denies.</li>
+      <li><b>Block Public Access.</b> Grants that would make the bucket public (principal <code>*</code> without a narrowing condition, public ACLs) are blocked or ignored.</li>
+      <li><b>Find an Allow.</b> Same account: an allow in <i>either</i> the IAM policy <i>or</i> the bucket policy is enough. Cross-account: the caller's IAM policy <i>and</i> the bucket policy must both allow. If nothing allows, the default is an implicit deny: 403 AccessDenied.</li>
+    </ol>
+  </div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is a firewall rule chain with a default-drop policy. <code>iptables -P INPUT DROP</code> is "private by default"; a <code>-j DROP</code> rule early in the chain is an explicit deny that no later ACCEPT can undo; the ACCEPT rules are the Allows. Cross-account access is like traffic crossing two firewalls - the sender's egress rule <i>and</i> the receiver's ingress rule must both permit it. And the VPC side maps directly onto routing: an S3 <b>gateway VPC endpoint</b> is literally a route-table entry whose destination is an AWS-managed prefix list (<code>pl-xxxx</code>, the S3 IP ranges) and whose next hop is the endpoint, so S3 traffic from private subnets skips the NAT gateway (and its per-GB charge). See <a href="{{BASE}}devops/devops-aws-01">AWS Networking</a> for route tables.</p>
+  </div>
+  <p>A bucket policy that a reviewer would be happy with: deny plain HTTP, only allow traffic through our VPC endpoint, and give one role write access to one prefix.</p>
+  <pre><code class="language-json">{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyInsecureTransport",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::dojo-uploads-surbhi", "arn:aws:s3:::dojo-uploads-surbhi/*"],
+      "Condition": { "Bool": { "aws:SecureTransport": "false" } }
+    },
+    {
+      "Sid": "DenyOutsideOurVpce",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::dojo-uploads-surbhi/*",
+      "Condition": { "StringNotEquals": { "aws:SourceVpce": "vpce-0a1b2c3d4e5f67890" } }
+    },
+    {
+      "Sid": "UploaderMayWriteIncoming",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/uploader" },
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::dojo-uploads-surbhi/incoming/*"
+    }
+  ]
+}</code></pre>
+  <pre><code class="language-bash">aws s3api put-bucket-policy --bucket dojo-uploads-surbhi --policy file://policy.json
+aws s3api get-public-access-block --bucket dojo-uploads-surbhi</code></pre>
+  <pre class="terminal"><code>{
+    "PublicAccessBlockConfiguration": {
+        "BlockPublicAcls": true,
+        "IgnorePublicAcls": true,
+        "BlockPublicPolicy": true,
+        "RestrictPublicBuckets": true
+    }
+}</code></pre>
+  <div class="callout warn"><p>A <code>DenyOutsideOurVpce</code> statement like the one above also blocks <b>you</b> in the console and on your laptop. Real policies add an exception (for example <code>aws:PrincipalArn</code> of a break-glass admin role) before applying it. Test with a second session open.</p></div>
+  <div class="callout tip"><p><code>ListBucket</code> is granted on the <b>bucket</b> ARN (<code>arn:aws:s3:::name</code>); <code>GetObject</code>/<code>PutObject</code> on the <b>object</b> ARN (<code>arn:aws:s3:::name/*</code>). Mixing them up is the most common reason a policy "looks right" but returns 403. Also: without <code>ListBucket</code>, a GET on a missing key returns 403 instead of 404, so the caller cannot probe which keys exist.</p></div>

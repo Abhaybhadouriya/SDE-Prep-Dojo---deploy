@@ -1,0 +1,61 @@
+
+        <h2>Interview questions</h2>
+
+        <details class="qa" data-level="4" data-topic="k8s" data-company="Flipkart,Amazon,Walmart">
+          <summary>How would you autoscale a Kafka consumer on Kubernetes?</summary>
+          <div class="answer">
+            <p>Not on CPU. A consumer can be blocked on a slow database with low CPU while lag piles up, so CPU is an indirect signal. I would scale on consumer lag using KEDA's Kafka scaler: it reads the group's committed offsets and the partitions' end offsets, exposes total lag as an external metric, and drives an HPA with a target like 100 messages per replica, so 480 lag gives 5 replicas. Max replicas equals the partition count, because in a consumer group each partition goes to one member. I scale up fast and down slowly, because every membership change is a rebalance: a long scale-down stabilization window, the cooperative-sticky assignor so only moved partitions pause, graceful shutdown on SIGTERM so members leave cleanly, and a PDB so a node drain does not evict several consumers at once.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say why not CPU in one sentence, name the signal (lag), the tool (KEDA or a Prometheus-adapter HPA), the cap (partitions), and then the hidden cost (rebalances) with three mitigations.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if you need more parallelism than partitions? (More partitions up front, or process records concurrently inside a consumer with per-key ordering, or Kafka share groups, which allow several consumers per partition without ordering.)</li><li>Can it scale to zero? (Yes with KEDA, minReplicaCount 0 and activationLagThreshold, at the cost of cold-start latency.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="k8s" data-company="Microsoft,Google">
+          <summary>What is a Kubernetes operator, and why use one for Kafka instead of a StatefulSet?</summary>
+          <div class="answer">
+            <p>An operator is a custom resource type plus a controller that reconciles it. I declare "a Kafka cluster with 3 brokers, RF 3, these listeners" as a <code>Kafka</code> object; the Strimzi operator watches it through the API server and creates and updates the pods, services, certificates and volumes, and writes status back. A StatefulSet gives stable names and disks and ordered restarts, but it knows nothing about Kafka. The operator knows the runbook: restart one broker at a time and wait until its partitions are back in sync, handle the KRaft controllers carefully, rotate TLS certificates, manage topics and users as resources. So it is automation of the operational knowledge, not just of process supervision.</p>
+            <div class="approach"><h5>How to answer</h5><p>Definition (CRD + controller + reconcile loop), concrete example (one safe rolling restart), comparison (StatefulSet = generic, operator = app-aware).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens if the operator pod dies? (Kafka keeps running; only changes and self-healing pause until it is back, like a control plane outage.)</li><li>Name other operators. (<a href="{{BASE}}interview/glossary#prometheus">Prometheus</a> Operator, cert-manager, CloudNativePG.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="k8s" data-company="Amazon,Microsoft,Flipkart">
+          <summary>How do you deploy a new version of a consumer service with zero data loss and minimal disruption?</summary>
+          <div class="answer">
+            <p>Rolling update with <code>maxUnavailable: 0</code> and <code>maxSurge: 1</code>, so capacity never drops. Each old pod gets SIGTERM; the app finishes its current batch, commits (or commits its transaction), and closes the consumer, which sends a leave-group so the rebalance starts immediately instead of after the session timeout. <code>terminationGracePeriodSeconds</code> is longer than a batch takes. Offsets are committed only after work is done, so anything in flight is re-read by the next owner, and the sink is <a href="{{BASE}}interview/glossary#idempotent">idempotent</a> so re-reading is harmless. The cooperative-sticky assignor limits each rebalance to the moved partitions; static membership can avoid rebalances entirely for quick restarts if pods have stable names. I watch lag and error rate during the rollout and roll back with <code>kubectl rollout undo</code> if they regress. Message format changes must be backward compatible, because old and new versions run side by side.</p>
+            <div class="approach"><h5>How to answer</h5><p>Cover three layers: Kubernetes (rollout strategy, grace period), Kafka (graceful leave, commit order, assignor), data (idempotent sink, compatible schemas). Then how you would detect a bad rollout.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if processing a batch takes longer than the grace period? (SIGKILL; the batch is re-read, so correctness holds, but tune batch size or grace period.)</li><li>Blue-green for consumers? (Possible with a new group and an offset copy, but usually not worth it.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="kafka" data-company="Google,Amazon">
+          <summary>Why can't you just put a load balancer in front of Kafka brokers?</summary>
+          <div class="answer">
+            <p>Because Kafka clients must talk to the specific leader broker of each partition. The bootstrap address is only used for the first metadata request; the response lists every broker's advertised address, and from then on the client opens a connection to each leader directly. A single load balancer would send requests to random brokers, which reply "not the leader". On Kubernetes, inside the cluster, brokers advertise their pod DNS names, so it just works. For external clients, each broker needs its own externally reachable address: Strimzi's nodeport, loadbalancer or ingress listeners create one per broker and set the advertised listeners to match.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain the two-step connection (bootstrap, then direct), then the fix. A small drawing helps.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What breaks if advertised.listeners is wrong? (Clients connect to bootstrap, then time out connecting to an unreachable address.)</li><li>How does follower fetching (client.rack) change this? (Consumers may read from a same-zone replica to save cross-zone traffic.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="k8s" data-company="Microsoft,Walmart">
+          <summary>Liveness vs readiness for a service that depends on Kafka: what does each probe check?</summary>
+          <div class="answer">
+            <p>Liveness answers "is this process healthy enough to keep?", so it checks only the process itself, like a simple <code>/healthz</code>. If it fails, the kubelet restarts the container. Readiness answers "should this pod get traffic right now?", so it may check dependencies: our <code>/readyz</code> asks Kafka for topic metadata. If Kafka is unreachable the pod leaves the Service endpoints but is not restarted, because a restart would not fix Kafka and restarting every pod at once would make recovery worse. A startup probe gives slow boots time before liveness starts counting. Workers like the enricher receive no Service traffic, so readiness matters little for them: we keep a readiness probe on <code>/metrics</code> only so a rolling update waits until the new process has started. For a worker, liveness is the probe that matters.</p>
+            <div class="approach"><h5>How to answer</h5><p>One line per probe with "who acts and what they do" (kubelet restarts; endpoints controller removes from Service), then the anti-pattern.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What does a readiness failure do during a rolling update? (Blocks the rollout, because maxUnavailable 0 waits for new pods to be ready.)</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: the platform team cannot drain a node for an upgrade</h4>
+          <div class="situation"><p>A node upgrade is stuck: <code>kubectl drain</code> keeps printing "Cannot evict pod as it would violate the pod's disruption budget" for an enricher pod. The enricher is currently at 1 replica because lag is low.</p></div>
+          <div class="bad"><p>Weak answer: "Delete the PDB" or "drain with --disable-eviction" and move on.</p></div>
+          <div class="good"><p>Strong answer: The PDB uses <code>minAvailable: 1</code> on a workload that can be at 1 replica, so it allows zero evictions, forever. The fix is <code>maxUnavailable: 1</code>, which still prevents a drain from evicting several consumers at once (one big rebalance) but never blocks. For the moment I could scale the enricher to 2 so the drain can proceed safely. Then I would audit other PDBs for the same pattern, and add a CI check: a PDB with minAvailable greater than or equal to the minimum replicas is a bug.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Do PDBs protect against a node crash? (No, only voluntary evictions.)</li><li>What protects Kafka brokers during drains? (Strimzi's PDB plus RF 3, min ISR 2 and rack awareness.)</li></ul></div>
+        </div>
+
+        <div class="callout interview">
+          <p><b>60-second answer: "How would you run this pipeline on Kubernetes?"</b><br>
+          "Kafka runs through the Strimzi operator: I declare node pools for three KRaft controllers and three brokers, rack-aware across three zones, with replication factor 3 and min ISR 2, and the operator handles safe rolling restarts and certificates. Topics are KafkaTopic resources in git. The services are Deployments with separate startup, liveness and readiness probes, a memory limit, a non-root read-only security context, and graceful SIGTERM handling so consumers leave the group cleanly. Config comes from a ConfigMap, credentials from a secret manager. The stateless API scales on CPU with an HPA; the consumer scales on lag with KEDA, capped at the partition count. PDBs keep drains safe, and default-deny NetworkPolicies allow only the flows we need."</p>
+        </div>
+      

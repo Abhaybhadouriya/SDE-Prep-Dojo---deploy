@@ -1,0 +1,61 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <ul>
+          <li><b>Kubernetes:</b> the gateway runs as a scalable Deployment. Today the forward path on Kubernetes is the <a href="{{BASE}}devops/k8s-06">Gateway API</a> (the community Ingress NGINX controller was retired: Kubernetes <a href="https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/" target="_blank" rel="noopener">announced it on 11 November 2025</a>, and best-effort maintenance ended in March 2026; your Ingress knowledge is still useful because many clusters run it, but new designs should use the Gateway API, see <a href="{{BASE}}devops/k8s-06">Ingress &amp; Gateway API</a>). With <b>Envoy Gateway</b>, global rate limiting is a policy object; Envoy calls a separate rate limit service backed by Redis, exactly the design on this page. Rules can live in a ConfigMap and be hot-reloaded. Redis runs as a managed service or as a <a href="{{BASE}}devops/k8s-10">StatefulSet</a> via an operator.</li>
+          <li><b>Kafka:</b> not on the decision path (too slow for a per-request check). It carries <b>decision and usage events</b> for analytics, billing ("how many calls did customer X make this month?") and abuse detection, and lets you <b>queue</b> work instead of rejecting it: an API can accept a request with 202, put it on a topic, and let workers process at a fixed rate. That is a leaky bucket built from Kafka plus a consumer group whose speed you control. See <a href="{{BASE}}devops/kafka-01">Why messaging</a> and <a href="{{BASE}}devops/kafka-04">consumer groups</a>.</li>
+          <li><b>Docker:</b> the Envoy proxy, the rate limit service (<code>envoyproxy/ratelimit</code>) and Redis all ship as container images; a local <a href="{{BASE}}devops/docker-07">Compose</a> file is a quick way to test rules.</li>
+        </ul>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Envoy Gateway policy">
+<pre><code class="language-yaml">apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: orders-api-ratelimit
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: orders-api
+  rateLimit:
+    # older Envoy Gateway releases also required "type: Global" here; current ones infer it from "global:"
+    global:                      # shared across all Envoy pods (Redis-backed rate limit service)
+      rules:
+      - clientSelectors:
+        - headers:
+          - name: x-api-key
+            type: Distinct       # one bucket per distinct API key
+        limit:
+          requests: 100
+          unit: Minute</code></pre>
+        <p class="muted">Field names follow the <a href="https://gateway.envoyproxy.io/docs/tasks/traffic/global-rate-limit/" target="_blank" rel="noopener">Envoy Gateway global rate limit task</a>; check that page for the version you install.</p>
+          </div>
+          <div class="tab-panel" data-title="envoyproxy/ratelimit rules">
+<pre><code class="language-yaml"># config for the standalone envoyproxy/ratelimit service
+domain: public-api
+descriptors:
+  - key: api_key
+    rate_limit:
+      unit: minute
+      requests_per_unit: 100
+  - key: route
+    value: "POST /login"
+    rate_limit:
+      unit: minute
+      requests_per_unit: 5</code></pre>
+          </div>
+          <div class="tab-panel" data-title="NGINX (single box)">
+<pre><code class="language-bash"># nginx.conf - leaky bucket per client IP, 10 req/s, queue of 20, answer 429 not 503
+limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+
+server {
+    listen 80;
+    location /api/ {
+        limit_req zone=api burst=20 nodelay;
+        limit_req_status 429;        # default is 503
+        proxy_pass http://backend;
+    }
+}</code></pre>
+            <p>The NGINX docs say a 1 MB zone holds about 16 thousand 64-byte states, so <code>10m</code> is room for roughly 160 thousand client IPs. Each NGINX box counts on its own, so with 10 boxes a client can get up to 10x the limit: fine for crude flood protection, not for per-customer quotas.</p>
+          </div>
+        </div>
+      

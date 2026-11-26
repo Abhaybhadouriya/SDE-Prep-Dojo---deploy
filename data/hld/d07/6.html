@@ -1,0 +1,170 @@
+
+        <h2>Deep dives</h2>
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> If you can explain the stepper above with the idempotent order and the outbox, you have a solid SDE-1 answer. SDE-2 interviewers will push on the next five topics, usually two or three of them.</p></div>
+
+        <h3>1. Rider assignment: why "nearest rider" is the wrong answer</h3>
+        <p>The naive answer is "when an order comes in, find the closest free rider and assign them". It sounds fine and it fails in three ways:</p>
+        <ul>
+          <li><b>Too early.</b> The nearest rider arrives in 3 minutes, but the food needs 15. The rider stands idle for 12 minutes, and that rider could have delivered another order.</li>
+          <li><b>Greedy is unfair to later orders.</b> Order A grabs rider R1, who is the only rider near restaurant B. Order B, a second later, now gets a rider 4 km away. Looking at both orders together would have given both a good rider.</li>
+          <li><b>No batching.</b> Two orders from the same restaurant going the same way can share one rider. Greedy one-at-a-time matching never sees that.</li>
+        </ul>
+        <p>The better answer is <b>batched matching</b>. Dispatch is split by <b>zone</b> (a group of H3 cells in one city area). Every short window (for example every 30-60 seconds, a tunable) it takes all unassigned orders and all free or soon-free riders in the zone and builds a cost for each (order, rider) pair:</p>
+<pre><code class="language-python"># cost of giving `order` to `rider` (lower is better); weights are tuned with experiments
+def cost(order, rider):
+    t_to_restaurant = eta_service.travel(rider.location, order.restaurant)   # road ETA, not straight line
+    t_food_ready    = order.ready_at - now()
+    rider_wait      = max(0, t_food_ready - t_to_restaurant)     # rider idles at the kitchen
+    food_wait       = max(0, t_to_restaurant - t_food_ready)     # food goes cold on the counter
+    t_to_customer   = eta_service.travel(order.restaurant, order.customer)
+    return (W_FOOD * food_wait          # the customer cares most about this
+          + W_RIDER * rider_wait        # wasted fleet capacity
+          + W_LATE * max(0, now() + t_to_restaurant + rider_wait + t_to_customer - order.promised_eta))</code></pre>
+        <p>Then it solves an <b>assignment problem</b> (a minimum-cost bipartite matching, for example with the Hungarian algorithm or a min-cost-flow solver, or a fast heuristic at large sizes). Swiggy's Akka case study describes exactly this shape: scoring every order-and-rider pairing for a city and returning the batch inside a one-minute SLA.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Greedy assignment versus batch assignment of two orders and two riders">
+            <text class="label title" x="200" y="24">Greedy (one at a time)</text>
+            <text class="label title" x="600" y="24">Batch (look at both)</text>
+            <rect class="box db" x="40" y="60" width="110" height="46"/><text class="label" x="95" y="83">Order A</text>
+            <rect class="box db" x="40" y="170" width="110" height="46"/><text class="label" x="95" y="193">Order B</text>
+            <rect class="box client" x="250" y="60" width="110" height="46"/><text class="label" x="305" y="83">Rider 1</text>
+            <rect class="box client" x="250" y="170" width="110" height="46"/><text class="label" x="305" y="193">Rider 2</text>
+            <path class="arrow bad" d="M150 92 L242 185"/><text class="label small bad" x="170" y="150">A takes R1? no, R2</text>
+            <path class="arrow bad" d="M150 180 L242 95"/>
+            <text class="label small" x="200" y="250">A grabbed the rider B needed: total wait 22 min</text>
+            <rect class="box db" x="440" y="60" width="110" height="46"/><text class="label" x="495" y="83">Order A</text>
+            <rect class="box db" x="440" y="170" width="110" height="46"/><text class="label" x="495" y="193">Order B</text>
+            <rect class="box client" x="650" y="60" width="110" height="46"/><text class="label" x="705" y="83">Rider 1</text>
+            <rect class="box client" x="650" y="170" width="110" height="46"/><text class="label" x="705" y="193">Rider 2</text>
+            <path class="arrow ok" d="M550 83 L642 83"/>
+            <path class="arrow ok" d="M550 193 L642 193"/>
+            <text class="label small" x="600" y="250">minimum total cost: total wait 9 min (example)</text>
+            <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M550 83 L650 83"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="2s" begin="1s" repeatCount="indefinite" path="M550 193 L650 193"/></circle>
+          </svg>
+          <figcaption>An illustrative example: matching orders one by one can steal the rider a later order needed. Solving the batch together minimises the total cost.</figcaption>
+        </figure>
+        <p><b>Locking the rider.</b> Two zones or two dispatch workers must never offer the same rider two jobs. Store rider status in Redis and flip it atomically, with a TTL so a crashed dispatcher does not freeze a rider forever:</p>
+<pre class="terminal"><code>127.0.0.1:6379&gt; SET rider:17:offer o_81234 NX EX 30
+OK
+127.0.0.1:6379&gt; SET rider:17:offer o_99999 NX EX 30
+(nil)
+127.0.0.1:6379&gt; TTL rider:17:offer
+(integer) 27</code></pre>
+        <p><code>NX</code> means "only set if the key does not exist", so the second offer fails. <code>EX 30</code> is the 30-second offer timeout. When the rider accepts, the order service writes the assignment to SQL with a conditional update (<code>... WHERE status = 'ACCEPTED' AND rider_id IS NULL</code>), so even a bug in Redis cannot assign two riders to one order.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Batch matching is a <b>scheduler</b>, the same shape as the <a href="{{BASE}}devops/k8s-09">Kubernetes scheduler</a> (filter feasible nodes, then score them) or admission control that places a flow on a line card with spare capacity. The time window is like <b>interrupt coalescing</b>: wait a little to batch work, and get much better decisions for a small latency cost. <b>Where it breaks:</b> riders can say no, so every placement is only an <em>offer</em> until they accept.</p>
+        </div>
+
+        <h3>2. The ETA is a sum of predictions</h3>
+        <p>"Your food will arrive in 32 minutes" is a promise. If you promise too low, customers are angry. If you promise too high, they order elsewhere. The ETA is built from parts, and each part has its own model:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="ETA timeline: order confirmed, prep time, rider travel overlaps with prep, pickup, travel to customer, last mile">
+            <text class="label small left" x="20" y="30">time -&gt;</text>
+            <rect class="box db" x="20" y="50" width="330" height="44"/>
+            <text class="label" x="185" y="72">kitchen prep (predicted 15 min)</text>
+            <rect class="box client" x="170" y="110" width="180" height="44"/>
+            <text class="label" x="260" y="132">rider to restaurant</text>
+            <rect class="box svc" x="350" y="80" width="70" height="44"/>
+            <text class="label small" x="385" y="102">pickup</text>
+            <rect class="box kafka" x="420" y="80" width="250" height="44"/>
+            <text class="label" x="545" y="102">ride to customer (road ETA)</text>
+            <rect class="box cache" x="670" y="80" width="110" height="44"/>
+            <text class="label small" x="725" y="102">last mile</text>
+            <path class="arrow dashed" d="M170 170 L170 200"/>
+            <text class="label small left" x="180" y="196">dispatch here, not at 0</text>
+            <circle class="packet gold" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M20 160 L780 160"/></circle>
+          </svg>
+          <figcaption>ETA = prep time + pickup + ride + last mile. The rider's trip to the restaurant overlaps with cooking. That overlap is why dispatch timing matters.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Prep time</b> is the hardest. The restaurant's own estimate is often wrong, so a model uses the dish mix, the restaurant's history at this hour, and how many orders it has open right now.</li>
+          <li><b>Travel time</b> comes from a routing service on the road graph with live traffic (see <a href="{{BASE}}hld/d37">Google Maps design</a>), never straight-line distance.</li>
+          <li><b>Last mile</b> (parking, finding the gate, the lift in an apartment block) is learned per building or area from past deliveries.</li>
+          <li><b>Re-estimate continuously.</b> After pickup, the ETA is recomputed from live pings every few seconds. Smooth the number shown to the user, so it does not jump around.</li>
+        </ul>
+        <p>Model serving is its own system. Swiggy's vendor case study reports P99 prediction latency dropping from 144 ms to 71 ms at more than 5,000 predictions per second on one model. That is a useful reminder that ML calls sit on the hot path and need latency budgets like any other dependency. Read more in <a href="{{BASE}}hld/d50">surge pricing and ETA</a>.</p>
+
+        <h3>3. Geo: "who can deliver to me?" and "which riders are near?"</h3>
+        <p>These are two different geo questions:</p>
+        <ul>
+          <li><b>Serviceability (static-ish):</b> each restaurant has a delivery polygon, which can shrink at peak. Precompute the set of <b>H3 cells</b> each polygon covers and index restaurants by cell. A customer query becomes "restaurants indexed under my cell", which is one fast lookup or an Elasticsearch <code>terms</code> filter. Uber's H3 uses hexagons at 16 resolutions, and each finer level has about 1/7 of the area.</li>
+          <li><b>Nearby riders (moving):</b> riders move every few seconds, so use an in-memory geo index. Redis <code>GEOADD</code> / <code>GEOSEARCH</code> (a geohash in a sorted set) is the simplest real option. Shard it by city, because riders never cross cities mid-shift.</li>
+        </ul>
+        <p>Try it locally with <code>docker run -d -p 6379:6379 redis:7</code> and <code>redis-cli</code>:</p>
+<pre class="terminal"><code>127.0.0.1:6379&gt; GEOADD riders:blr 77.6420 12.9716 rider:17 77.6310 12.9650 rider:42 77.6650 12.9900 rider:88
+(integer) 3
+127.0.0.1:6379&gt; GEOSEARCH riders:blr FROMLONLAT 77.6400 12.9700 BYRADIUS 3 km ASC WITHDIST
+1) 1) "rider:17"
+   2) "0.2805"
+2) 1) "rider:42"
+   2) "1.1229"</code></pre>
+        <p>rider:88 is about 3.5 km away, so it is not returned. (The last digit of a distance can differ slightly, because Redis stores positions as 52-bit geohashes.) Two gotchas: a rider who stops pinging still sits in the set, so also keep <code>rider:{id}:alive</code> with a short TTL and filter on it. And a geohash cell boundary can split two points that are very close, so a radius search must also look at the neighbouring cells (Redis does this for you; your own grid index must do it too).</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="A grid of geo cells: the customer cell plus its 8 neighbours are searched">
+            <g>
+              <rect class="box plain" x="250" y="20" width="70" height="70"/><rect class="box plain" x="320" y="20" width="70" height="70"/><rect class="box plain" x="390" y="20" width="70" height="70"/><rect class="box plain" x="460" y="20" width="70" height="70"/>
+              <rect class="box plain" x="250" y="90" width="70" height="70"/><rect class="box highlight" x="320" y="90" width="70" height="70"/><rect class="box highlight" x="390" y="90" width="70" height="70"/><rect class="box highlight" x="460" y="90" width="70" height="70"/>
+              <rect class="box plain" x="250" y="160" width="70" height="70"/><rect class="box highlight" x="320" y="160" width="70" height="70"/><rect class="box hot" x="390" y="160" width="70" height="70"/><rect class="box highlight" x="460" y="160" width="70" height="70"/>
+            </g>
+            <text class="label small" x="425" y="198">you</text>
+            <circle class="packet" r="6" cx="0" cy="0"><animateMotion dur="6s" repeatCount="indefinite" path="M260 30 L340 100 L440 120 L420 180"/></circle>
+            <text class="label small left" x="560" y="110">search your cell</text>
+            <text class="label small left" x="560" y="132">+ its neighbours</text>
+            <text class="label small left" x="560" y="154">(boundary trap)</text>
+            <text class="label small left" x="20" y="60">a rider moving</text>
+            <text class="label small left" x="20" y="82">into range</text>
+          </svg>
+          <figcaption>Search the customer's cell and its neighbours, because a rider 50 metres away can sit in a different cell. (Only part of the 3x3 ring is drawn.)</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A geohash prefix is like an <b>IP prefix</b>: a longer prefix means a smaller area, and "same prefix" usually means "near". Two adjacent addresses can sit on different sides of a /24 boundary, and two neighbouring points can sit in different geo cells, which is why you check the neighbours. Deeper detail is on the <a href="{{BASE}}hld/hld-15">geo indexes page</a>.</p>
+        </div>
+
+        <h3>4. The order state machine and exactly-once transitions</h3>
+        <p>An order is a small state machine. Many actors push it forward (the payment callback, the restaurant tablet, dispatch, the rider app), and many of them retry. The rule is: <b>every transition is a conditional update from an expected state</b>, so retries and races are harmless.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 260" role="img" aria-label="Order state machine from placed to delivered, with cancel and reject branches">
+            <rect class="box client" x="10" y="40" width="100" height="44"/><text class="label small" x="60" y="62">PLACED</text>
+            <rect class="box svc" x="140" y="40" width="110" height="44"/><text class="label small" x="195" y="62">CONFIRMED</text>
+            <rect class="box db" x="280" y="40" width="110" height="44"/><text class="label small" x="335" y="62">ACCEPTED</text>
+            <rect class="box kafka" x="420" y="40" width="130" height="44"/><text class="label small" x="485" y="62">RIDER_ASSIGNED</text>
+            <rect class="box cache" x="580" y="40" width="100" height="44"/><text class="label small" x="630" y="62">PICKED_UP</text>
+            <rect class="box svc" x="690" y="140" width="100" height="44"/><text class="label small" x="740" y="162">DELIVERED</text>
+            <path class="arrow" d="M110 62 L132 62"/><path class="arrow" d="M250 62 L272 62"/><path class="arrow" d="M390 62 L412 62"/><path class="arrow" d="M550 62 L572 62"/><path class="arrow" d="M650 84 L715 134"/>
+            <rect class="box fail" x="10" y="180" width="140" height="44"/><text class="label small" x="80" y="202">PAYMENT_FAILED</text>
+            <rect class="box fail" x="250" y="180" width="170" height="44"/><text class="label small" x="335" y="202">REJECTED -&gt; refund</text>
+            <rect class="box fail" x="450" y="180" width="170" height="44"/><text class="label small" x="535" y="202">CANCELLED -&gt; refund</text>
+            <path class="arrow bad" d="M60 84 L70 172"/><path class="arrow bad" d="M335 84 L335 172"/><path class="arrow bad" d="M485 84 L520 172"/>
+            <circle class="packet" r="6"><animateMotion dur="6s" repeatCount="indefinite" path="M60 62 L195 62 L335 62 L485 62 L630 62 L740 160"/></circle>
+          </svg>
+          <figcaption>The happy path runs along the top. Failure branches always end in a refund event, never in silence.</figcaption>
+        </figure>
+<pre><code class="language-sql">-- One statement (PostgreSQL): the outbox INSERT only sees rows the UPDATE actually changed.
+WITH moved AS (
+  UPDATE orders
+     SET status = 'RIDER_ASSIGNED', rider_id = 17, version = version + 1
+   WHERE order_id = 81234 AND status = 'ACCEPTED' AND rider_id IS NULL
+  RETURNING order_id
+)
+INSERT INTO outbox (aggregate_id, event_type, payload)
+SELECT order_id, 'rider.assigned', '{"riderId":17}' FROM moved;</code></pre>
+<pre class="terminal"><code>INSERT 0 1      -- first attempt: the order moved, so exactly one outbox row is written
+INSERT 0 0      -- the retry: the WHERE matched 0 rows, "moved" is empty, so no outbox row either</code></pre>
+        <p>Why not a plain <code>UPDATE</code> followed by an <code>INSERT</code>? Because the <code>INSERT</code> would run on the retry too and write a duplicate <code>rider.assigned</code> event. If you prefer two statements, the app must check rows affected: <code>if cur.rowcount == 1: insert the outbox row and COMMIT, else: ROLLBACK</code>. The single statement above makes that rule impossible to forget.</p>
+        <p>The outbox row commits together with the status change, so the Kafka event can never be "lost after commit" or "sent for a rollback". This is the <b>transactional outbox</b>, explained on <a href="{{BASE}}hld/hld-10">distributed transactions and events</a>. Consumers still dedupe by <code>(orderId, eventType)</code>, because the relay is at-least-once.</p>
+
+        <h3>5. Peaks: the bottleneck is riders, not servers</h3>
+        <p>On New Year's Eve 2020, Zomato's CEO said publicly that they "ran out of delivery partner capacity" before the peak. No amount of autoscaling creates more riders. A strong answer treats peak as a <b>supply problem</b> and shows how the system degrades on purpose:</p>
+        <ul>
+          <li><b>Honest ETAs.</b> When riders are scarce, the ETA model sees it and the promise goes up. That alone moves some demand.</li>
+          <li><b>Shrink serviceable areas.</b> Turn off far-away restaurants for a cell (fewer long trips means more deliveries per rider-hour).</li>
+          <li><b>Kitchen throttles.</b> Cap open orders per restaurant. A kitchen with 40 pending orders should stop appearing at the top of the list.</li>
+          <li><b>Surge or "high demand" fee</b> and rider incentives for that zone and hour.</li>
+          <li><b>Admission control.</b> In the worst case, show "we are very busy, try in 10 minutes" before the cart, never after payment.</li>
+          <li><b>Pre-scale the tech anyway.</b> Discovery, gateways and tracking get pre-scaled before known peaks, because autoscalers react in minutes and the dinner spike arrives in minutes too.</li>
+        </ul>
+        <div class="callout interview"><p>Interviewers love the line <b>"Autoscaling fixes CPU, not riders."</b> Then list the levers above. It shows product thinking, not just boxes.</p></div>
+      

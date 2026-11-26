@@ -1,0 +1,53 @@
+
+  <h2>Copy-on-write: change by replacing</h2>
+  <p>Immutability is great until something really must change: feature flags, a routing table, a price list. <b>Copy-on-write (COW)</b> combines the two ideas. The data itself is an immutable snapshot. A single mutable reference points at the current snapshot. Readers read the reference (one volatile read, no lock) and then work on a snapshot that can never change under them. A writer copies the snapshot, changes the copy, and swaps the reference in one atomic step.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Copy-on-write: readers use snapshot v1 while a writer builds v2 and swaps the reference">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box queue" x="300" y="20" width="200" height="50"/>
+      <text class="label mono" x="400" y="42">AtomicReference</text>
+      <text class="label small" x="400" y="60">current</text>
+      <rect class="box ok" x="80" y="150" width="240" height="80"/>
+      <text class="label big" x="200" y="178">Config v1</text>
+      <text class="label small" x="200" y="200">immutable snapshot</text>
+      <text class="label small" x="200" y="218">readers R1, R2 still using it</text>
+      <rect class="box svc" x="480" y="150" width="240" height="80"/>
+      <text class="label big" x="600" y="178">Config v2</text>
+      <text class="label small" x="600" y="200">copy of v1 + one change</text>
+      <text class="label small" x="600" y="218">built privately by the writer</text>
+      <path class="arrow dashed" d="M360 70 L250 144"/>
+      <text class="label small" x="250" y="104">old pointer</text>
+      <path class="arrow ok" d="M440 70 L560 144"/>
+      <text class="label small" x="560" y="104">compareAndSet(v1, v2)</text>
+      <text class="label small" x="400" y="266">new readers get v2; old readers finish on v1; the GC frees v1 when nobody holds it</text>
+    </svg>
+    <figcaption>Readers never wait and never see a half-applied change. Two writers racing each other are handled by the CAS loop in <code>updateAndGet</code>: the loser rebuilds from the winner's snapshot and tries again.</figcaption>
+  </figure>
+<pre><code class="language-java">record Config(int version, Map&lt;String, String&gt; values) {
+    Config { values = Map.copyOf(values); }                 // immutable snapshot
+    Config with(String k, String v) {
+        Map&lt;String, String&gt; m = new HashMap&lt;&gt;(values);
+        m.put(k, v);
+        return new Config(version + 1, m);
+    }
+}
+
+final class ConfigStore {
+    private final AtomicReference&lt;Config&gt; current = new AtomicReference&lt;&gt;(new Config(0, Map.of()));
+
+    Config snapshot() { return current.get(); }               // readers: no lock
+    void put(String k, String v) {
+        current.updateAndGet(c -&gt; c.with(k, v));              // writers: copy, modify, CAS; retry on clash
+    }
+}</code></pre>
+  <p>Our demo runs one reader in a tight loop checking the invariant <code>version == number of keys</code> on every snapshot, while 4 writers make 250 updates each. Result: version 1000, 1000 keys, no lost update, and the reader never saw a torn snapshot. The C++ version uses <code>std::shared_ptr&lt;const Config&gt;</code> with <code>std::atomic_load</code>/<code>std::atomic_store</code>; the reference count keeps an old snapshot alive while a reader still holds it.</p>
+  <h3>CopyOnWriteArrayList for listeners</h3>
+  <p>The JDK ships the same idea as <code>CopyOnWriteArrayList</code>: every add or remove copies the whole backing array, and iterators walk the snapshot that existed when they started, so they never throw <code>ConcurrentModificationException</code>. It is ideal for <a href="{{BASE}}lld/lld-pat-strategy">strategy</a> or listener lists in an Observer, where events fire constantly and subscriptions change rarely. It is a bad choice for a list that is written often: each write costs O(n) copying.</p>
+  <div class="proscons">
+    <div class="pros"><h5>COW is good when</h5><ul><li>Reads vastly outnumber writes (config, routing tables, listener lists)</li><li>Readers must never block or see a partial update</li><li>A full snapshot per read is what callers want</li></ul></div>
+    <div class="cons"><h5>COW is bad when</h5><ul><li>Writes are frequent or the data is large (each write copies everything)</li><li>Writers need to see each other's changes instantly in a read-modify-write (use a lock or CAS loop)</li><li>Memory is tight: old snapshots live until the last reader drops them</li></ul></div>
+  </div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is RCU (read-copy-update) without the hard part. In the kernel, readers enter <code>rcu_read_lock()</code>, follow a pointer with <code>rcu_dereference()</code>, and never block; a writer builds a new copy, publishes it with <code>rcu_assign_pointer()</code>, then waits in <code>synchronize_rcu()</code> for a grace period before freeing the old copy. In Java the garbage collector does the "wait until no reader holds it" step for you; in C++ <code>shared_ptr</code> reference counts do it (like <code>kref</code>). Routing tables and netfilter rule sets use this pattern for the same reason a Java config store does: lookups on the fast path, rare updates.</p>
+  </div>

@@ -1,0 +1,131 @@
+
+  <h2>Pattern 1: CloudWatch Logs subscription to Lambda (security signals)</h2>
+  <div class="chips"><span class="chip ok">Must know (SDE-1)</span></div>
+  <p>Your services write logs to a CloudWatch Logs <strong>log group</strong>. A <strong>subscription filter</strong> on that group says "send every log event that matches this pattern to this destination, in near real time". The destination can be Lambda, Kinesis Data Streams, Data Firehose or OpenSearch. When the destination is Lambda, the function receives a JSON event like <code>{"awslogs": {"data": "..."}}</code> where <code>data</code> is <b>base64 of gzip of JSON</b>.</p>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Log events flow from a log group through a subscription filter into Lambda, which emits metrics, alerts and an archive">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="20" y="120" width="150" height="60"/>
+      <text class="label" x="95" y="145">app / sshd / VPC</text>
+      <text class="label small" x="95" y="166">writes log lines</text>
+      <rect class="box db" x="210" y="120" width="140" height="60"/>
+      <text class="label" x="280" y="145">log group</text>
+      <text class="label small" x="280" y="166">/prod/auth</text>
+      <rect class="box warn" x="390" y="120" width="140" height="60"/>
+      <text class="label" x="460" y="145">subscription</text>
+      <text class="label small" x="460" y="166">filter pattern</text>
+      <rect class="box docker" x="570" y="120" width="120" height="60"/>
+      <text class="label" x="630" y="145">Lambda</text>
+      <text class="label small" x="630" y="166">parse + enrich</text>
+      <rect class="box cache" x="600" y="20" width="180" height="44"/>
+      <text class="label" x="690" y="47">metric (EMF)</text>
+      <rect class="box kafka" x="600" y="236" width="180" height="44"/>
+      <text class="label" x="690" y="263">alert (SNS)</text>
+      <path class="arrow" d="M170 150 L205 150"/>
+      <path class="arrow" d="M350 150 L385 150"/>
+      <path class="arrow" d="M530 150 L565 150"/>
+      <path class="arrow" d="M650 120 L670 68"/>
+      <path class="arrow" d="M650 180 L670 232"/>
+      <text class="label small" x="460" y="210">only matching events</text>
+      <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M170 150 L210 150 L350 150 L390 150 L530 150 L570 150"/></circle>
+      <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M170 150 L210 150 L350 150 L390 150 L530 150 L570 150"/></circle>
+      <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M650 120 L670 68"/></circle>
+      <circle class="packet bad" r="6"><animateMotion dur="2s" begin="0.7s" repeatCount="indefinite" path="M650 180 L670 232"/></circle>
+    </svg>
+    <figcaption>Log events stream through the filter. Only matches reach Lambda. Lambda turns them into a metric (cheap to graph and alarm on) and, for security events, an alert.</figcaption>
+  </figure>
+
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>A subscription filter is a <b>port mirror (SPAN) with an ACL in front</b>. The switch (CloudWatch Logs) keeps forwarding traffic normally; a copy of matching frames goes to an analyser port (Lambda). The filter pattern is your match rule, like a <code>tcpdump</code> BPF expression or an <code>iptables -m string</code> match. And the decode step (base64, then gunzip, then JSON) is exactly what you would do with a compressed capture before you can read the headers.</p>
+  </div>
+
+  <h3>Wire it up</h3>
+  <p>Two commands: allow CloudWatch Logs to invoke the function, then create the filter. The <code>--source-arn</code> limits the permission to one log group, which protects you from the "confused deputy" problem (another account's logs calling your function).</p>
+<pre><code class="language-bash"># 1. Let the CloudWatch Logs service invoke the function, only for this log group
+aws lambda add-permission \
+  --function-name auth-log-parser \
+  --statement-id cwlogs-prod-auth \
+  --principal logs.amazonaws.com \
+  --action lambda:InvokeFunction \
+  --source-arn "arn:aws:logs:us-east-1:111122223333:log-group:/prod/auth:*" \
+  --source-account 111122223333
+
+# 2. Send only failed SSH logins (from /var/log/secure) to the function
+aws logs put-subscription-filter \
+  --log-group-name /prod/auth \
+  --filter-name security-signals \
+  --filter-pattern '"Failed password"' \
+  --destination-arn arn:aws:lambda:us-east-1:111122223333:function:auth-log-parser
+
+# 2b. Failed console logins are CloudTrail events, so they live in the CloudTrail log group
+aws logs put-subscription-filter \
+  --log-group-name /aws/cloudtrail/org \
+  --filter-name console-login-failures \
+  --filter-pattern '{ $.eventName = "ConsoleLogin" &amp;&amp; $.responseElements.ConsoleLogin = "Failure" }' \
+  --destination-arn arn:aws:lambda:us-east-1:111122223333:function:auth-log-parser
+
+# 3. Check it
+aws logs describe-subscription-filters --log-group-name /prod/auth</code></pre>
+<pre class="terminal"><code>{
+    "subscriptionFilters": [
+        {
+            "filterName": "security-signals",
+            "logGroupName": "/prod/auth",
+            "filterPattern": "\"Failed password\"",
+            "destinationArn": "arn:aws:lambda:us-east-1:111122223333:function:auth-log-parser",
+            "distribution": "ByLogStream",
+            "creationTime": 1763891200000
+        }
+    ]
+}</code></pre>
+  <p>Two sources, two patterns: the OS auth log only ever contains sshd lines, while <code>ConsoleLogin</code> is a CloudTrail event, so it is matched with a JSON pattern on the CloudTrail log group. In plain-text patterns a <code>?</code> prefix means "OR" (<code>?"Failed password" ?"Invalid user"</code>). Quotas worth knowing: at most <b>2 subscription filters per log group</b>; an <b>account-level subscription filter</b> can cover many log groups at once; and when more consumers need the same stream, send it to Kinesis Data Streams or Firehose and fan out from there. An empty pattern <code>""</code> means "send everything", which is fine for a small group and expensive for a busy one.</p>
+
+  <h3>The handler: decode, parse, enrich, emit</h3>
+  <p>This Python handler decodes the payload, finds failed SSH logins, enriches each one with the source IP, and emits a metric using the <strong>Embedded Metric Format (EMF)</strong>: a JSON log line with an <code>_aws</code> block that CloudWatch turns into a real metric for you. No <code>PutMetricData</code> API call is needed, so no extra latency or throttling.</p>
+<pre><code class="language-python">import base64, gzip, json, re, time, os
+import boto3
+
+SNS = boto3.client("sns")             # created once per environment, reused when warm
+TOPIC = os.environ["ALERT_TOPIC_ARN"]
+FAILED = re.compile(r"Failed password for (invalid user )?(?P&lt;user&gt;\S+) from (?P&lt;ip&gt;[\d.]+)")
+
+def handler(event, context):
+    raw = gzip.decompress(base64.b64decode(event["awslogs"]["data"]))
+    batch = json.loads(raw)
+    if batch["messageType"] == "CONTROL_MESSAGE":   # reachability probe from CW Logs
+        return {"skipped": "control"}
+
+    per_ip = {}
+    for ev in batch["logEvents"]:
+        m = FAILED.search(ev["message"])
+        if m:
+            per_ip[m["ip"]] = per_ip.get(m["ip"], 0) + 1
+
+    # One EMF line = one metric datapoint, dimension = log group
+    print(json.dumps({
+        "_aws": {"Timestamp": int(time.time() * 1000),
+                 "CloudWatchMetrics": [{"Namespace": "Security",
+                                        "Dimensions": [["LogGroup"]],
+                                        "Metrics": [{"Name": "FailedSshLogins", "Unit": "Count"}]}]},
+        "LogGroup": batch["logGroup"],
+        "FailedSshLogins": sum(per_ip.values()),
+    }))
+
+    noisy = {ip: n for ip, n in per_ip.items() if n &gt;= 20}
+    if noisy:
+        SNS.publish(TopicArn=TOPIC, Subject="Possible SSH brute force",
+                    Message=json.dumps({"logGroup": batch["logGroup"], "ips": noisy}))
+    return {"events": len(batch["logEvents"]), "ips": len(per_ip)}</code></pre>
+  <p>Test locally by faking the payload the same way CloudWatch builds it:</p>
+<pre><code class="language-bash">python - &lt;&lt;'EOF'
+import base64, gzip, json
+doc = {"messageType": "DATA_MESSAGE", "logGroup": "/prod/auth", "logStream": "i-0abc",
+       "logEvents": [{"id": "1", "timestamp": 0,
+                      "message": "sshd[811]: Failed password for root from 203.0.113.9 port 52811 ssh2"}]}
+print(json.dumps({"awslogs": {"data": base64.b64encode(gzip.compress(json.dumps(doc).encode())).decode()}}))
+EOF</code></pre>
+<pre class="terminal"><code>{"awslogs": {"data": "H4sIAAAAAAAC/0WOy2rDMBBFf2WYdQK2..."}}</code></pre>
+  <p>Paste that JSON into <code>aws lambda invoke --payload</code> (with <code>--cli-binary-format raw-in-base64-out</code>) or a console test event, and you should see <code>{"events": 1, "ips": 1}</code> plus one EMF line in the function's own log group.</p>
+  <div class="callout warn"><p><b>Never subscribe a function to its own log group</b> (or to a group that receives its output). The function logs, the log triggers the function, the function logs again: an infinite loop that bills you for every turn.</p></div>

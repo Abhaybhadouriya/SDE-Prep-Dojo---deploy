@@ -1,0 +1,647 @@
+
+  <h2>The driver: the button the evaluator presses</h2>
+  <p>Flipkart's 2026 guideline asks for a driver program, main class or test cases so the evaluator can run your code with multiple cases (<a href="https://leetcode.com/discuss/post/7588244/" target="_blank" rel="noopener" title="Flipkart Machine coding round (posted 2026-02-18)">post 7588244</a> <span class="muted">(2026-02-18)</span>). A Cleartrip round made a driver demonstrating many test cases mandatory (<a href="https://leetcode.com/discuss/post/8411392/" target="_blank" rel="noopener" title="🚀 Cleartrip SDE Interview Experience | LLD + Concurrency | Food Ordering System | July 2026 (posted 2026-07-21)">post 8411392</a> <span class="muted">(2026-07-21)</span>). The driver below is built to be <b>shown</b>: a table of commands, one line per action, every expected error caught and printed so the run never stops.</p>
+  <p>The example problem is small on purpose (clinic slots with a waitlist, a cousin of the Meesho clinic booking in <a href="https://leetcode.com/discuss/post/6702200/" target="_blank" rel="noopener" title="Meesho SDE-1 Backend LLD Machine Coding Round (posted 2025-04-30)">post 6702200</a> <span class="muted">(2025-04-30)</span>), so you can see the driver ideas, not the domain. A full project layout with packages is on <a href="{{BASE}}lld/lld-int-code-layout">code layout</a>.</p>
+  <div class="bridge"><h4>From your world</h4><p>The command table is the same shape as an ioctl dispatch table or a CLI's command array of <code>{name, handler}</code> structs (think <code>struct cmd { const char *name; int (*fn)(int argc, char **argv); }</code>). Adding a command is adding a row. The per-command catch is the CLI printing <code>% Invalid input</code> and returning to the prompt instead of crashing the router.</p></div>
+  <p>The Java file uses a few library pieces you may not have met. Each one has a C or kernel twin:</p>
+  <div class="table-wrap">
+  <table class="table">
+    <thead><tr><th>Java</th><th>What it is</th><th>C / kernel twin</th></tr></thead>
+    <tbody>
+      <tr><td><code>a -&gt; { ... }</code> (lambda)</td><td>An anonymous function written inline</td><td>A static function whose pointer you store in a table</td></tr>
+      <tr><td><code>Consumer&lt;String[]&gt;</code></td><td>The type "function that takes a <code>String[]</code> and returns nothing"</td><td><code>void (*fn)(char **argv)</code></td></tr>
+      <tr><td><code>this::run</code> (method reference)</td><td>A pointer to an existing method, passed where a function is expected</td><td>Passing <code>&amp;run</code> as a callback</td></tr>
+      <tr><td><code>ExecutorService</code> / <code>submit()</code></td><td>A pool of worker threads; <code>submit</code> queues one task</td><td>A workqueue and <code>queue_work()</code></td></tr>
+      <tr><td><code>Future.get()</code></td><td>Block until that task has finished (and rethrow its error)</td><td><code>wait_for_completion()</code> / <code>flush_work()</code></td></tr>
+      <tr><td><code>CountDownLatch(1)</code></td><td>A start gate: <code>await()</code> blocks until someone calls <code>countDown()</code></td><td>A <code>struct completion</code> every thread waits on, then <code>complete_all()</code></td></tr>
+      <tr><td><code>AtomicInteger</code></td><td>An integer with atomic increment</td><td><code>atomic_t</code> and <code>atomic_inc()</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Now the Java file in four pieces. <b>1. Exceptions and entities.</b> One base exception, so the driver can tell "expected failure" from "bug". The entities are plain data.</p>
+<pre><code class="language-java">    // ---------- [1] exceptions: one base type so the driver can catch "expected" failures
+    static class ClinicException extends RuntimeException { ClinicException(String m) { super(m); } }
+    static class NotFoundException extends ClinicException { NotFoundException(String what, String id) { super(what + " not found: " + id); } }
+
+    // ---------- [2] entities (kept tiny; the code-layout page shows a full package structure)
+    enum BookingResult { BOOKED, WAITLISTED }
+    static final class Doctor {
+        final String id, speciality;
+        Doctor(String id, String speciality) { this.id = id; this.speciality = speciality; }
+    }
+    static final class Slot {                          // one doctor, one start time
+        final String doctorId, time;
+        String bookedBy;                               // null = free
+        final Deque&lt;String&gt; waitlist = new ArrayDeque&lt;&gt;();
+        Slot(String doctorId, String time) { this.doctorId = doctorId; this.time = time; }
+    }</code></pre>
+  <p class="small"><code>Slot</code> is a plain record with a mutable <code>bookedBy</code> field to keep the file short. That breaks the "no setters, expose legal moves" rule from the <a href="{{BASE}}lld/lld-int-code-layout">code layout</a> page on purpose; in a real round give it <code>book()</code> and <code>cancel()</code> methods.</p>
+  <p><b>2. The service.</b> Every rule lives here. <code>synchronized (s)</code> takes the lock built into the slot object, so the check "is it free?" and the act "take it" happen as one step.</p>
+<pre><code class="language-java">    // ---------- [3] service: all rules live here, all state in in-memory maps
+    static final class ClinicService {
+        private final Map&lt;String, Doctor&gt; doctors = new ConcurrentHashMap&lt;&gt;();
+        private final Set&lt;String&gt; patients = ConcurrentHashMap.newKeySet();
+        private final Map&lt;String, Slot&gt; slots = new ConcurrentHashMap&lt;&gt;();    // key doctorId@time
+        private static String key(String d, String t) { return d + "@" + t; }
+
+        void registerDoctor(String id, String speciality) {
+            if (doctors.putIfAbsent(id, new Doctor(id, speciality)) != null) throw new ClinicException("duplicate doctor " + id);
+        }
+        void registerPatient(String id) {
+            if (!patients.add(id)) throw new ClinicException("duplicate patient " + id);
+        }
+        void addSlot(String doctorId, String time) {
+            if (!doctors.containsKey(doctorId)) throw new NotFoundException("doctor", doctorId);
+            if (slots.putIfAbsent(key(doctorId, time), new Slot(doctorId, time)) != null) throw new ClinicException("slot exists " + time);
+        }
+        private Slot slot(String d, String t) {
+            Slot s = slots.get(key(d, t));
+            if (s == null) throw new NotFoundException("slot", key(d, t));
+            return s;
+        }
+        BookingResult book(String patientId, String doctorId, String time) {
+            if (!patients.contains(patientId)) throw new NotFoundException("patient", patientId);
+            Slot s = slot(doctorId, time);
+            synchronized (s) {                                // lock per slot: check-then-act is atomic
+                if (patientId.equals(s.bookedBy) || s.waitlist.contains(patientId)) throw new ClinicException("already holds " + key(doctorId, time));
+                if (s.bookedBy == null) { s.bookedBy = patientId; return BookingResult.BOOKED; }
+                s.waitlist.addLast(patientId);
+                return BookingResult.WAITLISTED;
+            }
+        }
+        /** Cancels; returns the patient promoted from the waitlist, or null. */
+        String cancel(String patientId, String doctorId, String time) {
+            Slot s = slot(doctorId, time);
+            synchronized (s) {
+                if (s.waitlist.remove(patientId)) return null;
+                if (!patientId.equals(s.bookedBy)) throw new ClinicException(patientId + " has no booking at " + key(doctorId, time));
+                s.bookedBy = s.waitlist.pollFirst();
+                return s.bookedBy;
+            }
+        }
+        List&lt;String&gt; freeSlots(String speciality) {
+            List&lt;String&gt; out = new ArrayList&lt;&gt;();
+            for (Slot s : slots.values()) {
+                Doctor d = doctors.get(s.doctorId);
+                synchronized (s) { if (d.speciality.equalsIgnoreCase(speciality) &amp;&amp; s.bookedBy == null) out.add(key(s.doctorId, s.time)); }
+            }
+            Collections.sort(out);                            // stable output for the demo
+            return out;
+        }
+        String holder(String doctorId, String time) { Slot s = slot(doctorId, time); synchronized (s) { return s.bookedBy; } }
+    }</code></pre>
+  <p><b>3. The command table and run loop.</b> Each entry maps a command word to a lambda (a function pointer). <code>need()</code> checks the argument count first, so a bug inside the service is not mistaken for bad input. <code>run()</code> catches only <code>ClinicException</code>.</p>
+<pre><code class="language-java">    // ---------- [4] command table + run loop: a new command is one line
+    static final class Driver {
+        private final ClinicService svc;
+        private final Map&lt;String, Consumer&lt;String[]&gt;&gt; commands = new LinkedHashMap&lt;&gt;();
+        private final PrintStream out;
+        Driver(ClinicService svc, PrintStream out) {
+            this.svc = svc; this.out = out;
+            commands.put("register_doctor", a -&gt; { need(a, 2); svc.registerDoctor(a[0], a[1]); ok("doctor " + a[0]); });
+            commands.put("register_patient", a -&gt; { need(a, 1); svc.registerPatient(a[0]); ok("patient " + a[0]); });
+            commands.put("add_slot", a -&gt; { need(a, 2); svc.addSlot(a[0], a[1]); ok("slot " + a[0] + "@" + a[1]); });
+            commands.put("book", a -&gt; { need(a, 3); out.println("  -&gt; " + svc.book(a[0], a[1], a[2])); });
+            commands.put("cancel", a -&gt; { need(a, 3); String p = svc.cancel(a[0], a[1], a[2]);
+                                          out.println("  -&gt; cancelled" + (p == null ? "" : ", promoted " + p)); });
+            commands.put("free_slots", a -&gt; { need(a, 1); out.println("  -&gt; " + svc.freeSlots(a[0])); });
+            commands.put("holder", a -&gt; { need(a, 2); String h = svc.holder(a[0], a[1]);
+                                          out.println("  -&gt; " + (h == null ? "free" : h)); });
+        }
+        private void ok(String m) { out.println("  -&gt; ok " + m); }
+        private static void need(String[] a, int n) { if (a.length != n) throw new ClinicException("expected " + n + " args, got " + a.length); }
+
+        /** Runs one line. Errors are printed, never thrown: one bad command must not stop the demo. */
+        void run(String line) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) return;
+            out.println("&gt; " + line);
+            String[] parts = line.split("\\s+");
+            Consumer&lt;String[]&gt; cmd = commands.get(parts[0]);
+            if (cmd == null) { out.println("  !! unknown command " + parts[0] + " (try: " + commands.keySet() + ")"); return; }
+            try { cmd.accept(Arrays.copyOfRange(parts, 1, parts.length)); }
+            catch (ClinicException e) { out.println("  !! " + e.getMessage()); }
+        }
+        void runAll(List&lt;String&gt; lines) { lines.forEach(this::run); }
+    }</code></pre>
+  <p><b>4. Tests and the race test.</b> <code>check()</code> is a home-made assert. The race test queues 50 booking tasks on 8 worker threads, holds them all at the latch, releases them together, waits for each with <code>get()</code>, and checks that exactly one got the slot.</p>
+<pre><code class="language-java">    // ---------- [5] tiny self-checking tests (no JUnit needed in a browser editor)
+    static int passed = 0, failed = 0;
+    static void check(String name, boolean cond) {
+        if (cond) passed++; else { failed++; System.out.println("FAIL " + name); }
+    }
+    static void expectThrows(String name, Runnable r) {
+        try { r.run(); check(name, false); } catch (ClinicException e) { check(name, true); }
+    }
+    static ClinicService seeded() {
+        ClinicService s = new ClinicService();
+        s.registerDoctor("D1", "cardio"); s.addSlot("D1", "10:00"); s.addSlot("D1", "11:00");
+        for (String p : new String[]{"P1", "P2", "P3"}) s.registerPatient(p);
+        return s;
+    }
+    static void runTests() throws Exception {
+        ClinicService s = seeded();
+        check("first booking wins", s.book("P1", "D1", "10:00") == BookingResult.BOOKED);
+        check("second is waitlisted", s.book("P2", "D1", "10:00") == BookingResult.WAITLISTED);
+        expectThrows("no double booking by same patient", () -&gt; s.book("P1", "D1", "10:00"));
+        check("cancel promotes waitlist", "P2".equals(s.cancel("P1", "D1", "10:00")));
+        check("holder updated", "P2".equals(s.holder("D1", "10:00")));
+        expectThrows("cancel without booking fails", () -&gt; s.cancel("P3", "D1", "10:00"));
+        expectThrows("unknown patient", () -&gt; s.book("PX", "D1", "10:00"));
+        expectThrows("unknown slot", () -&gt; s.book("P1", "D1", "23:00"));
+        check("free slots by speciality", s.freeSlots("cardio").equals(List.of("D1@11:00")));
+
+        // ---------- [6] race test: 50 tasks on 8 threads race for one free slot, exactly one must get BOOKED
+        ClinicService c = new ClinicService();
+        c.registerDoctor("D9", "ortho"); c.addSlot("D9", "09:00");
+        for (int i = 0; i &lt; 50; i++) c.registerPatient("U" + i);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger booked = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 50; i++) {
+            final String p = "U" + i;
+            fs.add(pool.submit(() -&gt; { start.await(); if (c.book(p, "D9", "09:00") == BookingResult.BOOKED) booked.incrementAndGet(); return null; }));
+        }
+        start.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        check("exactly one winner under 50 threads", booked.get() == 1);
+        System.out.println("tests: " + passed + " passed, " + failed + " failed");
+    }</code></pre>
+  <details class="callout note">
+    <summary><b>Show the full Java file</b> (one file, with the demo script and <code>main</code>)</summary>
+<pre><code class="language-java">// Machine-coding driver demo: clinic slot booking with a waitlist.
+// One file on purpose (browser editors like HackerRank/CodeSignal often force one file).
+// Shows: command-script driver, per-command error handling, self-checking tests, a concurrency check.
+// Map: [1] exceptions  [2] entities  [3] service (rules + per-slot lock)  [4] command table + run loop
+//      [5] tests  [6] race test  [7] demo script + main
+// Build/run: javac Main.java &amp;&amp; java Main            (runs tests, then the demo script)
+//            java Main script.txt                     (runs commands from a file instead)
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+public class Main {
+    // ---------- [1] exceptions: one base type so the driver can catch "expected" failures
+    static class ClinicException extends RuntimeException { ClinicException(String m) { super(m); } }
+    static class NotFoundException extends ClinicException { NotFoundException(String what, String id) { super(what + " not found: " + id); } }
+
+    // ---------- [2] entities (kept tiny; the code-layout page shows a full package structure)
+    enum BookingResult { BOOKED, WAITLISTED }
+    static final class Doctor {
+        final String id, speciality;
+        Doctor(String id, String speciality) { this.id = id; this.speciality = speciality; }
+    }
+    static final class Slot {                          // one doctor, one start time
+        final String doctorId, time;
+        String bookedBy;                               // null = free
+        final Deque&lt;String&gt; waitlist = new ArrayDeque&lt;&gt;();
+        Slot(String doctorId, String time) { this.doctorId = doctorId; this.time = time; }
+    }
+
+    // ---------- [3] service: all rules live here, all state in in-memory maps
+    static final class ClinicService {
+        private final Map&lt;String, Doctor&gt; doctors = new ConcurrentHashMap&lt;&gt;();
+        private final Set&lt;String&gt; patients = ConcurrentHashMap.newKeySet();
+        private final Map&lt;String, Slot&gt; slots = new ConcurrentHashMap&lt;&gt;();    // key doctorId@time
+        private static String key(String d, String t) { return d + "@" + t; }
+
+        void registerDoctor(String id, String speciality) {
+            if (doctors.putIfAbsent(id, new Doctor(id, speciality)) != null) throw new ClinicException("duplicate doctor " + id);
+        }
+        void registerPatient(String id) {
+            if (!patients.add(id)) throw new ClinicException("duplicate patient " + id);
+        }
+        void addSlot(String doctorId, String time) {
+            if (!doctors.containsKey(doctorId)) throw new NotFoundException("doctor", doctorId);
+            if (slots.putIfAbsent(key(doctorId, time), new Slot(doctorId, time)) != null) throw new ClinicException("slot exists " + time);
+        }
+        private Slot slot(String d, String t) {
+            Slot s = slots.get(key(d, t));
+            if (s == null) throw new NotFoundException("slot", key(d, t));
+            return s;
+        }
+        BookingResult book(String patientId, String doctorId, String time) {
+            if (!patients.contains(patientId)) throw new NotFoundException("patient", patientId);
+            Slot s = slot(doctorId, time);
+            synchronized (s) {                                // lock per slot: check-then-act is atomic
+                if (patientId.equals(s.bookedBy) || s.waitlist.contains(patientId)) throw new ClinicException("already holds " + key(doctorId, time));
+                if (s.bookedBy == null) { s.bookedBy = patientId; return BookingResult.BOOKED; }
+                s.waitlist.addLast(patientId);
+                return BookingResult.WAITLISTED;
+            }
+        }
+        /** Cancels; returns the patient promoted from the waitlist, or null. */
+        String cancel(String patientId, String doctorId, String time) {
+            Slot s = slot(doctorId, time);
+            synchronized (s) {
+                if (s.waitlist.remove(patientId)) return null;
+                if (!patientId.equals(s.bookedBy)) throw new ClinicException(patientId + " has no booking at " + key(doctorId, time));
+                s.bookedBy = s.waitlist.pollFirst();
+                return s.bookedBy;
+            }
+        }
+        List&lt;String&gt; freeSlots(String speciality) {
+            List&lt;String&gt; out = new ArrayList&lt;&gt;();
+            for (Slot s : slots.values()) {
+                Doctor d = doctors.get(s.doctorId);
+                synchronized (s) { if (d.speciality.equalsIgnoreCase(speciality) &amp;&amp; s.bookedBy == null) out.add(key(s.doctorId, s.time)); }
+            }
+            Collections.sort(out);                            // stable output for the demo
+            return out;
+        }
+        String holder(String doctorId, String time) { Slot s = slot(doctorId, time); synchronized (s) { return s.bookedBy; } }
+    }
+
+    // ---------- [4] command table + run loop: a new command is one line
+    static final class Driver {
+        private final ClinicService svc;
+        private final Map&lt;String, Consumer&lt;String[]&gt;&gt; commands = new LinkedHashMap&lt;&gt;();
+        private final PrintStream out;
+        Driver(ClinicService svc, PrintStream out) {
+            this.svc = svc; this.out = out;
+            commands.put("register_doctor", a -&gt; { need(a, 2); svc.registerDoctor(a[0], a[1]); ok("doctor " + a[0]); });
+            commands.put("register_patient", a -&gt; { need(a, 1); svc.registerPatient(a[0]); ok("patient " + a[0]); });
+            commands.put("add_slot", a -&gt; { need(a, 2); svc.addSlot(a[0], a[1]); ok("slot " + a[0] + "@" + a[1]); });
+            commands.put("book", a -&gt; { need(a, 3); out.println("  -&gt; " + svc.book(a[0], a[1], a[2])); });
+            commands.put("cancel", a -&gt; { need(a, 3); String p = svc.cancel(a[0], a[1], a[2]);
+                                          out.println("  -&gt; cancelled" + (p == null ? "" : ", promoted " + p)); });
+            commands.put("free_slots", a -&gt; { need(a, 1); out.println("  -&gt; " + svc.freeSlots(a[0])); });
+            commands.put("holder", a -&gt; { need(a, 2); String h = svc.holder(a[0], a[1]);
+                                          out.println("  -&gt; " + (h == null ? "free" : h)); });
+        }
+        private void ok(String m) { out.println("  -&gt; ok " + m); }
+        private static void need(String[] a, int n) { if (a.length != n) throw new ClinicException("expected " + n + " args, got " + a.length); }
+
+        /** Runs one line. Errors are printed, never thrown: one bad command must not stop the demo. */
+        void run(String line) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) return;
+            out.println("&gt; " + line);
+            String[] parts = line.split("\\s+");
+            Consumer&lt;String[]&gt; cmd = commands.get(parts[0]);
+            if (cmd == null) { out.println("  !! unknown command " + parts[0] + " (try: " + commands.keySet() + ")"); return; }
+            try { cmd.accept(Arrays.copyOfRange(parts, 1, parts.length)); }
+            catch (ClinicException e) { out.println("  !! " + e.getMessage()); }
+        }
+        void runAll(List&lt;String&gt; lines) { lines.forEach(this::run); }
+    }
+
+    // ---------- [5] tiny self-checking tests (no JUnit needed in a browser editor)
+    static int passed = 0, failed = 0;
+    static void check(String name, boolean cond) {
+        if (cond) passed++; else { failed++; System.out.println("FAIL " + name); }
+    }
+    static void expectThrows(String name, Runnable r) {
+        try { r.run(); check(name, false); } catch (ClinicException e) { check(name, true); }
+    }
+    static ClinicService seeded() {
+        ClinicService s = new ClinicService();
+        s.registerDoctor("D1", "cardio"); s.addSlot("D1", "10:00"); s.addSlot("D1", "11:00");
+        for (String p : new String[]{"P1", "P2", "P3"}) s.registerPatient(p);
+        return s;
+    }
+    static void runTests() throws Exception {
+        ClinicService s = seeded();
+        check("first booking wins", s.book("P1", "D1", "10:00") == BookingResult.BOOKED);
+        check("second is waitlisted", s.book("P2", "D1", "10:00") == BookingResult.WAITLISTED);
+        expectThrows("no double booking by same patient", () -&gt; s.book("P1", "D1", "10:00"));
+        check("cancel promotes waitlist", "P2".equals(s.cancel("P1", "D1", "10:00")));
+        check("holder updated", "P2".equals(s.holder("D1", "10:00")));
+        expectThrows("cancel without booking fails", () -&gt; s.cancel("P3", "D1", "10:00"));
+        expectThrows("unknown patient", () -&gt; s.book("PX", "D1", "10:00"));
+        expectThrows("unknown slot", () -&gt; s.book("P1", "D1", "23:00"));
+        check("free slots by speciality", s.freeSlots("cardio").equals(List.of("D1@11:00")));
+
+        // ---------- [6] race test: 50 tasks on 8 threads race for one free slot, exactly one must get BOOKED
+        ClinicService c = new ClinicService();
+        c.registerDoctor("D9", "ortho"); c.addSlot("D9", "09:00");
+        for (int i = 0; i &lt; 50; i++) c.registerPatient("U" + i);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger booked = new AtomicInteger();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; 50; i++) {
+            final String p = "U" + i;
+            fs.add(pool.submit(() -&gt; { start.await(); if (c.book(p, "D9", "09:00") == BookingResult.BOOKED) booked.incrementAndGet(); return null; }));
+        }
+        start.countDown();
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        check("exactly one winner under 50 threads", booked.get() == 1);
+        System.out.println("tests: " + passed + " passed, " + failed + " failed");
+    }
+
+    // ---------- [7] demo script + main: happy path first, then edge cases
+    static final List&lt;String&gt; DEMO = List.of(
+        "# P0 happy path",
+        "register_doctor D1 cardio", "register_doctor D2 derma",
+        "add_slot D1 10:00", "add_slot D1 11:00", "add_slot D2 10:00",
+        "register_patient P1", "register_patient P2",
+        "book P1 D1 10:00", "book P2 D1 10:00", "free_slots cardio",
+        "cancel P1 D1 10:00", "holder D1 10:00", "free_slots cardio",
+        "# edge cases must fail gracefully, and the run continues",
+        "book P9 D1 11:00", "book P2 D1 10:00", "cancel P1 D1 10:00", "add_slot D7 09:00", "book P1", "fly_to_moon");
+
+    public static void main(String[] args) throws Exception {
+        runTests();
+        Driver d = new Driver(new ClinicService(), System.out);
+        d.runAll(args.length &gt; 0 ? Files.readAllLines(Paths.get(args[0])) : DEMO);
+        if (failed &gt; 0) System.exit(1);
+    }
+}</code></pre>
+  </details>
+  <details class="callout note">
+    <summary><b>Show the full Python file</b> (same structure and the same section markers)</summary>
+<pre><code class="language-python">"""Machine-coding driver demo: clinic slot booking with a waitlist (Python twin of Main.java).
+
+Run: python driver.py            (tests, then the demo script)
+     python driver.py script.txt (commands from a file)
+Map: [1] exceptions  [2] entities  [3] service (rules + per-slot lock)  [4] command table + run loop
+     [5] tests  [6] race test  [7] demo script + main
+"""
+import sys
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
+
+
+# ---------- [1] exceptions: one base type so the driver can catch "expected" failures
+class ClinicError(Exception):
+    """Expected, user-facing failure. The driver prints it and carries on."""
+
+
+# ---------- [2] entities
+class Booking(Enum):
+    BOOKED = "BOOKED"
+    WAITLISTED = "WAITLISTED"
+
+
+class Slot:
+    def __init__(self, doctor_id, time):
+        self.doctor_id, self.time = doctor_id, time
+        self.booked_by = None
+        self.waitlist = deque()
+        self.lock = threading.Lock()          # lock per slot
+
+
+# ---------- [3] service: all rules live here, all state in in-memory dicts
+class ClinicService:
+    def __init__(self):
+        self._doctors = {}                     # id -&gt; speciality
+        self._patients = set()
+        self._slots = {}                       # "D1@10:00" -&gt; Slot
+        self._reg = threading.Lock()           # guards the three maps on writes
+        # Reads (book, cancel, free_slots) skip _reg on purpose: a single dict get / "in" test is atomic in
+        # CPython, and registrations never remove entries, so a reader sees an entry or not, never half of one.
+        # That is a property of these maps, not "the GIL makes it safe": compound steps still take a lock.
+
+    def register_doctor(self, did, speciality):
+        with self._reg:
+            if did in self._doctors:
+                raise ClinicError(f"duplicate doctor {did}")
+            self._doctors[did] = speciality
+
+    def register_patient(self, pid):
+        with self._reg:
+            if pid in self._patients:
+                raise ClinicError(f"duplicate patient {pid}")
+            self._patients.add(pid)
+
+    def add_slot(self, did, time):
+        with self._reg:
+            if did not in self._doctors:
+                raise ClinicError(f"doctor not found: {did}")
+            k = f"{did}@{time}"
+            if k in self._slots:
+                raise ClinicError(f"slot exists {time}")
+            self._slots[k] = Slot(did, time)
+
+    def _slot(self, did, time):
+        s = self._slots.get(f"{did}@{time}")
+        if s is None:
+            raise ClinicError(f"slot not found: {did}@{time}")
+        return s
+
+    def book(self, pid, did, time):
+        if pid not in self._patients:
+            raise ClinicError(f"patient not found: {pid}")
+        s = self._slot(did, time)
+        with s.lock:                           # check-then-act happens under one lock
+            if s.booked_by == pid or pid in s.waitlist:
+                raise ClinicError(f"already holds {did}@{time}")
+            if s.booked_by is None:
+                s.booked_by = pid
+                return Booking.BOOKED
+            s.waitlist.append(pid)
+            return Booking.WAITLISTED
+
+    def cancel(self, pid, did, time):
+        """Returns the patient promoted from the waitlist, or None."""
+        s = self._slot(did, time)
+        with s.lock:
+            if pid in s.waitlist:
+                s.waitlist.remove(pid)
+                return None
+            if s.booked_by != pid:
+                raise ClinicError(f"{pid} has no booking at {did}@{time}")
+            s.booked_by = s.waitlist.popleft() if s.waitlist else None
+            return s.booked_by
+
+    def free_slots(self, speciality):
+        out = []
+        for k, s in list(self._slots.items()):
+            with s.lock:
+                if self._doctors[s.doctor_id].lower() == speciality.lower() and s.booked_by is None:
+                    out.append(k)
+        return sorted(out)
+
+    def holder(self, did, time):
+        s = self._slot(did, time)
+        with s.lock:
+            return s.booked_by
+
+
+# ---------- [4] command table + run loop: a new command is one line
+class Driver:
+    def __init__(self, svc, out=print):
+        self.svc, self.out = svc, out
+        # command table: (number of args, handler). A new command is one entry.
+        self.commands = {
+            "register_doctor": (2, lambda a: self._ok(svc.register_doctor(*a), f"doctor {a[0]}")),
+            "register_patient": (1, lambda a: self._ok(svc.register_patient(*a), f"patient {a[0]}")),
+            "add_slot": (2, lambda a: self._ok(svc.add_slot(*a), f"slot {a[0]}@{a[1]}")),
+            "book": (3, lambda a: self.out(f"  -&gt; {svc.book(*a).value}")),
+            "cancel": (3, lambda a: self._cancel(a)),
+            "free_slots": (1, lambda a: self.out("  -&gt; [" + ", ".join(svc.free_slots(*a)) + "]")),
+            "holder": (2, lambda a: self.out(f"  -&gt; {svc.holder(*a) or 'free'}")),
+        }
+
+    def _ok(self, _, msg):
+        self.out(f"  -&gt; ok {msg}")
+
+    def _cancel(self, a):
+        p = self.svc.cancel(*a)
+        self.out("  -&gt; cancelled" + (f", promoted {p}" if p else ""))
+
+    def run(self, line):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return
+        self.out(f"&gt; {line}")
+        name, *args = line.split()
+        if name not in self.commands:
+            self.out(f"  !! unknown command {name} (try: [{', '.join(self.commands)}])")
+            return
+        n, fn = self.commands[name]
+        try:
+            if len(args) != n:
+                raise ClinicError(f"expected {n} args, got {len(args)}")
+            fn(args)
+        except ClinicError as e:               # expected errors: print, continue
+            self.out(f"  !! {e}")
+
+
+# ---------- [5] tiny self-checking tests (no pytest needed in a browser editor)
+PASSED, FAILED = [0], [0]
+
+
+def check(name, cond):
+    if cond:
+        PASSED[0] += 1
+    else:
+        FAILED[0] += 1
+        print("FAIL", name)
+
+
+def expect_error(name, fn):
+    try:
+        fn()
+        check(name, False)
+    except ClinicError:
+        check(name, True)
+
+
+def run_tests():
+    s = ClinicService()
+    s.register_doctor("D1", "cardio")
+    s.add_slot("D1", "10:00")
+    s.add_slot("D1", "11:00")
+    for p in ("P1", "P2", "P3"):
+        s.register_patient(p)
+    check("first booking wins", s.book("P1", "D1", "10:00") is Booking.BOOKED)
+    check("second is waitlisted", s.book("P2", "D1", "10:00") is Booking.WAITLISTED)
+    expect_error("no double booking by same patient", lambda: s.book("P1", "D1", "10:00"))
+    check("cancel promotes waitlist", s.cancel("P1", "D1", "10:00") == "P2")
+    check("holder updated", s.holder("D1", "10:00") == "P2")
+    expect_error("cancel without booking fails", lambda: s.cancel("P3", "D1", "10:00"))
+    expect_error("unknown patient", lambda: s.book("PX", "D1", "10:00"))
+    expect_error("unknown slot", lambda: s.book("P1", "D1", "23:00"))
+    check("free slots by speciality", s.free_slots("cardio") == ["D1@11:00"])
+
+    # ---------- [6] race test: 50 tasks on 8 threads race for one free slot, exactly one must get BOOKED
+    c = ClinicService()
+    c.register_doctor("D9", "ortho")
+    c.add_slot("D9", "09:00")
+    for i in range(50):
+        c.register_patient(f"U{i}")
+    start = threading.Event()
+
+    def attempt(i):
+        start.wait()
+        return c.book(f"U{i}", "D9", "09:00")
+
+    with ThreadPoolExecutor(8) as pool:
+        futures = [pool.submit(attempt, i) for i in range(50)]
+        start.set()
+        results = [f.result() for f in futures]
+    check("exactly one winner under 50 threads", results.count(Booking.BOOKED) == 1)
+    print(f"tests: {PASSED[0]} passed, {FAILED[0]} failed")
+
+
+# ---------- [7] demo script + main: happy path first, then edge cases
+DEMO = """
+# P0 happy path
+register_doctor D1 cardio
+register_doctor D2 derma
+add_slot D1 10:00
+add_slot D1 11:00
+add_slot D2 10:00
+register_patient P1
+register_patient P2
+book P1 D1 10:00
+book P2 D1 10:00
+free_slots cardio
+cancel P1 D1 10:00
+holder D1 10:00
+free_slots cardio
+# edge cases must fail gracefully, and the run continues
+book P9 D1 11:00
+book P2 D1 10:00
+cancel P1 D1 10:00
+add_slot D7 09:00
+book P1
+fly_to_moon
+""".splitlines()
+
+if __name__ == "__main__":
+    run_tests()
+    lines = open(sys.argv[1], encoding="utf8").read().splitlines() if len(sys.argv) &gt; 1 else DEMO
+    d = Driver(ClinicService())
+    for ln in lines:
+        d.run(ln)
+    sys.exit(1 if FAILED[0] else 0)</code></pre>
+  </details>
+  <p>Output (identical for both versions; tests run first, then the script). After the cancel, <code>holder D1 10:00</code> shows the waitlisted patient P2 promoted into the slot:</p>
+<pre class="terminal"><code>tests: 10 passed, 0 failed
+&gt; register_doctor D1 cardio
+  -&gt; ok doctor D1
+&gt; register_doctor D2 derma
+  -&gt; ok doctor D2
+&gt; add_slot D1 10:00
+  -&gt; ok slot D1@10:00
+&gt; add_slot D1 11:00
+  -&gt; ok slot D1@11:00
+&gt; add_slot D2 10:00
+  -&gt; ok slot D2@10:00
+&gt; register_patient P1
+  -&gt; ok patient P1
+&gt; register_patient P2
+  -&gt; ok patient P2
+&gt; book P1 D1 10:00
+  -&gt; BOOKED
+&gt; book P2 D1 10:00
+  -&gt; WAITLISTED
+&gt; free_slots cardio
+  -&gt; [D1@11:00]
+&gt; cancel P1 D1 10:00
+  -&gt; cancelled, promoted P2
+&gt; holder D1 10:00
+  -&gt; P2
+&gt; free_slots cardio
+  -&gt; [D1@11:00]
+&gt; book P9 D1 11:00
+  !! patient not found: P9
+&gt; book P2 D1 10:00
+  !! already holds D1@10:00
+&gt; cancel P1 D1 10:00
+  !! P1 has no booking at D1@10:00
+&gt; add_slot D7 09:00
+  !! doctor not found: D7
+&gt; book P1
+  !! expected 3 args, got 1
+&gt; fly_to_moon
+  !! unknown command fly_to_moon (try: [register_doctor, register_patient, add_slot, book, cancel, free_slots, holder])</code></pre>
+  <h3>Five driver rules</h3>
+  <ol class="steps">
+    <li><strong>Commands, not hard-coded calls.</strong> A map from command name to handler means a new feature is one line, and the evaluator can type their own commands or pass a file (the BNPL prompt in <a href="https://leetcode.com/discuss/post/8331479/" target="_blank" rel="noopener" title="Flipkart Machine coding round (posted 2026-06-13)">post 8331479</a> <span class="muted">(2026-06-13)</span> asks you to read from a file, STDIN or the driver).</li>
+    <li><strong>One bad line never stops the run.</strong> Catch your own exception type per command and print it. Let real bugs (NullPointerException) crash loudly so you see them while building.</li>
+    <li><strong>Happy path first, then edge cases, with comments.</strong> The evaluator reads the script like a story.</li>
+    <li><strong>Stable output.</strong> Sort lists before printing; maps with random order make demos look flaky.</li>
+    <li><strong>Inject time.</strong> For timeouts (auto-cancel after 30 minutes) pass "now" in or use a fake clock; never sleep for real in a demo.</li>
+  </ol>

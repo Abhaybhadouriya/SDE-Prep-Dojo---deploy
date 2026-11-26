@@ -1,0 +1,56 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+        <p>Interviewers often ask "would you use Kafka here?" The honest answer: Kafka is a great <b>pipe between stages</b>, but it is a poor frontier by itself, because a Kafka partition is a strict FIFO log. It cannot reorder by priority, cannot delay one host for 2 seconds while serving others, and cannot dedup. So we use Kafka for the durable hand-offs and keep the smart frontier in the shard services.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Kafka topics between crawler stages on Kubernetes: frontier shards produce fetch tasks, fetchers consume and produce pages, parsers produce links back">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone k8s" x="10" y="10" width="780" height="280"/>
+            <text class="zone-label" x="24" y="32">Kubernetes cluster</text>
+            <rect class="box queue" x="30" y="60" width="150" height="70"/>
+            <text class="label" x="105" y="88">Frontier shards</text>
+            <text class="label small" x="105" y="110">StatefulSet + PVC</text>
+            <rect class="box kafka" x="230" y="50" width="160" height="40"/><text class="label" x="310" y="75">fetch-tasks</text>
+            <rect class="box svc" x="440" y="60" width="150" height="70"/>
+            <text class="label" x="515" y="88">Fetchers</text>
+            <text class="label small" x="515" y="110">Deployment + HPA</text>
+            <rect class="box kafka" x="620" y="50" width="160" height="40"/><text class="label" x="700" y="75">pages</text>
+            <rect class="box svc" x="620" y="180" width="160" height="70"/>
+            <text class="label" x="700" y="208">Parsers</text>
+            <text class="label small" x="700" y="230">Deployment</text>
+            <rect class="box kafka" x="230" y="200" width="160" height="40"/><text class="label" x="310" y="225">links-found</text>
+            <rect class="box db" x="440" y="200" width="150" height="56"/><text class="label" x="515" y="224">Indexer</text><text class="label small" x="515" y="244">other consumers</text>
+            <path class="arrow" d="M180 80 L224 70"/>
+            <path class="arrow" d="M390 70 L434 85"/>
+            <path class="arrow" d="M590 85 L614 70"/>
+            <path class="arrow" d="M700 90 L700 174"/>
+            <path class="arrow" d="M620 215 L396 220"/>
+            <path class="arrow" d="M230 220 C 150 220, 105 180, 105 136"/>
+            <path class="arrow dashed" d="M700 90 C 640 150, 560 160, 530 194"/>
+            <circle class="packet" r="6"><animateMotion dur="6s" repeatCount="indefinite" path="M180 80 L230 70 L390 70 L440 85 L590 85 L620 70 L700 90 L700 180 L620 215 L390 220 L230 220 C 150 220, 105 180, 105 136"/></circle>
+          </svg>
+          <figcaption>Three Kafka topics connect the stages. Each topic is keyed by host so one host's tasks stay in one partition, in order. The page topic has several consumer groups: parsers, the indexer, analytics.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Kafka</b> (<a href="{{BASE}}devops/kafka-02">core concepts</a>): <code>fetch-tasks</code> (key = host, so a fetcher partition sees a host in order), <code>pages</code> (metadata + blob pointer, not the 100 KB body; Kafka's default max message size is about 1 MB, and pointers keep the log small), and <code>links-found</code> (key = host so links land on the partition read by the owning frontier shard). Each stage is a consumer group (<a href="{{BASE}}devops/kafka-04">consumer groups</a>): if a parser dies, its partitions move to another parser and it resumes from the last committed offset. This gives replay for free: found a parser bug? Reset the parser group's offsets and re-parse a day of pages.</li>
+          <li><b>Kubernetes</b>: fetchers and parsers are stateless <a href="{{BASE}}devops/k8s-04">Deployments</a> that autoscale on consumer lag (KEDA's Kafka scaler or an HPA on an external metric; see <a href="{{BASE}}devops/k8s-09">autoscaling</a>). Frontier shards hold state (queues on disk, Bloom filter snapshots), so they are a <a href="{{BASE}}devops/k8s-10">StatefulSet</a> with a persistent volume per shard and a stable name (<code>frontier-0</code>, <code>frontier-1</code>) that maps to a host-hash range. A node-local DNS cache runs as a DaemonSet.</li>
+          <li><b>Docker</b>: one small image per stage (multi-stage builds, see <a href="{{BASE}}devops/docker-03">Dockerfiles</a>). The JavaScript-rendering pool is a separate, much bigger image with headless Chromium, and gets its own resource limits so it cannot starve the cheap fetchers.</li>
+        </ul>
+<pre><code class="language-yaml"># KEDA ScaledObject: scale fetchers on Kafka consumer lag
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fetcher
+spec:
+  scaleTargetRef:
+    name: fetcher            # the Deployment
+  minReplicaCount: 4
+  maxReplicaCount: 40        # never more than the topic's partition count
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka:9092
+        consumerGroup: fetchers
+        topic: fetch-tasks
+        lagThreshold: "5000"</code></pre>
+        <div class="callout warn"><p><b>Trap:</b> autoscaling fetchers does <i>not</i> make you crawl a given site faster. Politeness caps per-host throughput. More fetchers only help when you have many hosts ready at once. Say this before the interviewer does.</p></div>
+      

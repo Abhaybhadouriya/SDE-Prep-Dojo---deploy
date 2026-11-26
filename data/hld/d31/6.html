@@ -1,0 +1,86 @@
+
+        <h2>Deep dives: the hard parts</h2>
+
+        <h3>1. The clock goes backwards</h3>
+        <p>Snowflake trusts the wall clock. NTP can step the clock back, a VM can be paused and resumed, and leap seconds happen. If a worker reuses a millisecond it already used, with a sequence it already used, you get a <b>duplicate ID</b>, which is the one thing this system must never do.</p>
+        <ul>
+          <li><b>Refuse.</b> Twitter's code compares <code>now</code> to <code>lastTimestamp</code> and throws "Clock moved backwards. Refusing to generate id" until time catches up. Its README recommends running NTP in a mode that does not step the clock back (slewing only).</li>
+          <li><b>Wait out small jumps.</b> Meituan Leaf waits if the rollback is 5 ms or less (it sleeps twice the offset, then checks again) and raises an error and alerts for anything bigger.</li>
+          <li><b>Guard across restarts.</b> In-memory <code>last</code> is lost on restart. Leaf writes each node's time to ZooKeeper every 3 seconds and refuses to start if the local clock is behind its last report, or far from the average of the other nodes. Meituan says this logic protected them during the 2017 leap second.</li>
+          <li><b>Borrow from the future.</b> Baidu's UidGenerator uses seconds, not milliseconds, and lets the timestamp run ahead of real time when it is busy, so it never needs the wall clock to move forward first.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is <code>CLOCK_REALTIME</code> vs <code>CLOCK_MONOTONIC</code>. Wall time can jump (settimeofday, NTP step); monotonic cannot, but it resets at boot. A robust generator uses the wall clock only as the ID value and a persisted high-water mark to make sure it never goes below the last value issued, which is the same idea as a TCP sequence number never moving backwards within a connection.</p>
+        </div>
+
+        <h3>2. Assigning worker IDs safely</h3>
+        <p>Two live workers with the same worker ID will create duplicates within the first millisecond they overlap. Options, from simplest to most robust:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Method</th><th>How</th><th>Risk</th></tr></thead>
+            <tbody>
+              <tr><td>Static config</td><td>Ops writes <code>worker_id=17</code> in each host's config</td><td>Human error; breaks with autoscaling</td></tr>
+              <tr><td>Derived from IP / hostname</td><td>Sonyflake's default uses the lower 16 bits of the private IP</td><td>Fine inside one /16; collides across VPCs or after IP reuse</td></tr>
+              <tr><td>Kubernetes <a href="{{BASE}}interview/glossary#statefulset">StatefulSet</a> ordinal</td><td>Pod <code>idgen-17</code> uses 17</td><td>Unique within one StatefulSet only; add a cluster/DC prefix</td></tr>
+              <tr><td>ZooKeeper / etcd lease</td><td>Create a sequential or ephemeral node; its number is your ID; renew with a heartbeat</td><td>Needs the coordinator at startup; a paused worker must stop when its lease expires</td></tr>
+              <tr><td>DB row per boot (Baidu)</td><td>Insert a row at startup; the auto-increment row ID becomes the worker ID</td><td>Burns IDs on every restart, so Baidu gives worker ID 22 bits (about 4.2 million)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn"><p><b>Zombie worker trap.</b> A worker freezes (long GC pause), its lease expires, a new worker takes the same ID, then the old one wakes up and keeps issuing. Fix: the worker checks lease validity before issuing and stops if it has not renewed within the lease time minus a safety margin. This is the same fencing problem as in the <a href="{{BASE}}hld/d55">Distributed Lock Service</a>.</p></div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> If you can draw the 41/10/12 layout, explain clock rollback (wait or refuse) and explain how worker IDs are leased, you have the interview-sufficient core. Deep dives 3-6 (bit budgets across companies, Instagram's in-database IDs, segments, UUIDv7) are SDE-2 depth: read them when the basics feel easy.</p></div>
+
+        <h3>3. Choosing the bit split</h3>
+        <p>The 64 bits are a budget. Every real system spends it differently:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>System</th><th>Time</th><th>Machine / shard</th><th>Sequence</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>Twitter Snowflake</td><td>41 bits, ms</td><td>5 DC + 5 worker</td><td>12 bits</td><td>~69 years, 1,024 workers, 4,096/ms each</td></tr>
+              <tr><td>Instagram</td><td>41 bits, ms</td><td>13-bit logical shard</td><td>10 bits</td><td>8,192 shards, 1,024/ms per shard, made inside PostgreSQL</td></tr>
+              <tr><td>Discord</td><td>42 bits, ms since 2015-01-01</td><td>5 worker + 5 process</td><td>12 bits</td><td>Same as Snowflake with a later epoch</td></tr>
+              <tr><td>Sonyflake</td><td>39 bits, units of 10 ms</td><td>16 bits</td><td>8 bits</td><td>~174 years, 65,536 machines, only 256 per 10 ms each</td></tr>
+              <tr><td>Baidu UidGenerator</td><td>28 bits, seconds</td><td>22 bits</td><td>13 bits</td><td>~8.5 years by default (2^28 s / 31.56M s per year; Baidu's README rounds to 8.7), millions of worker IDs, 8,192/s per worker plus future-borrowing</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Rule of thumb: <b>more time bits</b> = longer life; <b>more machine bits</b> = more generators (good for autoscaling and per-boot IDs); <b>more sequence bits</b> = more IDs per tick per generator. You cannot have all three.</p>
+
+        <h3>4. Instagram's trick: generate the ID inside the database</h3>
+        <p>Instagram (2012) sharded PostgreSQL into several thousand <b>logical shards</b> mapped onto fewer physical servers. Each logical shard is a schema with a PL/pgSQL function <code>next_id()</code> used as the column default. It takes the current milliseconds minus a custom epoch, shifts left 23, ORs in the 13-bit shard ID shifted left 10, then ORs in a per-shard sequence modulo 1024. Two wins: no extra service to run, and <b>the shard is inside the ID</b>, so given any ID you know which shard holds the row without a lookup table.</p>
+        <div class="callout interview"><p><b>Interviewers love this:</b> "Embed the shard ID in the primary key so routing needs no directory lookup." It links ID design to sharding (see <a href="{{BASE}}hld/hld-08">Choosing Storage</a> and <a href="{{BASE}}hld/hld-07">Data Modeling &amp; Indexing</a>).</p></div>
+
+        <h3>5. Segment (range) allocation: the boring option that works</h3>
+        <p>If you do not need time order across servers, hand out <b>blocks</b>. Meituan Leaf-segment keeps one row per business tag with <code>max_id</code> and <code>step</code>:</p>
+<pre><code class="language-sql">BEGIN;
+UPDATE id_segment SET max_id = max_id + step WHERE biz_tag = 'order';
+SELECT max_id, step FROM id_segment WHERE biz_tag = 'order';
+COMMIT;
+-- this server now owns (max_id - step, max_id] and serves it from memory</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Segment double buffer: app serves IDs from segment A in memory while segment B is pre-fetched from the database">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="95" width="130" height="60"/><text class="label" x="85" y="130">callers</text>
+            <rect class="zone" x="210" y="20" width="330" height="210"/>
+            <text class="zone-label" x="222" y="42">ID server memory</text>
+            <rect class="box cache" x="240" y="60" width="270" height="60"/><text class="label" x="375" y="86">segment A: 3001-4000</text><text class="label small" x="375" y="106">serving now (at 3120)</text>
+            <rect class="box ghost" x="240" y="145" width="270" height="60"/><text class="label" x="375" y="171">segment B: 4001-5000</text><text class="label small" x="375" y="191">pre-loaded after 10% used</text>
+            <rect class="box db" x="620" y="95" width="160" height="60"/><text class="label" x="700" y="120">DB row</text><text class="label small" x="700" y="140">max_id, step</text>
+            <path class="arrow" d="M240 90 L155 120"/>
+            <path class="arrow" d="M620 135 L515 175"/>
+            <circle class="packet" r="6"><animateMotion dur="1.5s" repeatCount="indefinite" path="M240 90 L150 125"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M620 135 L515 175"/></circle>
+          </svg>
+          <figcaption>Segment mode: IDs come from memory; the database is touched once per block, in the background. When A runs out, the server flips to B and fetches the next block.</figcaption>
+        </figure>
+        <p>Leaf keeps a <b>double buffer</b>: when about 10% of the current block is used it fetches the next block in the background, so callers never wait on the database. Meituan sizes a block at about 600 x peak QPS (roughly 10 minutes of IDs), so the generator keeps working for 10 to 20 minutes if the database is down. The cost: IDs from different servers interleave (server A is handing out 1,000-1,999 while server B hands out 2,000-2,999), and a crash wastes the rest of a block. Gaps are fine; IDs are names, not counts.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Double-buffered segments are DMA ping-pong buffers: the device fills one while the CPU drains the other. Baidu's CachedUidGenerator goes further and pre-fills a power-of-two <b>ring buffer</b> of IDs with tail and cursor pointers, and pads slots to avoid false sharing on cache lines. Baidu claims over 6 million QPS per instance that way.</p>
+        </div>
+
+        <h3>6. UUIDs: when they are the right answer</h3>
+        <p>A <b>UUIDv4</b> is 122 random bits: no coordination at all, but 128 bits (too big for our 64-bit requirement) and random, so new keys land all over a B-tree index. <b>RFC 9562</b> (May 2024) added <b>UUIDv7</b>: a 48-bit Unix millisecond timestamp at the front, then random bits. It keeps the "no coordination" property of v4 and gets time order back, and the RFC notes that time-ordered keys give much better index locality. <b>ULID</b> is the same shape (48-bit time + 80 random bits) written as 26 Crockford base32 characters. If the interviewer drops the 64-bit requirement, UUIDv7 is often the best real-world answer.</p>
+      

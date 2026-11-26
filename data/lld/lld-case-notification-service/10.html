@@ -1,0 +1,75 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Even in a "design only" round, expect "what if two requests arrive at once?". Walk the shared state.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two submits with the same idempotency key both pass a contains check; an atomic add lets exactly one through">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">submit(bulk-7), copy 1</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">submit(bulk-7), copy 2</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">idempotency keys</text><text class="label small" x="400" y="166">bulk-7 not seen yet</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. contains(bulk-7)? no, so enqueue</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. contains(bulk-7)? no, so enqueue</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">both enqueue the same job:</text><text class="label bad" x="645" y="164">the user gets the SMS twice</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. A's add returns true: enqueued</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: one atomic add</text><text class="label mono" x="645" y="66">keys.add(key) on a concurrent set</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">B's add returns false</text><text class="label small" x="645" y="242">B is told it is a duplicate</text><text class="label small" x="645" y="266">one notification is sent</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>A client retries a bulk send, and both copies arrive together. With "check, then add" both see the key as new and both enqueue: the user is notified twice.</li>
+      <li>The guard: <code>keys.add(key)</code> on a <code>ConcurrentHashMap.newKeySet()</code> tests and inserts in one atomic step. Only one caller gets <code>true</code>.</li>
+      <li>The second copy gets <code>false</code> and returns as a duplicate without touching the queue. Exactly one job is sent.</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Writers</th><th>Readers</th><th>Protection</th></tr></thead>
+      <tbody>
+        <tr><td>Job queue</td><td>any caller of <code>submit</code></td><td>the worker</td><td>One <code>ReentrantLock</code> + <code>Condition changed</code>. <code>PriorityQueue</code> is not thread-safe; every access is under the lock.</td></tr>
+        <tr><td>Idempotency keys</td><td>callers</td><td>callers</td><td><code>ConcurrentHashMap.newKeySet().add()</code> is atomic: of four threads adding <code>bulk-7</code>, exactly one gets <code>true</code>. Check-then-add with <code>contains</code> would let two through.</td></tr>
+        <tr><td>Users, senders, opt-outs, templates</td><td>setup, <code>optOut</code></td><td>worker</td><td><code>ConcurrentHashMap</code>; the opt-out sets are concurrent sets.</td></tr>
+        <tr><td>History</td><td>worker</td><td>support queries</td><td><code>synchronizedList</code>; readers copy under the list's monitor before streaming.</td></tr>
+        <tr><td>Rate-limit windows</td><td>worker (or several)</td><td>-</td><td><code>synchronized</code> block per limiter around the check-and-record, so two threads cannot both take the last slot.</td></tr>
+        <tr><td>Fake provider state</td><td>tests</td><td>worker</td><td><code>synchronized</code> on the provider.</td></tr>
+        <tr><td>Requests, messages, records</td><td>nobody after creation</td><td>everyone</td><td>Immutable records with <code>Map.copyOf</code> / <code>EnumSet</code> copies.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3 id="worker-wait">The worker's wait, line by line</h3>
+  <ul>
+    <li><b>Timed wait until the head is due.</b> <code>changed.await(head.sendAt - now)</code>: the worker sleeps exactly as long as needed; no polling every 10 ms.</li>
+    <li><b>Re-check in a <code>while</code>.</b> After waking (signal, timeout or spurious wake-up) it re-evaluates "is the head due?", because a new, earlier job may have arrived, or nothing changed.</li>
+    <li><b>Signal on every submit.</b> A new job may be earlier than the one the worker is waiting for; the signal makes it recompute its timeout.</li>
+    <li><b>Deliver outside the lock.</b> Providers take hundreds of milliseconds. Holding the queue lock while sending would block every <code>submit</code>.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This loop is a kernel timer queue in miniature: the earliest-expiry job is the head of a heap (like the next hrtimer in the red-black tree), and the worker programs its "alarm" for that time. Adding an earlier timer reprograms the alarm, which is exactly what <code>changed.signal()</code> forces. Delivering outside the lock is the softirq rule again: take the item off the queue under the spinlock, do the slow work after dropping it.</p>
+  </div>
+  <h3 id="scaling">More workers, and per-user order</h3>
+  <p>One worker is a bottleneck when providers are slow. Two ways out, with different trade-offs:</p>
+  <div class="proscons">
+    <div class="pros"><h5>Pool of N workers on the same queue</h5><ul><li>Simple: same loop, N threads.</li><li>Throughput scales with N.</li><li>Two messages to one user may arrive out of order ("shipped" before "placed").</li></ul></div>
+    <div class="cons"><h5>Lane per user: hash(userId) % N</h5><ul><li>Keeps per-user order: one lane serves one user.</li><li>A hot user only slows their own lane.</li><li>This is the partition idea from the <a href="{{BASE}}lld/lld-case-pub-sub">pub-sub case</a>.</li></ul></div>
+  </div>
+  <p>A further option is a small executor <b>per channel</b> so a slow SMS gateway cannot starve e-mail; combine it with per-channel bulkheads (bounded queues) so one provider's outage does not eat all memory.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>ReentrantLock</code> = <code>pthread_mutex_t</code> of the recursive kind (the owning thread may lock it again), with <code>tryLock</code> like <code>mutex_trylock</code>.</li>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>Condition.await</code> / <code>awaitNanos</code>, <code>wait</code> / <code>notifyAll</code> = <code>pthread_cond_wait</code> / <code>pthread_cond_timedwait</code>; always recheck the predicate in a <code>while</code> loop because of spurious wake-ups, as <code>wait_event()</code> does.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

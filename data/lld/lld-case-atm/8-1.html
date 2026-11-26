@@ -1,0 +1,1115 @@
+<h3>Python</h3>
+  <ul class="file-roles"><li><code>atm.py</code>: the whole model; states are small classes, the bank and dispenser each take a <code>threading.Lock</code>.</li><li><code>main.py</code>: demo driver.</li><li><code>test_atm.py</code>: 12 unit tests, including the joint-account race and the backtracking case.</li></ul>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="atm.py">
+<pre><code class="language-python">"""ATM - Python version of the Java design: State machine, Chain of Responsibility dispenser, bank Adapter."""
+from __future__ import annotations
+
+import hashlib
+import itertools
+import threading
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+
+class InvalidOperation(Exception): pass
+class TransactionDeclined(Exception): pass
+
+
+class DebitResult(Enum):
+    APPROVED = "APPROVED"
+    INSUFFICIENT_FUNDS = "INSUFFICIENT_FUNDS"
+    DAILY_LIMIT_EXCEEDED = "DAILY_LIMIT_EXCEEDED"
+    CARD_BLOCKED = "CARD_BLOCKED"
+    UNKNOWN_CARD = "UNKNOWN_CARD"
+    ALREADY_REVERSED = "ALREADY_REVERSED"
+    BANK_ERROR = "BANK_ERROR"
+
+
+# ---------------------------------------------------------------- bank side
+class LegacyCoreBanking:
+    """Pretend vendor library: paise, two-character response codes, hashed PIN blocks. We adapt to it."""
+
+    def __init__(self):
+        self._acc: dict = {}
+        # ref -&gt; [pan, paise, code, reversed]: kept for approvals AND declines and never removed;
+        # a reversal marks it reversed (a tombstone) instead of deleting it.
+        self._outcomes: dict = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def pin_block(pan: str, pin: str) -&gt; str:
+        return hashlib.sha256(f"{pan}:{pin}".encode()).hexdigest()[:16]
+
+    def open_account(self, pan, pin, rupees, daily_limit_rupees):
+        with self._lock:
+            self._acc[pan] = {"pin": self.pin_block(pan, pin), "paise": rupees * 100,
+                              "limit": daily_limit_rupees * 100, "today": 0, "blocked": False}
+
+    def authorize(self, pan, pin_block) -&gt; str:
+        with self._lock:
+            a = self._acc.get(pan)
+            if a is None:
+                return "14"
+            if a["blocked"]:
+                return "62"
+            return "00" if a["pin"] == pin_block else "55"
+
+    def ledger_paise(self, pan) -&gt; int:
+        with self._lock:
+            return self._acc[pan]["paise"]
+
+    def post_debit(self, pan, paise, ref) -&gt; str:
+        """Same ref twice = the first answer again, and at most one debit. "94" = ref already reversed."""
+        with self._lock:
+            known = self._outcomes.get(ref)
+            if known is not None:        # retransmit: replay the stored answer, never re-post
+                return "94" if known[3] else known[2]
+            code = self._decide(pan, paise)
+            if code == "00":
+                a = self._acc[pan]
+                a["paise"] -= paise
+                a["today"] += paise
+            self._outcomes[ref] = [pan, paise, code, False]
+            return code
+
+    def _decide(self, pan, paise) -&gt; str:
+        a = self._acc.get(pan)
+        if a is None:
+            return "14"
+        if a["blocked"]:
+            return "62"
+        if a["today"] + paise &gt; a["limit"]:
+            return "61"
+        if a["paise"] &lt; paise:
+            return "51"
+        return "00"
+
+    def reversal(self, ref) -&gt; str:
+        """Idempotent. If the debit was never seen, store a tombstone so a late debit is declined."""
+        with self._lock:
+            o = self._outcomes.get(ref)
+            if o is None:                # the reversal overtook its debit
+                self._outcomes[ref] = [None, 0, "25", True]
+                return "25"
+            pan, paise, code, reversed_ = o
+            if not reversed_ and code == "00":
+                self._acc[pan]["paise"] += paise
+                self._acc[pan]["today"] -= paise
+            o[3] = True
+            return "00"
+
+    def block(self, pan):
+        with self._lock:
+            self._acc[pan]["blocked"] = True
+
+
+class CoreBankingAdapter:
+    """Adapter: the BankService the ATM expects (rupees, enums) on top of the legacy core."""
+    _CODES = {"00": DebitResult.APPROVED, "51": DebitResult.INSUFFICIENT_FUNDS, "61": DebitResult.DAILY_LIMIT_EXCEEDED,
+              "62": DebitResult.CARD_BLOCKED, "14": DebitResult.UNKNOWN_CARD, "94": DebitResult.ALREADY_REVERSED}
+
+    def __init__(self, core: LegacyCoreBanking):
+        self.core = core
+
+    def verify_pin(self, card, pin) -&gt; bool:
+        return self.core.authorize(card, LegacyCoreBanking.pin_block(card, pin)) == "00"
+
+    def balance(self, card) -&gt; int:
+        return self.core.ledger_paise(card) // 100
+
+    def debit(self, card, rupees, txn_id) -&gt; DebitResult:
+        # an unknown code is a bank error, never a guess like "blocked"
+        return self._CODES.get(self.core.post_debit(card, rupees * 100, txn_id), DebitResult.BANK_ERROR)
+
+    def reverse(self, txn_id):
+        self.core.reversal(txn_id)
+
+    def block_card(self, card):
+        self.core.block(card)
+
+
+# ---------------------------------------------------------------- cash side (Chain of Responsibility)
+class NoteHandler:
+    def __init__(self, denomination: int, count: int, nxt: Optional["NoteHandler"]):
+        self.denomination, self.count, self.next = denomination, count, nxt
+
+    def plan(self, amount: int, notes_left: int) -&gt; Optional[dict]:
+        """Greedy first, then one note fewer at a time (bounded backtracking). Does not change stock."""
+        for take in range(min(self.count, amount // self.denomination, notes_left), -1, -1):
+            rest = amount - take * self.denomination
+            if rest == 0:
+                tail = {}
+            elif self.next is None:
+                continue
+            else:
+                tail = self.next.plan(rest, notes_left - take)
+            if tail is None:
+                continue
+            return ({self.denomination: take} if take else {}) | tail
+        return None
+
+    def apply(self, notes: dict, sign: int):
+        self.count += sign * notes.get(self.denomination, 0)
+        if self.next:
+            self.next.apply(notes, sign)
+
+    def walk(self):
+        h = self
+        while h:
+            yield h
+            h = h.next
+
+
+class CashDispenser:
+    MAX_NOTES = 40
+
+    def __init__(self, stock: dict):
+        head = None
+        for d in sorted(stock):                    # build smallest -&gt; largest so head is the largest
+            head = NoteHandler(d, stock[d], head)
+        self.head = head
+        self._lock = threading.Lock()
+        self._jam = False
+
+    def reserve(self, amount: int) -&gt; Optional[dict]:
+        with self._lock:                           # plan + set aside in one step
+            plan = self.head.plan(amount, self.MAX_NOTES)
+            if plan is not None:
+                self.head.apply(plan, -1)
+            return plan
+
+    def release(self, notes: dict):
+        with self._lock:
+            self.head.apply(notes, +1)
+
+    def load(self, denom: int, n: int):
+        with self._lock:
+            for h in self.head.walk():
+                if h.denomination == denom:
+                    h.count += n
+                    return
+            raise ValueError(f"no cassette for {denom}")
+
+    def stock(self) -&gt; dict:
+        with self._lock:
+            return {h.denomination: h.count for h in self.head.walk()}
+
+    def total(self) -&gt; int:
+        return sum(d * c for d, c in self.stock().items())
+
+    def jam_next(self):
+        self._jam = True
+
+    def eject(self, notes: dict) -&gt; bool:
+        if self._jam:
+            self._jam = False
+            return False
+        return True
+
+
+# ---------------------------------------------------------------- states
+class StateName(Enum):
+    IDLE = "IDLE"
+    CARD_INSERTED = "CARD_INSERTED"
+    AUTHENTICATED = "AUTHENTICATED"
+    DISPENSING = "DISPENSING"
+    OUT_OF_SERVICE = "OUT_OF_SERVICE"
+
+
+@dataclass(frozen=True)
+class Receipt:
+    txn_id: str
+    amount: int
+    balance_after: int
+    notes: dict = field(default_factory=dict)
+    status: str = "OK"
+
+
+class AtmState:
+    name = None
+
+    def _no(self, what):
+        raise InvalidOperation(f"cannot {what} while {self.name.value}")
+
+    def insert_card(self, atm, card): self._no("insert a card")
+    def enter_pin(self, atm, pin): self._no("enter a PIN")
+    def balance(self, atm): self._no("check balance")
+    def withdraw(self, atm, amount): self._no("withdraw")
+    def eject_card(self, atm): self._no("eject a card")
+
+
+class Idle(AtmState):
+    name = StateName.IDLE
+
+    def insert_card(self, atm, card):
+        if card in atm.retained:
+            raise InvalidOperation(f"card {card} is blocked")
+        atm.card = card
+        atm.move_to(CardInserted())
+
+
+class CardInserted(AtmState):
+    name = StateName.CARD_INSERTED
+    MAX_TRIES = 3
+
+    def __init__(self):
+        self.tries = 0
+
+    def enter_pin(self, atm, pin):
+        if atm.bank.verify_pin(atm.card, pin):
+            atm.move_to(Authenticated())
+            return
+        self.tries += 1
+        if self.tries &gt;= self.MAX_TRIES:
+            atm.retain_card()
+            atm.move_to(Idle())
+            raise InvalidOperation(f"wrong PIN {self.tries} times: card retained")
+        raise InvalidOperation(f"wrong PIN, tries left: {self.MAX_TRIES - self.tries}")
+
+    def eject_card(self, atm):
+        atm.end_session()
+
+
+class Authenticated(AtmState):
+    name = StateName.AUTHENTICATED
+    MAX_PER_TXN = 20_000
+
+    def balance(self, atm):
+        return atm.bank.balance(atm.card)
+
+    def withdraw(self, atm, amount):
+        if amount &lt;= 0 or amount % 100:
+            raise InvalidOperation("amount must be a positive multiple of 100")
+        if amount &gt; self.MAX_PER_TXN:
+            raise InvalidOperation(f"max {self.MAX_PER_TXN} per withdrawal")
+        d = Dispensing()
+        atm.move_to(d)
+        try:
+            return d.run(atm, amount)
+        finally:
+            atm.move_to(self)
+
+    def eject_card(self, atm):
+        atm.end_session()
+
+
+class Dispensing(AtmState):
+    name = StateName.DISPENSING
+
+    def run(self, atm, amount):
+        txn = atm.next_txn_id()
+        notes = atm.dispenser.reserve(amount)
+        if notes is None:
+            raise TransactionDeclined(f"ATM cannot dispense {amount} with the notes it has")
+        try:
+            result = atm.bank.debit(atm.card, amount, txn)
+        except Exception:                # timeout: did the debit land? unknown
+            atm.dispenser.release(notes)
+            try:
+                atm.bank.reverse(txn)    # safe either way: a tombstone if the bank never saw the debit
+            except Exception:
+                pass                     # a real ATM queues the reversal and retries it (store-and-forward)
+            raise TransactionDeclined(f"bank unavailable for {txn}: nothing dispensed, reversal sent")
+        if result is not DebitResult.APPROVED:
+            atm.dispenser.release(notes)
+            raise TransactionDeclined(f"bank declined {txn}: {result.value}")
+        if not atm.dispenser.eject(notes):
+            atm.bank.reverse(txn)
+            atm.dispenser.release(notes)
+            return Receipt(txn, amount, atm.bank.balance(atm.card), {}, "REVERSED (dispense fault)")
+        return Receipt(txn, amount, atm.bank.balance(atm.card), notes)
+
+
+class OutOfService(AtmState):
+    name = StateName.OUT_OF_SERVICE
+
+
+# ---------------------------------------------------------------- context
+class Atm:
+    _txn = itertools.count(1)
+    _txn_lock = threading.Lock()
+
+    def __init__(self, atm_id: str, bank: CoreBankingAdapter, dispenser: CashDispenser, min_cash: int = 100):
+        self.id, self.bank, self.dispenser, self.min_cash = atm_id, bank, dispenser, min_cash
+        self.card: Optional[str] = None
+        self.retained: set = set()
+        self.history: list = []
+        self._state: AtmState = Idle() if dispenser.total() &gt;= min_cash else OutOfService()
+        self._lock = threading.RLock()            # one customer at a time
+
+    # user actions
+    def insert_card(self, card):
+        with self._lock: self._state.insert_card(self, card)
+    def enter_pin(self, pin):
+        with self._lock: self._state.enter_pin(self, pin)
+    def balance(self):
+        with self._lock: return self._state.balance(self)
+    def withdraw(self, amount):
+        with self._lock: return self._state.withdraw(self, amount)
+    def eject_card(self):
+        with self._lock: self._state.eject_card(self)
+
+    # operator
+    def load_cash(self, denom, n):
+        with self._lock:
+            self.dispenser.load(denom, n)
+            if self._state.name is StateName.OUT_OF_SERVICE and self.dispenser.total() &gt;= self.min_cash:
+                self.move_to(Idle())
+
+    # used by states
+    @property
+    def state(self) -&gt; StateName:
+        return self._state.name
+
+    def next_txn_id(self):
+        with Atm._txn_lock:
+            return f"{self.id}-T{next(Atm._txn)}"
+
+    def end_session(self):
+        self.card = None
+        self.move_to(OutOfService() if self.dispenser.total() &lt; self.min_cash else Idle())
+
+    def retain_card(self):
+        self.retained.add(self.card)
+        self.bank.block_card(self.card)
+        self.card = None
+
+    def move_to(self, nxt: AtmState):
+        if nxt.name is not self._state.name:
+            self.history.append(f"{self._state.name.value} -&gt; {nxt.name.value}")
+        self._state = nxt</code></pre>
+    </div>
+    <div class="tab-panel" data-title="main.py">
+<pre><code class="language-python">"""Demo driver: the same story as Java Main, with simple asserts."""
+from atm import (Atm, CashDispenser, CoreBankingAdapter, DebitResult, InvalidOperation, LegacyCoreBanking, StateName,
+                 TransactionDeclined)
+
+
+def expect(err, fn):
+    try:
+        fn()
+    except err as e:
+        print("  rejected as expected:", e)
+        return
+    raise AssertionError(f"expected {err.__name__}")
+
+
+def main():
+    core = LegacyCoreBanking()
+    core.open_account("4111-0001", "1234", 10_000, 20_000)
+    core.open_account("4111-0002", "4321", 500, 20_000)
+    bank = CoreBankingAdapter(core)
+    atm = Atm("ATM1", bank, CashDispenser({2000: 1, 500: 5, 200: 4, 100: 4}))
+
+    print("== 1. wrong-state actions ==")
+    expect(InvalidOperation, lambda: atm.withdraw(500))
+
+    print("== 2. card, PIN, withdraw 1700 ==")
+    atm.insert_card("4111-0001")
+    expect(InvalidOperation, lambda: atm.enter_pin("9999"))
+    atm.enter_pin("1234")
+    r = atm.withdraw(1700)
+    print(" ", r)
+    assert r.notes == {500: 3, 200: 1} and r.balance_after == 8_300
+    expect(InvalidOperation, lambda: atm.withdraw(250))
+    expect(TransactionDeclined, lambda: atm.withdraw(4500))
+    assert bank.balance("4111-0001") == 8_300
+    atm.eject_card()
+
+    print("== 3. greedy is not enough: 600 from 2000x1, 500x1, 200x4, no 100s ==")
+    atm2 = Atm("ATM2", bank, CashDispenser({2000: 1, 500: 1, 200: 4, 100: 0}))
+    atm2.insert_card("4111-0001")
+    atm2.enter_pin("1234")
+    r2 = atm2.withdraw(600)
+    print(" ", r2)
+    assert r2.notes == {200: 3}
+    atm2.eject_card()
+
+    print("== 4. bank declines, notes go back ==")
+    before = atm.dispenser.stock()
+    atm.insert_card("4111-0002")
+    atm.enter_pin("4321")
+    expect(TransactionDeclined, lambda: atm.withdraw(1000))
+    assert atm.dispenser.stock() == before
+    atm.eject_card()
+
+    print("== 5. jam after debit: reversed ==")
+    atm.insert_card("4111-0001")
+    atm.enter_pin("1234")
+    atm.dispenser.jam_next()
+    r3 = atm.withdraw(1000)
+    print(" ", r3)
+    assert r3.status.startswith("REVERSED") and r3.balance_after == 7_700
+    atm.eject_card()
+
+    print("== 5b. retries and the network: one durable answer per txn id ==")
+    assert bank.debit("4111-0001", 1000, "RETRY-1") is DebitResult.APPROVED
+    assert bank.debit("4111-0001", 1000, "RETRY-1") is DebitResult.APPROVED      # retransmit: replayed
+    bank.reverse("RETRY-1")
+    assert bank.debit("4111-0001", 1000, "RETRY-1") is DebitResult.ALREADY_REVERSED
+    bank.reverse("LATE-1")                                                       # reversal overtakes its debit
+    assert bank.debit("4111-0001", 1000, "LATE-1") is DebitResult.ALREADY_REVERSED
+    assert bank.balance("4111-0001") == 7_700
+    print("  reverse-then-retry and reversal-before-debit both declined; balance", bank.balance("4111-0001"))
+
+    print("== 6. three wrong PINs ==")
+    atm.insert_card("4111-0002")
+    for p in ("1111", "2222", "3333"):
+        expect(InvalidOperation, lambda: atm.enter_pin(p))
+    assert atm.state is StateName.IDLE
+    expect(InvalidOperation, lambda: atm.insert_card("4111-0002"))
+    print("  history:", atm.history[:4], "...")
+    print("ALL DEMO ASSERTS PASSED")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="test_atm.py">
+<pre><code class="language-python">import threading
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+
+from atm import (Atm, CashDispenser, CoreBankingAdapter, DebitResult, InvalidOperation, LegacyCoreBanking, StateName,
+                 TransactionDeclined)
+
+
+def bank_with(*accounts):
+    core = LegacyCoreBanking()
+    for pan, pin, bal, limit in accounts:
+        core.open_account(pan, pin, bal, limit)
+    return CoreBankingAdapter(core)
+
+
+class DispenserTest(unittest.TestCase):
+    def test_greedy_when_possible(self):
+        d = CashDispenser({2000: 1, 500: 5, 200: 4, 100: 4})
+        self.assertEqual(d.reserve(1700), {500: 3, 200: 1})
+
+    def test_backtracks_when_greedy_gets_stuck(self):
+        d = CashDispenser({2000: 1, 500: 1, 200: 4, 100: 0})
+        self.assertEqual(d.reserve(600), {200: 3})
+
+    def test_impossible_amount_leaves_stock_alone(self):
+        d = CashDispenser({500: 1, 200: 1})
+        self.assertIsNone(d.reserve(600))
+        self.assertEqual(d.stock(), {500: 1, 200: 1})
+
+    def test_reserve_then_release(self):
+        d = CashDispenser({500: 2})
+        notes = d.reserve(1000)
+        self.assertEqual(d.total(), 0)
+        d.release(notes)
+        self.assertEqual(d.total(), 1000)
+
+
+class AtmTest(unittest.TestCase):
+    def setUp(self):
+        self.bank = bank_with(("c1", "1111", 5_000, 3_000), ("c2", "2222", 300, 10_000))
+        self.atm = Atm("A", self.bank, CashDispenser({500: 10, 100: 10}))
+
+    def login(self, card="c1", pin="1111"):
+        self.atm.insert_card(card)
+        self.atm.enter_pin(pin)
+
+    def test_state_guards(self):
+        with self.assertRaises(InvalidOperation):
+            self.atm.balance()
+        self.atm.insert_card("c1")
+        with self.assertRaises(InvalidOperation):
+            self.atm.withdraw(100)
+        with self.assertRaises(InvalidOperation):
+            self.atm.insert_card("c2")
+
+    def test_daily_limit_from_core(self):
+        self.login()
+        self.atm.withdraw(2_000)
+        with self.assertRaises(TransactionDeclined) as e:
+            self.atm.withdraw(1_500)
+        self.assertIn("DAILY_LIMIT_EXCEEDED", str(e.exception))
+
+    def test_insufficient_funds_returns_notes(self):
+        self.login("c2", "2222")
+        before = self.atm.dispenser.stock()
+        with self.assertRaises(TransactionDeclined):
+            self.atm.withdraw(500)
+        self.assertEqual(self.atm.dispenser.stock(), before)
+
+    def test_jam_reverses_debit(self):
+        self.login()
+        self.atm.dispenser.jam_next()
+        r = self.atm.withdraw(1_000)
+        self.assertTrue(r.status.startswith("REVERSED"))
+        self.assertEqual(self.bank.balance("c1"), 5_000)
+
+    def test_three_wrong_pins_retain_card(self):
+        self.atm.insert_card("c1")
+        for _ in range(3):
+            with self.assertRaises(InvalidOperation):
+                self.atm.enter_pin("0000")
+        self.assertIs(self.atm.state, StateName.IDLE)
+        self.assertFalse(self.bank.verify_pin("c1", "1111"))
+
+    def test_out_of_service_and_refill(self):
+        atm = Atm("S", self.bank, CashDispenser({500: 2}), min_cash=500)
+        atm.insert_card("c1"); atm.enter_pin("1111"); atm.withdraw(1_000); atm.eject_card()
+        self.assertIs(atm.state, StateName.OUT_OF_SERVICE)
+        atm.load_cash(500, 4)
+        self.assertIs(atm.state, StateName.IDLE)
+
+    def test_idempotent_debit(self):
+        self.assertIs(self.bank.debit("c1", 100, "X"), DebitResult.APPROVED)
+        self.assertIs(self.bank.debit("c1", 100, "X"), DebitResult.APPROVED)
+        self.assertEqual(self.bank.balance("c1"), 4_900)
+
+    def test_reverse_then_retry_debit_takes_nothing(self):
+        before = self.bank.balance("c1")
+        self.assertEqual(self.bank.debit("c1", 1000, "R-1"), DebitResult.APPROVED)
+        self.bank.reverse("R-1")
+        self.assertEqual(self.bank.debit("c1", 1000, "R-1"), DebitResult.ALREADY_REVERSED)
+        self.assertEqual(self.bank.balance("c1"), before)
+
+    def test_reversal_before_debit_declines_the_late_debit(self):
+        before = self.bank.balance("c1")
+        self.bank.reverse("LATE-1")
+        self.assertEqual(self.bank.debit("c1", 1000, "LATE-1"), DebitResult.ALREADY_REVERSED)
+        self.assertEqual(self.bank.balance("c1"), before)
+
+    def test_declines_are_remembered_and_unknown_card_is_not_blocked(self):
+        self.assertEqual(self.bank.debit("c2", 1000, "NF-1"), DebitResult.INSUFFICIENT_FUNDS)
+        self.assertEqual(self.bank.debit("c2", 1000, "NF-1"), DebitResult.INSUFFICIENT_FUNDS)
+        self.assertEqual(self.bank.debit("nope", 100, "NC-1"), DebitResult.UNKNOWN_CARD)
+
+    def test_bank_timeout_after_posting_releases_notes_and_reverses(self):
+        class LostAnswerBank(CoreBankingAdapter):
+            def debit(self, card, rupees, txn_id):
+                super().debit(card, rupees, txn_id)
+                raise TimeoutError("timeout waiting for the bank")
+        before = self.bank.balance("c1")
+        atm = Atm("F", LostAnswerBank(self.bank.core), CashDispenser({500: 4}), 100)
+        full = atm.dispenser.stock()
+        atm.insert_card("c1")
+        atm.enter_pin("1111")
+        with self.assertRaises(TransactionDeclined):
+            atm.withdraw(1000)
+        self.assertEqual(atm.dispenser.stock(), full)
+        self.assertEqual(self.bank.balance("c1"), before)
+
+    def test_joint_account_never_overdrawn(self):
+        bank = bank_with(("j", "9", 10_000, 100_000))
+        go = threading.Event()
+
+        def one(i):
+            a = Atm(f"J{i}", bank, CashDispenser({500: 4}))
+            go.wait()
+            a.insert_card("j"); a.enter_pin("9")
+            try:
+                a.withdraw(1_000)
+                return True
+            except TransactionDeclined:
+                return False
+            finally:
+                a.eject_card()
+
+        with ThreadPoolExecutor(8) as pool:
+            futs = [pool.submit(one, i) for i in range(20)]
+            go.set()
+            wins = sum(f.result() for f in futs)
+        self.assertEqual(wins, 10)
+        self.assertEqual(bank.balance("j"), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+<pre class="terminal"><code>$ python main.py
+== 1. wrong-state actions ==
+  rejected as expected: cannot withdraw while IDLE
+== 2. card, PIN, withdraw 1700 ==
+  rejected as expected: wrong PIN, tries left: 2
+  Receipt(txn_id='ATM1-T1', amount=1700, balance_after=8300, notes={500: 3, 200: 1}, status='OK')
+  rejected as expected: amount must be a positive multiple of 100
+  rejected as expected: ATM cannot dispense 4500 with the notes it has
+== 3. greedy is not enough: 600 from 2000x1, 500x1, 200x4, no 100s ==
+  Receipt(txn_id='ATM2-T3', amount=600, balance_after=7700, notes={200: 3}, status='OK')
+== 4. bank declines, notes go back ==
+  rejected as expected: bank declined ATM1-T4: INSUFFICIENT_FUNDS
+== 5. jam after debit: reversed ==
+  Receipt(txn_id='ATM1-T5', amount=1000, balance_after=7700, notes={}, status='REVERSED (dispense fault)')
+== 5b. retries and the network: one durable answer per txn id ==
+  reverse-then-retry and reversal-before-debit both declined; balance 7700
+== 6. three wrong PINs ==
+  rejected as expected: wrong PIN, tries left: 2
+  rejected as expected: wrong PIN, tries left: 1
+  rejected as expected: wrong PIN 3 times: card retained
+  rejected as expected: card 4111-0002 is blocked
+  history: ['IDLE -&gt; CARD_INSERTED', 'CARD_INSERTED -&gt; AUTHENTICATED', 'AUTHENTICATED -&gt; DISPENSING', 'DISPENSING -&gt; AUTHENTICATED'] ...
+ALL DEMO ASSERTS PASSED</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output: tests">
+<pre class="terminal"><code>$ python -m unittest -v test_atm
+test_bank_timeout_after_posting_releases_notes_and_reverses (test_atm.AtmTest.test_bank_timeout_after_posting_releases_notes_and_reverses) ... ok
+test_daily_limit_from_core (test_atm.AtmTest.test_daily_limit_from_core) ... ok
+test_declines_are_remembered_and_unknown_card_is_not_blocked (test_atm.AtmTest.test_declines_are_remembered_and_unknown_card_is_not_blocked) ... ok
+test_idempotent_debit (test_atm.AtmTest.test_idempotent_debit) ... ok
+test_insufficient_funds_returns_notes (test_atm.AtmTest.test_insufficient_funds_returns_notes) ... ok
+test_jam_reverses_debit (test_atm.AtmTest.test_jam_reverses_debit) ... ok
+test_joint_account_never_overdrawn (test_atm.AtmTest.test_joint_account_never_overdrawn) ... ok
+test_out_of_service_and_refill (test_atm.AtmTest.test_out_of_service_and_refill) ... ok
+test_reversal_before_debit_declines_the_late_debit (test_atm.AtmTest.test_reversal_before_debit_declines_the_late_debit) ... ok
+test_reverse_then_retry_debit_takes_nothing (test_atm.AtmTest.test_reverse_then_retry_debit_takes_nothing) ... ok
+test_state_guards (test_atm.AtmTest.test_state_guards) ... ok
+test_three_wrong_pins_retain_card (test_atm.AtmTest.test_three_wrong_pins_retain_card) ... ok
+test_backtracks_when_greedy_gets_stuck (test_atm.DispenserTest.test_backtracks_when_greedy_gets_stuck) ... ok
+test_greedy_when_possible (test_atm.DispenserTest.test_greedy_when_possible) ... ok
+test_impossible_amount_leaves_stock_alone (test_atm.DispenserTest.test_impossible_amount_leaves_stock_alone) ... ok
+test_reserve_then_release (test_atm.DispenserTest.test_reserve_then_release) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.004s
+
+OK</code></pre>
+    </div>
+  </div>
+  <h3>C++14</h3>
+  <ul class="file-roles"><li><code>main.cpp</code>: abstract base classes as the state table (a vtable is the ops table you know from C), <code>unique_ptr</code> links for the chain, an abstract <code>BankService</code> with an adapter.</li></ul>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>ALL 25 CHECKS PASSED</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// ATM in C++14: State (abstract class per state), Chain of Responsibility (note handlers), Adapter (bank).
+// Windows (MinGW g++ 6.3):  g++ -std=c++14 -Wall -O2 main.cpp -o atm
+// Linux (real locks):       g++ -std=c++14 -Wall -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o atm
+// MinGW.org g++ 6.3 uses the win32 thread model: no std::mutex/std::thread, and -pthread fails to link.
+// Without HAVE_STD_MUTEX, Mutex is a no-op with the same lock()/unlock(), so the SAME locking code
+// builds both ways. Lock order: Atm -&gt; CashDispenser -&gt; LegacyCore (never the other way round).
+#include &lt;cstdio&gt;
+#include &lt;mutex&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+using namespace std;
+#ifdef HAVE_STD_MUTEX
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+typedef std::mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+struct InvalidOperation : runtime_error { using runtime_error::runtime_error; };
+struct Declined : runtime_error { using runtime_error::runtime_error; };
+enum class DebitResult { APPROVED, INSUFFICIENT_FUNDS, DAILY_LIMIT, BLOCKED, UNKNOWN_CARD, ALREADY_REVERSED, BANK_ERROR };
+using Notes = map&lt;int, int, greater&lt;int&gt;&gt;;            // denomination -&gt; count, largest first
+
+static string show(const Notes&amp; n) {
+    string s = "{";
+    for (auto&amp; e : n) s += (s.size() &gt; 1 ? ", " : "") + to_string(e.first) + "x" + to_string(e.second);
+    return s + "}";
+}
+
+// ------------------------------------------------------------ bank: legacy core + adapter
+class LegacyCore {                       // paise, response codes; we cannot change this class
+    struct Acc { size_t pinHash; long paise; long limit; long today; bool blocked; };
+    // The durable answer per ref, kept for approvals AND declines and never erased: a reversal
+    // marks it reversed (a tombstone), so a retransmitted or late debit cannot post again.
+    struct Outcome { string pan; long paise; string code; bool reversed; };
+    Mutex mu_;                                           // one lock for the whole core (fine for a demo)
+    map&lt;string, Acc&gt; acc_;
+    map&lt;string, Outcome&gt; outcomes_;
+    string decide(const string&amp; pan, long paise) {
+        auto it = acc_.find(pan);
+        if (it == acc_.end()) return "14";
+        const Acc&amp; a = it-&gt;second;
+        if (a.blocked) return "62";
+        if (a.today + paise &gt; a.limit) return "61";
+        if (a.paise &lt; paise) return "51";
+        return "00";
+    }
+public:
+    static size_t pinBlock(const string&amp; pan, const string&amp; pin) { return hash&lt;string&gt;()(pan + ":" + pin); }
+    void open(const string&amp; pan, const string&amp; pin, long rupees, long limit) {
+        LockGuard g(mu_); acc_[pan] = Acc{pinBlock(pan, pin), rupees * 100, limit * 100, 0, false};
+    }
+    string authorize(const string&amp; pan, size_t block) {
+        LockGuard g(mu_);
+        auto it = acc_.find(pan);
+        if (it == acc_.end()) return "14";
+        if (it-&gt;second.blocked) return "62";
+        return it-&gt;second.pinHash == block ? "00" : "55";
+    }
+    long ledger(const string&amp; pan) { LockGuard g(mu_); return acc_.at(pan).paise; }
+    // Same ref twice = the first answer again, at most one debit. "94" = this ref was reversed.
+    string postDebit(const string&amp; pan, long paise, const string&amp; ref) {
+        LockGuard g(mu_);
+        auto known = outcomes_.find(ref);
+        if (known != outcomes_.end()) return known-&gt;second.reversed ? "94" : known-&gt;second.code;
+        string code = decide(pan, paise);
+        if (code == "00") { Acc&amp; a = acc_.at(pan); a.paise -= paise; a.today += paise; }
+        outcomes_[ref] = Outcome{pan, paise, code, false};
+        return code;
+    }
+    // Idempotent. A reversal that overtakes its debit leaves a tombstone ("25") so the late debit is declined.
+    string reversal(const string&amp; ref) {
+        LockGuard g(mu_);
+        auto it = outcomes_.find(ref);
+        if (it == outcomes_.end()) { outcomes_[ref] = Outcome{"", 0, "25", true}; return "25"; }
+        Outcome&amp; o = it-&gt;second;
+        if (!o.reversed &amp;&amp; o.code == "00") { Acc&amp; a = acc_.at(o.pan); a.paise += o.paise; a.today -= o.paise; }
+        o.reversed = true;
+        return "00";
+    }
+    void block(const string&amp; pan) { LockGuard g(mu_); acc_.at(pan).blocked = true; }
+};
+
+struct BankService {                     // what the ATM was written against
+    virtual ~BankService() {}
+    virtual bool verifyPin(const string&amp; card, const string&amp; pin) = 0;
+    virtual long balance(const string&amp; card) = 0;
+    virtual DebitResult debit(const string&amp; card, long rupees, const string&amp; txn) = 0;
+    virtual void reverse(const string&amp; txn) = 0;
+    virtual void blockCard(const string&amp; card) = 0;
+};
+
+class CoreAdapter : public BankService {
+    LegacyCore&amp; core_;
+public:
+    explicit CoreAdapter(LegacyCore&amp; c) : core_(c) {}
+    bool verifyPin(const string&amp; c, const string&amp; p) override { return core_.authorize(c, LegacyCore::pinBlock(c, p)) == "00"; }
+    long balance(const string&amp; c) override { return core_.ledger(c) / 100; }
+    DebitResult debit(const string&amp; c, long r, const string&amp; t) override {
+        string code = core_.postDebit(c, r * 100, t);
+        if (code == "00") return DebitResult::APPROVED;
+        if (code == "51") return DebitResult::INSUFFICIENT_FUNDS;
+        if (code == "61") return DebitResult::DAILY_LIMIT;
+        if (code == "62") return DebitResult::BLOCKED;
+        if (code == "14") return DebitResult::UNKNOWN_CARD;
+        if (code == "94") return DebitResult::ALREADY_REVERSED;
+        return DebitResult::BANK_ERROR;                  // never guess "blocked" for an unknown code
+    }
+    void reverse(const string&amp; t) override { core_.reversal(t); }
+    void blockCard(const string&amp; c) override { core_.block(c); }
+};
+
+// ------------------------------------------------------------ cash: chain of note handlers
+class NoteHandler {
+    int denom_, count_;
+    unique_ptr&lt;NoteHandler&gt; next_;
+public:
+    NoteHandler(int d, int c, unique_ptr&lt;NoteHandler&gt; n) : denom_(d), count_(c), next_(move(n)) {}
+    // greedy first, then one note fewer (bounded backtracking); returns false if impossible
+    bool plan(int amount, int notesLeft, Notes&amp; out) const {
+        int mx = min(min(count_, amount / denom_), notesLeft);
+        for (int take = mx; take &gt;= 0; take--) {
+            int rest = amount - take * denom_;
+            Notes tail;
+            if (rest != 0 &amp;&amp; (!next_ || !next_-&gt;plan(rest, notesLeft - take, tail))) continue;
+            if (take) tail[denom_] = take;
+            out = tail;
+            return true;
+        }
+        return false;
+    }
+    void apply(const Notes&amp; n, int sign) {
+        auto it = n.find(denom_);
+        if (it != n.end()) count_ += sign * it-&gt;second;
+        if (next_) next_-&gt;apply(n, sign);
+    }
+    long total() const { return (long)denom_ * count_ + (next_ ? next_-&gt;total() : 0); }
+};
+
+class CashDispenser {
+    unique_ptr&lt;NoteHandler&gt; head_;
+    bool jam_ = false;
+    mutable Mutex mu_;                                   // the cassettes are shared hardware
+public:
+    explicit CashDispenser(const Notes&amp; stock) {
+        for (auto it = stock.rbegin(); it != stock.rend(); ++it)      // smallest first, so head = largest
+            head_.reset(new NoteHandler(it-&gt;first, it-&gt;second, move(head_)));
+    }
+    bool reserve(int amount, Notes&amp; out) {
+        LockGuard g(mu_);
+        if (!head_-&gt;plan(amount, 40, out)) return false;
+        head_-&gt;apply(out, -1);
+        return true;
+    }
+    void release(const Notes&amp; n) { LockGuard g(mu_); head_-&gt;apply(n, +1); }
+    long total() const { LockGuard g(mu_); return head_-&gt;total(); }
+    void jamNext() { LockGuard g(mu_); jam_ = true; }
+    bool eject(const Notes&amp;) { LockGuard g(mu_); if (jam_) { jam_ = false; return false; } return true; }
+};
+
+// ------------------------------------------------------------ states
+class Atm;
+struct AtmState {
+    virtual ~AtmState() {}
+    virtual const char* name() const = 0;
+    virtual void insertCard(Atm&amp;, const string&amp;) { no("insert a card"); }
+    virtual void enterPin(Atm&amp;, const string&amp;) { no("enter a PIN"); }
+    virtual long balance(Atm&amp;) { no("check balance"); return 0; }
+    virtual string withdraw(Atm&amp;, long) { no("withdraw"); return ""; }
+    virtual void ejectCard(Atm&amp;) { no("eject a card"); }
+protected:
+    void no(const string&amp; what) const { throw InvalidOperation("cannot " + what + " while " + name()); }
+};
+
+class Atm {
+    unique_ptr&lt;AtmState&gt; state_;
+    BankService&amp; bank_;
+    CashDispenser&amp; cash_;
+    string id_;                          // txn ids are "&lt;atmId&gt;-T&lt;n&gt;": globally unique, so idempotency keys never collide
+    set&lt;string&gt; retained_;
+    long txn_ = 0;
+    Mutex mu_;                           // one customer, one keypad: every user action holds it
+public:
+    string card;
+    string history;
+    Atm(const string&amp; id, BankService&amp; b, CashDispenser&amp; c);
+    void moveTo(AtmState* s) {
+        if (string(s-&gt;name()) != state_-&gt;name()) history += string(state_-&gt;name()) + "-&gt;" + s-&gt;name() + " ";
+        state_.reset(s);
+    }
+    BankService&amp; bank() { return bank_; }
+    CashDispenser&amp; cash() { return cash_; }
+    string nextTxn() { return id_ + "-T" + to_string(++txn_); }
+    bool isRetained(const string&amp; c) const { return retained_.count(c) &gt; 0; }
+    void retain() { retained_.insert(card); bank_.blockCard(card); card.clear(); }
+    void endSession();
+    const char* state() const { return state_-&gt;name(); }
+    // user actions: each takes the ATM lock, then delegates to the current state object
+    void insertCard(const string&amp; c) { LockGuard g(mu_); state_-&gt;insertCard(*this, c); }
+    void enterPin(const string&amp; p) { LockGuard g(mu_); state_-&gt;enterPin(*this, p); }
+    long balance() { LockGuard g(mu_); return state_-&gt;balance(*this); }
+    string withdraw(long a) { LockGuard g(mu_); return state_-&gt;withdraw(*this, a); }
+    void ejectCard() { LockGuard g(mu_); state_-&gt;ejectCard(*this); }
+};
+
+struct Idle : AtmState {
+    const char* name() const override { return "IDLE"; }
+    void insertCard(Atm&amp; atm, const string&amp; c) override;
+};
+struct OutOfService : AtmState { const char* name() const override { return "OUT_OF_SERVICE"; } };
+
+struct Dispensing : AtmState {
+    const char* name() const override { return "DISPENSING"; }
+    static string run(Atm&amp; atm, long amount) {
+        string txn = atm.nextTxn();
+        Notes notes;
+        if (!atm.cash().reserve((int)amount, notes)) throw Declined("ATM cannot dispense " + to_string(amount));
+        DebitResult r;
+        try {
+            r = atm.bank().debit(atm.card, amount, txn);
+        } catch (const exception&amp;) {                    // timeout: did the debit land? unknown
+            atm.cash().release(notes);
+            try { atm.bank().reverse(txn); }            // safe either way: tombstone if never seen
+            catch (const exception&amp;) { /* a real ATM queues it and retries (store-and-forward) */ }
+            throw Declined("bank unavailable for " + txn + ": nothing dispensed, reversal sent");
+        }
+        if (r != DebitResult::APPROVED) {
+            atm.cash().release(notes);
+            throw Declined("bank declined " + txn);
+        }
+        if (!atm.cash().eject(notes)) {
+            atm.bank().reverse(txn);
+            atm.cash().release(notes);
+            return txn + " REVERSED, balance " + to_string(atm.bank().balance(atm.card));
+        }
+        return txn + " OK " + show(notes) + ", balance " + to_string(atm.bank().balance(atm.card));
+    }
+};
+
+struct Authenticated : AtmState {
+    const char* name() const override { return "AUTHENTICATED"; }
+    long balance(Atm&amp; atm) override { return atm.bank().balance(atm.card); }
+    string withdraw(Atm&amp; atm, long amount) override {
+        if (amount &lt;= 0 || amount % 100) throw InvalidOperation("amount must be a positive multiple of 100");
+        atm.moveTo(new Dispensing());            // 'this' is destroyed here: do not touch members after
+        string r;
+        try { r = Dispensing::run(atm, amount); }
+        catch (...) { atm.moveTo(new Authenticated()); throw; }
+        atm.moveTo(new Authenticated());
+        return r;
+    }
+    void ejectCard(Atm&amp; atm) override { atm.endSession(); }
+};
+
+struct CardInserted : AtmState {
+    int tries = 0;
+    const char* name() const override { return "CARD_INSERTED"; }
+    void enterPin(Atm&amp; atm, const string&amp; pin) override {
+        if (atm.bank().verifyPin(atm.card, pin)) { atm.moveTo(new Authenticated()); return; }
+        if (++tries &gt;= 3) {
+            atm.retain();
+            atm.moveTo(new Idle());              // 'this' is gone after this line
+            throw InvalidOperation("wrong PIN 3 times: card retained");
+        }
+        throw InvalidOperation("wrong PIN, tries left: " + to_string(3 - tries));
+    }
+    void ejectCard(Atm&amp; atm) override { atm.endSession(); }
+};
+
+void Idle::insertCard(Atm&amp; atm, const string&amp; c) {
+    if (atm.isRetained(c)) throw InvalidOperation("card " + c + " is blocked");
+    atm.card = c;
+    atm.moveTo(new CardInserted());
+}
+Atm::Atm(const string&amp; id, BankService&amp; b, CashDispenser&amp; c) : state_(new Idle()), bank_(b), cash_(c), id_(id) {
+    if (cash_.total() &lt; 100) state_.reset(new OutOfService());
+}
+void Atm::endSession() { card.clear(); moveTo(cash_.total() &lt; 100 ? (AtmState*)new OutOfService() : new Idle()); }
+
+// Test double: the core posts the debit, then the answer is lost on the way back.
+struct LostAnswerBank : CoreAdapter {
+    explicit LostAnswerBank(LegacyCore&amp; c) : CoreAdapter(c) {}
+    DebitResult debit(const string&amp; c, long r, const string&amp; t) override {
+        CoreAdapter::debit(c, r, t);
+        throw runtime_error("timeout waiting for the bank");
+    }
+};
+
+// ------------------------------------------------------------ demo
+static int checks = 0;
+static void check(bool ok, const string&amp; what) { if (!ok) { printf("FAILED: %s\n", what.c_str()); exit(1); } checks++; }
+template &lt;class E&gt; static void expect(function&lt;void()&gt; f, const string&amp; what) {
+    try { f(); } catch (const E&amp; e) { printf("  rejected as expected: %s\n", e.what()); checks++; return; }
+    check(false, "expected an exception: " + what);
+}
+
+int main() {
+    LegacyCore core;
+    core.open("4111-0001", "1234", 10000, 20000);
+    core.open("4111-0002", "4321", 500, 20000);
+    CoreAdapter bank(core);
+    CashDispenser cash({{2000, 1}, {500, 5}, {200, 4}, {100, 4}});
+    Atm atm("ATM1", bank, cash);
+
+    printf("== 1. wrong state ==\n");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.withdraw(500); }, "withdraw while idle");
+    printf("== 2. withdraw 1700 ==\n");
+    atm.insertCard("4111-0001");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.enterPin("9999"); }, "wrong pin");
+    atm.enterPin("1234");
+    check(atm.balance() == 10000, "balance");
+    string r = atm.withdraw(1700);
+    printf("  %s\n", r.c_str());
+    check(r.find("500x3, 200x1") != string::npos, "500x3 + 200x1");
+    expect&lt;Declined&gt;([&amp;] { atm.withdraw(4500); }, "not enough notes");
+    check(bank.balance("4111-0001") == 8300, "account untouched by failed plan");
+    atm.ejectCard();
+
+    printf("== 3. backtracking: 600 from 2000x1, 500x1, 200x4 ==\n");
+    CashDispenser cash2({{2000, 1}, {500, 1}, {200, 4}, {100, 0}});
+    Atm atm2("ATM2", bank, cash2);
+    atm2.insertCard("4111-0001"); atm2.enterPin("1234");
+    r = atm2.withdraw(600);
+    printf("  %s\n", r.c_str());
+    check(r.find("{200x3}") != string::npos &amp;&amp; bank.balance("4111-0001") == 7700, "200x3, debited");
+    atm2.ejectCard();
+
+    printf("== 4. declined and jammed ==\n");
+    long before = cash.total();
+    atm.insertCard("4111-0002"); atm.enterPin("4321");
+    expect&lt;Declined&gt;([&amp;] { atm.withdraw(1000); }, "insufficient funds");
+    check(cash.total() == before, "notes released");
+    atm.ejectCard();
+    atm.insertCard("4111-0001"); atm.enterPin("1234");
+    cash.jamNext();
+    r = atm.withdraw(1000);
+    printf("  %s\n", r.c_str());
+    check(r.find("REVERSED") != string::npos &amp;&amp; bank.balance("4111-0001") == 7700, "debit reversed");
+    atm.ejectCard();
+
+    printf("== 4b. retries and the network: one durable answer per txn id ==\n");
+    core.open("4111-0003", "0000", 9000, 20000);
+    check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult::APPROVED, "first post");
+    check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult::APPROVED &amp;&amp; bank.balance("4111-0003") == 8000, "retry replayed, debited once");
+    bank.reverse("RETRY-1"); bank.reverse("RETRY-1");
+    check(bank.balance("4111-0003") == 9000, "reversed once");
+    check(bank.debit("4111-0003", 1000, "RETRY-1") == DebitResult::ALREADY_REVERSED &amp;&amp; bank.balance("4111-0003") == 9000,
+          "reverse then retry debit -&gt; no second debit");
+    bank.reverse("LATE-1");
+    check(bank.debit("4111-0003", 1000, "LATE-1") == DebitResult::ALREADY_REVERSED &amp;&amp; bank.balance("4111-0003") == 9000,
+          "reversal before debit -&gt; late debit declined");
+    check(bank.debit("4111-0002", 15000, "NF-1") == DebitResult::INSUFFICIENT_FUNDS &amp;&amp;
+          bank.debit("4111-0002", 15000, "NF-1") == DebitResult::INSUFFICIENT_FUNDS, "declines remembered");
+    check(bank.debit("4111-9999", 100, "NC-1") == DebitResult::UNKNOWN_CARD, "14 is UNKNOWN_CARD");
+    LostAnswerBank flakyBank(core);
+    CashDispenser cash4(Notes{{500, 4}});
+    Atm flaky("ATM4", flakyBank, cash4);
+    flaky.insertCard("4111-0003"); flaky.enterPin("0000");
+    expect&lt;Declined&gt;([&amp;] { flaky.withdraw(1000); }, "bank unavailable");
+    check(cash4.total() == 2000 &amp;&amp; bank.balance("4111-0003") == 9000, "notes released, landed debit reversed");
+    flaky.ejectCard();
+
+    printf("== 5. three wrong PINs ==\n");
+    atm.insertCard("4111-0002");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.enterPin("1"); }, "1");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.enterPin("2"); }, "2");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.enterPin("3"); }, "3");
+    check(string(atm.state()) == "IDLE", "idle again");
+    expect&lt;InvalidOperation&gt;([&amp;] { atm.insertCard("4111-0002"); }, "retained");
+    printf("  history: %s\n", atm.history.substr(0, 90).c_str());
+#ifdef HAVE_STD_MUTEX
+    printf("== 6. 20 ATMs on 20 threads, one joint account of 10000, each withdraws 1000 ==\n");
+    core.open("4111-JOINT", "2468", 10000, 50000);
+    {
+        Mutex m; int ok = 0, declined = 0;
+        vector&lt;thread&gt; ts;
+        for (int i = 0; i &lt; 20; i++)
+            ts.emplace_back([&amp;, i] {
+                CashDispenser c(Notes{{500, 4}});
+                Atm a("J" + to_string(i), bank, c);
+                a.insertCard("4111-JOINT"); a.enterPin("2468");
+                bool won = true;
+                try { a.withdraw(1000); } catch (const Declined&amp;) { won = false; }
+                a.ejectCard();
+                LockGuard g(m); (won ? ok : declined)++;
+            });
+        for (auto&amp; t : ts) t.join();
+        printf("  approved %d, declined %d, balance %ld\n", ok, declined, bank.balance("4111-JOINT"));
+        check(ok == 10 &amp;&amp; declined == 10 &amp;&amp; bank.balance("4111-JOINT") == 0, "never overdrawn");
+    }
+#endif
+    printf("ALL %d CHECKS PASSED\n", checks);
+    return 0;
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Output">
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -O2 main.cpp -o atm &amp;&amp; ./atm
+== 1. wrong state ==
+  rejected as expected: cannot withdraw while IDLE
+== 2. withdraw 1700 ==
+  rejected as expected: wrong PIN, tries left: 2
+  ATM1-T1 OK {500x3, 200x1}, balance 8300
+  rejected as expected: ATM cannot dispense 4500
+== 3. backtracking: 600 from 2000x1, 500x1, 200x4 ==
+  ATM2-T1 OK {200x3}, balance 7700
+== 4. declined and jammed ==
+  rejected as expected: bank declined ATM1-T3
+  ATM1-T4 REVERSED, balance 7700
+== 4b. retries and the network: one durable answer per txn id ==
+  rejected as expected: bank unavailable for ATM4-T1: nothing dispensed, reversal sent
+== 5. three wrong PINs ==
+  rejected as expected: wrong PIN, tries left: 2
+  rejected as expected: wrong PIN, tries left: 1
+  rejected as expected: wrong PIN 3 times: card retained
+  rejected as expected: card 4111-0002 is blocked
+  history: IDLE-&gt;CARD_INSERTED CARD_INSERTED-&gt;AUTHENTICATED AUTHENTICATED-&gt;DISPENSING DISPENSING-&gt;AUT
+ALL 24 CHECKS PASSED</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it runs 24 of Java's 39 checks (25 in the Linux <code>-DHAVE_STD_MUTEX</code> build, measured): no card-retention-after-three-PINs check, no out-of-service and refill scenario, and no 20-ATM thread race on the joint account (the Linux build adds a smaller race). The tombstone, decline memory and bank-exception paths are all covered.</p></div>
+
+  <p>Read the Java output against the flows. Step 2 dispenses 1,700 as 500x3 + 200x1: the 2000 handler takes nothing because 2000 is bigger than the amount. Step 3 is the case greedy gets wrong. Step 5 is the jam: the receipt says REVERSED and the balance is unchanged. Step 9 fires 20 ATMs at one joint account holding 10,000, each asking for 1,000: exactly 10 succeed and the balance ends at 0, never below.</p>
+  <div class="callout warn"><p><b>A real bug we hit while writing the C++ version.</b> Each C++ ATM first numbered its transactions T1, T2, ... on its own. The second ATM's first withdrawal was then sent as "T1", which the bank had already seen from the first ATM. The bank's idempotency check answered "approved" from memory and <b>debited nothing</b>, while the ATM handed out cash. The assertion on the balance caught it. The fix is the rule every idempotency key needs: it must be unique across all senders, so the id is now <code>&lt;atmId&gt;-T&lt;n&gt;</code>. Java and Python use the ATM id plus a global counter for the same reason.</p></div>
+  <p>A small C++ detail worth knowing: after <code>atm.moveTo(new Dispensing())</code> the old state object is destroyed, so the code that called it must not touch its own members afterwards. The comments mark those lines. It is the C++ version of using a struct after <code>kfree()</code>; Java and Python hide it with garbage collection.</p>

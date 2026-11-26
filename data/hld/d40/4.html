@@ -1,0 +1,75 @@
+
+        <h2>Data model</h2>
+        <p>The key insight: <b>guests do not book a room, they book a room <em>type</em> for a set of nights</b>. The exact room number is given at check-in. So inventory is a counter per (hotel, room type, date). That counter is the "boxes on each page" from the story.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 330" role="img" aria-label="Tables: hotel, room_type, room_type_inventory, rate, reservation, hold">
+            <rect class="box svc" x="20" y="20" width="220" height="90"/>
+            <text class="label" x="130" y="45">hotel</text>
+            <text class="label small" x="130" y="68">hotel_id PK, name, geo</text>
+            <text class="label small" x="130" y="88">shard key = hotel_id</text>
+
+            <rect class="box svc" x="20" y="140" width="220" height="80"/>
+            <text class="label" x="130" y="165">room_type</text>
+            <text class="label small" x="130" y="188">hotel_id, room_type_id,</text>
+            <text class="label small" x="130" y="206">name, max_guests</text>
+
+            <rect class="box db" x="290" y="20" width="250" height="130"/>
+            <text class="label" x="415" y="45">room_type_inventory</text>
+            <text class="label small" x="415" y="68">PK (hotel_id, room_type_id, date)</text>
+            <text class="label small" x="415" y="88">total_inventory</text>
+            <text class="label small" x="415" y="106">total_reserved</text>
+            <text class="label small" x="415" y="124">version</text>
+            <text class="label small" x="415" y="142">CHECK reserved &lt;= 1.1 x total</text>
+
+            <rect class="box db" x="290" y="180" width="250" height="70"/>
+            <text class="label" x="415" y="205">room_type_rate</text>
+            <text class="label small" x="415" y="228">(hotel_id, room_type_id, date) -&gt; price</text>
+
+            <rect class="box queue" x="580" y="20" width="200" height="130"/>
+            <text class="label" x="680" y="45">reservation</text>
+            <text class="label small" x="680" y="68">reservation_id PK</text>
+            <text class="label small" x="680" y="88">guest_id, hotel_id</text>
+            <text class="label small" x="680" y="106">room_type_id, dates</text>
+            <text class="label small" x="680" y="124">status, amount</text>
+
+            <rect class="box cache" x="580" y="180" width="200" height="70"/>
+            <text class="label" x="680" y="205">idempotency_key</text>
+            <text class="label small" x="680" y="228">key PK, state, response</text>
+
+            <path class="arrow" d="M240 65 L282 65"/>
+            <path class="arrow" d="M130 110 L130 132"/>
+            <path class="arrow" d="M540 85 L572 85"/>
+            <text class="label small" x="400" y="290">One row per room type per night, pre-created for 2 years by a daily job.</text>
+            <text class="label small" x="400" y="312">A 3-night stay touches 3 inventory rows, and all 3 must change in one transaction.</text>
+          </svg>
+          <figcaption>The hotel schema. <code>room_type_inventory</code> is the hot table. Every booking reads and updates N rows, where N is the number of nights.</figcaption>
+        </figure>
+        <h3>Airbnb variant: single-unit calendars</h3>
+        <p>An Airbnb listing usually has exactly one unit, so the "counter" is just 0 or 1. You can keep a <code>listing_night(listing_id, date, status)</code> table, where status is <code>available</code>, <code>blocked</code>, <code>held</code> or <code>booked</code>. Or you can store reservations as ranges and let the database refuse overlaps. PostgreSQL can do this natively with an exclusion constraint:</p>
+<pre><code class="language-sql">CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE booking (
+  booking_id  uuid PRIMARY KEY,
+  listing_id  bigint NOT NULL,
+  stay        daterange NOT NULL,        -- [checkin, checkout)
+  status      text NOT NULL,
+  hold_expires_at timestamptz,
+  EXCLUDE USING gist (listing_id WITH =, stay WITH &amp;&amp;)
+    WHERE (status IN ('HELD','CONFIRMED'))
+);</code></pre>
+        <p>Two overlapping active bookings for the same listing now fail at commit time, whatever bug the application has. One catch: the constraint's <code>WHERE</code> cannot say "and the hold has not expired", because index predicates must be immutable and <code>now()</code> is not. So an expired HELD row still blocks the dates until something flips it to EXPIRED. Deep dive 2 shows how the booking transaction does that itself, so it never waits for a background job. The half-open range <code>[checkin, checkout)</code> means that a guest leaving on the 27th does not clash with a guest arriving on the 27th.</p>
+        <h3>SQL or NoSQL?</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Store</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td>Inventory, holds, reservations</td><td>Relational (MySQL / Postgres), sharded by hotel_id</td><td>Multi-row ACID transactions, constraints, and a low write rate. The rows for a booking all live on one shard.</td></tr>
+              <tr><td>Hotel and listing content, photos metadata</td><td>Relational or document store + CDN for images</td><td>Read-heavy and rarely changes, so cache it hard.</td></tr>
+              <tr><td>Search index (geo, dates, amenities, price)</td><td>Elasticsearch / OpenSearch</td><td>Geo and full-text queries. Fed by <a href="{{BASE}}interview/glossary#cdc">CDC</a>, and may be seconds stale.</td></tr>
+              <tr><td>Availability cache</td><td>Redis, key <code>hotel:roomType:date</code></td><td>Serves the 300 QPS read path. The database stays the source of truth.</td></tr>
+              <tr><td>Idempotency records</td><td>Same SQL primary, sharded by key</td><td>Must be read from the primary, never a lagging replica (Airbnb learned this).</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>What "fed by CDC" means.</b> CDC (change data capture) tails the database's write-ahead log and publishes each committed row change to Kafka. The <a href="{{BASE}}interview/glossary#outbox">outbox</a> pattern is the alternative: the service writes the event into an <code>outbox</code> table in the same DB transaction as the booking, and a small relay publishes it. Either way the database commit and the event can never disagree. It is like a journal replay in a filesystem: the log is the truth, and every copy downstream (search index, Redis) is rebuilt from it in order.</p>
+        <p>More on choosing stores: <a href="{{BASE}}hld/hld-08">choosing storage</a> and <a href="{{BASE}}hld/hld-07">data modeling</a>.</p>
+      

@@ -1,0 +1,86 @@
+
+        <h2>Data model</h2>
+        <p>The heart is one small table: one row per slot with a capacity and two counters. Everything else is ordinary.</p>
+        <pre><code class="language-sql">-- Reference data (rarely changes; cache it everywhere)
+CREATE TABLE centre (
+  centre_id    BIGINT PRIMARY KEY,
+  name         TEXT, district_id INT, pincode TEXT,
+  lat DOUBLE PRECISION, lon DOUBLE PRECISION,
+  fee_paise    INT DEFAULT 0,          -- 0 = free centre
+  tz           TEXT DEFAULT 'Asia/Kolkata'
+);
+
+-- The inventory: one row per bookable window
+CREATE TABLE slot (
+  slot_id      BIGINT PRIMARY KEY,
+  centre_id    BIGINT NOT NULL REFERENCES centre,
+  starts_at    TIMESTAMPTZ NOT NULL,   -- always store UTC instants
+  ends_at      TIMESTAMPTZ NOT NULL,
+  vaccine      TEXT, min_age INT,
+  capacity     INT NOT NULL,
+  booked       INT NOT NULL DEFAULT 0,
+  held         INT NOT NULL DEFAULT 0,
+  version      BIGINT NOT NULL DEFAULT 0,
+  CHECK (booked + held &lt;= capacity),   -- the database itself refuses overbooking
+  UNIQUE (centre_id, starts_at, vaccine)
+);
+
+-- Pencil marks: one row per hold
+CREATE TABLE hold (
+  hold_id      UUID PRIMARY KEY,
+  slot_id      BIGINT NOT NULL REFERENCES slot,
+  user_id      BIGINT NOT NULL,
+  qty          INT NOT NULL,
+  status       TEXT NOT NULL,          -- ACTIVE | CONVERTED | EXPIRED | RELEASED
+  expires_at   TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX ON hold (expires_at) WHERE status = 'ACTIVE';
+
+-- Pen marks: the booking (same database as slot, on purpose)
+CREATE TABLE booking (
+  booking_id   UUID PRIMARY KEY,
+  hold_id      UUID UNIQUE REFERENCES hold,   -- one booking per hold: idempotent
+  slot_id      BIGINT NOT NULL, user_id BIGINT NOT NULL,
+  status       TEXT NOT NULL,          -- PAYMENT_PENDING | CONFIRMED | CANCELLED | REFUNDED | ATTENDED
+  amount_paise INT, psp_order_id TEXT UNIQUE,
+  created_at   TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE booking_beneficiary (
+  booking_id UUID, beneficiary_id BIGINT, dose_no INT,
+  live BOOLEAN NOT NULL DEFAULT true,     -- false once cancelled or refunded
+  PRIMARY KEY (booking_id, beneficiary_id));
+-- A beneficiary may have only one live appointment per dose
+CREATE UNIQUE INDEX one_live_appt ON booking_beneficiary (beneficiary_id, dose_no) WHERE live;</code></pre>
+        <h3>SQL or NoSQL?</h3>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Data</th><th>Store</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>slot, hold, booking</td><td><b>Postgres / MySQL</b>, sharded by state or district</td><td>Needs a transaction that changes a counter and inserts a booking together, plus CHECK and UNIQUE constraints. Data is small. This is exactly what a relational database is for.</td></tr>
+            <tr><td>Centre search</td><td><b>Elasticsearch</b> (geo_point)</td><td>Geo distance, filters (vaccine, age, fee) and text search; rebuilt from the centre table by CDC.</td></tr>
+            <tr><td>Availability counts for reads</td><td><b>Redis</b> + CDN</td><td>A million reads per second, a few seconds stale is fine. Updated by events, never trusted for the decision.</td></tr>
+            <tr><td>Holds (fast gate)</td><td><b>Redis</b> with TTL (optional)</td><td>Cheap pre-filter in front of the database for hot slots; the database hold row is still the record.</td></tr>
+            <tr><td>Notifications, audit stream</td><td><b>Kafka</b></td><td>Fan-out to SMS, reminders, analytics; replayable.</td></tr>
+            <tr><td>Old bookings</td><td><b>S3 / object storage</b> (Parquet)</td><td>Archive after 30-60 days; cheap; queryable by Athena/Spark.</td></tr>
+          </tbody>
+        </table></div>
+        <div class="callout interview"><p><b>"Keep the order and the slot in the same transactional database."</b> This is the exact phrase from the October 2026 Amazon report (<a href="https://leetcode.com/discuss/post/8555479/" target="_blank" rel="noopener">post</a>). If slot counts live in one service's database and bookings in another, you need a distributed transaction or a Saga just to avoid overbooking. Put them together and it is one local transaction. Split services by <i>reason to change</i>, not by noun.</p></div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 250" role="img" aria-label="Hold and booking state machine">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="100" width="130" height="50"/><text class="label" x="85" y="130">open slot</text>
+            <rect class="box queue" x="220" y="100" width="130" height="50"/><text class="label" x="285" y="130">HOLD active</text>
+            <rect class="box cache" x="420" y="100" width="160" height="50"/><text class="label" x="500" y="130">PAYMENT_PENDING</text>
+            <rect class="box db solid" x="660" y="100" width="170" height="50"/><text class="label" x="745" y="130">CONFIRMED</text>
+            <rect class="box plain" x="220" y="200" width="130" height="40"/><text class="label small" x="285" y="225">EXPIRED</text>
+            <rect class="box plain" x="660" y="20" width="170" height="40"/><text class="label small" x="745" y="45">CANCELLED / REFUNDED</text>
+            <path class="arrow" d="M150 125 L214 125"/><text class="label small" x="182" y="115">held+=n</text>
+            <path class="arrow" d="M350 125 L414 125"/><text class="label small" x="382" y="115">book</text>
+            <path class="arrow ok" d="M580 125 L654 125"/><text class="label small ok" x="617" y="115">webhook ok</text>
+            <path class="arrow bad dashed" d="M285 150 L285 194"/><text class="label small bad start" x="295" y="180">TTL passed: held-=n</text>
+            <path class="arrow bad dashed" d="M500 150 L360 215"/><text class="label small bad start" x="440" y="200">pay failed / late</text>
+            <path class="arrow dashed" d="M745 100 L745 66"/><text class="label small start" x="755" y="88">cancel</text>
+          </svg>
+          <figcaption>Each arrow is one conditional UPDATE that names the state it expects to leave. A late webhook that finds the hold EXPIRED does not confirm; it triggers a refund.</figcaption>
+        </figure>
+      

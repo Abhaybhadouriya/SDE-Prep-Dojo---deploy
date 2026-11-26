@@ -1,0 +1,73 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Find the shared mutable state first, then protect each piece at the smallest scope that keeps it correct:</p>
+  <p>Step through the race this section is about, then the fix the code uses:</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 310" role="img" aria-label="Two vote calls from one user race; the atomic put on the vote map plus atomic counters keep the score right">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="42">Thread A</text>
+      <rect class="box client" x="20" y="210" width="150" height="44"/><text class="label small" x="95" y="232">Thread B</text>
+      <rect class="box db" x="300" y="110" width="210" height="70"/><text class="label" x="405" y="136">post 001 votes</text><text class="label small" x="405" y="160">up = 0, map: {}</text>
+      <g data-step="1"><path class="arrow" d="M170 50 L294 120"/><text class="label small left" x="196" y="56">1. old vote? none -&gt; up+1</text></g>
+      <g data-step="2"><path class="arrow" d="M170 225 L294 170"/><text class="label small left" x="186" y="268">2. old vote? still none -&gt; up+1</text></g>
+      <g data-step-only="3">
+        <rect class="box ring fail" x="300" y="110" width="210" height="70"/>
+        <text class="label bad" x="650" y="120">3. counted twice:</text>
+        <text class="label small bad" x="650" y="145">up = 2 from one user</text>
+        <text class="label small bad" x="650" y="170">score drifts</text>
+      </g>
+      <g data-step="4">
+        <rect class="box ok" x="510" y="196" width="280" height="118"/>
+        <text class="label small" x="650" y="216">Fix: one atomic step per key</text>
+        <text class="label mono" x="650" y="238">old = votes.put(user, dir)</text>
+        <text class="label mono" x="650" y="260">adjust counters by dir - old</text>
+        <text class="label mono" x="650" y="282">(AtomicInteger add)</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Thread A handles "ana upvotes 001": it reads ana's previous vote (none) and plans to add 1.</li>
+      <li>A duplicate request from ana's second tab reads the same empty previous vote.</li>
+      <li>Both add 1: one user, two upvotes. Recounting later will not match the counters.</li>
+      <li>The fix: <code>votes.put(user, dir)</code> on a <code>ConcurrentHashMap</code> returns the previous vote atomically for that key, and the two <code>AtomicInteger</code> counters move by the difference. The demo: 400 users vote down then up from 8 threads; the post ends at exactly 400 up, 0 down.</li>
+    </ol>
+  </div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>State</th><th>Race without care</th><th>Our protection</th></tr></thead>
+      <tbody>
+        <tr><td>Users map</td><td>Two signups with one id both succeed</td><td><code>putIfAbsent</code> on a <code>ConcurrentHashMap</code>: one atomic check-and-insert</td></tr>
+        <tr><td>Post and comment ids</td><td>Two posts get the same id</td><td><code>AtomicLong.incrementAndGet()</code></td></tr>
+        <tr><td>Votes</td><td>A user votes twice in parallel and is counted twice; counters drift</td><td><code>votes.put(user, dir)</code> returns the previous vote atomically per key; adjust two <code>AtomicInteger</code>s by the difference</td></tr>
+        <tr><td>Follow sets</td><td>Lost follow under concurrent adds</td><td><code>ConcurrentHashMap.newKeySet()</code></td></tr>
+        <tr><td>Author timelines</td><td>Reader iterates while writer appends</td><td>Append under <code>synchronized(list)</code>; readers copy under the same lock</td></tr>
+        <tr><td>Push inboxes</td><td>Two posts delivered at once corrupt a deque</td><td>One lock per inbox, so different users never contend</td></tr>
+        <tr><td>Comments list</td><td>Iterating while someone comments</td><td><code>CopyOnWriteArrayList</code> (reads far outnumber writes)</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>The demo proves two of these: 400 users each vote down then up on one post from 8 threads and the post ends at exactly 400 up, 0 down; 400 posts are fanned out concurrently and a follower's inbox holds all 401. There is no global lock, so a vote on one post never waits for a post by someone else. More on choosing these tools: <a href="{{BASE}}lld/lld-conc-locks">locks and synchronisation</a>.</p>
+  <h3>What the code deliberately does not do</h3>
+  <ul>
+    <li><b>Fan-out happens on the posting thread.</b> A user with 10 million followers would make <code>post()</code> take seconds. At scale, <code>post()</code> enqueues an event and a worker pool does the delivery (a producer-consumer queue, see <a href="{{BASE}}lld/lld-conc-thread-pool">thread pools</a>). The feed then becomes eventually consistent: a follower may see the post a moment later.</li>
+    <li><b>A feed read is not a snapshot.</b> Votes can change while we sort, so two posts may compare differently mid-sort. Java's TimSort is allowed to throw <code>IllegalArgumentException</code> ("Comparison method violates its general contract") when that happens. The clean fix is to copy each candidate's score and comment count into a small snapshot record first and sort the snapshots.</li>
+    <li><b>Offset cursors shift</b> if new posts arrive between pages: a post can appear twice. See the pagination follow-up below.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>Per-inbox locks are per-CPU or per-queue locks: they turn one hot lock into many cold ones, as multi-queue NICs give each RX queue its own lock and IRQ. The vote counters follow the kernel's refcount rule: change them only through atomic operations, and derive the score from the counters instead of recounting the map. Moving fan-out to a worker is the classic top half / bottom half split: <code>post()</code> does the minimum and defers the heavy part, like an interrupt handler scheduling a softirq or workqueue item.</p>
+  </div>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td>Java <code>volatile</code></td><td><b>Not</b> C's <code>volatile</code>. It means visibility plus ordering: every read is like <code>READ_ONCE()</code> with acquire semantics and every write like <code>WRITE_ONCE()</code> with release semantics (<code>smp_load_acquire</code>/<code>smp_store_release</code>). It does not make <code>x++</code> atomic. See <a href="{{BASE}}lld/lld-conc-basics#volatile">volatile in Concurrency basics</a>.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

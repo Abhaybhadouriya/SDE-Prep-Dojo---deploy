@@ -1,0 +1,186 @@
+
+        <h2>Key technologies: nine deep cards</h2>
+        <p>Interviewers do not need trivia, but they do expect you to know each popular store's data model, its sweet spot, one or two hard numbers, and how it fails. Scan the summary table first, then click a tab for the full card.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Store</th><th>Best at</th><th>Avoid when</th><th>One number to remember</th></tr></thead>
+            <tbody>
+              <tr><td>PostgreSQL</td><td>Transactions, constraints, joins; the default</td><td>Writes outgrow one primary and you cannot shard</td><td>One process per connection: put PgBouncer in front</td></tr>
+              <tr><td>MySQL (InnoDB)</td><td>Same OLTP sweet spot; clustered primary key</td><td>Random UUID primary keys (index fragmentation)</td><td>Secondary lookup = 2 B-tree walks</td></tr>
+              <tr><td>Redis</td><td>Cache, counters, leaderboards, locks, rate limits</td><td>Data that must never be lost or does not fit in RAM</td><td>16,384 hash slots; ~100k writes/s per node</td></tr>
+              <tr><td>Cassandra / ScyllaDB</td><td>Huge write rates, known access patterns</td><td>Joins, ad-hoc queries, multi-row transactions</td><td>Tunable consistency: ONE / QUORUM / ALL</td></tr>
+              <tr><td>DynamoDB</td><td>Managed key-value at any scale</td><td>Ad-hoc queries, aggregations, hot partition keys</td><td>1,000 writes/s and 3,000 reads/s per partition; 400 KB items</td></tr>
+              <tr><td>MongoDB</td><td>Whole documents with varying fields</td><td>Heavy many-to-many relations, unbounded arrays</td><td>16 MiB per document</td></tr>
+              <tr><td>Elasticsearch</td><td>Full-text, facets, log search</td><td>Being the source of truth</td><td>~1 s refresh before a write is searchable</td></tr>
+              <tr><td>S3</td><td>Blobs, backups, the data lake</td><td>Small random updates, low-latency reads without a CDN</td><td>Designed for 11 nines durability</td></tr>
+              <tr><td>ClickHouse</td><td>Analytics over billions of rows</td><td>OLTP, single-row updates, many tiny inserts</td><td>8,192 rows per index granule</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="tabs" data-tabs>
+          <div class="tab-panel" data-title="Postgres">
+            <h3>PostgreSQL: the default answer</h3>
+            <p><b>Model:</b> relational tables, B-tree indexes by default (plus GIN, GiST, BRIN), MVCC, a write-ahead log. Default isolation is Read Committed; Serializable uses SSI. <b>Extensions</b> make it multi-model: JSONB columns, PostGIS for geo, pgvector for embeddings, Timescale for time-series, built-in full-text search.</p>
+            <p><b>Use when:</b> you need transactions, constraints (unique, foreign keys, exclusion), joins, and ad-hoc queries. Bookings, payments, users, orders, inventory. Instagram, Reddit and Figma all scaled on it (Figma by sharding it horizontally).</p>
+            <p><b>Watch out:</b> one process per connection, so you put a pooler (PgBouncer) in front; an update writes a whole new row version, and with many secondary indexes every update touches every index (the write amplification Uber described when it moved to MySQL); long transactions cause bloat until VACUUM runs. Scaling writes beyond one primary means sharding (Citus, app-level) or a distributed SQL system.</p>
+          </div>
+          <div class="tab-panel" data-title="MySQL">
+            <h3>MySQL (InnoDB)</h3>
+            <p><b>Model:</b> relational, InnoDB engine with a <b>clustered primary key</b>: rows live inside the PK B-tree, and secondary indexes store the primary key, so a secondary lookup is two B-tree walks. Default isolation is Repeatable Read with gap and next-key locks; old versions live in the undo log.</p>
+            <p><b>Use when:</b> same OLTP sweet spot as Postgres. Netflix uses MySQL for billing, subscriptions and revenue; Facebook's TAO graph sits on sharded MySQL; Uber moved its Schemaless store from Postgres to MySQL citing cheaper secondary-index updates and replication.</p>
+            <p><b>Watch out:</b> random UUID primary keys fragment the clustered index (use time-ordered IDs, see <a href="{{BASE}}hld/d31">d31</a>); large schema changes need online-DDL tools; sharding is manual (Vitess is the common answer).</p>
+          </div>
+          <div class="tab-panel" data-title="Redis">
+            <h3>Redis: in-memory data structures</h3>
+            <p><b>Model:</b> keys mapping to strings, hashes, lists, sets, <b>sorted sets</b>, streams, geo indexes, bitmaps, HyperLogLog. Commands run one at a time on a single thread (no locks needed inside a command); ByteByteGo's three reasons it is fast are RAM, I/O multiplexing on one event loop, and efficient data structures.</p>
+            <p><b>Numbers:</b> roughly 100k writes/s per node and sub-millisecond reads (Hello Interview). Redis Cluster splits keys into <b>16,384 hash slots</b>; clients cache the slot map and follow <code>MOVED</code> redirects. Hash tags like <code>{user:123}</code> force related keys into one slot so multi-key commands work.</p>
+            <p><b>Use for:</b> cache, sessions, rate limiters (INCR + EXPIRE in Lua), leaderboards (sorted sets, <a href="{{BASE}}hld/d22">d22</a>), nearby search (GEOSEARCH), short-lived locks (<code>SET key token NX EX 30</code>), lightweight queues.</p>
+            <p><b>Watch out:</b> data must fit in RAM; by default Redis persists only with periodic RDB snapshots, so a crash can lose minutes of writes; with AOF turned on (<code>appendonly yes</code>), the default <code>appendfsync everysec</code> can lose about 1 s; replication is asynchronous either way; Pub/Sub is at-most-once with no persistence; hot keys overload one node. It is not a system of record unless you accept those losses.</p>
+            <div class="bridge"><h4>From your world</h4><p>Redis's core loop is an <code>epoll</code> event loop on one thread, exactly like a high-performance packet daemon: no locks, no context switches, everything in cache-friendly memory. Hash slots are like ECMP buckets: hash the key, map the bucket to a next hop (node), move buckets to rebalance.</p><p><b>Where this breaks:</b> ECMP rehashing just moves flows; moving a Redis hash slot means copying its keys to the new node while clients follow redirects, so resharding is slow and visible, not instant.</p></div>
+          </div>
+          <div class="tab-panel" data-title="Cassandra">
+            <h3>Apache Cassandra (and ScyllaDB)</h3>
+            <p><b>Model:</b> wide-column, <code>PRIMARY KEY ((partition key), clustering keys)</code>; LSM storage (commit log, memtable, SSTables, compaction, tombstones for deletes); consistent-hash ring with virtual nodes; leaderless replication with tunable consistency (ONE, QUORUM, ALL); gossip for membership and a phi-accrual failure detector; NetworkTopologyStrategy for rack and data-centre aware replicas.</p>
+            <p><b>Use when:</b> very high write throughput, availability over strict consistency, access patterns known up front. Netflix calls it its default for viewing history, user and device data; Discord stored trillions of messages in it.</p>
+            <p><b>Watch out:</b> no joins and no multi-partition transactions (atomicity only within a partition); one table per query; unbounded partitions (bucket by time); tombstone build-up from deletes; compaction debt. ScyllaDB is a C++ rewrite with the same model and no JVM pauses.</p>
+          </div>
+          <div class="tab-panel" data-title="DynamoDB">
+            <h3>Amazon DynamoDB</h3>
+            <p><b>Model:</b> managed key-value and document store, partition key (hashed) plus optional sort key (range within a partition). Items up to <b>400 KB</b>. Data is replicated across three Availability Zones automatically; Global Tables add multi-region replication.</p>
+            <p><b>Numbers:</b> each partition serves up to 3,000 read units and 1,000 write units per second (about 12 MB/s reads, 1 MB/s writes), so a hot partition key throttles no matter how big the table is. Up to 20 Global Secondary Indexes (own partitions, eventually consistent) and 5 Local Secondary Indexes (same partition key, strongly consistent, defined at creation, 10 GB per partition key value). Transactions cover up to 100 items across tables. Strongly consistent reads cost twice as much as eventually consistent ones.</p>
+            <p><b>Use when:</b> you want single-digit-ms latency at any scale with no servers to run, and you know your access patterns. DAX adds a microsecond read cache; DynamoDB Streams provide CDC to Lambda or Elasticsearch.</p>
+            <p><b>Watch out:</b> ad-hoc queries and aggregations (Scan is a full read); cost at very high volume; vendor lock-in; leaning on many GSIs often means you wanted Postgres. Ask the interviewer whether managed AWS services are allowed.</p>
+          </div>
+          <div class="tab-panel" data-title="MongoDB">
+            <h3>MongoDB</h3>
+            <p><b>Model:</b> document store of BSON documents in collections, B-tree indexes (WiredTiger engine), replica sets with a primary and secondaries, sharding by a shard key (ranged or hashed). Limits: 16 MiB per document, 100 nesting levels, 64 indexes per collection.</p>
+            <p><b>Use when:</b> entities are read and written as a whole and their fields vary: product catalogs (<a href="{{BASE}}hld/d49">d49</a>), CMS content, user profiles, game state. "Store together what is read together."</p>
+            <p><b>Watch out:</b> unbounded arrays inside documents (embed the 5 newest reviews, reference the rest); choosing a monotonically increasing shard key makes one hot shard; heavy many-to-many relationships push joins into code. Single-document writes are atomic; multi-document transactions exist but cost more.</p>
+            <h4 id="mongo-replica-sets">Replica sets, the oplog and elections</h4>
+            <p>A <b>replica set</b> is one primary plus secondaries holding the same data (up to 50 members, at most 7 of them voting). All writes go to the primary. The primary records every change in the <b>oplog</b> (<code>local.oplog.rs</code>), an ordered, fixed-size (capped) collection. Each secondary tails that oplog and replays the entries in order. Oplog entries are written so that replaying one twice gives the same result (an <code>$inc</code> becomes "set the field to 6"), which makes catch-up after a hiccup safe. If a secondary falls further behind than the oplog holds (the <b>oplog window</b>), it cannot catch up and needs a full initial sync.</p>
+            <p>Members send each other heartbeats. If secondaries cannot reach the primary for <code>electionTimeoutMillis</code> (10 seconds by default), one of them calls an <b>election</b>; the candidate that wins votes from a majority becomes primary. MongoDB's docs say the median failover should not normally exceed about 12 seconds. During that gap <b>writes fail</b>; reads can continue only if you allow reads from secondaries. Drivers retry a failed write once by default (<i>retryable writes</i>), which hides most short failovers.</p>
+            <div class="stepper" data-stepper>
+              <svg viewBox="0 0 820 300" role="img" aria-label="MongoDB replica set: primary streams oplog entries to two secondaries, the primary dies, heartbeats time out, a secondary wins a majority vote and becomes the new primary">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+                <rect class="box client" x="20" y="120" width="110" height="60"/><text class="label" x="75" y="155">App</text>
+                <g data-step-only="1">
+                  <rect class="box db hot" x="300" y="40" width="200" height="70"/><text class="label" x="400" y="70">Primary (A)</text><text class="label small" x="400" y="92">writes + oplog</text>
+                  <path class="arrow" d="M130 140 L296 80"/>
+                  <circle class="packet" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M400 112 L230 200"/></circle>
+                  <circle class="packet alt" r="6"><animateMotion dur="2s" begin="1s" repeatCount="indefinite" path="M400 112 L570 200"/></circle>
+                </g>
+                <g data-step="2">
+                  <rect class="box fail" x="300" y="40" width="200" height="70"/><text class="label bad" x="400" y="70">A is down</text><text class="label small" x="400" y="92">no heartbeats</text>
+                </g>
+                <g data-step-only="2">
+                  <text class="label small bad" x="400" y="140">writes fail: no primary</text>
+                </g>
+                <rect class="box db" x="140" y="200" width="180" height="70"/><text class="label" x="230" y="230">Secondary B</text><text class="label small" x="230" y="252">tails the oplog</text>
+                <rect class="box db" x="480" y="200" width="180" height="70"/><text class="label" x="570" y="230">Secondary C</text><text class="label small" x="570" y="252">tails the oplog</text>
+                <g data-step-only="3">
+                  <text class="label small" x="400" y="176">10 s without a heartbeat: B calls an election</text>
+                  <path class="arrow dashed" d="M322 235 L476 235"/><text class="label small" x="400" y="226">vote for B?</text>
+                </g>
+                <g data-step="4">
+                  <rect class="box ok" x="140" y="200" width="180" height="70"/><text class="label" x="230" y="230">B = Primary</text><text class="label small" x="230" y="252">2 of 3 votes</text>
+                  <path class="arrow ok" d="M130 165 L136 210"/>
+                  <circle class="packet ok" r="6"><animateMotion dur="2s" repeatCount="indefinite" path="M320 255 L478 255"/></circle>
+                </g>
+                <g data-step="5">
+                  <text class="label small left" x="680" y="60">A comes back:</text>
+                  <text class="label small left" x="680" y="82">rejoins as secondary,</text>
+                  <text class="label small left" x="680" y="104">rolls back writes that</text>
+                  <text class="label small left" x="680" y="126">no majority had seen</text>
+                </g>
+              </svg>
+              <ol class="stepper-captions">
+                <li>Normal life: the app writes to primary A; B and C pull oplog entries and replay them in order.</li>
+                <li>A dies. Writes now fail because there is no primary.</li>
+                <li>After <code>electionTimeoutMillis</code> (10 s by default) without a heartbeat, B asks the others for votes.</li>
+                <li>B wins a majority (2 of 3) and becomes primary. Drivers find it and retry the failed write once.</li>
+                <li>When A returns it becomes a secondary. Any write it had accepted but never replicated to a majority is rolled back. Use <code>w: "majority"</code> for writes you cannot lose.</li>
+              </ol>
+            </div>
+<pre><code class="language-javascript">// mongosh on any member
+rs.status().members.map(m =&gt; ({ name: m.name, state: m.stateStr, health: m.health }))
+rs.printSecondaryReplicationInfo()   // how far behind each secondary is</code></pre>
+<pre class="terminal"><code>[
+  { name: 'mongo-a:27017', state: 'PRIMARY',   health: 1 },
+  { name: 'mongo-b:27017', state: 'SECONDARY', health: 1 },
+  { name: 'mongo-c:27017', state: 'SECONDARY', health: 1 }
+]
+source: mongo-b:27017
+{
+  syncedTo: 'Mon Nov 23 2026 10:00:01 GMT+0000 (Coordinated Universal Time)',
+  replLag: '0 secs (0 hrs) behind the primary '
+}
+...</code></pre>
+            <h4 id="mongo-multikey">Indexing nested fields and arrays (multikey indexes)</h4>
+            <p>Documents nest, so indexes must too. You index a field inside an embedded document with dot notation, and if the indexed field holds an <b>array</b>, MongoDB creates a <b>multikey index</b>: one index entry per array element. A query for one tag then finds the document straight from the index.</p>
+<pre><code class="language-javascript">db.products.insertOne({ sku: "P1", tags: ["shoe", "running", "sale"], seller: { city: "Pune", rating: 4.6 } })
+db.products.createIndex({ tags: 1 })                          // multikey: 3 index keys for P1
+db.products.createIndex({ "seller.city": 1, "seller.rating": -1 })  // nested fields
+db.products.find({ tags: "running" }).explain("queryPlanner")</code></pre>
+<pre class="terminal"><code>// excerpt of the winning plan
+stage: 'IXSCAN',
+keyPattern: { tags: 1 },
+indexName: 'tags_1',
+isMultiKey: true,
+multiKeyPaths: { tags: [ 'tags' ] },</code></pre>
+            <p><b>Watch out:</b> a compound index may contain at most one array field per document (two arrays would mean a cross product of keys, so MongoDB refuses the insert or the index build); a document with a 1,000-element array adds 1,000 index keys, so large arrays make writes slow; and schema-less does not mean schema-free: use JSON Schema validation (<code>$jsonSchema</code>) on the collection so one buggy service cannot write a different shape.</p>
+            <div class="bridge"><h4>From your world</h4><p>The oplog is the same idea as a write-ahead log or the MySQL binlog, and a secondary tailing it is a follower replaying a journal. Elections are VRRP with a quorum: VRRP lets the highest-priority backup take the virtual IP after missed adverts, but MongoDB also demands a majority vote, so a node cut off on the minority side of a partition can never become a second primary (no split brain).</p></div>
+          </div>
+          <div class="tab-panel" data-title="Elasticsearch">
+            <h3>Elasticsearch / OpenSearch</h3>
+            <p><b>Model:</b> JSON documents indexed into an inverted index (Lucene). An index is split into <b>shards</b>, each a Lucene index of immutable segments, with replicas for availability and read throughput. Queries fan out to shards and a coordinating node merges results.</p>
+            <p><b>Numbers:</b> refresh every 1 second by default, so writes become searchable in about a second; deep paging beyond about 10,000 hits needs <code>search_after</code>; Hello Interview suggests you may not need it at all under about 100k documents.</p>
+            <p><b>Use for:</b> full-text search, autocomplete, faceted filters, log search (<a href="{{BASE}}hld/d19">d19</a>), geo queries, hybrid keyword + vector search.</p>
+            <p><b>Watch out:</b> not a source of truth (eventual, can be noticeably stale); frequent updates are expensive (delete + reinsert); denormalize documents so one query answers the screen; sync drift from the primary DB through CDC is the classic bug.</p>
+            <h4 id="opensearch-fork">Why OpenSearch exists: the 2021 licence fork</h4>
+            <p>Elasticsearch and Kibana were Apache 2.0 licensed until early 2021. In January 2021 Elastic moved new versions (from 7.11) to a choice of the Server Side Public License (SSPL) or the Elastic License, mainly to stop cloud providers selling Elasticsearch as a managed service without a deal with Elastic. Neither licence is approved by the Open Source Initiative. AWS answered by forking the last Apache 2.0 releases, <b>Elasticsearch 7.10.2 and Kibana 7.10.2</b>, into <b>OpenSearch</b> and <b>OpenSearch Dashboards</b>; OpenSearch 1.0 became generally available in July 2021, still under Apache 2.0. In August 2024 Elastic added the AGPLv3 as a third licence option, and in September 2024 AWS moved OpenSearch to the new OpenSearch Software Foundation under the Linux Foundation.</p>
+            <figure class="diagram">
+              <svg viewBox="0 0 820 230" role="img" aria-label="Timeline: Elasticsearch Apache 2.0 until 7.10.2, licence change in 2021, OpenSearch forks from 7.10.2, both lines continue separately">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+                <path class="arrow" d="M30 70 L790 70"/>
+                <path class="arrow" d="M300 70 C 340 70, 340 160, 400 160 L790 160"/>
+                <circle class="box db" cx="120" cy="70" r="10"/><text class="label small" x="120" y="45">Apache 2.0</text>
+                <circle class="box hot" cx="300" cy="70" r="12"/><text class="label small" x="300" y="45">7.10.2 (last Apache)</text>
+                <circle class="box warn" cx="420" cy="70" r="10"/><text class="label small" x="420" y="100">Jan 2021: SSPL / Elastic License</text>
+                <circle class="box warn" cx="660" cy="70" r="10"/><text class="label small" x="660" y="100">Aug 2024: + AGPLv3 option</text>
+                <circle class="box ok" cx="480" cy="160" r="10"/><text class="label small" x="480" y="190">Jul 2021: OpenSearch 1.0 (Apache 2.0)</text>
+                <circle class="box ok" cx="700" cy="160" r="10"/><text class="label small" x="700" y="190">Sep 2024: Linux Foundation</text>
+                <text class="label left" x="30" y="25">Elasticsearch + Kibana (Elastic)</text>
+                <text class="label left" x="30" y="220">OpenSearch + OpenSearch Dashboards</text>
+                <circle class="packet" r="6"><animateMotion dur="5s" repeatCount="indefinite" path="M30 70 L300 70 C 340 70, 340 160, 400 160 L790 160"/></circle>
+              </svg>
+              <figcaption>One code base, two roads since 7.10.2. Same Lucene core and the same basic query DSL, drifting apart release by release.</figcaption>
+            </figure>
+            <div class="table-wrap">
+              <table class="table">
+                <thead><tr><th></th><th>Elasticsearch / Kibana</th><th>OpenSearch / OpenSearch Dashboards</th></tr></thead>
+                <tbody>
+                  <tr><td>Licence today</td><td>SSPL, Elastic License 2.0 or AGPLv3 (your choice)</td><td>Apache 2.0</td></tr>
+                  <tr><td>Who runs it</td><td>Elastic (Elastic Cloud, self-managed)</td><td>OpenSearch Software Foundation; AWS offers Amazon OpenSearch Service</td></tr>
+                  <tr><td>Index lifecycle</td><td>ILM (Index Lifecycle Management)</td><td>ISM (Index State Management)</td></tr>
+                  <tr><td>Security, alerting</td><td>Basic security free; advanced features in paid tiers</td><td>Security plugin, alerting, anomaly detection bundled</td></tr>
+                  <tr><td>Saved "what to query" object</td><td>Data view (called index pattern before 8.0)</td><td>Index pattern</td></tr>
+                  <tr><td>Clients</td><td>Official clients check they are talking to Elasticsearch</td><td>Use the OpenSearch clients, not the newer Elastic ones</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <p><b>In an interview:</b> treat them as the same design choice ("an inverted-index search cluster"). Mention the fork only when cost, licence or "we are on AWS" comes up, or when the interviewer asks why a team runs OpenSearch. The operating rules (shard sizing, refresh interval, not a source of truth) are identical. For the dashboard side, see <a href="{{BASE}}hld/d19#kibana-dashboards">Kibana and OpenSearch Dashboards</a> in the log aggregation design.</p>
+          </div>
+          <div class="tab-panel" data-title="S3">
+            <h3>Amazon S3 (object storage)</h3>
+            <p><b>Model:</b> buckets of immutable objects addressed by key, accessed over HTTP. Launched in 2006, built from millions of hard disks and hundreds of microservices; erasure-coded across tens of drives; designed for 11 nines of durability. The bottom layer that manages each disk, ShardStore, was rewritten in Rust and checked against a small executable specification on every commit.</p>
+            <p><b>Use for:</b> images, video segments, user uploads, backups, logs, and the data lake under analytics (Netflix keeps almost all images, video, metrics and logs in S3, with Apache Iceberg tables on top).</p>
+            <p><b>Watch out:</b> no partial updates or appends (replace the object or use multipart upload); per-request latency in tens of milliseconds, so put a CDN in front for reads; listing millions of keys is slow, so keep an index of objects in your own database. Design one yourself in <a href="{{BASE}}hld/d36">d36</a>.</p>
+          </div>
+          <div class="tab-panel" data-title="ClickHouse">
+            <h3>ClickHouse (columnar OLAP)</h3>
+            <p><b>Model:</b> column-oriented MergeTree tables sorted by a primary key; sparse index with one mark per 8,192-row granule; every INSERT writes a new part, merged in the background; per-column compression codecs (Delta, Gorilla, ZSTD); vectorized execution that processes batches of rows with SIMD and splits a query into one lane per CPU core.</p>
+            <p><b>Use for:</b> analytics over billions of events: ad-click aggregation (<a href="{{BASE}}hld/d21">d21</a>), product analytics dashboards, observability backends, top-K reports (<a href="{{BASE}}hld/d35">d35</a>). Aggregating merges can pre-compute rollups at merge time.</p>
+            <p><b>Watch out:</b> many tiny inserts create many parts (batch them, or buffer through Kafka); single-row updates and deletes are heavy; it is not an OLTP database. Druid, Pinot, Redshift and BigQuery sit in the same family.</p>
+          </div>
+        </div>
+      

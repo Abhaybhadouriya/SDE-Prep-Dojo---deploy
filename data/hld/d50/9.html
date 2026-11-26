@@ -1,0 +1,121 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5 min</strong> Clarify: surge only, ETA only, or both? Per product? Global? State "freshness over consistency, quote is the contract".</li>
+          <li><strong>5-12 min</strong> Numbers: 2M pings/s, ~5K quotes/s, 100Ks ETA/s, ~1M cells x 100 B state.</li>
+          <li><strong>12-20 min</strong> Grid choice (H3), data flow: Kafka -&gt; Flink windows -&gt; KV -&gt; quote service.</li>
+          <li><strong>20-35 min</strong> Deep dives: multiplier stability, late data and watermarks, hot cells, multi-region; ETA = routing + residual.</li>
+          <li><strong>35-45 min</strong> Failure modes, monitoring (staleness, MAE), fairness guardrails.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "Two systems share a grid. For surge, driver pings and rider requests go into Kafka; a Flink job maps each event to an H3 hexagon and counts demand and distinct drivers per cell per one-minute tumbling window, using event time and a watermark, and drops late events because freshness matters more than completeness. A pricing model turns the ratio into a multiplier, smooths it across neighbours and over time, and writes changed cells with a version to a key-value store that the quote service caches in memory. For ETA, a routing engine on the live road graph gives a physical estimate and an ML model adds the residual. The quote stores price, surge version and ETA with a TTL, and booking honours it. Each region computes surge from the same replicated input; one writes."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: H3 cells, Kafka into a stream job, per-cell windowed counts, a key-value store read by the quote service, quote locking with a TTL, ETA from a routing service. SDE-2 adds: event time vs processing time and watermarks, smoothing to avoid flapping, hot cells and key skew, the multi-region "all compute, one writes" design, staleness decay when the job lags, and routing plus ML residual with how you measure ETA error.</p></div>
+        <div class="callout note"><p><b>You might confuse this with</b> <b>a sliding window.</b> A <b>tumbling</b> window is fixed and non-overlapping (18:40-18:41, then 18:41-18:42), so each event counts once. A <b>sliding</b> window overlaps (the last 60 s, recomputed every 10 s), so each event counts in several windows. Also do not confuse the <b>watermark</b> with a timeout on the wall clock: it moves with event time, so a replayed hour of data closes windows in seconds.</p></div>
+        <h3>Common mistakes</h3>
+        <div class="callout warn"><p><b>Common mistakes:</b> writing every GPS ping to a SQL table; computing surge on the request path; using zip codes; one global surge lock or transaction; ignoring the price lock (rider sees 1.2x, pays 1.8x); treating ETA as only Dijkstra; forgetting that supply must be counted as distinct drivers.</p></div>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>Design surge pricing. Walk me through the data flow.</summary>
+          <div class="answer">
+            <p>Riders' demand events and drivers' location/status events go to Kafka keyed by H3 cell or city. A Flink job assigns each event to an H3 cell (res 8), counts demand and distinct open drivers per cell per one-minute event-time window, smooths across neighbours and time, and maps the ratio to a capped multiplier. Results go to a key-value store with a version, cached in the quote service. Quotes read the cell's multiplier and lock the price with a TTL. Driver apps get a heatmap so supply moves toward demand.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start with "it is a streaming aggregation problem", draw the pipeline, then name the three hard bits: noisy ratios, late data, price lock.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why hexagons?</li><li>How do you stop surge flapping?</li><li>What happens if the Flink job stops?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Google">
+          <summary>Why does Uber use hexagons (H3) instead of squares or geohash for surge?</summary>
+          <div class="answer">
+            <p>Every hexagon neighbour is the same distance from the centre, so smoothing and "nearby" calculations use one weight; squares have edge and corner neighbours at two distances. Hexagons also reduce quantisation error for moving users. H3 adds a hierarchy (res 0-15, about 7 children per parent), so sparse cells can roll up, and cell ids are 64-bit integers that make great partition keys. Postal zones are irregular and change for unrelated reasons.</p>
+            <div class="approach"><h5>How to answer</h5><p>Neighbour distance, hierarchy, stable ids. Mention geohash is fine for proximity search but has square cells with edge effects.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which resolution would you pick and why?</li><li>How do you handle the 12 pentagons? (They are in the ocean.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Uber">
+          <summary>Events arrive late or out of order. What do you do?</summary>
+          <div class="answer">
+            <p>Window by event time and use a watermark with a small allowed lateness (seconds). When the watermark passes the window end, emit the result and drop later events. This is what Uber describes: late messages do not contribute, because the pipeline has a strict latency SLA. The error is small since the next ping arrives in seconds. For billing or analytics, a separate, complete batch job can recompute exactly.</p>
+            <div class="approach"><h5>How to answer</h5><p>Event time vs processing time, watermark, allowed lateness, and why dropping is correct here but not for payments.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A region's phones have skewed clocks. Impact?</li><li>How would you measure how many events you drop?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Uber">
+          <summary>How do you make surge survive a whole region going down?</summary>
+          <div class="answer">
+            <p>Follow Uber's active-active design: regional Kafka clusters replicate into aggregate clusters with the global view; every region runs the same Flink job on that identical input, so state converges without replicating it; an all-active coordinator chooses one region's update service as primary to write to an active/active database. On failure, promote another region; its job is already warm. The cost is redundant compute.</p>
+            <div class="approach"><h5>How to answer</h5><p>Explain why you cannot replicate Flink state synchronously (too big), and how deterministic input gives the same output.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the two regions' outputs differ slightly?</li><li>When is active/passive good enough?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Google,Amazon">
+          <summary>How would you compute ETA? Why not just run Dijkstra?</summary>
+          <div class="answer">
+            <p>Model roads as a graph with travel-time weights from live traffic. Dijkstra on a raw continental graph is too slow for 100Ks of requests/s. Contraction hierarchies are fast but need hours of preprocessing, which breaks with live traffic (Uber measured ~12 h for the world graph). Partition the graph into small cells and redo preprocessing only for cells whose weights changed; that gives ms queries with fresh traffic. Then add an ML model that predicts the residual between routing ETA and actual arrival, trained on historical trips.</p>
+            <div class="approach"><h5>How to answer</h5><p>Tell the evolution: Dijkstra, CH, A*, partitioned preprocessing, then ML on top. It shows depth.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you get live road speeds? (map matching GPS traces)</li><li>How do you evaluate ETA quality? (MAE vs actual arrival, by segment)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Uber">
+          <summary>Your ML ETA model must answer in a few ms at the highest QPS in the company. How?</summary>
+          <div class="answer">
+            <p>DeepETA's choices: discretise every feature (quantile buckets) and look up embeddings, so serving is mostly O(1) hash lookups; hash locations into multi-resolution grids with several hash functions to reduce collisions; use a linear transformer (O(K d²) instead of O(K² d)); keep the decoder small with per-segment bias layers instead of multi-task heads. Only ~0.25% of parameters are touched per prediction. Serve on a platform (Michelangelo) behind the routing front end, batch requests from matching, and autoscale.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name latency as a design constraint on the model, not just the infrastructure.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why would you use an asymmetric loss?</li><li>How do you roll out a new model safely?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>A rider saw 1.2x but surge became 1.8x before they tapped Book. What price do they pay?</summary>
+          <div class="answer">
+            <p>1.2x, if they book within the quote's validity. The fare-estimate call creates a quote (price, surge version, ETA) stored with a short TTL. Booking references the quote id, and the ride service reads it with a strongly consistent single-key read. After expiry, the client must re-quote and show the new price. This isolates the only consistency-critical step from the eventually consistent surge pipeline.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the pattern: snapshot the derived value into a contract record.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long should the TTL be?</li><li>How do you stop clients reusing old quotes? (signed or server-stored, expiry)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber,Microsoft">
+          <summary>One cell (a stadium after a match) gets a huge burst. What breaks?</summary>
+          <div class="answer">
+            <p>The Flink task owning that key gets hot and lags, delaying its window. Fixes: pre-aggregate locally before the keyed shuffle (two-phase aggregation), key by cell plus a small salt and merge, and make sure the partition count lets you spread cities. On the product side, a forecast feature can raise supply before the burst, and caps protect riders.</p>
+            <div class="approach"><h5>How to answer</h5><p>Hot key = classic skew. Say "two-phase aggregation" and "salting".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect a hot key in production?</li><li>Would you change cell resolution for that area?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Uber,Amazon,Microsoft">
+          <summary>How do you count supply correctly when drivers ping every 5 seconds?</summary>
+          <div class="answer">
+            <p>Count distinct driver ids that were "open" in the cell during the window, not pings. Use a per-cell set (small), or HyperLogLog sketches for large cardinalities. Assign a driver who crosses cells to the cell of their latest ping in the window, to avoid double counting. Filter drivers already on a trip.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show you noticed the 12-pings-per-minute trap.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Should a driver about to finish a trip nearby count as supply?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Uber">
+          <summary>How would you monitor this system?</summary>
+          <div class="answer">
+            <p>Surge: Kafka consumer lag and watermark delay in seconds, window emit latency, dropped-late-event rate, KV version age per city, distribution of multipliers per city (alert on jumps), share of cells capped. ETA: p50/p99 latency, QPS, MAE between ETA and actual arrival by city and trip type (Uber built a tool that reads actual arrival times from Kafka in real time), and fallback rate.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate system health (lag, latency) from business correctness (MAE, multiplier distribution).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Which alert would page you at 3 a.m.?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: surge is stuck at 2.5x across a whole city on a quiet Tuesday</h4>
+          <div class="situation"><p>Riders complain on social media. Driver heatmap shows red everywhere. Demand graphs look normal.</p></div>
+          <div class="bad"><p>Weak answer: "Manually set the city to 1.0x in the database."</p></div>
+          <div class="good"><p>Strong answer: first flip the city kill switch to a safe value (that is fine as mitigation). Then check the KV version age: if it is old, the Flink job is stalled and the cache froze the last value, so fix the job (checkpoint failure, poison event, lag). If fresh, check inputs: did supply drop to near zero because a driver-app release broke "open" status events? Add the staleness decay rule and an input-sanity alert (supply fell 90% in 5 minutes) so this cannot repeat silently.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you refund affected riders?</li><li>What test would have caught the app bug?</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: ETAs are 30% too optimistic in one new city</h4>
+          <div class="situation"><p>Pickup ETAs say 3 minutes, real pickups take 4. Older cities are fine.</p></div>
+          <div class="bad"><p>Weak answer: "Multiply ETAs by 1.3 in that city."</p></div>
+          <div class="good"><p>Strong answer: this is the cold-start problem Uber described with its old Goldeta model. Check whether live speeds exist for that city's segments (map-matching coverage), whether the map has missing one-way or turn restrictions, and whether the ML model has enough training data there. Short term, use a segment bias for the new city (DeepETA has per-segment bias layers) and fall back to wider grid embeddings; long term, collect ETA vs actual and retrain.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>Pickup ETA vs trip ETA: why do errors differ?</li></ul></div>
+        </div>
+      

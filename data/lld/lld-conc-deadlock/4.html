@@ -1,0 +1,344 @@
+
+  <h2>The three fixes, as a design</h2>
+  <p>In an LLD round you rarely write raw <code>synchronized</code> blocks for this. You put the rule in one place: an <code>Account</code> exposes its lock and its id, and a <code>TransferService</code> owns the policy for taking two locks. Callers never take two locks themselves.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 330" role="img" aria-label="UML class diagram: TransferService uses a LockOrderPolicy interface with OrderedLocking and TryLockWithBackoff implementations, and locks Account objects">
+      <rect class="box client" x="20" y="20" width="260" height="128"/>
+      <text class="label" x="150" y="38">TransferService</text>
+      <line class="line" x1="20" y1="52" x2="280" y2="52"/>
+      <text class="label small mono left" x="29" y="70">- policy: LockPairPolicy</text>
+      <text class="label small mono left" x="29" y="89">- ledger: Ledger</text>
+      <line class="line" x1="20" y1="100" x2="280" y2="100"/>
+      <text class="label small mono left" x="29" y="118">+ transfer(from, to, amt)</text>
+      <text class="label small mono left" x="29" y="137">- check(from, amt)</text>
+      <rect class="box svc" x="330" y="20" width="250" height="110"/>
+      <text class="label small" x="455" y="34">&#171;interface&#187;</text>
+      <text class="label" x="455" y="52" font-style="italic">LockPairPolicy</text>
+      <line class="line" x1="330" y1="66" x2="580" y2="66"/>
+      <text class="label small mono left" x="339" y="84">(no state)</text>
+      <line class="line" x1="330" y1="94" x2="580" y2="94"/>
+      <text class="label small mono left" x="339" y="114">+ runLocked(a, b, action)</text>
+      <rect class="box ok" x="230" y="200" width="250" height="110"/>
+      <text class="label" x="355" y="218">OrderedLocking</text>
+      <line class="line" x1="230" y1="232" x2="480" y2="232"/>
+      <text class="label small mono left" x="239" y="250">(order = account id)</text>
+      <line class="line" x1="230" y1="260" x2="480" y2="260"/>
+      <text class="label small mono left" x="239" y="278">+ runLocked(a, b, action)</text>
+      <text class="label small mono left" x="239" y="297">  lock min(id), then max(id)</text>
+      <rect class="box ok" x="510" y="200" width="270" height="110"/>
+      <text class="label" x="645" y="218">TryLockWithBackoff</text>
+      <line class="line" x1="510" y1="232" x2="780" y2="232"/>
+      <text class="label small mono left" x="519" y="250">- timeout, maxWait</text>
+      <line class="line" x1="510" y1="260" x2="780" y2="260"/>
+      <text class="label small mono left" x="519" y="278">+ runLocked(a, b, action)</text>
+      <text class="label small mono left" x="519" y="297">  tryLock both, else back off</text>
+      <rect class="box db" x="20" y="200" width="180" height="110"/>
+      <text class="label" x="110" y="218">Account</text>
+      <line class="line" x1="20" y1="232" x2="200" y2="232"/>
+      <text class="label small mono left" x="29" y="250">- id: long</text>
+      <text class="label small mono left" x="29" y="269">- balance: long</text>
+      <line class="line" x1="20" y1="280" x2="200" y2="280"/>
+      <text class="label small mono left" x="29" y="298">~ lock(): Lock</text>
+      <path class="arrow" d="M282 80 L324 80"/>
+      <path class="arrow none" d="M355 198 L430 134" style="marker-end:url(#dl-tri)"/>
+      <path class="arrow none" d="M645 198 L500 134" style="marker-end:url(#dl-tri)"/>
+      <path class="arrow dashed" d="M110 150 L110 194"/>
+      <text class="label small left" x="118" y="178">locks 2</text>
+    </svg>
+    <figcaption>The lock rule lives in one Strategy (<code>LockPairPolicy</code>). Swapping ordered locking for tryLock is a one-line change, and no caller can take two account locks in the wrong order because callers never take them at all.</figcaption>
+  </figure>
+
+  <h3>Fix 1: one global lock order (breaks circular wait)</h3>
+  <p>Give every lock a rank and always acquire in increasing rank. If every thread climbs the ranks in the same direction, no chain of waits can ever come back down to close a cycle. The rank must be stable and unique: a database id, a seat number, an enum "lock level" (<code>ORDER &lt; INVENTORY &lt; PAYMENT</code>). Avoid <code>System.identityHashCode</code> as the only rank: two objects can share a hash, so you need a tie-breaker lock for that case.</p>
+<pre><code class="language-java">void transfer(Account from, Account to, long amt) {
+    Account first  = from.id() &lt; to.id() ? from : to;   // rank = id
+    Account second = from.id() &lt; to.id() ? to : from;
+    first.lock().lock();
+    try {
+        second.lock().lock();
+        try {
+            from.debit(amt);
+            to.credit(amt);
+        } finally { second.lock().unlock(); }
+    } finally { first.lock().unlock(); }
+}</code></pre>
+  <p>For <b>N</b> resources (book seats 14, 3 and 9 together), sort the ids and lock in that order. This is exactly the multi-seat hold in <a href="{{BASE}}lld/lld-conc-booking#multi">the double-booking lesson</a>.</p>
+
+  <h3>Fix 2: tryLock with timeout and back-off (breaks no-preemption)</h3>
+  <p>Sometimes you cannot know the order up front (you discover the second resource only after reading the first). Then make your own preemption: take the first lock, <b>try</b> the second with a short timeout, and if it fails, release the first and start again after a short random sleep.</p>
+<pre><code class="language-java">while (System.nanoTime() &lt; deadline) {
+    if (from.lock().tryLock(10, MILLISECONDS)) {
+        try {
+            if (to.lock().tryLock(10, MILLISECONDS)) {
+                try { move(from, to, amt); return true; }
+                finally { to.lock().unlock(); }
+            }
+        } finally { from.lock().unlock(); }          // give back what we hold
+    }
+    Thread.sleep(ThreadLocalRandom.current().nextInt(1, 5));   // RANDOM, or you get livelock
+}
+return false;   // surface "busy, try again" instead of hanging</code></pre>
+  <p><code>synchronized</code> cannot do this: a thread waiting on a monitor cannot time out or be interrupted. That is one of the main reasons to choose <code>ReentrantLock</code> in a design.</p>
+
+  <h3>Fix 3: hold one lock, or none, while you call out (breaks hold-and-wait)</h3>
+  <p>The sneakiest deadlocks are not two locks in one method. They are one lock in your class plus one lock in code you call while holding it: a listener, a callback, a logger, a <code>Map.computeIfAbsent</code> lambda that touches another map. Brian Goetz calls this calling an <b>alien method</b>. The rule: copy what you need under the lock, release it, then notify.</p>
+<pre><code class="language-java">// BEFORE: listener runs while we hold our lock. If it calls back into us
+// from another thread, or takes its own lock, we can deadlock.
+synchronized void setStatus(Status s) {
+    this.status = s;
+    for (Listener l : listeners) l.onChange(s);
+}
+
+// AFTER: "open call". Mutate under the lock, notify outside it.
+void setStatus(Status s) {
+    List&lt;Listener&gt; snapshot;
+    synchronized (this) {
+        this.status = s;
+        snapshot = List.copyOf(listeners);
+    }
+    for (Listener l : snapshot) l.onChange(s);
+}</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The kernel's notifier chains and callbacks have the same rule: you do not call <code>blocking_notifier_call_chain()</code> while holding a spinlock, and drivers often drop their lock before calling up the stack (for example before handing a packet to <code>netif_rx()</code>-style paths or calling a completion). "Drop the lock, then call out" is the open-call idea in C.</p>
+  </div>
+
+  <h3>The code, run</h3>
+  <p>The Java program shows all three behaviours in one run: the naive version deadlocks and the JVM itself finds the cycle (<code>ThreadMXBean.findDeadlockedThreads()</code>, the same check <code>jstack</code> runs); ordered locking finishes 200,000 opposite transfers; tryLock with back-off finishes 4,000 and conserves money. Python shows dining philosophers both ways. The C++14 tab is a toy <code>lockdep</code>: it learns lock order and warns about an inversion <em>before</em> any thread hangs. Files are in <code>lld-code/lld-conc-deadlock/</code>.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+// Three ways to move money between two accounts.
+// 1. naive:   lock "from" then "to"  -&gt; two opposite transfers deadlock.
+// 2. ordered: always lock the lower id first -&gt; no cycle, no deadlock.
+// 3. tryLock: take the first lock, TRY the second with a timeout, back off and retry.
+public class DeadlockDemo {
+
+    static final class Account {
+        final int id;
+        long balance;
+        final ReentrantLock lock = new ReentrantLock();
+        Account(int id, long balance) { this.id = id; this.balance = balance; }
+        public String toString() { return "acct-" + id; }
+    }
+
+    // ---------- 1. naive: lock order depends on the call -&gt; deadlock
+    static void transferNaive(Account from, Account to, long amt, CountDownLatch bothHoldFirst) {
+        synchronized (from) {
+            bothHoldFirst.countDown();
+            try { bothHoldFirst.await(); } catch (InterruptedException e) { return; }
+            synchronized (to) {                    // waits for the other thread forever
+                from.balance -= amt;
+                to.balance += amt;
+            }
+        }
+    }
+
+    // ---------- 2. global lock order: lower id first, always
+    static void transferOrdered(Account from, Account to, long amt) {
+        Account first = from.id &lt; to.id ? from : to;
+        Account second = from.id &lt; to.id ? to : from;
+        synchronized (first) {
+            synchronized (second) {
+                from.balance -= amt;
+                to.balance += amt;
+            }
+        }
+    }
+
+    // ---------- 3. tryLock + random back-off (no global order needed)
+    static int retries = 0;
+    static boolean transferTry(Account from, Account to, long amt, long deadlineMs) throws InterruptedException {
+        long stop = System.currentTimeMillis() + deadlineMs;
+        while (System.currentTimeMillis() &lt; stop) {
+            if (from.lock.tryLock(10, TimeUnit.MILLISECONDS)) {
+                try {
+                    if (to.lock.tryLock(10, TimeUnit.MILLISECONDS)) {
+                        try {
+                            from.balance -= amt;
+                            to.balance += amt;
+                            return true;
+                        } finally { to.lock.unlock(); }
+                    }
+                } finally { from.lock.unlock(); }       // give back what we hold
+            }
+            synchronized (DeadlockDemo.class) { retries++; }
+            Thread.sleep(ThreadLocalRandom.current().nextInt(1, 5)); // random back-off breaks livelock
+        }
+        return false;                                    // caller decides: retry later or fail
+    }
+
+    public static void main(String[] args) throws Exception {
+        // ---- 1. naive deadlock, detected with ThreadMXBean (what jstack does)
+        Account a = new Account(1, 100), b = new Account(2, 100);
+        CountDownLatch latch = new CountDownLatch(2);
+        Thread t1 = new Thread(() -&gt; transferNaive(a, b, 10, latch), "T1 a-&gt;b");
+        Thread t2 = new Thread(() -&gt; transferNaive(b, a, 20, latch), "T2 b-&gt;a");
+        t1.setDaemon(true); t2.setDaemon(true);          // let the JVM exit despite the deadlock
+        t1.start(); t2.start();
+        Thread.sleep(300);
+        ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+        long[] ids = mx.findDeadlockedThreads();
+        System.out.println("1. naive: deadlocked threads = " + (ids == null ? 0 : ids.length));
+        if (ids != null) {
+            for (ThreadInfo ti : mx.getThreadInfo(ids)) {
+                System.out.println("   " + ti.getThreadName() + " holds one monitor and waits for "
+                        + ti.getLockName().replaceAll("DeadlockDemo\\$Account@\\w+", "an Account monitor")
+                        + " owned by " + ti.getLockOwnerName());
+            }
+        }
+
+        // ---- 2. ordered locks: 2 threads x 100k opposite transfers, finishes, money conserved
+        Account c = new Account(3, 1_000_000), d = new Account(4, 1_000_000);
+        Thread o1 = new Thread(() -&gt; { for (int i = 0; i &lt; 100_000; i++) transferOrdered(c, d, 1); });
+        Thread o2 = new Thread(() -&gt; { for (int i = 0; i &lt; 100_000; i++) transferOrdered(d, c, 1); });
+        o1.start(); o2.start();
+        o1.join(5000); o2.join(5000);
+        System.out.println("2. ordered: finished = " + (!o1.isAlive() &amp;&amp; !o2.isAlive())
+                + ", total = " + (c.balance + d.balance) + " (expected 2000000)");
+
+        // ---- 3. tryLock with back-off: same opposite transfers, no order rule
+        Account e = new Account(5, 1_000_000), f = new Account(6, 1_000_000);
+        int[] ok = new int[2];
+        Thread r1 = new Thread(() -&gt; { try { for (int i = 0; i &lt; 2000; i++) if (transferTry(e, f, 1, 1000)) ok[0]++; } catch (InterruptedException ignored) {} });
+        Thread r2 = new Thread(() -&gt; { try { for (int i = 0; i &lt; 2000; i++) if (transferTry(f, e, 1, 1000)) ok[1]++; } catch (InterruptedException ignored) {} });
+        r1.start(); r2.start();
+        r1.join(); r2.join();
+        System.out.println("3. tryLock: done " + (ok[0] + ok[1]) + "/4000 transfers, total = "
+                + (e.balance + f.balance) + " (back-offs vary per run)");
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out DeadlockDemo.java &amp;&amp; java -cp out DeadlockDemo
+1. naive: deadlocked threads = 2
+   T1 a-&gt;b holds one monitor and waits for an Account monitor owned by T2 b-&gt;a
+   T2 b-&gt;a holds one monitor and waits for an Account monitor owned by T1 a-&gt;b
+2. ordered: finished = true, total = 2000000 (expected 2000000)
+3. tryLock: done 4000/4000 transfers, total = 2000000 (back-offs vary per run)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Dining philosophers: five threads, five forks (locks).
+naive  : everyone picks up the LEFT fork, then the RIGHT one -&gt; can deadlock.
+ordered: pick up the LOWER-numbered fork first -&gt; the cycle is impossible."""
+import threading
+
+N = 5
+MEALS = 2000
+
+
+def run(ordered: bool, timeout: float = 3.0) -&gt; str:
+    forks = [threading.Lock() for _ in range(N)]
+    eaten = [0] * N
+    all_left = threading.Barrier(N, timeout=1.0)    # forces the worst case in the naive version
+
+    def philosopher(i: int) -&gt; None:
+        left, right = i, (i + 1) % N
+        first, second = (min(left, right), max(left, right)) if ordered else (left, right)
+        for meal in range(MEALS):
+            with forks[first]:
+                if not ordered and meal == 0:
+                    try:
+                        all_left.wait()             # everyone now holds exactly one fork
+                    except threading.BrokenBarrierError:
+                        pass
+                with forks[second]:
+                    eaten[i] += 1
+
+    threads = [threading.Thread(target=philosopher, args=(i,), daemon=True) for i in range(N)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout)
+    stuck = sum(t.is_alive() for t in threads)
+    return f"meals={sum(eaten)}/{N * MEALS} stuck_threads={stuck}"
+
+
+if __name__ == "__main__":
+    print("naive   (left then right):", run(ordered=False))
+    print("ordered (low fork first) :", run(ordered=True))</code></pre>
+<pre class="terminal"><code>$ python philosophers.py
+naive   (left then right): meals=0/10000 stuck_threads=5
+ordered (low fork first) : meals=10000/10000 stuck_threads=0</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ (toy lockdep)">
+<pre><code class="language-cpp">// A toy "lockdep": record the order in which lock CLASSES are taken and report a cycle
+// the first time an inversion is SEEN, even if the deadlock never actually happened.
+// Single-threaded on purpose (g++ 6.3 MinGW has no std::thread); the checker is the point.
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;set&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+class LockDep {
+    std::map&lt;std::string, std::set&lt;std::string&gt;&gt; after_;   // edge A -&gt; B: "B was taken while holding A"
+    std::vector&lt;std::string&gt; held_;                         // per-thread stack (one thread here)
+
+    bool reachable(const std::string&amp; from, const std::string&amp; to, std::set&lt;std::string&gt;&amp; seen) {
+        if (from == to) return true;
+        if (!seen.insert(from).second) return false;
+        for (const auto&amp; n : after_[from])
+            if (reachable(n, to, seen)) return true;
+        return false;
+    }
+
+public:
+    // Called before every lock(). Returns false if this acquisition closes a cycle.
+    bool acquire(const std::string&amp; cls) {
+        for (const auto&amp; h : held_) {
+            std::set&lt;std::string&gt; seen;
+            if (reachable(cls, h, seen)) {           // cls -&gt; ... -&gt; h already exists, now h -&gt; cls
+                std::cout &lt;&lt; "  WARNING: possible circular locking: holding " &lt;&lt; h
+                          &lt;&lt; ", taking " &lt;&lt; cls &lt;&lt; ",\n           but the recorded order already says " &lt;&lt; cls &lt;&lt; " comes before " &lt;&lt; h &lt;&lt; "\n";
+                held_.push_back(cls);
+                return false;
+            }
+            after_[h].insert(cls);
+        }
+        held_.push_back(cls);
+        return true;
+    }
+    void release(const std::string&amp; cls) {
+        for (auto it = held_.end(); it != held_.begin();) {
+            --it;
+            if (*it == cls) { held_.erase(it); return; }
+        }
+    }
+};
+
+int main() {
+    LockDep dep;
+    std::cout &lt;&lt; "path 1: ioctl handler takes dev-&gt;lock then queue-&gt;lock\n";
+    dep.acquire("dev-&gt;lock"); dep.acquire("queue-&gt;lock");
+    dep.release("queue-&gt;lock"); dep.release("dev-&gt;lock");
+    std::cout &lt;&lt; "  ok, learned edge dev-&gt;lock -&gt; queue-&gt;lock\n";
+
+    std::cout &lt;&lt; "path 2: completion path takes queue-&gt;lock then stats-&gt;lock\n";
+    dep.acquire("queue-&gt;lock"); dep.acquire("stats-&gt;lock");
+    dep.release("stats-&gt;lock"); dep.release("queue-&gt;lock");
+    std::cout &lt;&lt; "  ok, learned edge queue-&gt;lock -&gt; stats-&gt;lock\n";
+
+    std::cout &lt;&lt; "path 3: stats timer takes stats-&gt;lock then dev-&gt;lock\n";
+    dep.acquire("stats-&gt;lock");
+    bool ok = dep.acquire("dev-&gt;lock");
+    dep.release("dev-&gt;lock"); dep.release("stats-&gt;lock");
+    std::cout &lt;&lt; (ok ? "  no problem found\n" : "  -&gt; cycle dev -&gt; queue -&gt; stats -&gt; dev reported before any real hang\n");
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall lockdep.cpp -o lockdep &amp;&amp; ./lockdep
+path 1: ioctl handler takes dev-&gt;lock then queue-&gt;lock
+  ok, learned edge dev-&gt;lock -&gt; queue-&gt;lock
+path 2: completion path takes queue-&gt;lock then stats-&gt;lock
+  ok, learned edge queue-&gt;lock -&gt; stats-&gt;lock
+path 3: stats timer takes stats-&gt;lock then dev-&gt;lock
+  WARNING: possible circular locking: holding stats-&gt;lock, taking dev-&gt;lock,
+           but the recorded order already says dev-&gt;lock comes before stats-&gt;lock
+  -&gt; cycle dev -&gt; queue -&gt; stats -&gt; dev reported before any real hang</code></pre>
+    </div>
+  </div>

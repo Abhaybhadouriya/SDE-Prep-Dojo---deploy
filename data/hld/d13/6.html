@@ -1,0 +1,175 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Resumable, parallel, direct-to-storage upload</h3>
+        <p>Phones lose signal, laptops sleep, and a 4 GB single PUT that fails at 99% is a disaster. So we use <b>multipart upload</b>: the file is cut into parts (S3 allows 5 MB to 5 GB per part and up to 10,000 parts per upload; check the <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html" target="_blank" rel="noopener">S3 multipart docs</a>). Each part has a number and gets an ETag back. Only when the client calls <em>complete</em> with the list of parts does the object appear, atomically.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 230" role="img" aria-label="File split into parts, part 4 fails and is retried alone">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label start" x="20" y="30">4 GB file cut into 16 MB parts</text>
+            <rect class="box svc highlight" x="20" y="45" width="70" height="40"/><text class="label small" x="55" y="70">1</text>
+            <rect class="box svc highlight" x="95" y="45" width="70" height="40"/><text class="label small" x="130" y="70">2</text>
+            <rect class="box svc highlight" x="170" y="45" width="70" height="40"/><text class="label small" x="205" y="70">3</text>
+            <rect class="box fail" x="245" y="45" width="70" height="40"/><text class="label small" x="280" y="70">4 lost</text>
+            <rect class="box svc highlight" x="320" y="45" width="70" height="40"/><text class="label small" x="355" y="70">5</text>
+            <rect class="box ghost" x="395" y="45" width="70" height="40"/><text class="label small" x="430" y="70">...256</text>
+            <rect class="box db" x="600" y="40" width="240" height="150"/>
+            <text class="label" x="720" y="70">Raw bucket</text>
+            <text class="label small" x="720" y="96">has: 1, 2, 3, 5 ...</text>
+            <text class="label small" x="720" y="120">missing: 4</text>
+            <text class="label small" x="720" y="150">complete() stitches</text>
+            <text class="label small" x="720" y="172">parts in order</text>
+            <path class="arrow" d="M440 90 C 500 120, 540 120, 593 115"/>
+            <path class="arrow bad dashed" d="M280 85 L280 150 L593 150"/>
+            <text class="label small bad" x="420" y="170">retry part 4 only</text>
+            <circle class="packet" r="5"><animateMotion dur="2.5s" repeatCount="indefinite" path="M55 85 C 300 130, 500 120, 600 115"/></circle>
+            <circle class="packet bad" r="5"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M280 85 L280 150 L600 150"/></circle>
+          </svg>
+          <figcaption>Parts upload in parallel; only the lost part is resent. The client can ask "which parts do you have?" after a crash and continue.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Part size is a trade-off.</b> Small parts (5-8 MB) lose less work on failure, which suits mobile. Big parts mean fewer requests, which suits fast desktop links. Let the server suggest a size from the file size and device type.</li>
+          <li><b>Parallelism:</b> 3-6 parts in flight fill a fast link without starving the user's other apps. It is the same idea as a TCP window.</li>
+          <li><b>Integrity:</b> send a checksum per part (for example <code>Content-MD5</code> or a SHA-256 checksum header) so the store rejects corrupt parts, plus a whole-file hash to detect duplicate uploads.</li>
+          <li><b>Garbage:</b> abandoned uploads leave orphan parts that cost money. Add a lifecycle rule such as "abort incomplete multipart uploads after 7 days".</li>
+          <li><b>Open protocol option:</b> <a href="https://tus.io/" target="_blank" rel="noopener">tus</a> is an open resumable-upload protocol with a Go server (<a href="https://github.com/tus/tusd" target="_blank" rel="noopener">tusd</a>) if you do not want vendor-specific multipart.</li>
+        </ul>
+<pre><code class="language-python"># Server side: create the multipart upload and sign one URL per part (boto3)
+import boto3
+s3 = boto3.client("s3")
+mpu = s3.create_multipart_upload(Bucket="raw-videos", Key="raw/v_9Kx2/source.mp4",
+                                 ContentType="video/mp4")
+urls = [
+    s3.generate_presigned_url(
+        "upload_part",
+        Params={"Bucket": "raw-videos", "Key": "raw/v_9Kx2/source.mp4",
+                "UploadId": mpu["UploadId"], "PartNumber": n},
+        ExpiresIn=3600)                      # 1 hour, one key, one part
+    for n in range(1, 257)
+]
+# ...later, after the client reports its ETags:
+# s3.complete_multipart_upload(Bucket=..., Key=..., UploadId=...,
+#     MultipartUpload={"Parts": [{"PartNumber": n, "ETag": etag}, ...]})</code></pre>
+
+        <h3>2. The transcoding DAG and segment-level parallelism</h3>
+        <p>Encoding a 2-hour 4K movie on one machine can take hours. So we split it. The orchestrator cuts the source at <b>keyframes</b> (frames that can be decoded alone, also called I-frames) into chunks of a few seconds, and fans out one task per chunk per profile. A <b>DAG</b> (directed acyclic graph) describes which steps wait for which.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 880 300" role="img" aria-label="Transcoding DAG: validate, split, parallel encodes, merge, package, ready, with thumbnails and content checks in parallel">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="10" y="125" width="100" height="50"/><text class="label small" x="60" y="155">validate</text>
+            <rect class="box svc" x="140" y="125" width="100" height="50"/><text class="label small" x="190" y="155">probe + split</text>
+            <rect class="box k8s" x="290" y="20" width="120" height="40"/><text class="label small" x="350" y="45">seg 1 x 1080p</text>
+            <rect class="box k8s" x="290" y="70" width="120" height="40"/><text class="label small" x="350" y="95">seg 2 x 1080p</text>
+            <rect class="box k8s" x="290" y="120" width="120" height="40"/><text class="label small" x="350" y="145">seg 1 x 480p</text>
+            <rect class="box k8s" x="290" y="170" width="120" height="40"/><text class="label small" x="350" y="195">seg N x 240p</text>
+            <rect class="box cache" x="290" y="235" width="120" height="40"/><text class="label small" x="350" y="260">thumbnails</text>
+            <rect class="box queue" x="460" y="95" width="110" height="50"/><text class="label small" x="515" y="125">merge check</text>
+            <rect class="box queue" x="610" y="95" width="110" height="50"/><text class="label small" x="665" y="125">package HLS</text>
+            <rect class="box fail" x="460" y="225" width="150" height="50"/><text class="label small" x="535" y="255">copyright + policy</text>
+            <rect class="box svc highlight" x="760" y="125" width="100" height="50"/><text class="label small" x="810" y="155">READY</text>
+            <path class="arrow" d="M110 150 L133 150"/>
+            <path class="arrow" d="M240 140 L283 40"/>
+            <path class="arrow" d="M240 145 L283 90"/>
+            <path class="arrow" d="M240 150 L283 140"/>
+            <path class="arrow" d="M240 155 L283 190"/>
+            <path class="arrow" d="M240 160 L283 255"/>
+            <path class="arrow" d="M410 40 L453 110"/>
+            <path class="arrow" d="M410 90 L453 115"/>
+            <path class="arrow" d="M410 140 L453 122"/>
+            <path class="arrow" d="M410 190 L453 132"/>
+            <path class="arrow" d="M570 120 L603 120"/>
+            <path class="arrow" d="M720 125 L753 145"/>
+            <path class="arrow" d="M410 255 L453 252"/>
+            <path class="arrow" d="M610 250 L760 172"/>
+            <path class="arrow dashed" d="M410 255 C 600 290, 760 260, 800 182"/>
+            <circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M110 150 L140 150 L240 140 L290 40 L410 40 L460 110 L570 120 L610 120 L720 125 L760 150"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="3s" begin="1s" repeatCount="indefinite" path="M110 150 L140 150 L240 155 L290 190 L410 190 L460 132 L570 120 L610 120 L720 125 L760 150"/></circle>
+          </svg>
+          <figcaption>Fan-out, then fan-in. Thousands of small tasks run at once; "merge check" waits for all segments of a profile. The copyright branch can block the video even after encoding finishes.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Idempotent tasks.</b> A task's identity is <code>(video_id, profile, seg_no)</code> and its output key is derived from it. If a spot machine dies mid-task and the task runs twice, the second run overwrites the same key with the same bytes. No duplicates, no locks.</li>
+          <li><b>Fan-in without races.</b> When a worker finishes, it marks its row DONE and checks "are all segments of this profile DONE?" with one conditional query. Only the worker whose update made the count complete triggers packaging. Or let a workflow engine (Temporal, AWS Step Functions, Netflix-style workflow systems) own the DAG state.</li>
+          <li><b>Stragglers.</b> One slow machine delays the whole video. Track task duration; if a task runs much longer than its peers, start a <b>speculative copy</b> elsewhere and take whichever finishes first. That is safe only because tasks are idempotent.</li>
+          <li><b>Poison segments.</b> A corrupt chunk crashes ffmpeg every time. Count attempts; after 3, mark the task FAILED, send the details to a dead-letter queue, and fail or degrade the video (for example, publish without that rendition) instead of retrying forever.</li>
+          <li><b>Keyframe alignment.</b> Every rendition must put keyframes at the same timestamps (for example every 2 s, with scene-cut keyframes off), or the player cannot switch quality cleanly at a segment edge. This is the detail that shows you have actually done it.</li>
+          <li><b>Fast first rendition.</b> Encode a low and a medium rendition first so the video becomes watchable quickly, then add 4K and extra codecs later as background work.</li>
+        </ul>
+
+        <h3>3. Cost: do not encode everything for everyone</h3>
+        <p>Most uploads get few views, while a small fraction gets most of them. Encoding every video into every codec at every resolution wastes compute and storage on videos nobody watches. The usual policy:</p>
+        <ul>
+          <li><b>At upload:</b> a basic H.264 ladder that every device can play.</li>
+          <li><b>When a video becomes popular:</b> re-encode into more efficient codecs (VP9, AV1). They cost more CPU to encode but save CDN bandwidth on every later view, and bandwidth is the bigger bill for popular videos.</li>
+          <li><b>Per-title tuning:</b> a cartoon with flat colours needs far fewer bits than a confetti-filled concert. Netflix publicly described choosing the ladder per title by complexity; the same idea applies here.</li>
+          <li><b>Storage tiers:</b> move cold renditions and originals to colder, cheaper storage classes with erasure coding; keep hot segments on fast storage and the CDN.</li>
+          <li><b>Hardware:</b> spot or preemptible VMs for batch encoding (tasks are short and idempotent, so losing a machine is cheap), GPUs or dedicated video encoding chips for scale. Google has publicly described building custom video transcoding hardware for YouTube.</li>
+        </ul>
+
+        <h3>4. Adaptive streaming: HLS and DASH</h3>
+        <p>The player does not download "the video". It downloads a small text <b>manifest</b> that lists the renditions, then fetches segments one by one over plain HTTP. HLS (<a href="https://www.rfc-editor.org/rfc/rfc8216" target="_blank" rel="noopener">RFC 8216</a>) uses <code>.m3u8</code> playlists; DASH uses an XML <code>.mpd</code>. Because every segment is a normal cacheable HTTP object, any CDN can serve video.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 240" role="img" aria-label="Bitrate ladder and player switching between renditions as bandwidth changes">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label start" x="10" y="25">Rendition</text>
+            <text class="label small start" x="10" y="60">1080p 5 Mbit/s</text>
+            <text class="label small start" x="10" y="110">720p 2.8 Mbit/s</text>
+            <text class="label small start" x="10" y="160">480p 1.4 Mbit/s</text>
+            <text class="label small start" x="10" y="210">240p 0.4 Mbit/s</text>
+            <rect class="box ghost" x="140" y="42" width="700" height="30"/>
+            <rect class="box ghost" x="140" y="92" width="700" height="30"/>
+            <rect class="box ghost" x="140" y="142" width="700" height="30"/>
+            <rect class="box ghost" x="140" y="192" width="700" height="30"/>
+            <rect class="box svc" x="140" y="142" width="80" height="30"/>
+            <rect class="box svc" x="225" y="92" width="80" height="30"/>
+            <rect class="box svc" x="310" y="42" width="80" height="30"/>
+            <rect class="box svc" x="395" y="42" width="80" height="30"/>
+            <rect class="box fail" x="480" y="192" width="80" height="30"/>
+            <rect class="box fail" x="565" y="192" width="80" height="30"/>
+            <rect class="box svc" x="650" y="142" width="80" height="30"/>
+            <rect class="box svc" x="735" y="92" width="80" height="30"/>
+            <text class="label small" x="520" y="185">tunnel!</text>
+            <circle class="packet" r="6"><animateMotion dur="6s" repeatCount="indefinite" path="M180 157 L265 107 L350 57 L435 57 L520 207 L605 207 L690 157 L775 107"/></circle>
+          </svg>
+          <figcaption>Each box is one 4-6 second segment. The player starts low for a fast first frame, climbs as bandwidth allows, drops to 240p in the tunnel instead of freezing, and climbs again.</figcaption>
+        </figure>
+        <p>Here is a real ffmpeg command that makes a 3-rung HLS ladder with aligned keyframes. Try it on any MP4 on your laptop:</p>
+<pre><code class="language-bash">mkdir -p out
+ffmpeg -i input.mp4 \
+  -filter_complex "[0:v]split=3[a][b][c];[a]scale=-2:1080[v0];[b]scale=-2:720[v1];[c]scale=-2:480[v2]" \
+  -map "[v0]" -map "[v1]" -map "[v2]" -map 0:a -map 0:a -map 0:a \
+  -c:v libx264 -preset veryfast -g 48 -keyint_min 48 -sc_threshold 0 \
+  -b:v:0 5M -b:v:1 2800k -b:v:2 1400k \
+  -c:a aac -b:a 128k \
+  -f hls -hls_time 6 -hls_playlist_type vod \
+  -hls_segment_filename "out/v%v/seg_%03d.ts" \
+  -master_pl_name master.m3u8 \
+  -var_stream_map "v:0,a:0 v:1,a:1 v:2,a:2" \
+  "out/v%v/index.m3u8"</code></pre>
+<pre class="terminal"><code>$ ls out out/v1 | head
+out:
+master.m3u8  v0  v1  v2
+
+out/v1:
+index.m3u8  seg_000.ts  seg_001.ts  seg_002.ts  ...
+
+$ cat out/master.m3u8        # bandwidth numbers will differ for your file
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-STREAM-INF:BANDWIDTH=5640800,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+v0/index.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=3220800,RESOLUTION=1280x720,CODECS="avc1.64001f,mp4a.40.2"
+v1/index.m3u8
+
+#EXT-X-STREAM-INF:BANDWIDTH=1680800,RESOLUTION=854x480,CODECS="avc1.64001f,mp4a.40.2"
+v2/index.m3u8</code></pre>
+        <p><code>-g 48 -keyint_min 48 -sc_threshold 0</code> forces a keyframe every 48 frames (2 s at 24 fps) in every rendition, so all three ladders line up. That only works if the source is 24 fps: at 30 or 60 fps, 48 frames is 1.6 s or 0.8 s. Real pipelines set keyframes <b>by time</b> instead: replace <code>-g 48 -keyint_min 48</code> with <code>-force_key_frames "expr:gte(t,n_forced*2)"</code> (keep <code>-sc_threshold 0</code>), or compute <code>-g</code> = 2 x the source fps after probing. Probe a file first with <code>ffprobe -v error -show_entries format=duration:stream=codec_name,width,height -of json input.mp4</code>; the orchestrator does the same to plan the ladder (no point making 1080p from a 720p source).</p>
+
+        <h3>5. Metadata, view counts and hot videos</h3>
+        <ul>
+          <li><b>Metadata at scale.</b> YouTube built <a href="https://vitess.io/docs/overview/history/" target="_blank" rel="noopener">Vitess</a> in 2010 to shard MySQL behind a proxy layer, so applications see one database. Shard by <code>video_id</code>; keep renditions and tasks in the same shard; put a cache (Memcached/Redis) in front of the watch-page read.</li>
+          <li><b>View counts.</b> Never <code>UPDATE videos SET views = views + 1</code> per view: a viral video would make one row the hottest lock in the company. Send view events to Kafka, aggregate per video per minute in a stream job, and add the totals to a counter store. Counts lag by seconds to minutes, which is fine. See <a href="{{BASE}}hld/d35">Top-K / Heavy Hitters</a> for the same streaming pattern.</li>
+          <li><b>Hot videos.</b> A viral video is a CDN problem, not a database problem: segments are immutable, so cache them with long TTLs. Use <b>request coalescing</b> at the CDN (many misses for the same segment become one origin fetch) and an <b>origin shield</b> (a mid-tier cache) so a new viral video does not stampede the bucket.</li>
+        </ul>
+      

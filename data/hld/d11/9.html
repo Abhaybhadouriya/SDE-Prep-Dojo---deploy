@@ -1,0 +1,112 @@
+
+        <h2>Interview: how to drive 45 minutes</h2>
+        <ol class="steps">
+          <li><strong>0-5: scope.</strong> Stores + DCs + online; track, reserve, show availability, replenish. Clarify: pickup and ship-from-store in scope?</li>
+          <li><strong>5-9: vocabulary + numbers.</strong> Draw the on-hand / reserved / safety / available bar. 250M keys, 15k events/s, 250k reads/s, 50 GB state.</li>
+          <li><strong>9-14: API.</strong> Events in via Kafka; availability GET; reservation POST with idempotency key.</li>
+          <li><strong>14-18: data model.</strong> Position table keyed by item+location, reservations, event log.</li>
+          <li><strong>18-28: architecture.</strong> The stepper flow. Say "one writer per key" out loud.</li>
+          <li><strong>28-40: deep dives.</strong> Oversell race (conditional update), late events after a count, hot SKU, partition count.</li>
+          <li><strong>40-45: failures and monitoring.</strong> Lag per partition, shrink rate, reservation 409 rate, as_of age.</li>
+        </ol>
+
+        <details class="qa" data-level="3" data-topic="hld,kafka" data-company="Walmart,Flipkart,Amazon">
+          <summary>Why partition the inventory topic by item+location, and not by item or by store?</summary>
+          <div class="answer">
+            <p>Item+location is the unit we update, and we need every update for that unit in order and handled by exactly one consumer, so no two threads write the same counter. Partitioning by item alone would put a popular item's events for all 5,000 stores into one partition (a hot partition). By store alone, a giant store's events would crowd one partition, and we lose parallelism. Item+location has very high cardinality, which spreads load evenly.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from what must be ordered (per item-location), then show the hot-partition risk of coarser keys. Mention Walmart's post uses exactly this key.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if you need ordering across all stores for an item? (You usually do not; aggregate downstream.)</li><li>How many partitions?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Flipkart">
+          <summary>Two customers try to reserve the last unit at the same time. Walk me through what happens.</summary>
+          <div class="answer">
+            <p>Both see "1 available" from the cache, which is fine. Both call the reservation service. It runs an atomic conditional update on the position row: increment reserved only if on_hand minus reserved minus safety is at least 1. The database applies the two updates one after the other on that row; the first matches one row and succeeds, the second matches zero rows and gets 409. The UI tells the second shopper to pick another store. The availability view updates within seconds from the positions stream.</p>
+            <div class="approach"><h5>How to answer</h5><p>Separate "stale read is OK" from "the write must be atomic". Write the SQL. That is the core signal.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the reserved shopper never pays? (TTL and a sweeper.)</li><li>How would you do this on Cassandra? (Lightweight transactions, or route through the single writer.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>Why store events at all? Why not just keep the current count?</summary>
+          <div class="answer">
+            <p>Events give four things a single number cannot: an audit trail (why is this 7?), replay (fix a bug and rebuild state), many consumers (replenishment, analytics, availability all read the same stream), and decoupling (tills just emit, they never wait for the central database). The current count is still kept as a derived, fast-to-read view. This is event sourcing plus CQRS.</p>
+            <div class="approach"><h5>How to answer</h5><p>List the benefits, then the cost: more components, eventual consistency on the read side, and schema evolution of events.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep events in Kafka vs the lake?</li><li>How do you evolve the event schema? (Schema Registry, backward-compatible changes.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,kafka" data-company="Walmart,Flipkart">
+          <summary>Events arrive twice or late. How do you keep counts correct?</summary>
+          <div class="answer">
+            <p>Duplicates: every event has a stable event_id; the processor keeps recently seen ids in its state store and skips repeats, and exactly-once processing in Kafka Streams commits state and output together. Late events: deltas are applied whenever they arrive because addition is order-independent, except around absolute COUNT events. When a count arrives I record last_count_at and ignore deltas with event_time before it, because the count already reflects them. Per-source sequence numbers detect missing events.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name "delta vs absolute" explicitly. Few candidates do.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How long do you keep event ids for dedupe?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart,Amazon,Microsoft">
+          <summary>How do you serve hundreds of thousands of availability checks per second?</summary>
+          <div class="answer">
+            <p>Precompute and cache. The availability service consumes position updates and stores a small value per item-location (status bucket, available count, as_of) in Redis or a KV store, plus regional rollups for ship-to-address. Product pages read the cache with short TTLs at the edge. Buckets (IN_STOCK / LOW / OUT) change rarely, so caches stay warm. The source of truth is only touched at reservation time.</p>
+            <div class="approach"><h5>How to answer</h5><p>Quote your read/write ratio from the estimate; it justifies CQRS.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How stale can it be? (Seconds; show as_of; re-check at checkout.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,kafka" data-company="Walmart,Flipkart">
+          <summary>How many partitions would you pick, and what if you need more later?</summary>
+          <div class="answer">
+            <p>Size from peak throughput divided by what one consumer can do, then add headroom: about 15k events/s at maybe 500-1,000 per consumer gives 15-30, so I would pick 64 or 128. I pick high up front because adding partitions changes hash(key) % N for most keys, which can reorder events for a key during the switch. If I must grow, I create a new topic, pause, drain the old one, then switch producers and consumers, or migrate key ranges carefully.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the formula, then the ordering trap. Also mention the cost of too many partitions (more files, memory, longer failover).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not 10,000 partitions?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,kafka" data-company="Walmart,Flipkart,Amazon">
+          <summary>On Black Friday morning, consumer lag on one partition is 200,000 and growing. What do you do?</summary>
+          <div class="answer">
+            <p>One partition, not all, points to a hot key or a slow pod. Check which keys dominate that partition (a doorbuster SKU at a big store?), and the pod's CPU, GC and DB latency. Short term: move that pod to a bigger node or restart it if it is unhealthy; if a hot key, route its online reservations through a bucketed counter and keep only physical events on the partition. Adding consumers does not help one partition, since only one consumer can own it. Afterwards, add an alert on per-partition lag and plan bucketed keys for known hot items.</p>
+            <div class="approach"><h5>How to answer</h5><p>Diagnose before acting; know that consumers beyond the partition count sit idle.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if all partitions lag?</li><li>What does the website show meanwhile? (Last known status with as_of; strict check at reserve.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Walmart,Amazon">
+          <summary>The system says 9 units, a store associate counts 7. What happens?</summary>
+          <div class="answer">
+            <p>The count is an absolute COUNT event with event_time, produced into the same partition as that item-location, so it is ordered with other events. The processor sets on_hand to 7, sets last_count_at, and emits a shrink record of -2 for finance and loss prevention. Open reservations are re-checked; if available goes negative, the newest unpicked holds are flagged so customers are told early. Frequent drift on a SKU raises its safety stock.</p>
+            <div class="approach"><h5>How to answer</h5><p>Treat physical truth as an event, not a manual DB edit. Mention what happens to reservations.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A sale from before the count arrives late. (Ignore by event_time.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,k8s" data-company="Walmart,Microsoft">
+          <summary>A processor pod restarts. How does it get its state back, and how long does it take?</summary>
+          <div class="answer">
+            <p>Kafka Streams keeps state in a local RocksDB store and writes every change to a compacted changelog topic. After a clean shutdown or a rebalance, if the pod's PersistentVolume still has the store (StatefulSet), it only replays the changelog tail since its last checkpoint: seconds. But this page uses <code>processing.guarantee=exactly_once_v2</code>. Under exactly-once, after a crash (not a clean shutdown) there is no valid checkpoint, so Kafka Streams treats the local store as dirty, wipes it and restores it from the full changelog, which takes time in proportion to state size. That is why standby replicas (<code>num.standby.replicas=1</code>) matter: they keep a warm copy on another pod, so the task fails over to the standby almost immediately while the crashed pod rebuilds. (Transactional state stores, KIP-892, aim to remove the full wipe in future versions.)</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the changelog topic, the local store, and standby replicas. Tie it to StatefulSet + PVC on Kubernetes.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why a StatefulSet and not a Deployment?</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld" data-company="Walmart,Flipkart">
+          <summary>How would you answer "ship to my ZIP code by Friday" across 5,000 locations?</summary>
+          <div class="answer">
+            <p>Do not scan 5,000 stores per request. Precompute a regional view: for each item and delivery region, the top N locations that have available stock and can ship within the promise window, ordered by cost and speed. Update it from the positions stream. At request time, read the region's list, pick the best location, and reserve there with the conditional update; if that fails, try the next. Promise dates also need carrier cut-off times, so the view stores a "ship by" capability per location.</p>
+            <div class="approach"><h5>How to answer</h5><p>Precompute plus fallback. Mention that the promise is checked again at reservation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you split one order across two locations?</li></ul></div>
+          </div>
+        </details>
+
+        <div class="scenario">
+          <h4>Scenario: "in stock" online, empty shelf in store</h4>
+          <div class="situation"><p>Pickup orders are being cancelled because associates cannot find the items. The system shows stock at those stores.</p></div>
+          <div class="bad"><p>Weak answer: "Make the cache TTL shorter."</p></div>
+          <div class="good"><p>Strong answer: this is phantom inventory (records higher than reality), not cache staleness. Measure it: cancellation rate by store and SKU, and the gap at the next cycle count. Causes: theft or damage not recorded, receiving errors, misplaced stock. Fixes: targeted cycle counts for high-cancel SKUs, higher safety stock for them, a "can't find" button in the picker app that emits an ADJUST event immediately, and showing LOW instead of IN_STOCK when available is small.</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you choose which SKUs to count first?</li></ul></div>
+        </div>
+
+        <div class="callout danger"><p><b>Common mistakes:</b> one global <code>UPDATE stock</code> hit by every till; reading the cache to decide a reservation; partitioning by item only (hot partitions); adding partitions without thinking about key ordering; editing counts by hand instead of emitting events; ignoring late events after a count; forgetting reservation expiry; skipping monitoring of per-partition lag.</p></div>
+      

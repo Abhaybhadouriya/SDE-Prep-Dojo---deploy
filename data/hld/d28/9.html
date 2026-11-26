@@ -1,0 +1,135 @@
+
+        <h2>Interview: driving the 45 minutes</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Minute</th><th>What you do</th><th>What you say</th></tr></thead>
+            <tbody>
+              <tr><td>0-5</td><td>Requirements</td><td>"Which DBs, which tables, which consumers, freshness target, can we lose or duplicate, can we load the DB?"</td></tr>
+              <tr><td>5-10</td><td>Estimation</td><td>"~50k changes/s, ~50 MB/s, 4 TB/day. Not a throughput problem; a correctness and ops problem."</td></tr>
+              <tr><td>10-15</td><td>Why CDC</td><td>"Polling misses deletes and loads the DB; dual writes are not atomic; so read the binlog/WAL."</td></tr>
+              <tr><td>15-25</td><td>Diagram</td><td>DB log → Debezium on Connect → Kafka (PK key, registry) → Flink→Iceberg, ES sink, cache invalidator.</td></tr>
+              <tr><td>25-38</td><td>Deep dives</td><td>Snapshot handoff, ordering + tombstones, replication slot risk, schema evolution, idempotent upserts.</td></tr>
+              <tr><td>38-45</td><td>Failures + wrap-up</td><td>Failover, binlog purge, monitoring: connector state, DB-to-Kafka latency, retained WAL, <a href="{{BASE}}interview/glossary#consumer-lag">consumer lag</a> per sink.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout interview"><p><b>60-second answer:</b> "I would not poll tables or dual-write. Every database already has a change log - binlog in MySQL, WAL in Postgres - so I run Debezium connectors on Kafka Connect, one per database, which read that log like a replica and publish one event per row change to a Kafka topic per table, keyed by primary key so each row's changes stay in order. Schemas go through Schema Registry with backward compatibility. Each consumer is its own group: a Flink job upserts into Iceberg for the lake, a sink upserts Elasticsearch, a small service invalidates the cache. Delivery is at-least-once, so every sink is idempotent - upsert by key and skip older log positions. New tables are bootstrapped with incremental watermark snapshots, so no locks. The scary failure is an abandoned Postgres replication slot filling the disk, so I alert on retained WAL and cap it."</p></div>
+
+        <details class="qa" data-level="3" data-topic="hld,cdc,kafka" data-company="Amazon,Flipkart,Walmart">
+          <summary>Why not just have the application write to the database and then publish to Kafka?</summary>
+          <div class="answer">
+            <p>That is the <b>dual-write problem</b>. The two writes are not atomic. If the DB commit succeeds and the Kafka publish fails (or the process crashes in between), downstream never hears about the change. If you publish first and the DB transaction rolls back, downstream hears about a change that never happened. Retries do not fix it, they only shrink the window. CDC fixes it by making the database log the single source: if it committed, it is in the log, and the log is what we publish. For service events, the <b>outbox pattern</b> does the same: write the business row and an outbox row in one transaction, and let Debezium publish the outbox row.</p>
+            <div class="approach"><h5>How to answer</h5><p>Name the problem, give both failure orders (commit-then-fail, publish-then-rollback), then the fix (one atomic write, log-based relay). Mention the relay is still at-least-once, so consumers stay idempotent.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why not a distributed transaction (2PC) across DB and Kafka? (Kafka does not join XA; 2PC is slow and fragile.)</li><li>Outbox with a poller instead of CDC? (Works; more DB load and latency; still need ordering care.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,cdc" data-company="Microsoft,Amazon">
+          <summary>How does Debezium read MySQL vs Postgres, and what must be configured on each?</summary>
+          <div class="answer">
+            <p><b>MySQL:</b> the connector registers as a replication client and reads the binlog. The server needs <code>binlog_format=ROW</code> (row images, not SQL statements) and <code>binlog_row_image=FULL</code> (full before/after), and GTIDs are recommended so it can resume after failover. <b>Postgres:</b> it uses logical decoding through a <b>replication slot</b>, normally with the built-in <code>pgoutput</code> plugin and a publication listing the tables. The server needs <code>wal_level=logical</code>. The slot remembers how far the connector has confirmed, and Postgres keeps WAL until then.</p>
+            <div class="approach"><h5>How to answer</h5><p>Two lines per DB: mechanism, then the required settings. Then the operational risk of each (binlog purge vs WAL growth).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why is statement-based binlog not enough? (non-deterministic statements, no row values)</li><li>What about MongoDB or DynamoDB? (change streams / DynamoDB Streams - same idea)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,cdc,kafka" data-company="Google,Uber">
+          <summary>How do you guarantee the lake applies an update and a delete for the same row in the right order?</summary>
+          <div class="answer">
+            <p>Order comes from three links. (1) The database log is in commit order. (2) Debezium keys each event by primary key, and Kafka keeps one partition's records in order, so all events for row 1042 are in one partition in order. (3) The Flink job keys by the same primary key, so one task applies them in order, and the Iceberg upsert writes the last state per key per commit. For safety the sink also stores the source position (LSN) and ignores any event older than what it has, which protects against replays and against an old snapshot row arriving late.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the chain hop by hop and show order is preserved at each hop - and say where it is <i>not</i> (across tables, after a partition-count change).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if you increase partitions on the topic? (hash(key) mod N changes, so new changes for a row can land on a different partition than its older ones and a consumer may apply them out of order. Pick the count up front; if you must grow, create a new topic and re-snapshot into it.)</li><li>What if the primary key itself is updated? (Debezium emits a delete + tombstone for the old key and a create for the new key, on two partitions, so for a moment downstream sees both rows or neither. Sinks must tolerate that, or forbid PK updates.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,cdc" data-company="Netflix,Amazon">
+          <summary>A new team needs the full history of a 3 TB table. How do you bootstrap them without hurting production?</summary>
+          <div class="answer">
+            <p>Two options. If a compacted "latest state" topic exists, they simply consume it from the beginning - Kafka already holds the latest row per key. Otherwise, trigger an <b>incremental snapshot</b> for that table via the signal table: Debezium reads it in primary-key chunks while streaming continues, using low/high watermarks to discard chunk rows that changed in the meantime (the DBLog technique). Run it against a read replica if supported, throttle chunk size, and schedule outside peak. No table locks, no stop of the main stream.</p>
+            <div class="approach"><h5>How to answer</h5><p>Offer the cheap path (compacted topic) first, then the snapshot mechanism, then how you protect the source (chunks, throttling, off-peak).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Explain exactly why watermarks prevent stale overwrites. (The chunk is read between a LOW and a HIGH marker written into the log. Any row that also appears as a log event between the markers is dropped from the chunk, because the log event is newer. So a snapshot row is emitted only if nothing changed it during the read - it can never overwrite a newer change.)</li><li>Why not just <code>mysqldump</code>? (no consistent handoff with the stream; locks or long transactions)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,cdc,postgres" data-company="Microsoft,Walmart">
+          <summary>The Postgres primary's disk went from 40% to 95% overnight. CDC is involved. What happened?</summary>
+          <div class="answer">
+            <p>Most likely an inactive replication slot: the connector stopped (crash, pause, deleted without dropping the slot), so Postgres retained every WAL segment since. Confirm with <code>pg_replication_slots</code> (active = f, large retained WAL). Immediate fix: restart the connector if it can catch up, or drop the slot to free disk (then re-snapshot). Prevention: alerts on retained WAL and connector state, <code>max_slot_wal_keep_size</code>, Debezium heartbeats for quiet databases, and a runbook that always drops slots for retired connectors.</p>
+            <div class="approach"><h5>How to answer</h5><p>Stabilise first (free disk), confirm with one query, then prevention. Mention you would rather lose the slot (re-snapshot) than lose the primary.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why do heartbeats help on a database with no traffic on captured tables? (Debezium writes to a heartbeat table or emits heartbeat events, so the slot's confirmed LSN keeps advancing and Postgres can free WAL that other, busy tables generated. Without it the slot stands still and WAL piles up.)</li><li>What is MySQL's equivalent risk? (binlog purge → connector must re-snapshot)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,cdc,schema" data-company="Amazon,Google">
+          <summary>A developer renames a column in the orders table. What happens to the pipeline?</summary>
+          <div class="answer">
+            <p>Debezium emits events with the new field name and tries to register a new schema. Under BACKWARD compatibility a rename registers as "delete old field + add new field". If the new column is nullable (optional, default null) the registry <b>accepts</b> it - and old consumers silently stop seeing the old field, which is the real danger. If the new column is NOT NULL without a default, the registry rejects it and the connector fails loudly. FULL / FULL_TRANSITIVE compatibility would catch the silent case. To do it safely use <b>expand and contract</b>: add the new column, write both, migrate consumers, then drop the old one. Longer term, put a contract layer in front: outbox events or a stream job that maps raw table events to a stable, versioned schema, so internal refactors do not break consumers.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say what technically happens, then the safe migration, then the architectural fix (contract layer).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>BACKWARD vs FORWARD vs FULL compatibility? (BACKWARD = the new schema can read data written with the old one, so upgrade consumers first; FORWARD = the old schema can read data written with the new one, so upgrade producers first; FULL = both. The _TRANSITIVE variants check against every older version, not just the last.)</li><li>How does Iceberg handle a renamed column? (columns are tracked by id, so rename is metadata-only)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,cdc,cache" data-company="Flipkart,Amazon">
+          <summary>How would you use CDC to keep a Redis cache correct?</summary>
+          <div class="answer">
+            <p>A small consumer reads the change topic and <b>deletes</b> the cache key for each changed row (<code>DEL product:77</code>). The next read misses and reloads from the DB. Delete rather than set, because events can be duplicated or slightly reordered across restarts and a delete is always safe; a set could write an older value. Debezium's own blog describes CDC-driven cache invalidation. This replaces fragile "app updates DB then cache" code, which has the same dual-write race.</p>
+            <div class="approach"><h5>How to answer</h5><p>Delete-not-set, and why. Mention the small staleness window (seconds) and that a TTL is still a good safety net.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>A read repopulates the cache from a lagging replica right after the delete - how do you avoid that? (read from primary on miss for <a href="{{BASE}}interview/glossary#hot-partition">hot keys</a>, or versioned values)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="5" data-topic="hld,cdc,kafka" data-company="Shopify,Uber">
+          <summary>You have 100+ MySQL shards. How do you organise connectors and topics?</summary>
+          <div class="answer">
+            <p>One connector per shard, because each shard has its own binlog and a log is read by a single task. Run them on a Kafka Connect cluster on Kubernetes, managed declaratively (Strimzi <code>KafkaConnector</code> resources generated from a shard list). For topics, either one topic per shard per table, or route all shards of a table into one logical topic with a shard id in the key (key = shard + PK) so per-row order holds and consumers see one stream. Spread connectors across workers, monitor per-connector latency, and keep connector configs identical through templates. Shopify reported about 150 connectors on 12 Connect pods for 100+ shards.</p>
+            <div class="approach"><h5>How to answer</h5><p>Start from "one log = one task", then placement, then topic layout trade-off (many topics vs merged topic), then automation.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What happens when a shard is split? (new connectors, snapshot the new shard, keys must still be unique)</li><li>How do you detect one shard falling behind? (Per-connector lag in time: compare the source commit time in each event with now, per shard, and alert on the worst shard - an average across shards hides one stuck connector. Also watch retained WAL/binlog per slot.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld,cdc,lakehouse" data-company="Google,Microsoft">
+          <summary>Why Iceberg (or Hudi/Delta) and not just Parquet files in S3?</summary>
+          <div class="answer">
+            <p>Plain Parquet folders have no transactions: a reader can see half-written files, there is no safe way to update or delete a row, and listing millions of files is slow. A table format adds a metadata layer: each commit creates a new <b>snapshot</b> that points to an exact set of data and delete files, so readers always see a consistent table, writers can upsert (v2 delete files), you get time travel and schema evolution, and query engines prune files using stored statistics. The cost is maintenance: compaction, snapshot expiry and orphan-file cleanup.</p>
+            <div class="approach"><h5>How to answer</h5><p>List what plain files lack (atomicity, updates, metadata), then what the table format gives, then the maintenance cost.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Copy-on-write vs merge-on-read? (Copy-on-write rewrites the affected data files on every upsert: slow writes, fast reads. Merge-on-read writes small delete/change files and merges them at query time: fast writes, slower reads until compaction runs.)</li><li>How fresh can the lake be? (bounded by the commit interval; minutes, not seconds)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld,cdc,kafka" data-company="Amazon,Walmart">
+          <summary>What do you monitor for a CDC pipeline?</summary>
+          <div class="answer">
+            <p>Per connector: task state, and <b>source-to-Kafka latency</b> (Kafka record time minus the <code>source.ts_ms</code> commit time). Per database: retained WAL per slot (Postgres) or binlog position lag (MySQL). Per sink: consumer lag in <b>time</b>, error/DLQ rate, and end-to-end freshness (newest row timestamp in the lake or index). Plus a correctness check: daily row counts or checksums per table between source and lake, alerting on drift.</p>
+            <div class="approach"><h5>How to answer</h5><p>Go hop by hop: source, connector, Kafka, sink, then "and I verify correctness with reconciliation". Interviewers like that last line.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why lag in time rather than in messages? (message count means nothing without the rate)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Proposing dual writes from the app, or polling with <code>updated_at</code>, without saying what they miss (deletes, atomicity).</li>
+          <li>Claiming "exactly-once end to end" without explaining idempotent sinks.</li>
+          <li>Forgetting the initial snapshot, or not knowing how the snapshot and stream hand off.</li>
+          <li>Ignoring the replication slot / binlog retention risk - the classic real outage.</li>
+          <li>Publishing raw tables as the public contract between services with no schema governance.</li>
+          <li>Random or missing keys on change topics, which destroys per-row ordering.</li>
+          <li>No compaction plan for the lake, so it slows down a little more every day.</li>
+        </ul>
+
+        <div class="scenario">
+          <h4>Scenario: the search index shows cancelled orders as active</h4>
+          <div class="situation"><p>Support reports that orders cancelled hours ago still appear as "PLACED" in the order search tool. The database is correct. CDC is supposed to keep Elasticsearch in sync.</p></div>
+          <div class="bad"><p>Weak answer: "Re-index everything from the database every night."</p></div>
+          <div class="good"><p>Strong answer: "Find which hop is behind. Connector status and source-to-Kafka latency tell me if events are being produced; if the event for that order is in the topic (I can check with the key), the problem is downstream. Then the ES sink's consumer lag and DLQ: maybe the sink is failing on a mapping error and sending these events to a dead-letter topic, or lag is hours because ES is rejecting bulk writes. Fix the cause, then replay: reset the sink group's offset to before the incident - safe because the sink upserts by order id. Add alerts on sink lag in time and DLQ rate, plus a daily count reconciliation."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>The event is missing from the topic entirely - now what? (connector filters, table include list, slot invalidated → incremental snapshot)</li></ul></div>
+        </div>
+
+        <div class="scenario">
+          <h4>Scenario: DB failover during Big Billion Days</h4>
+          <div class="situation"><p>During a sale, the MySQL primary for shard 17 fails and a replica is promoted. The Debezium connector for shard 17 starts failing with "could not find binlog position".</p></div>
+          <div class="bad"><p>Weak answer: "Delete the connector and recreate it with snapshot."</p></div>
+          <div class="good"><p>Strong answer: "Binlog file names and positions differ between servers, so a position from the old primary is meaningless on the new one. With GTIDs enabled the connector resumes by transaction id on the new primary - that is why GTIDs are a requirement in my design. If GTIDs were not on, I would point the connector at the new primary and run an incremental snapshot for shard 17 tables, accepting duplicates (sinks are idempotent) rather than a full blocking snapshot during peak traffic."</p></div>
+          <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you test failover before the sale? (game day on a staging shard)</li></ul></div>
+        </div>
+      

@@ -1,0 +1,76 @@
+
+        <h2>Production: a highly available control plane</h2>
+        <div class="chips"><span class="chip warn">Deep dive (platform teams)</span></div>
+        <p>Your kind cluster has one control-plane node. Production clusters run <b>three</b> (sometimes five) control-plane machines, ideally in different availability zones, with a load balancer in front of the API servers.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 340" role="img" aria-label="HA control plane: load balancer, three API servers, leader-elected scheduler and controller manager, three etcd members">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="20" width="200" height="44"/><text class="label" x="120" y="42">kubelets, kubectl</text>
+            <rect class="box svc" x="290" y="20" width="220" height="44"/><text class="label" x="400" y="42">load balancer :6443</text>
+            <path class="arrow" d="M220 42 L282 42"/>
+            <path class="arrow" d="M340 64 L140 102"/>
+            <path class="arrow" d="M400 64 L400 102"/>
+            <path class="arrow" d="M460 64 L660 102"/>
+
+            <rect class="zone k8s" x="20" y="110" width="240" height="215"/><text class="zone-label" x="34" y="130">control-plane-1 (zone a)</text>
+            <rect class="zone k8s" x="280" y="110" width="240" height="215"/><text class="zone-label" x="294" y="130">control-plane-2 (zone b)</text>
+            <rect class="zone k8s" x="540" y="110" width="240" height="215"/><text class="zone-label" x="554" y="130">control-plane-3 (zone c)</text>
+
+            <rect class="box k8s solid" x="40" y="145" width="200" height="38"/><text class="label white" x="140" y="164">apiserver (active)</text>
+            <rect class="box k8s solid" x="300" y="145" width="200" height="38"/><text class="label white" x="400" y="164">apiserver (active)</text>
+            <rect class="box k8s solid" x="560" y="145" width="200" height="38"/><text class="label white" x="660" y="164">apiserver (active)</text>
+            <rect class="box svc hot" x="40" y="193" width="200" height="38"/><text class="label small" x="140" y="212">scheduler LEADER</text>
+            <rect class="box ghost" x="300" y="193" width="200" height="38"/><text class="label small" x="400" y="212">scheduler standby</text>
+            <rect class="box ghost" x="560" y="193" width="200" height="38"/><text class="label small" x="660" y="212">scheduler standby</text>
+            <rect class="box ghost" x="40" y="241" width="200" height="34"/><text class="label small" x="140" y="258">controller-mgr standby</text>
+            <rect class="box svc hot" x="300" y="241" width="200" height="34"/><text class="label small" x="400" y="258">controller-mgr LEADER</text>
+            <rect class="box ghost" x="560" y="241" width="200" height="34"/><text class="label small" x="660" y="258">controller-mgr standby</text>
+            <rect class="box db" x="40" y="283" width="200" height="34"/><text class="label small" x="140" y="300">etcd member</text>
+            <rect class="box db solid" x="300" y="283" width="200" height="34"/><text class="label white" x="400" y="300">etcd member (Raft leader)</text>
+            <rect class="box db" x="560" y="283" width="200" height="34"/><text class="label small" x="660" y="300">etcd member</text>
+            <path class="arrow both dashed" d="M240 300 L292 300"/>
+            <path class="arrow both dashed" d="M500 300 L552 300"/>
+            <circle class="packet" r="5"><animateMotion dur="3s" repeatCount="indefinite" path="M220 42 L400 42 L400 102"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" repeatCount="indefinite" path="M300 300 L240 300"/></circle>
+            <circle class="packet alt" r="5"><animateMotion dur="2s" begin="1s" repeatCount="indefinite" path="M500 300 L560 300"/></circle>
+          </svg>
+          <figcaption>API servers are stateless and all active behind a load balancer. The scheduler and controller manager run on every control-plane node but only the leader acts; the others wait. etcd keeps 3 Raft members. This layout is called "stacked etcd".</figcaption>
+        </figure>
+        <ul>
+          <li><b>API servers: active-active.</b> They keep no state of their own, so any of them can serve any request.</li>
+          <li><b>Scheduler and controller manager: active-standby.</b> Two schedulers acting at once could place the same pod twice, so they use <b>leader election</b> through a <code>Lease</code> object in <code>kube-system</code>. The leader keeps renewing it; if it stops, a standby takes the lease within seconds.</li>
+          <li><b>etcd: Raft quorum.</b> Either "stacked" on the control-plane machines (simpler) or on its own dedicated machines ("external etcd", more isolation). OpenAI, at 7,500 nodes, ran 5 etcd and 5 API servers on dedicated machines and even moved Kubernetes <b>Events</b> into a separate etcd cluster so noisy events could not slow down real state.</li>
+        </ul>
+
+        <h3>What dies, what still works</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>If this fails...</th><th>Running pods</th><th>What stops working</th></tr></thead>
+            <tbody>
+              <tr><td>One of 3 API servers</td><td>Fine</td><td>Nothing; the load balancer uses the other two.</td></tr>
+              <tr><td>All API servers</td><td>Keep running</td><td>kubectl, scheduling, scaling, rollouts, self-healing across nodes. Kubelets still restart crashed containers locally.</td></tr>
+              <tr><td>Scheduler (all copies)</td><td>Keep running</td><td>New pods stay Pending.</td></tr>
+              <tr><td>Controller manager (all copies)</td><td>Keep running</td><td>No replacement of lost pods, no Deployment rollouts, no EndpointSlice updates (so new pods do not get traffic).</td></tr>
+              <tr><td>etcd loses quorum</td><td>Keep running</td><td>All writes fail, so effectively the whole control plane is frozen.</td></tr>
+              <tr><td>A kubelet / one node</td><td>Pods on that node are lost</td><td>After the timers above, they are recreated elsewhere.</td></tr>
+              <tr><td>kube-proxy on a node</td><td>Keep running</td><td>That node's Service rules stop updating; new or removed pod IPs are not reflected there.</td></tr>
+              <tr><td>CoreDNS</td><td>Keep running</td><td>Service names stop resolving; calls by name fail even though IPs still work.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Managed Kubernetes: who runs what</h3>
+        <p>With <b>Amazon EKS</b>, <b>Azure AKS</b> or <b>Google GKE</b>, the cloud runs the control plane (API servers, etcd, scheduler, controller manager) for you, usually spread across zones, and you only see the API endpoint. You still own the worker nodes (or use a serverless node option), node upgrades, add-ons, your workloads and their security. That split is worth stating in an interview at Microsoft or Amazon, because those teams build exactly these services.</p>
+
+        <h3>Version skew and upgrades</h3>
+        <p>Components do not all have to run the same version, but there are rules. The kubelet may be up to <b>three minor versions older</b> than the API server, and <b>never newer</b>. So you upgrade the <b>control plane first</b>, then the nodes, one minor version at a time. There is <b>no supported downgrade</b>, which is why an etcd backup and a <b><a href="{{BASE}}interview/glossary#canary">canary</a> cluster</b> (a small, low-risk cluster you upgrade first, like a canary in a coal mine) matter. Kubernetes ships about three minor releases a year (the current one is v1.37, from August 2026).</p>
+
+        <h3>How big can a cluster get?</h3>
+        <div class="stats">
+          <div class="stat"><b>110</b><span>pods per node (official guideline)</span></div>
+          <div class="stat"><b>5,000</b><span>nodes per cluster (guideline)</span></div>
+          <div class="stat"><b>150,000</b><span>pods per cluster (guideline)</span></div>
+          <div class="stat"><b>7,500</b><span>nodes in one OpenAI cluster, with heavy tuning</span></div>
+        </div>
+        <p>These are the limits from the official "considerations for large clusters" page; they are tested guidelines, not hard walls. OpenAI's 7,500-node write-up describes the tuning that got them past 5,000 nodes: more API server memory (up to 70 GB heap per API server), Kubernetes Events moved into a separate etcd cluster, and EndpointSlices, which they say cut endpoint watch load by about 1000 times. Other large operators such as Uber describe the same family of tuning (rate-limiting expensive LIST calls with API Priority and Fairness, compact Protobuf encoding instead of JSON, forced periodic reconciles); read both posts in Resources for which team did what. The lesson for interviews: <b>the scaling bottleneck of Kubernetes is the API server and etcd</b>, not the nodes.</p>
+      

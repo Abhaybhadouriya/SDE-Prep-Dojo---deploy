@@ -1,0 +1,402 @@
+<h3>C++14</h3>
+  <p>Build it two ways from the same file. The output shown on this page is from Windows MinGW.org g++ 6.3, where the lock class is a no-op with the same <code>lock()</code>/<code>unlock()</code>; on Linux, define <code>HAVE_STD_MUTEX</code> and the same lock sites use a real <code>std::mutex</code> through a scoped guard. Where two locks are held at once they are taken in one fixed order (sorted ids, or outer object first), which is the rule <code>std::lock</code> would otherwise enforce for you:</p>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall -Wextra main.cpp -o main            # MinGW g++ 6.3: single-threaded build
+$ g++ -std=c++14 -Wall -Wextra -O2 -pthread -DHAVE_STD_MUTEX main.cpp -o main &amp;&amp; ./main   # Linux: real locks</code></pre>
+  <p>Say it plainly in an interview: MinGW.org g++ 6.3 uses the "win32" thread model, ships no <code>std::mutex</code> or <code>std::thread</code>, and <code>-pthread</code> fails to link there. The <code>-DHAVE_STD_MUTEX</code> build of this file was compiled and run with g++ 13.3 on Linux (WSL Ubuntu 24.04); its last line was <code>All 4 checks passed</code>.</p>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="main.cpp">
+<pre><code class="language-cpp">// Library management - C++14 version.
+// Book vs BookCopy, copy state table, fine Strategy, availability Observer, FIFO reservations.
+// The MinGW 6.3 toolchain here has no std::thread / std::mutex, so this version is single-threaded;
+// the Java and Python tabs show the locking.
+#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;cstdio&gt;
+#include &lt;cstdlib&gt;
+#include &lt;deque&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+#include &lt;mutex&gt;
+// Locking: one facade lock, a real std::recursive_mutex when built with -DHAVE_STD_MUTEX (Linux:
+//   g++ -std=c++14 -pthread -DHAVE_STD_MUTEX main.cpp). Recursive because public methods call each other,
+// just as Java's synchronized is re-entrant. MinGW.org g++ 6.3 (win32 thread model) has no std::mutex and
+// -pthread fails to link there, so the default build uses a no-op Mutex with the same lock()/unlock():
+// the SAME locking code compiles both ways and simply runs single-threaded on MinGW.
+#ifdef HAVE_STD_MUTEX
+typedef std::recursive_mutex Mutex;
+#else
+struct Mutex { void lock() {} void unlock() {} bool try_lock() { return true; } };
+#endif
+typedef std::lock_guard&lt;Mutex&gt; LockGuard;
+
+typedef long long Paise;
+
+std::string fmt(Paise p) {
+    std::string cents = std::to_string(p % 100);
+    return std::to_string(p / 100) + "." + (cents.size() &lt; 2 ? "0" : "") + cents;
+}
+
+// ---------- dates as day numbers (civil calendar &lt;-&gt; days since 1970-01-01) ----------
+long daysFromCivil(int y, int m, int d) {
+    y -= m &lt;= 2;
+    const long era = (y &gt;= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast&lt;unsigned&gt;(y - era * 400);
+    const unsigned doy = (153 * (m + (m &gt; 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast&lt;long&gt;(doe) - 719468;
+}
+std::string dateStr(long z) {
+    z += 719468;
+    const long era = (z &gt;= 0 ? z : z - 146096) / 146097;
+    const unsigned doe = static_cast&lt;unsigned&gt;(z - era * 146097);
+    const unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const unsigned mp = (5 * doy + 2) / 153;
+    const unsigned d = doy - (153 * mp + 2) / 5 + 1;
+    const unsigned m = mp &lt; 10 ? mp + 3 : mp - 9;
+    const long y = static_cast&lt;long&gt;(yoe) + era * 400 + (m &lt;= 2);
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%04ld-%02u-%02u", y, m, d);
+    return buf;
+}
+
+struct LibraryError : std::runtime_error {
+    explicit LibraryError(const std::string&amp; m) : std::runtime_error(m) {}
+};
+
+struct Book { std::string isbn, title, author, subject; };
+
+enum class CopyStatus { AVAILABLE, BORROWED, ON_HOLD, LOST };
+
+bool canMove(CopyStatus from, CopyStatus to) {   // state table
+    switch (from) {
+        case CopyStatus::AVAILABLE: return to == CopyStatus::BORROWED || to == CopyStatus::ON_HOLD || to == CopyStatus::LOST;
+        case CopyStatus::BORROWED:  return to == CopyStatus::AVAILABLE || to == CopyStatus::ON_HOLD || to == CopyStatus::LOST;
+        case CopyStatus::ON_HOLD:   return to == CopyStatus::BORROWED || to == CopyStatus::AVAILABLE || to == CopyStatus::ON_HOLD;
+        default:                    return false;
+    }
+}
+
+struct BookCopy {
+    std::string barcode, rack;
+    const Book* book;
+    CopyStatus status = CopyStatus::AVAILABLE;
+    std::string holdFor;
+    long holdUntil = 0;
+    void moveTo(CopyStatus next) {
+        if (!canMove(status, next)) throw std::logic_error(barcode + ": illegal transition");
+        status = next;
+        if (next != CopyStatus::ON_HOLD) { holdFor.clear(); holdUntil = 0; }
+    }
+};
+
+enum class MemberType { STUDENT, FACULTY };
+int maxLoans(MemberType t) { return t == MemberType::STUDENT ? 2 : 5; }
+int loanDays(MemberType t) { return t == MemberType::STUDENT ? 14 : 30; }
+
+struct Loan { BookCopy* copy; std::string memberId; long issued, due; bool renewed; };
+
+struct Member {
+    std::string id, name;
+    MemberType type;
+    Paise dues = 0;
+    std::map&lt;std::string, Loan*&gt; loans;   // barcode -&gt; loan
+};
+
+// ---------- Strategy ----------
+struct FineStrategy {
+    virtual ~FineStrategy() {}
+    virtual Paise fine(long daysLate) const = 0;
+};
+struct PerDayFine : FineStrategy {
+    Paise rate, cap;
+    PerDayFine(Paise r, Paise c) : rate(r), cap(c) {}
+    Paise fine(long late) const override { return std::min&lt;Paise&gt;(std::max(0L, late) * rate, cap); }
+};
+struct GraceThenPerDayFine : FineStrategy {
+    long grace; Paise rate;
+    GraceThenPerDayFine(long g, Paise r) : grace(g), rate(r) {}
+    Paise fine(long late) const override { return std::max(0L, late - grace) * rate; }
+};
+
+// ---------- Observer ----------
+typedef std::function&lt;void(const Member&amp;, const Book&amp;, long)&gt; Listener;
+
+class LibraryService {
+    mutable Mutex mu_;   // the facade lock: every public call holds it
+    static const int HOLD_DAYS = 3;
+    std::vector&lt;std::unique_ptr&lt;Book&gt;&gt; books;                       // stable addresses
+    std::map&lt;std::string, Book*&gt; byIsbn;
+    std::map&lt;std::string, std::vector&lt;BookCopy*&gt;&gt; copiesByIsbn;
+    std::map&lt;std::string, std::unique_ptr&lt;BookCopy&gt;&gt; copies;
+    std::map&lt;std::string, Member&gt; members;
+    std::map&lt;std::string, std::unique_ptr&lt;Loan&gt;&gt; active;            // barcode -&gt; loan
+    std::map&lt;std::string, std::deque&lt;std::string&gt;&gt; waitlist;
+    std::map&lt;MemberType, std::unique_ptr&lt;FineStrategy&gt;&gt; fines;
+    std::vector&lt;Listener&gt; listeners;
+
+    const Book&amp; book(const std::string&amp; isbn) const {
+        auto it = byIsbn.find(isbn);
+        if (it == byIsbn.end()) throw LibraryError("unknown book " + isbn);
+        return *it-&gt;second;
+    }
+    Member&amp; member(const std::string&amp; id) {
+        auto it = members.find(id);
+        if (it == members.end()) throw LibraryError("unknown member " + id);
+        return it-&gt;second;
+    }
+    BookCopy&amp; copy(const std::string&amp; barcode) {
+        auto it = copies.find(barcode);
+        if (it == copies.end()) throw LibraryError("unknown copy " + barcode);
+        return *it-&gt;second;
+    }
+    bool hasTitle(const Member&amp; m, const Book&amp; b) const {
+        for (const auto&amp; kv : m.loans) if (kv.second-&gt;copy-&gt;book == &amp;b) return true;
+        return false;
+    }
+    void passToNext(BookCopy&amp; c) {
+        auto&amp; q = waitlist[c.book-&gt;isbn];
+        if (q.empty()) return;
+        Member&amp; next = member(q.front());
+        q.pop_front();
+        c.moveTo(CopyStatus::ON_HOLD);
+        c.holdFor = next.id;
+        c.holdUntil = today + HOLD_DAYS;
+        for (const auto&amp; l : listeners) l(next, *c.book, c.holdUntil);
+    }
+
+public:
+    long today;
+    explicit LibraryService(long t) : today(t) {
+        fines[MemberType::STUDENT].reset(new PerDayFine(1000, 50000));
+        fines[MemberType::FACULTY].reset(new GraceThenPerDayFine(2, 500));
+    }
+    void subscribe(Listener l) { LockGuard g(mu_); listeners.push_back(l); }
+    void addBook(const Book&amp; b) { LockGuard g(mu_); books.emplace_back(new Book(b)); byIsbn[b.isbn] = books.back().get(); copiesByIsbn[b.isbn]; }
+    void addCopy(const std::string&amp; barcode, const std::string&amp; isbn, const std::string&amp; rack) { LockGuard g(mu_);
+        std::unique_ptr&lt;BookCopy&gt; c(new BookCopy());
+        c-&gt;barcode = barcode; c-&gt;rack = rack; c-&gt;book = &amp;book(isbn);
+        copiesByIsbn[isbn].push_back(c.get());
+        copies[barcode] = std::move(c);
+    }
+    void addMember(const std::string&amp; id, const std::string&amp; name, MemberType t) { LockGuard g(mu_);
+        Member m; m.id = id; m.name = name; m.type = t; members[id] = m;
+    }
+
+    std::vector&lt;std::string&gt; search(std::string q) const { LockGuard g(mu_);
+        auto lower = [](std::string s) { for (auto&amp; ch : s) ch = static_cast&lt;char&gt;(std::tolower(static_cast&lt;unsigned char&gt;(ch))); return s; };
+        q = lower(q);
+        std::vector&lt;std::string&gt; out;
+        for (const auto&amp; b : books) {
+            if (lower(b-&gt;title + " " + b-&gt;author + " " + b-&gt;subject).find(q) == std::string::npos) continue;
+            const auto&amp; cs = copiesByIsbn.at(b-&gt;isbn);
+            int freeN = 0;
+            for (const auto* c : cs) if (c-&gt;status == CopyStatus::AVAILABLE) ++freeN;
+            out.push_back(b-&gt;title + " by " + b-&gt;author + " [" + std::to_string(freeN) + "/" + std::to_string(cs.size()) + " available]");
+        }
+        return out;
+    }
+
+    Loan borrow(const std::string&amp; memberId, const std::string&amp; isbn) { LockGuard g(mu_);
+        Member&amp; m = member(memberId);
+        const Book&amp; b = book(isbn);
+        if (m.dues &gt; 0) throw LibraryError("pay dues " + fmt(m.dues) + " first");
+        if (static_cast&lt;int&gt;(m.loans.size()) &gt;= maxLoans(m.type)) throw LibraryError("loan limit " + std::to_string(maxLoans(m.type)) + " reached");
+        if (hasTitle(m, b)) throw LibraryError("already has a copy of " + b.title);
+        BookCopy* pick = nullptr;
+        bool held = false;
+        for (auto* c : copiesByIsbn[isbn]) if (c-&gt;status == CopyStatus::ON_HOLD &amp;&amp; c-&gt;holdFor == memberId) pick = c;
+        if (!pick) for (auto* c : copiesByIsbn[isbn]) if (c-&gt;status == CopyStatus::AVAILABLE) { pick = c; break; }
+        for (auto* c : copiesByIsbn[isbn]) if (c-&gt;status == CopyStatus::ON_HOLD) held = true;
+        if (!pick) throw LibraryError(held ? "all copies are on hold for other members" : "no copy available; reserve it");
+        pick-&gt;moveTo(CopyStatus::BORROWED);
+        auto&amp; q = waitlist[isbn];
+        q.erase(std::remove(q.begin(), q.end(), memberId), q.end());
+        std::unique_ptr&lt;Loan&gt; loan(new Loan{pick, memberId, today, today + loanDays(m.type), false});
+        m.loans[pick-&gt;barcode] = loan.get();
+        Loan copyOut = *loan;
+        active[pick-&gt;barcode] = std::move(loan);
+        return copyOut;
+    }
+
+    int reserve(const std::string&amp; memberId, const std::string&amp; isbn) { LockGuard g(mu_);
+        Member&amp; m = member(memberId);
+        const Book&amp; b = book(isbn);
+        for (auto* c : copiesByIsbn[isbn]) if (c-&gt;status == CopyStatus::AVAILABLE) throw LibraryError("a copy is available; borrow it instead");
+        if (hasTitle(m, b)) throw LibraryError("already has a copy of " + b.title);
+        auto&amp; q = waitlist[isbn];
+        if (std::find(q.begin(), q.end(), memberId) != q.end()) throw LibraryError("already in the queue");
+        q.push_back(memberId);
+        return static_cast&lt;int&gt;(q.size());
+    }
+
+    Paise returnCopy(const std::string&amp; barcode) { LockGuard g(mu_);
+        BookCopy&amp; c = copy(barcode);
+        if (c.status != CopyStatus::BORROWED) throw LibraryError(barcode + " is not on loan");
+        std::unique_ptr&lt;Loan&gt; loan = std::move(active[barcode]);
+        active.erase(barcode);
+        Member&amp; m = member(loan-&gt;memberId);
+        m.loans.erase(barcode);
+        Paise f = fines[m.type]-&gt;fine(today - loan-&gt;due);
+        m.dues += f;
+        c.moveTo(CopyStatus::AVAILABLE);
+        passToNext(c);
+        return f;
+    }
+
+    int expireHolds() { LockGuard g(mu_);
+        int n = 0;
+        for (auto&amp; kv : copies) {
+            BookCopy&amp; c = *kv.second;
+            if (c.status == CopyStatus::ON_HOLD &amp;&amp; today &gt; c.holdUntil) { ++n; c.moveTo(CopyStatus::AVAILABLE); passToNext(c); }
+        }
+        return n;
+    }
+
+    void renew(const std::string&amp; barcode) { LockGuard g(mu_);
+        BookCopy&amp; c = copy(barcode);
+        if (c.status != CopyStatus::BORROWED) throw LibraryError(barcode + " is not on loan");
+        size_t waiting = waitlist[c.book-&gt;isbn].size();
+        if (waiting &gt; 0) throw LibraryError("cannot renew: " + std::to_string(waiting) + " member(s) waiting");
+        Loan&amp; l = *active[barcode];
+        if (l.renewed) throw LibraryError("already renewed once");
+        l.due += loanDays(member(l.memberId).type);
+        l.renewed = true;
+    }
+
+    void payDues(const std::string&amp; memberId, Paise p) { LockGuard g(mu_);
+        Member&amp; m = member(memberId);
+        if (p &lt;= 0 || p &gt; m.dues) throw LibraryError("invalid payment");
+        m.dues -= p;
+    }
+    CopyStatus statusOf(const std::string&amp; barcode) { LockGuard g(mu_); return copy(barcode).status; }
+};
+
+static int checks = 0;
+void check(bool ok, const char* what) {
+    if (!ok) { std::cerr &lt;&lt; "check failed: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); }
+    ++checks;
+}
+void attempt(const std::string&amp; label, const std::function&lt;void()&gt;&amp; fn) {
+    try { fn(); std::cout &lt;&lt; label &lt;&lt; " -&gt; ok\n"; }
+    catch (const LibraryError&amp; e) { std::cout &lt;&lt; label &lt;&lt; " -&gt; rejected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+}
+
+int main() {
+    LibraryService lib(daysFromCivil(2026, 11, 1));
+    int sent = 0;
+    lib.subscribe([&amp;sent](const Member&amp; m, const Book&amp; b, long until) {
+        ++sent;
+        std::cout &lt;&lt; "  notify " &lt;&lt; m.id &lt;&lt; ": '" &lt;&lt; b.title &lt;&lt; "' is ready for pickup until " &lt;&lt; dateStr(until) &lt;&lt; "\n";
+    });
+    lib.addBook(Book{"B1", "Clean Code", "Robert Martin", "Software"});
+    lib.addBook(Book{"B2", "Linux Kernel Development", "Robert Love", "Operating systems"});
+    lib.addBook(Book{"B3", "TCP/IP Illustrated", "W. Richard Stevens", "Networking"});
+    lib.addCopy("C1", "B1", "R1-S2");
+    lib.addCopy("C2", "B1", "R1-S2");
+    lib.addCopy("C3", "B2", "R4-S1");
+    lib.addCopy("C4", "B3", "R5-S3");
+    lib.addMember("m1", "Asha", MemberType::STUDENT);
+    lib.addMember("m2", "Ben", MemberType::STUDENT);
+    lib.addMember("m3", "Chitra", MemberType::FACULTY);
+
+    std::cout &lt;&lt; "== 2026-11-01 search 'robert'\n";
+    for (const auto&amp; s : lib.search("robert")) std::cout &lt;&lt; "  " &lt;&lt; s &lt;&lt; "\n";
+    Loan l1 = lib.borrow("m1", "B2");
+    std::cout &lt;&lt; "m1 borrows B2 -&gt; " &lt;&lt; l1.copy-&gt;barcode &lt;&lt; " due " &lt;&lt; dateStr(l1.due) &lt;&lt; "\n";
+    Loan l2 = lib.borrow("m1", "B1");
+    std::cout &lt;&lt; "m1 borrows B1 -&gt; " &lt;&lt; l2.copy-&gt;barcode &lt;&lt; " due " &lt;&lt; dateStr(l2.due) &lt;&lt; "\n";
+    attempt("m1 borrows B3", [&amp;] { lib.borrow("m1", "B3"); });
+    attempt("m2 borrows B2", [&amp;] { lib.borrow("m2", "B2"); });
+    std::cout &lt;&lt; "m2 reserves B2 -&gt; position " &lt;&lt; lib.reserve("m2", "B2") &lt;&lt; "\n";
+    std::cout &lt;&lt; "m3 reserves B2 -&gt; position " &lt;&lt; lib.reserve("m3", "B2") &lt;&lt; "\n";
+    attempt("m3 reserves B1", [&amp;] { lib.reserve("m3", "B1"); });
+    attempt("m1 renews C3", [&amp;] { lib.renew("C3"); });
+
+    std::cout &lt;&lt; "== 2026-11-10 m1 returns C1 early\n";
+    lib.today = daysFromCivil(2026, 11, 10);
+    std::cout &lt;&lt; "fine " &lt;&lt; fmt(lib.returnCopy("C1")) &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "== 2026-11-18 m1 returns C3, 3 days late\n";
+    lib.today = daysFromCivil(2026, 11, 18);
+    Paise f = lib.returnCopy("C3");
+    std::cout &lt;&lt; "fine " &lt;&lt; fmt(f) &lt;&lt; "\n";
+    check(f == 3000, "student fine");
+    check(lib.statusOf("C3") == CopyStatus::ON_HOLD, "held for queue");
+    attempt("m3 borrows B2", [&amp;] { lib.borrow("m3", "B2"); });
+    attempt("m1 borrows B3", [&amp;] { lib.borrow("m1", "B3"); });
+    lib.payDues("m1", 3000);
+    std::cout &lt;&lt; "m1 pays 30.00\n";
+    attempt("m1 borrows B3", [&amp;] { lib.borrow("m1", "B3"); });
+
+    std::cout &lt;&lt; "== 2026-11-22 m2 never picked up\n";
+    lib.today = daysFromCivil(2026, 11, 22);
+    std::cout &lt;&lt; "expired holds: " &lt;&lt; lib.expireHolds() &lt;&lt; "\n";
+    attempt("m2 borrows B2", [&amp;] { lib.borrow("m2", "B2"); });
+    Loan l3 = lib.borrow("m3", "B2");
+    std::cout &lt;&lt; "m3 borrows B2 -&gt; " &lt;&lt; l3.copy-&gt;barcode &lt;&lt; " due " &lt;&lt; dateStr(l3.due) &lt;&lt; "\n";
+
+    std::cout &lt;&lt; "== 2026-12-26 m3 returns C3, 4 days late\n";
+    lib.today = daysFromCivil(2026, 12, 26);
+    Paise f3 = lib.returnCopy("C3");
+    std::cout &lt;&lt; "fine " &lt;&lt; fmt(f3) &lt;&lt; " (2 days grace, then 5.00 a day)\n";
+    check(f3 == 1000, "faculty grace fine");
+    check(lib.statusOf("C3") == CopyStatus::AVAILABLE &amp;&amp; sent == 2, "shelf + two notices");
+    std::cout &lt;&lt; "All " &lt;&lt; checks &lt;&lt; " checks passed\n";
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <div class="callout note"><p><b>What this C++ version leaves out:</b> it runs 4 of Java's 8 checks: no 6-student race for 2 copies, no faculty-loan-length check, and two of the shelf and notice checks are merged. It prints the same calendar walk.</p></div>
+
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+== 2026-11-01 search 'robert'
+  Clean Code by Robert Martin [2/2 available]
+  Linux Kernel Development by Robert Love [1/1 available]
+m1 borrows B2 -&gt; C3 due 2026-11-15
+m1 borrows B1 -&gt; C1 due 2026-11-15
+m1 borrows B3 -&gt; rejected: loan limit 2 reached
+m2 borrows B2 -&gt; rejected: no copy available; reserve it
+m2 reserves B2 -&gt; position 1
+m3 reserves B2 -&gt; position 2
+m3 reserves B1 -&gt; rejected: a copy is available; borrow it instead
+m1 renews C3 -&gt; rejected: cannot renew: 2 member(s) waiting
+== 2026-11-10 m1 returns C1 early
+fine 0.00
+== 2026-11-18 m1 returns C3, 3 days late
+  notify m2: 'Linux Kernel Development' is ready for pickup until 2026-11-21
+fine 30.00
+m3 borrows B2 -&gt; rejected: all copies are on hold for other members
+m1 borrows B3 -&gt; rejected: pay dues 30.00 first
+m1 pays 30.00
+m1 borrows B3 -&gt; ok
+== 2026-11-22 m2 never picked up
+  notify m3: 'Linux Kernel Development' is ready for pickup until 2026-11-25
+expired holds: 1
+m2 borrows B2 -&gt; rejected: all copies are on hold for other members
+m3 borrows B2 -&gt; C3 due 2026-12-22
+== 2026-12-26 m3 returns C3, 4 days late
+fine 10.00 (2 days grace, then 5.00 a day)
+== race: 6 students want Clean Code, 2 copies on the shelf
+borrowed: 2, turned away: 4
+All 8 checks passed
+
+$ python main.py | tail -2; python -m unittest test_main
+fine 10.00 (2 days grace, then 5.00 a day)
+demo OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.003s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main | tail -2
+fine 10.00 (2 days grace, then 5.00 a day)
+All 4 checks passed</code></pre>
+  <div class="callout note"><p>Follow copy C3 through the log: borrowed by m1 on 11-01, returned 3 days late on 11-18 (fine 30.00), held for m2 and m2 notified, m3 turned away, hold expired on 11-22, passed to m3 and m3 notified, borrowed by m3 for 30 days as faculty, returned 4 days late with 2 days of grace (fine 10.00), back on the shelf. Every step is one legal move in the state table.</p></div>

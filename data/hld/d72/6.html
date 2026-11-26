@@ -1,0 +1,99 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Accepting bids consistently under heavy concurrency</h3>
+        <p>The bug to avoid: two servers read "current price 110", both accept 120 and 125 as "higher than 110", and the lower bid overwrites the higher one, or both bidders are told they lead. Options, from weakest to strongest:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 270" role="img" aria-label="Lost update race versus conditional update">
+            <text class="label" x="200" y="22">Read-then-write: lost update</text>
+            <rect class="box svc" x="40" y="40" width="110" height="36"/>
+            <text class="label small" x="95" y="63">server 1</text>
+            <rect class="box svc" x="250" y="40" width="110" height="36"/>
+            <text class="label small" x="305" y="63">server 2</text>
+            <text class="label small" x="95" y="100">read 110</text>
+            <text class="label small" x="305" y="100">read 110</text>
+            <text class="label small" x="95" y="130">write 125</text>
+            <text class="label small" x="305" y="160">write 120</text>
+            <rect class="box kafka" x="110" y="190" width="180" height="40"/>
+            <text class="label small" x="200" y="215">row = 120 (125 lost!)</text>
+            <text class="label" x="600" y="22">Conditional update: one wins</text>
+            <rect class="box svc" x="460" y="40" width="110" height="36"/>
+            <text class="label small" x="515" y="63">server 1</text>
+            <rect class="box svc" x="640" y="40" width="110" height="36"/>
+            <text class="label small" x="695" y="63">server 2</text>
+            <text class="label small" x="515" y="100">SET 125 WHERE</text>
+            <text class="label small" x="515" y="118">price+inc &lt;= 125</text>
+            <text class="label small" x="695" y="100">SET 120 WHERE</text>
+            <text class="label small" x="695" y="118">price+inc &lt;= 120</text>
+            <text class="label small" x="515" y="150">1 row: OK</text>
+            <text class="label small" x="695" y="150">0 rows: TOO_LOW</text>
+            <rect class="box db" x="510" y="190" width="180" height="40"/>
+            <text class="label small" x="600" y="215">row = 125, version + 1</text>
+          </svg>
+          <figcaption>The condition is evaluated inside the database at write time, on the latest version of the row, so the check and the write cannot be separated by another bid.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>Pessimistic lock</strong> <code>SELECT ... FOR UPDATE</code> on the auction row, check, write the bid, update the row, commit. Correct; holds a lock for the whole transaction, so a hot auction queues on it. Fine up to hundreds of bids per second per auction if the transaction is short.</li>
+          <li><strong>Conditional update (optimistic, single statement)</strong> The usual best answer:
+            <pre><code class="language-sql">UPDATE auction
+   SET current_price = :amount, leader_id = :bidder, bid_count = bid_count + 1, version = version + 1
+ WHERE auction_id = :id AND status = 'LIVE' AND now() &lt; ends_at
+   AND :amount &gt;= CASE WHEN bid_count = 0 THEN start_price
+                    ELSE current_price + increment_for(current_price) END
+RETURNING version;            -- 0 rows: reject with the fresh price</code></pre>
+            Then insert the bid with <code>seq = version</code> in the same transaction. DynamoDB does the same with a <code>ConditionExpression</code>; a failed condition raises <code>ConditionalCheckFailedException</code>, and the write is idempotent if the condition is on the attribute being changed (AWS docs).</li>
+          <li><strong>Per-auction serialisation through a partitioned queue</strong> The bid API publishes each bid to Kafka keyed by <code>auction_id</code>; one consumer per partition processes bids for that auction strictly in order, keeping the current price in memory (backed by the database) and writing results. No row contention at all and natural ordering, at the cost of an asynchronous answer (the client waits for a result event, typically tens of milliseconds) and more moving parts.</li>
+          <li><strong>Redis Lua script</strong> Keep the hot auction's state in Redis and run check-and-set atomically in a Lua script (Redis runs one script at a time per shard). Very fast; you must still persist durably (write-behind to the database or Kafka) and handle failover carefully.</li>
+        </ol>
+        <p>A good interview path: start with the conditional update (simple, correct, synchronous), then say "if one auction gets thousands of bids a second, I move that auction's bids onto a Kafka partition with a single consumer", which is the queue option. This is exactly the "conflict resolution between simultaneous bids" follow-up from the Razorpay round. See also <a href="{{BASE}}hld/p02">Dealing with Contention</a>.</p>
+        <div class="callout warn"><p>Do not use a distributed lock (Redis SETNX) around a read-then-write as your main answer. Locks expire during GC pauses and network stalls, and then two writers proceed. A conditional write inside the store that owns the data is simpler and safer; if you must lock, add a fencing token.</p></div>
+
+        <h3>2. Proxy bidding and ties</h3>
+        <p>eBay's automatic bidding lets you enter the most you are willing to pay; eBay then bids for you in increments, only enough to keep you ahead, never above your maximum. Increments depend on the price (eBay's table runs from $0.05 for prices under $1 to $100 for prices of $5,000 and up).</p>
+        <ul>
+          <li>Store the leader's secret maximum on the auction row (<code>leader_max</code>), never shown to others.</li>
+          <li>New bid with max M from a different bidder: if <code>M &gt; leader_max</code>, the new bidder leads at <code>min(M, leader_max + increment)</code>; else the old leader stays and the price rises to <code>min(leader_max, M + increment)</code>, recorded as an automatic bid. Both outcomes are one conditional update on the row.</li>
+          <li><b>Ties</b>: the earlier bid wins. With a total order (<code>seq</code>) this is unambiguous: whoever reached the row first holds the lead. Never use client timestamps.</li>
+          <li>Proxy bidding also reduces sniping pressure, because a sniper must beat your maximum, not your last visible bid.</li>
+        </ul>
+
+        <h3>3. Closing exactly at the end time, and anti-sniping</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Timeline of soft close extending end time when a late bid arrives">
+            <path class="arrow" d="M30 120 L780 120"/>
+            <text class="label small" x="60" y="145">listing</text>
+            <rect class="box db" x="420" y="100" width="6" height="40"/>
+            <text class="label small" x="423" y="160">original end 10:00:00</text>
+            <rect class="box kafka" x="380" y="70" width="10" height="30"/>
+            <text class="label small" x="330" y="60">bid at 09:59:30</text>
+            <rect class="zone" x="300" y="95" width="126" height="50"/>
+            <text class="label small" x="363" y="185">last 2 min window</text>
+            <rect class="box cache" x="560" y="100" width="6" height="40"/>
+            <text class="label small" x="600" y="160">new end 10:01:30</text>
+            <path class="arrow dashed" d="M426 90 C 470 50 520 50 560 96"/>
+            <text class="label small" x="495" y="40">ends_at = bid_ts + 120 s</text>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M300 120 L426 120 L563 120"/></circle>
+          </svg>
+          <figcaption>A soft close: a bid inside the final window pushes the end time out, in the same conditional update that accepts the bid.</figcaption>
+        </figure>
+        <ul>
+          <li><b>The bid check enforces the end, not the closer.</b> <code>now() &lt; ends_at</code> in the conditional update, using the database's clock (one clock, no skew between app servers). A bid at 10:00:00.001 is rejected even if the closer has not run yet.</li>
+          <li><b>Closer</b>: poll <code>auction_ending</code> index every second (<code>ends_at &lt;= now() AND status='LIVE'</code>, with <code>SKIP LOCKED</code> across instances), or schedule a delayed message per auction at <code>ends_at</code> (a Redis sorted set by end time, or a delay queue). On firing, re-read: if <code>ends_at</code> moved (soft close), reschedule; else <code>UPDATE ... SET status='CLOSED' WHERE status='LIVE' AND ends_at &lt;= now()</code>. Conditional, so duplicates are harmless.</li>
+          <li><b>10M auctions</b> spread their end times, but sellers like round times (Sunday 20:00). Shard the closer by auction id and size it for the busiest minute: say 50K auctions ending at 20:00 closed within a few seconds = tens of thousands of conditional updates, spread over shards.</li>
+          <li><b>Anti-sniping options</b>: soft close (extend by N seconds when a bid lands in the last N seconds; many auction sites do this), proxy bidding (eBay keeps a fixed end time and relies on automatic bids), or a sealed final phase. The extension is part of the bid's conditional update: <code>ends_at = GREATEST(ends_at, now() + soft_close)</code>. Cap total extensions if the business wants a hard stop.</li>
+          <li><b>Announce</b> the new <code>endsAt</code> in every price event, so all clients count down to the server's time, not their own guess.</li>
+        </ul>
+
+        <h3>4. Real-time updates to watchers</h3>
+        <p>An accepted bid produces one event; a hot auction may have 100K watchers. Pattern: clients open SSE (one-way is enough) or a WebSocket to a gateway; the gateway subscribes to Redis channel <code>auction:{id}</code> while it has watchers for that auction; the publisher sends <code>{version, price, bidCount, endsAt}</code>. Because Redis pub/sub is at-most-once, every message carries the version and clients refetch <code>GET /auctions/{id}</code> on a gap or reconnect. For a hot auction, coalesce: send at most a few updates per second per auction (the latest state wins); watchers do not need every intermediate bid, only the current price. Polling every 2 to 5 seconds is a valid fallback and an honest SDE-1 answer. Full treatment in <a href="{{BASE}}hld/p01">Real-time Updates</a> and <a href="{{BASE}}hld/d44">Live Comments</a>.</p>
+
+        <h3>5. Settlement: winner, reserve, payment, second chance</h3>
+        <ol class="steps">
+          <li><strong>Reserve check</strong> If the final price is below the hidden reserve, the auction closes with no sale; seller and top bidder are told.</li>
+          <li><strong>Create the order</strong> Settlement creates an order and a payment request for the winner with an idempotency key <code>auction_id</code>, and a deadline (for example 48 hours). If the bidder has a saved payment method and agreed to auto-pay, charge immediately.</li>
+          <li><strong>Notify</strong> Winner, seller, and all other bidders ("auction ended").</li>
+          <li><strong>Non-payment</strong> After the deadline, mark EXPIRED, optionally offer the item to the second-highest bidder at their bid (second chance), and record the non-paying bidder (strike).</li>
+          <li><strong>Saga</strong> Payment success then order confirmed then seller payout after delivery. Each step has a compensating action (refund, relist). See <a href="{{BASE}}hld/d10">Payment System</a> and <a href="{{BASE}}hld/p03">Multi-step Processes</a>.</li>
+        </ol>
+        <div class="callout note"><p><b>Consistency vs availability</b> (a follow-up the Razorpay interviewer pushed): bids are CP. If the auction's shard leader is unreachable, reject bids for that auction ("try again") rather than accept them on a replica that might disagree. Browsing, search and the live price feed are AP: show slightly stale data rather than an error. Saying exactly where you draw that line is the answer.</p></div>
+      

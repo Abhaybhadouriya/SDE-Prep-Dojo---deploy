@@ -1,0 +1,86 @@
+
+        <h2>Serving embeddings from memory (Redis)</h2>
+  <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+        <p>After training you have two tables: user vectors and item vectors. At request time you need (1) the user's vector by id, in under a millisecond, and (2) the items whose vectors have the highest dot product with it. Recomputing either from the data lake per request is far too slow, so both live in RAM.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 900 320" role="img" aria-label="Serving path: rec service reads the user vector from Redis, runs KNN on the item index, filters and ranks">
+            <rect class="box client" x="20" y="130" width="120" height="60"/>
+            <text class="label" x="80" y="165">App</text>
+            <rect class="box k8s" x="190" y="130" width="170" height="60"/>
+            <text class="label" x="275" y="155">Rec service</text>
+            <text class="label small" x="275" y="175">stateless pods</text>
+            <rect class="box cache" x="440" y="30" width="200" height="60"/>
+            <text class="label" x="540" y="55">user:{id}:vec</text>
+            <text class="label small" x="540" y="75">HGET, ~0.5 ms</text>
+            <rect class="box cache" x="440" y="130" width="200" height="60"/>
+            <text class="label" x="540" y="155">idx:items:v42</text>
+            <text class="label small" x="540" y="175">HNSW KNN 500</text>
+            <rect class="box svc" x="440" y="230" width="200" height="60"/>
+            <text class="label" x="540" y="255">Ranker</text>
+            <text class="label small" x="540" y="275">features, filters</text>
+            <rect class="zone kafka" x="690" y="20" width="190" height="180"/>
+            <text class="zone-label" x="700" y="40">Offline publisher</text>
+            <rect class="box kafka" x="710" y="60" width="150" height="50"/>
+            <text class="label small" x="785" y="90">ALS output v42</text>
+            <rect class="box ghost" x="710" y="130" width="150" height="50"/>
+            <text class="label small" x="785" y="160">alias -&gt; v42</text>
+            <path class="arrow dashed" d="M710 85 L646 60"/>
+            <path class="arrow dashed" d="M710 155 L646 160"/>
+            <path class="arrow" d="M140 160 L184 160"/>
+            <path class="arrow both" d="M360 145 L434 60"/>
+            <path class="arrow both" d="M360 160 L434 160"/>
+            <path class="arrow both" d="M360 175 L434 260"/>
+            <circle class="packet" r="6"><animateMotion dur="4.5s" repeatCount="indefinite" path="M140 160 L190 160 L360 145 L440 60 L360 150 L440 160 L360 170 L440 260 L360 180 L190 165 L140 165"/></circle>
+          </svg>
+          <figcaption>A request does three in-memory hops: fetch the user vector, KNN over item vectors, rank the candidates. The offline job loads a complete new version, then flips an alias, so readers never see a half-written index.</figcaption>
+        </figure>
+
+        <h3>Sizing it</h3>
+        <div class="stats">
+          <div class="stat"><b>512 B</b><span>one 128-dim float32 vector</span></div>
+          <div class="stat"><b>~5 GB</b><span>10M item vectors, raw</span></div>
+          <div class="stat"><b>~1.3 GB</b><span>HNSW links at M = 16 (32 x 4 B per vector on layer 0)</span></div>
+          <div class="stat"><b>~51 GB</b><span>100M user vectors at 128 dims</span></div>
+        </div>
+        <p>Item vectors need an ANN index (you search them). User vectors do not: you only look them up by key, so they can sit in a plain hash, a key-value store like DynamoDB, or even be computed on the fly from recent activity (fold-in: one ALS user solve with the frozen V, a few microseconds). Storing float16 halves memory with little ranking loss; int8 quantises further.</p>
+
+        <h3>Redis commands, end to end</h3>
+        <pre><code class="language-bash"># 1) index over hashes with prefix item:  (HNSW defaults: M 16, EF_CONSTRUCTION 200, EF_RUNTIME 10)
+FT.CREATE idx:items:v42 ON HASH PREFIX 1 item:v42: \
+  SCHEMA category TAG in_stock TAG \
+         emb VECTOR HNSW 10 TYPE FLOAT32 DIM 128 DISTANCE_METRIC IP M 16 EF_CONSTRUCTION 200
+
+# 2) load vectors (raw little-endian float32 bytes; 128 x 4 = 512 bytes each)
+HSET item:v42:991 emb "&lt;512 bytes&gt;" category scifi in_stock yes
+
+# 3) KNN with a filter; LIMIT is needed or you get only 10 rows back
+FT.SEARCH idx:items:v42 "(@in_stock:{yes})=&gt;[KNN 500 @emb $vec EF_RUNTIME 200 AS score]" \
+  PARAMS 2 vec "&lt;user vector bytes&gt;" SORTBY score LIMIT 0 500 RETURN 1 score DIALECT 2</code></pre>
+        <pre class="terminal"><code>127.0.0.1:6379&gt; FT.CREATE idx:items:v42 ON HASH PREFIX 1 item:v42: SCHEMA ...
+OK
+127.0.0.1:6379&gt; HSET item:v42:991 emb "..." category scifi in_stock yes
+(integer) 3
+127.0.0.1:6379&gt; FT.SEARCH idx:items:v42 "(@in_stock:{yes})=&gt;[KNN 500 @emb $vec ...]" ... DIALECT 2
+1) (integer) 500
+2) "item:v42:991"
+3) 1) "score"
+   2) "0.1374"
+4) "item:v42:12"
+...</code></pre>
+        <p>Redis reports distance, not similarity: for <code>IP</code> it is 1 - dot product, so smaller is better and <code>SORTBY score</code> ascending is right. Redis docs recommend FLAT (exact) below about 1M vectors and HNSW above. Redis 8.2 added SVS-VAMANA, a compressed graph index, for memory-bound cases.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is RIB vs FIB. Training in the lake is the routing protocol building the RIB: slow, complete, on cheap storage. The Redis index is the FIB: a compact, read-optimised copy in fast memory, built from the RIB and pushed down. Versioned keys plus an alias flip is make-before-break: build the new table fully, switch the pointer atomically, then garbage-collect the old one. And just like a FIB, it is never the source of truth; you can always rebuild it.</p>
+        </div>
+
+        <div class="callout note"><p><b>Two Redis paths.</b> Redis 8 also has a native <b>Vector Set</b> type (<code>VADD</code> to add, <code>VSIM</code> to query; HNSW with built-in quantisation), the simpler choice for a pure "nearest items to this vector" lookup. Use the Query Engine (<code>FT.CREATE</code> / <code>FT.SEARCH</code>, above) when you need filters such as <code>in_stock</code>, hybrid text-plus-vector queries or aggregations.</p></div>
+        <h3>Rules that keep serving correct</h3>
+        <ul>
+          <li><strong>Same model version on both sides.</strong> A user vector from model v41 dotted with item vectors from v42 is meaningless (the factor axes are re-learned every run). Store the version with the vector and fail closed on mismatch.</li>
+          <li><strong>Inner product vs cosine.</strong> MF is trained for dot product, where vector length carries popularity. Searching by cosine silently removes that signal; searching by raw inner product boosts popular items. Pick deliberately; this is maximum inner product search (MIPS).</li>
+          <li><strong>Cold start fallbacks.</strong> New user: popular-in-region or content-based items until a few clicks arrive, then fold-in. New item: content embedding (text, image) or a boosted exploration slot until it collects interactions.</li>
+          <li><strong>Hot key.</strong> One user vector is read once per request, which is fine; but a global "trending" key read by every request is a hot key. Replicate it or cache it in the pod. See <a href="{{BASE}}hld/p04">Scaling Reads</a>.</li>
+        </ul>
+      

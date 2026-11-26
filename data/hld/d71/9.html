@@ -1,0 +1,132 @@
+
+        <h2>Interview: driving 45 minutes</h2>
+        <div class="callout interview">
+          <p><b>What interviewers actually asked</b> (self-reported interview posts):</p>
+          <ul>
+            <li>Amazon SDE2, 2026-08, hiring-manager HLD round: a recurring subscription service that auto-places orders, for example 2 milk packets every Monday; the interviewer was strict about missing entity attributes. <a href="https://leetcode.com/discuss/post/8487224/" target="_blank" rel="noopener">post</a></li>
+            <li>Razorpay SSE, 2024-12, selected: recurring subscriptions on top of a card-payment flow (redirect, bank 2FA, callback); plans weekly or monthly with different prices, charged automatically each cycle, for example on the 1st of every month for a year. <a href="https://leetcode.com/discuss/post/6179716/" target="_blank" rel="noopener">post</a></li>
+            <li>PhonePe SDE-2, 2024-06, about 1.5 hours: add a subscription feature to an existing e-commerce platform; which services to reuse and which to add, schema, API contracts, failure cases and handling, with many cross-questions. <a href="https://leetcode.com/discuss/post/5241117/" target="_blank" rel="noopener">post</a></li>
+            <li>Walmart Senior, 2025-05, selected: online grocery delivery with and without subscriptions; why a message queue is needed, plus the DB schema. <a href="https://leetcode.com/discuss/post/6782621/" target="_blank" rel="noopener">post</a></li>
+          </ul>
+        </div>
+        <ol class="steps">
+          <li><strong>0-5 min: requirements</strong> Goods or charges or both; frequencies; manage actions; cut-off rule; compliance (pre-debit, AFA). Write "exactly one order and charge per cycle".</li>
+          <li><strong>5-10 min: estimation</strong> Peak cycle day (Monday plus the 1st), orders per second in the window, retries. Conclude: correctness problem, one relational DB.</li>
+          <li><strong>10-20 min: entities and data model</strong> Plan, Subscription, Cycle, Mandate, ScheduleChange, PaymentAttempt, with full attributes. This is where Amazon was strict.</li>
+          <li><strong>20-30 min: architecture and APIs</strong> Reuse table, the sign-up and mandate flow, the scheduler and cycle worker.</li>
+          <li><strong>30-40 min: deep dives</strong> Idempotency per cycle, scheduler options, dunning, races with pause and skip.</li>
+          <li><strong>40-45 min: failures and monitoring</strong> Lag before cut-off, failure rate by decline code, reconciliation mismatches, webhook processing lag.</li>
+        </ol>
+        <div class="callout interview"><p><b>60-second answer, said out loud:</b> "I build a Subscription service and a scheduler and reuse catalogue, order, inventory, payment and notification. A plan defines product, quantity, interval, anchor and price; a subscription copies price and timezone, holds status, mandate and next action time, plus a version for concurrency. Sign-up registers a mandate through the gateway with bank 2FA; the signed webhook activates it. The scheduler claims due subscriptions with SKIP LOCKED, inserts a cycle row keyed by subscription and cycle number, advances the next time, and publishes cycle.due through an outbox. A worker re-checks pause and skip, creates the order and then the charge with keys derived from the cycle, so retries never duplicate. Failed charges go to dunning: soft declines retry over days, hard declines ask for a new method, then the subscription is past due and suspended. A daily reconciliation compares our attempts with the gateway's report."</p></div>
+        <div class="callout note"><p><b>SDE-1 stops here / SDE-2 adds.</b> SDE-1: the entities with sensible attributes, a cron-like scheduler, create order and charge per cycle, a retry on failure, pause and cancel. SDE-2 adds: the cycle primary key and derived idempotency keys, unknown-outcome handling and reconciliation, SKIP LOCKED or bucketed scheduling with look-ahead, the mandate and webhook flow with pre-debit rules, soft vs hard declines, and the cut-off rule with optimistic locking for races.</p></div>
+
+        <h3>Follow-up questions</h3>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Amazon">
+          <summary>List the entities and their attributes for "2 milk packets every Monday".</summary>
+          <div class="answer">
+            <p>Plan (product, quantity, interval unit and count, weekday anchor, price in minor units, currency, trial, max cycles, active). Subscription (customer, plan, status, quantity, locked price, start and end, timezone, address, delivery slot, mandate, cycles done, next cycle number and action time, cancel at period end, version, timestamps). Cycle (subscription, cycle number, due date, state, amount, order id, payment ref, attempts, next retry). Mandate (method, gateway token, max amount, status, validity). ScheduleChange (pause, skip, quantity or address change with effective dates and author). PaymentAttempt (attempt number, idempotency key, status, decline code).</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the boxes first, then say the "easy to forget" attributes out loud: timezone, locked price, minor units, version, max cycles.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Why copy the price into the subscription? (Plan price changes must not silently change existing customers.)</li><li>Where does "skip 7 December" live? (A schedule change row, consumed by the cycle worker.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon,Razorpay">
+          <summary>The scheduler runs twice, or a worker crashes mid-way. How do you guarantee one order and one charge?</summary>
+          <div class="answer">
+            <p>The cycle row with primary key <code>(subscription_id, cycle_no)</code> is created in the same transaction that advances <code>next_cycle_at</code>, so a second run finds nothing due or fails the insert. Downstream calls use keys derived from the cycle (<code>sub:cycle</code> for the order, <code>sub:cycle:attempt</code> for the charge), so retries return the same order and charge. State transitions are guarded by the current state. A timed-out charge stays CHARGING and is resolved by asking the gateway about that key.</p>
+            <div class="approach"><h5>How to answer</h5><p>Walk the crash points one by one (before insert, after order, after charge request) and show each is safe.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>What if the gateway does not support idempotency keys? (Store our reference in the charge's metadata and query by it before retrying.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Razorpay">
+          <summary>Card payments need a redirect, bank 2FA and a callback. How does a subscription charge every month without the customer?</summary>
+          <div class="answer">
+            <p>Authenticate once to create a mandate (or a network token with a merchant-initiated agreement): redirect to the gateway, OTP or 3-D Secure at the bank, return to our page, and a signed webhook confirms. We store only the token and mandate reference. Each month we send the pre-debit notice at least 24 h before (India), then charge the mandate off-session. Debits above Rs 15,000 or above the mandate's max need the customer to authenticate that specific debit.</p>
+            <div class="approach"><h5>How to answer</h5><p>Split on-session (setup) from off-session (each cycle). Say "trust the webhook, not the redirect".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The webhook arrives before the redirect returns. (Fine: the page polls subscription status.)</li><li>The webhook never arrives. (Poll the gateway for pending mandates after N minutes.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Razorpay">
+          <summary>How do you support weekly and monthly plans at different prices, and "the 1st of every month for a year"?</summary>
+          <div class="answer">
+            <p>A plan stores interval unit and count plus an anchor (weekday, or day of month) and max cycles. "1st of every month for a year" is <code>MONTH, 1, monthDay=1, max_cycles=12</code>. Several plans can point to the same product at different prices. The next action time is computed from the anchor in the subscription's timezone; the 31st in short months clamps to the last day.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the plan row; mention calendar edge cases quickly.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Upgrade from weekly to monthly mid-cycle? (Proration or switch at next cycle.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="PhonePe">
+          <summary>You are adding subscriptions to an existing e-commerce platform. What do you reuse and what do you build?</summary>
+          <div class="answer">
+            <p>Reuse catalogue, checkout for the first payment, order management, inventory and delivery slots, payments (extended with mandates) and notifications. Build the subscription service (plans, subscriptions, cycles, changes), the scheduler with cycle workers, and dunning plus reconciliation. Subscription orders are ordinary orders with <code>source=SUBSCRIPTION</code> and an idempotency key, so fulfilment needs no change.</p>
+            <div class="approach"><h5>How to answer</h5><p>Use the reuse table; give each new piece one API contract.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How does inventory plan for subscription demand? (Publish the next week's cycles as a forecast to the warehouse.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="PhonePe,Razorpay">
+          <summary>The monthly charge fails. What happens next?</summary>
+          <div class="answer">
+            <p>Classify the decline. Soft (insufficient funds, issuer unavailable): mark the cycle FAILED, subscription PAST_DUE, schedule retries over days, notify with an update-payment link. Hard (stolen card, revoked mandate): no automatic retry; ask for a new method. After the last retry, apply the merchant's policy: suspend, cancel, or stay past due. Each retry is a new attempt row with its own key; in India each retry needs its own pre-debit notice.</p>
+            <div class="approach"><h5>How to answer</h5><p>Draw the subscription state diagram and name one real policy (Stripe default: up to 8 retries in 2 weeks).</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Do you still deliver the milk while past due? (Policy; usually hold delivery after the first failed cycle.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>A user skips next week at the same moment the scheduler processes their subscription. Who wins?</summary>
+          <div class="answer">
+            <p>Define a cut-off, then serialise per subscription. Both the skip API and the scheduler update the subscription row with optimistic locking (<code>WHERE version = ?</code>) or a row lock; the loser re-reads. The cycle worker also re-reads schedule changes before creating the order. Skips after the cut-off apply to the following cycle, and the UI says so.</p>
+            <div class="approach"><h5>How to answer</h5><p>Say "cut-off plus one serialisation point per subscription" and show the conditional update.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>The order is already created when the skip arrives before cut-off. (Cancel the order and void the charge in a compensating step.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="3" data-topic="hld" data-company="Walmart">
+          <summary>Why do you need a message queue in this design?</summary>
+          <div class="answer">
+            <p>Three reasons. Load: 1.2M Monday orders must not hit order and inventory services at once; the queue lets workers drain at a safe rate. Reliability: a worker crash leaves the message for another worker; retries are natural. Decoupling: one cycle event feeds notifications, analytics, warehouse forecasts and the merchant dashboard without the subscription service calling each. Plus webhooks go on a queue so the endpoint answers fast.</p>
+            <div class="approach"><h5>How to answer</h5><p>Give numbers for the burst, then the three benefits. Add "the DB row is the truth, the message is the trigger".</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>Kafka or SQS? (Either; Kafka if several consumers need the events, SQS if it is a simple work queue.)</li></ul></div>
+          </div>
+        </details>
+
+        <details class="qa" data-level="4" data-topic="hld" data-company="Amazon">
+          <summary>How does the scheduler scale to tens of millions of subscriptions clustered on Mondays and the 1st?</summary>
+          <div class="answer">
+            <p>Start with an indexed poll using SKIP LOCKED across several instances. When the index or the burst hurts, move to a time-bucketed due table with shards: each worker leases one (bucket, shard) slice, so work is spread and claimed without contention. Act at the action time (cut-off or pre-debit time), not the delivery time, which spreads work over the evening. Rate-limit dispatch to downstream capacity.</p>
+            <div class="approach"><h5>How to answer</h5><p>Show the three options and the trigger to move between them.</p></div>
+            <div class="followups"><h5>Likely follow-ups</h5><ul><li>How do you detect a stuck scheduler? (Age of oldest due item; alert well before the cut-off.)</li></ul></div>
+          </div>
+        </details>
+
+        <h3>Scenario drills</h3>
+        <div class="scenario">
+          <h4>Scenario: customers were charged twice on the 1st</h4>
+          <div class="situation">After a deploy on the morning of the 1st, 3,000 customers report two charges.</div>
+          <div class="bad">Weak answer: "Refund them and add a check."</div>
+          <div class="good">Strong answer: refund first (find all <code>cycle</code> rows with two successful attempts via the gateway report). Then root cause: most likely the charge call used a fresh idempotency key on retry (for example a random UUID per call) or the scheduler created cycles without the unique key during a migration. Fix: derive keys from <code>(subscription, cycle, attempt)</code>, never random; treat timeouts as unknown, reconcile before retry; add a daily check "more than one success per cycle" that pages.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>How would you have caught it in testing? (A fake gateway that charges and then times out.)</li></ul></div>
+        </div>
+        <div class="scenario">
+          <h4>Scenario: Monday milk did not arrive for one city</h4>
+          <div class="situation">40K subscriptions in one city had no orders created for Monday.</div>
+          <div class="bad">Weak answer: "Restart the scheduler."</div>
+          <div class="good">Strong answer: check the age-of-oldest-due metric and the cycle states. Likely causes: timezone bug (city in a different zone), the order service rejecting the city's warehouse code, or a poison message blocking a partition. Recovery: process the backlog with the catch-up rule (deliver the same day if the slot allows, else skip and notify, no charge), then fix and add a per-city "orders created vs expected" check before the cut-off.</div>
+          <div class="followups"><h5>Follow-ups</h5><ul><li>What should the customer see? (A proactive notice and no charge for the missed cycle.)</li></ul></div>
+        </div>
+
+        <h3>Common mistakes</h3>
+        <ul>
+          <li>Missing attributes: timezone, locked price, minor units, end date or max cycles, version.</li>
+          <li>One cron job that loops over all subscriptions at midnight, with no claim or idempotency.</li>
+          <li>Retrying a timed-out charge with a new key.</li>
+          <li>Trusting the browser redirect instead of the signed webhook.</li>
+          <li>Storing card numbers instead of gateway tokens.</li>
+          <li>Ignoring pre-debit rules for India, or acting at the delivery time instead of the action time.</li>
+          <li>Building order, inventory and notification logic inside the subscription service instead of reusing them.</li>
+        </ul>
+      

@@ -1,0 +1,135 @@
+
+        <h2>Deep dives</h2>
+        <div class="callout tip"><p><b>Stop here for SDE-1.</b> The stepper with an idempotency key, a reservation and an outbox is a strong SDE-1 answer. SDE-2 rounds dig into the topics below: the exact idempotency mechanics, the saga and its failure cases, oversell, and unknown payment outcomes.</p></div>
+
+        <h3>1. Making Place Order idempotent (for real)</h3>
+        <p>"Use an idempotency key" is the slogan. The interviewer wants the mechanics. There are four rules:</p>
+        <ol class="steps">
+          <li><strong>The client creates the key</strong> once per checkout attempt (when the review page loads) and resends the same key on every retry. A key created on the server after the request arrives is useless: the retry would get a new one.</li>
+          <li><strong>A UNIQUE constraint enforces it</strong>, not a "SELECT then INSERT". Two parallel requests can both pass a SELECT, but only one can win an INSERT.</li>
+          <li><strong>Store the request hash.</strong> The same key with a different body is a client bug. Return an error instead of guessing (Stripe documents this behaviour).</li>
+          <li><strong>Store the final response</strong> and replay it on a retry. If the first request is still running, return 202 "in progress" or make the retry wait briefly.</li>
+        </ol>
+<pre><code class="language-sql">INSERT INTO orders (order_id, customer_id, idempotency_key, request_hash, status, total_minor, currency, quote_id)
+VALUES (5001, 42, '0d5c3f0a-6b0e-4a39-9a51-2f1f8d0b6c11', 'sha256:ab12...', 'PENDING', 1899900, 'INR', 'q_9')
+ON CONFLICT (customer_id, idempotency_key) DO NOTHING;</code></pre>
+<pre class="terminal"><code>INSERT 0 1     -- first click: we own this checkout attempt, run the saga
+INSERT 0 0     -- double click / retry: read the existing row and return its saved response</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="A double click sends two requests with the same key; only the first creates an order">
+            <rect class="box client" x="20" y="90" width="120" height="60"/><text class="label" x="80" y="114">Browser</text><text class="label small" x="80" y="134">key K</text>
+            <rect class="box svc" x="330" y="90" width="140" height="60"/><text class="label" x="400" y="114">Checkout</text><text class="label small" x="400" y="134">INSERT key K</text>
+            <rect class="box db" x="620" y="30" width="160" height="56"/><text class="label" x="700" y="52">INSERT 0 1</text><text class="label small ok" x="700" y="72">order o_5001 created</text>
+            <rect class="box fail" x="620" y="160" width="160" height="56"/><text class="label" x="700" y="182">INSERT 0 0</text><text class="label small" x="700" y="202">replay saved response</text>
+            <path class="arrow" d="M140 110 L322 110"/><path class="arrow" d="M140 130 L322 130"/>
+            <text class="label small" x="230" y="96">click 1</text><text class="label small" x="230" y="152">click 2 (same K)</text>
+            <path class="arrow ok" d="M470 110 L612 60"/><path class="arrow" d="M470 130 L612 185"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M140 110 L400 110 L700 58"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.4s" begin="0.4s" repeatCount="indefinite" path="M140 130 L400 130 L700 188"/></circle>
+          </svg>
+          <figcaption>Both requests carry key K. The database lets only one insert win, so there is exactly one order.</figcaption>
+        </figure>
+        <p>Amazon's Builders' Library describes the same idea for EC2: the caller passes a client request token, and the service returns the original result for repeats. Airbnb's payments team adds a lesson learned the hard way: read and write idempotency records on the <b>primary</b>, never on a lagging replica, or a retry may not "see" the first attempt.</p>
+
+        <h3>2. The saga: orchestrated, with compensations</h3>
+        <p>Inventory, payment and orders are different services with different databases. One ACID transaction across all of them would need <b>two-phase commit (2PC)</b>: every participant locks its rows and waits for a coordinator. If the coordinator dies at the wrong moment, the locks stay held. Across microservices and an external payment provider (which will never join your 2PC), it is not workable.</p>
+        <p>A <b>saga</b> replaces one big transaction with a list of local ones, and each step has a <b>compensating step</b> that semantically undoes it:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>#</th><th>Step (local transaction)</th><th>Compensation</th><th>Kind</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Create order PENDING</td><td>Mark order PAYMENT_FAILED</td><td>compensatable</td></tr>
+              <tr><td>2</td><td>Reserve inventory (TTL)</td><td>Release reservation</td><td>compensatable</td></tr>
+              <tr><td>3</td><td>Authorise payment</td><td>Void authorisation</td><td>compensatable</td></tr>
+              <tr><td>4</td><td>Confirm order + outbox</td><td>(none: this is the pivot)</td><td>pivot</td></tr>
+              <tr><td>5</td><td>Fulfil, capture at ship, email</td><td>Retried until done; cancel = a new refund flow</td><td>retriable</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 250" role="img" aria-label="Saga forward steps and compensations running backwards">
+            <rect class="box client" x="20" y="40" width="130" height="50"/><text class="label small" x="85" y="65">1 order PENDING</text>
+            <rect class="box db" x="200" y="40" width="130" height="50"/><text class="label small" x="265" y="65">2 reserve</text>
+            <rect class="box svc" x="380" y="40" width="130" height="50"/><text class="label small" x="445" y="65">3 authorise</text>
+            <rect class="box kafka" x="560" y="40" width="130" height="50"/><text class="label small" x="625" y="65">4 CONFIRM (pivot)</text>
+            <path class="arrow ok" d="M150 65 L192 65"/><path class="arrow ok" d="M330 65 L372 65"/><path class="arrow ok" d="M510 65 L552 65"/>
+            <rect class="box fail" x="20" y="170" width="130" height="50"/><text class="label small" x="85" y="195">PAYMENT_FAILED</text>
+            <rect class="box fail" x="200" y="170" width="130" height="50"/><text class="label small" x="265" y="195">release hold</text>
+            <rect class="box fail" x="380" y="170" width="130" height="50"/><text class="label small" x="445" y="195">void auth</text>
+            <path class="arrow bad" d="M445 90 L445 162"/>
+            <path class="arrow bad" d="M380 195 L338 195"/><path class="arrow bad" d="M200 195 L158 195"/>
+            <text class="label small bad" x="560" y="130">step 3 fails: undo 2, then 1</text>
+            <text class="label small" x="690" y="200">after 4: only forward</text>
+            <circle class="packet bad" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M445 90 L445 195 L265 195 L85 195"/></circle>
+          </svg>
+          <figcaption>Forward steps run left to right. When step 3 fails, the compensations run right to left. After the pivot there is no going back, only retrying forward.</figcaption>
+        </figure>
+        <p><b>Orchestration vs choreography.</b> In <b>choreography</b> each service listens to events and reacts ("OrderCreated" -&gt; inventory reserves -&gt; "StockReserved" -&gt; payment authorises ...). Nobody owns the whole flow, and with five or more steps it becomes hard to see where an order is stuck. In <b>orchestration</b> one component (the checkout orchestrator, or a workflow engine like Temporal or AWS Step Functions) stores the saga state and calls each step. For checkout, pick orchestration: the flow is business-critical and you want one place that answers "where is order o_5001 right now?".</p>
+        <p><b>Saga rules that interviewers check:</b></p>
+        <ul>
+          <li><b>Persist saga state after every step</b> so a crashed orchestrator resumes instead of starting again.</li>
+          <li><b>Every step and every compensation is idempotent</b>, keyed by <code>(orderId, step)</code>, because resuming means re-sending.</li>
+          <li><b>Compensations must eventually succeed.</b> Retry them with backoff and alert a human if they keep failing. "Void failed" can never be silently dropped.</li>
+          <li><b>Sagas are not isolated.</b> Between steps other users can see the intermediate state (stock looks lower because it is reserved). Design for it with "semantic locks" such as the PENDING status and the reservation itself.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A saga is like a network-wide config push with <b>commit confirmed</b> (Junos or IOS-XR style): apply on each box locally, and if a later box fails, roll back the earlier boxes, instead of holding a lock across the whole network while you wait. The pivot step is the moment you "confirm" the commit. <b>Where it breaks:</b> a router rollback restores the exact old state, but a saga compensation is a <em>new</em> business action (a void, a refund), and others may have seen the intermediate state.</p>
+        </div>
+
+        <h3>3. Inventory: never oversell, and do not lock the world</h3>
+        <p>Three approaches, from weakest to strongest:</p>
+        <ul>
+          <li><b>Check, then write</b> ("SELECT stock; if &gt; 0 then UPDATE"): two buyers both see 1 and both buy. This is a classic race. Never do it.</li>
+          <li><b>Pessimistic lock</b> (<code>SELECT ... FOR UPDATE</code>, then update): correct, but every buyer of that SKU waits in line on one row lock. That is fine for normal items and terrible for a hot one.</li>
+          <li><b>Atomic conditional update</b>: one statement that checks and changes together. Correct, short, and the database does the locking for microseconds only.</li>
+        </ul>
+<pre><code class="language-sql">UPDATE inventory
+   SET reserved = reserved + 1
+ WHERE sku = 'B0-PHONE-128' AND warehouse_id = 7
+   AND on_hand - reserved &gt;= 1;</code></pre>
+<pre class="terminal"><code>UPDATE 1     -- reserved: insert the reservation row with expires_at = now() + interval '15 minutes'
+UPDATE 0     -- not enough stock in warehouse 7: try the next warehouse, or tell the customer</code></pre>
+        <p><b>Reservations expire.</b> A sweeper job finds expired <code>HELD</code> rows and releases them (each release is the same idempotent compensation the saga uses). It must <b>skip</b> any reservation whose payment is still in flight, or a slow payment that later succeeds will find its stock sold to someone else:</p>
+<pre><code class="language-sql">SELECT r.reservation_id
+  FROM reservations r
+ WHERE r.status = 'HELD' AND r.expires_at &lt; now()
+   AND NOT EXISTS (SELECT 1 FROM payments p
+                    WHERE p.order_id = r.order_id
+                      AND p.status IN ('UNKNOWN', 'AUTH_PENDING'));   -- payment still being decided</code></pre>
+        <p> Choose the TTL with the payment flow in mind: long enough for a UPI app switch or a 3-D Secure page, short enough that abandoned checkouts do not hide stock for long.</p>
+        <p><b>Where to reserve: add-to-cart or checkout?</b> Amazon-style shops reserve at checkout, not at add-to-cart. Carts are wish lists and most are abandoned, so reserving at add-to-cart would hide stock from real buyers. The product page's "only 3 left" comes from a cache and is advisory. The decision is made by the conditional update.</p>
+        <p><b>Hot SKUs.</b> When one SKU gets thousands of buyers per second (a lightning deal), one row is the bottleneck. That is the <a href="{{BASE}}hld/d09">flash sale</a> problem: gate the traffic, split stock into sub-counters, and move the counter into Redis. Normal checkout does not need those tricks, and adding them everywhere is over-engineering.</p>
+
+        <h3>4. Payment timeouts: the "unknown" state</h3>
+        <p>The payment provider call times out. Did the bank hold the money or not? You do not know, and guessing either way is a bug:</p>
+        <ul>
+          <li>Assume failure and let the user retry with a <em>new</em> key: you may charge twice.</li>
+          <li>Assume success and ship: you may ship for free.</li>
+        </ul>
+        <p>The correct answer is to store the payment as <b>UNKNOWN</b>, keep the reservation, and <b>ask</b>: query the provider's status API with the <em>same</em> reference, retry the authorisation with the <em>same</em> idempotency key (the provider dedupes it), and wait for the provider's webhook. A <b>reconciliation job</b> compares your payments table with the provider's settlement report daily, and fixes any mismatch with explicit, audited actions. The customer sees "We are confirming your payment" rather than an error.</p>
+        <p><b>Tie this to the reservation sweeper (deep dive 3).</b> "Keep the reservation" only works if the sweeper agrees: it skips reservations whose payment is <code>UNKNOWN</code> or <code>AUTH_PENDING</code>, and when reconciliation finally decides, the saga either confirms the reservation or releases it. (An equivalent design extends <code>expires_at</code> whenever a payment enters UNKNOWN.) Without this link, a 15-minute TTL plus a 20-minute UPI delay is an oversell or a forced refund.</p>
+        <div class="callout warn"><p><b>Webhooks arrive more than once and out of order.</b> Verify the signature, dedupe by the provider's <code>eventId</code>, and apply state changes only forward (AUTHORIZED cannot go back to AUTH_PENDING). Shopify's "Building resilient payment systems" post covers timeouts, circuit breakers, idempotency keys and reconciliation together.</p></div>
+
+        <h3>5. The outbox: reliable events without dual writes</h3>
+        <p>After the order is CONFIRMED, fulfilment must hear about it. The tempting code is "commit, then <code>kafka.send()</code>". If the process dies between the two lines, the order exists but no warehouse ever ships it. Reversing the order (send, then commit) is worse: the warehouse may ship an order that rolled back.</p>
+        <p>The <b>transactional outbox</b> writes the event into an <code>outbox</code> table <em>in the same transaction</em> as the order change. A relay then publishes outbox rows to Kafka: either a poller, or Debezium reading the database's write-ahead log with its Outbox Event Router. The relay is at-least-once, so consumers dedupe by event id. Full walk-through: <a href="{{BASE}}hld/hld-10">distributed transactions and events</a> and the <a href="{{BASE}}devops/pipeline-01">ShopStream pipeline</a>, which builds exactly this.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Order and outbox rows commit together; a CDC relay publishes to Kafka">
+            <rect class="zone db" x="20" y="20" width="330" height="160"/>
+            <text class="zone-label" x="36" y="44">one DB transaction</text>
+            <rect class="box db" x="45" y="70" width="130" height="50"/><text class="label small" x="110" y="95">orders: CONFIRMED</text>
+            <rect class="box db" x="195" y="70" width="130" height="50"/><text class="label small" x="260" y="95">outbox: event row</text>
+            <rect class="box svc" x="400" y="70" width="140" height="50"/><text class="label" x="470" y="95">Debezium</text>
+            <rect class="box kafka" x="590" y="70" width="190" height="50"/><text class="label" x="685" y="95">Kafka order-events</text>
+            <path class="arrow" d="M325 95 L392 95"/><path class="arrow" d="M540 95 L582 95"/>
+            <text class="label small" x="470" y="150">reads the WAL, at-least-once</text>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M260 95 L470 95 L685 95"/></circle>
+          </svg>
+          <figcaption>Both rows commit or neither does. The relay turns committed outbox rows into Kafka messages.</figcaption>
+        </figure>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The outbox is a <b>write-ahead log</b> idea: record the intent durably in the same atomic write as the state change, and let a separate process replay it to the outside world, like a journaling file system replays its journal after a crash. Debezium literally reads the database's own WAL (Postgres) or binlog (MySQL). <b>Where it breaks:</b> a journal is replayed once, by one owner, onto the same disk; outbox rows are delivered at-least-once to many independent consumers over a network, so each consumer must dedupe by event id, and nothing rolls them back if a consumer misbehaves.</p>
+        </div>
+      

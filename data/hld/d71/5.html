@@ -1,0 +1,105 @@
+
+        <h2>Architecture: from "every Monday" to a doorbell</h2>
+        <p>Click <b>Next</b> or <b>Play</b>. The new pieces are the Subscription service and its Scheduler; everything else is an existing e-commerce or payments service we call.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 430" role="img" aria-label="Subscription flow from sign-up and mandate to scheduler, cycle worker, order, payment and notifications">
+            <g data-step="1">
+              <rect class="box client" x="20" y="30" width="130" height="56"/>
+              <text class="label" x="85" y="52">Customer app</text>
+              <text class="label small" x="85" y="72">pick plan</text>
+              <rect class="box svc" x="220" y="30" width="170" height="56"/>
+              <text class="label" x="305" y="52">Subscription svc</text>
+              <text class="label small" x="305" y="72">PENDING_AUTH</text>
+              <path class="arrow" d="M150 58 L216 58"/>
+              <rect class="box db" x="220" y="130" width="170" height="56"/>
+              <text class="label" x="305" y="152">Subscription DB</text>
+              <text class="label small" x="305" y="172">plans, subs, cycles</text>
+              <path class="arrow both" d="M305 86 L305 126"/>
+            </g>
+            <g data-step="2">
+              <rect class="box cache" x="460" y="30" width="150" height="56"/>
+              <text class="label" x="535" y="52">Payment gateway</text>
+              <text class="label small" x="535" y="72">mandate + bank 2FA</text>
+              <path class="arrow dashed" d="M85 86 C 120 120 480 120 520 86"/>
+              <text class="label small" x="300" y="112">redirect, OTP / 3DS</text>
+              <path class="arrow" d="M460 50 L394 50"/>
+              <text class="label small" x="427" y="22">webhook</text>
+            </g>
+            <g data-step="3">
+              <rect class="box k8s" x="20" y="230" width="170" height="56"/>
+              <text class="label" x="105" y="252">Scheduler</text>
+              <text class="label small" x="105" y="272">due buckets, leases</text>
+              <path class="arrow" d="M220 170 L190 240"/>
+            </g>
+            <g data-step="4">
+              <rect class="box kafka" x="250" y="230" width="170" height="56"/>
+              <text class="label" x="335" y="252">Queue: cycle.due</text>
+              <text class="label small" x="335" y="272">key = subscription_id</text>
+              <path class="arrow" d="M190 258 L246 258"/>
+              <rect class="box svc" x="480" y="230" width="150" height="56"/>
+              <text class="label" x="555" y="252">Cycle worker</text>
+              <text class="label small" x="555" y="272">idempotent per cycle</text>
+              <path class="arrow" d="M420 258 L476 258"/>
+            </g>
+            <g data-step="5">
+              <rect class="box svc" x="480" y="340" width="150" height="56"/>
+              <text class="label" x="555" y="362">Order + inventory</text>
+              <text class="label small" x="555" y="382">existing services</text>
+              <path class="arrow" d="M555 286 L555 336"/>
+              <circle class="packet" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M190 258 L480 258 L555 286 L555 340"/></circle>
+            </g>
+            <g data-step="6">
+              <path class="arrow" d="M600 230 L600 90"/>
+              <text class="label small" x="650" y="160">charge with</text>
+              <text class="label small" x="650" y="176">idempotency key</text>
+            </g>
+            <g data-step="7">
+              <rect class="box queue" x="660" y="230" width="120" height="56"/>
+              <text class="label" x="720" y="252">Notification</text>
+              <text class="label small" x="720" y="272">pre-debit, receipt</text>
+              <path class="arrow" d="M630 258 L656 258"/>
+              <rect class="box svc" x="250" y="340" width="170" height="56"/>
+              <text class="label" x="335" y="362">Dunning</text>
+              <text class="label small" x="335" y="382">retry schedule</text>
+              <path class="arrow dashed" d="M480 375 L424 375"/>
+              <path class="arrow dashed" d="M335 340 L335 290"/>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Subscribe.</b> The app calls the Subscription service with the plan, start date, address and slot. We store the subscription as <code>PENDING_AUTH</code>, with the price and timezone copied from the plan.</li>
+            <li><b>Authorise once.</b> We ask the gateway to register a mandate (card e-mandate, UPI AutoPay or e-NACH). The customer is redirected, completes bank 2FA (OTP, 3-D Secure or UPI PIN), and comes back. The truth arrives by a signed <b>webhook</b> (<code>mandate.activated</code>), which flips the subscription to <code>ACTIVE</code> and sets <code>next_cycle_at</code>. This is the "redirect, bank 2FA, callback" flow in the Razorpay question. Webhooks can repeat; handling is idempotent by event id.</li>
+            <li><b>Find what is due.</b> The scheduler repeatedly claims due subscriptions: <code>next_cycle_at &lt;= now()</code> on an indexed column (or a time-bucket table, see deep dive 2), using <code>FOR UPDATE SKIP LOCKED</code> so several scheduler instances share the work without collisions.</li>
+            <li><b>Hand off to a queue.</b> For each claimed subscription it inserts the <code>cycle</code> row (primary key = subscription and cycle number), advances <code>next_cycle_at</code>, and publishes <code>cycle.due</code> via an outbox, all in one transaction. Cycle workers consume at a controlled rate.</li>
+            <li><b>Create the order.</b> The worker re-reads the subscription (paused? skipped? cancelled?), applies any schedule changes, then calls the existing Order service with <code>idempotency key = sub:cycle</code>. Order reserves inventory and books the delivery slot as for any order.</li>
+            <li><b>Charge.</b> The worker asks the Payment service to charge the mandate with idempotency key <code>sub:cycle:attempt</code>. For Indian e-mandates the pre-debit notice went out at least 24 h earlier (the cycle's first step), so the charge is just the execution.</li>
+            <li><b>Notify, retry, recover.</b> Notifications send the pre-debit notice, "your order is on the way" and receipts. A failed charge moves the cycle to <code>FAILED</code> and the dunning component schedules retries; after the last one, the subscription goes to <code>PAST_DUE</code>, then suspends or cancels according to the merchant's setting.</li>
+          </ol>
+        </div>
+
+        <p>The heartbeat of the system, running: every cycle goes round the same loop.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Looping animation of a cycle moving from scheduler to order, charge and notification">
+            <rect class="box k8s" x="20" y="70" width="120" height="56"/>
+            <text class="label" x="80" y="102">Scheduler</text>
+            <rect class="box kafka" x="180" y="70" width="120" height="56"/>
+            <text class="label" x="240" y="102">cycle.due</text>
+            <rect class="box svc" x="340" y="70" width="120" height="56"/>
+            <text class="label" x="400" y="102">Order</text>
+            <rect class="box cache" x="500" y="70" width="120" height="56"/>
+            <text class="label" x="560" y="102">Charge</text>
+            <rect class="box queue" x="660" y="70" width="120" height="56"/>
+            <text class="label" x="720" y="102">Notify</text>
+            <path class="arrow" d="M140 98 L176 98"/>
+            <path class="arrow" d="M300 98 L336 98"/>
+            <path class="arrow" d="M460 98 L496 98"/>
+            <path class="arrow" d="M620 98 L656 98"/>
+            <path class="arrow dashed" d="M560 126 C 560 180 80 180 80 126"/>
+            <text class="label small" x="320" y="190">failed charge: dunning puts a retry back on the schedule</text>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M80 70 L80 50 L720 50 L720 70"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="5s" begin="1.5s" repeatCount="indefinite" path="M560 126 C 560 180 80 180 80 126"/></circle>
+            <text class="label small" x="400" y="40">one cycle = one order + one successful charge</text>
+          </svg>
+          <figcaption>Most cycles take the top path once a week or month; a few failed charges loop back through dunning.</figcaption>
+        </figure>
+      

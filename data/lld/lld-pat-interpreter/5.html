@@ -1,0 +1,321 @@
+
+  <h2>Code: rule engine (Java), pricing formula (Python), packet filter (C++14)</h2>
+  <p>All three programs were compiled and run; output is from the real runs. The Java tab includes a small recursive-descent parser and an operator registry so a new operator needs no new class. Files live in <code>lld-code/lld-pat-interpreter/</code>.</p>
+  <div class="callout note syntax-notes">
+    <p><b>Syntax you will meet in this code</b>, mapped to C. Skim it now and come back when a line puzzles you:</p>
+    <ul>
+      <li><b><code>record Foo(int a, String b)</code></b> (Java): an immutable struct with a constructor, getters (<code>a()</code>, <code>b()</code>), <code>equals</code> and <code>toString</code> generated for you.</li>
+      <li><b>Lambda <code>x -&gt; x * 2</code></b>: a function pointer plus the variables it captured, packed into one object (like a callback with a <code>void *ctx</code>).</li>
+      <li><b><code>Map.of(k1, v1, ...)</code>, <code>List.of(...)</code></b>: build a small read-only map or list in one expression.</li>
+      <li><b><code>static { ... }</code></b>: a block that runs once when the class is loaded, like a module init function.</li>
+      <li><b><code>var</code></b> (Java): let the compiler infer a local variable's type, like C23 <code>auto</code>.</li>
+      <li><b>Python <code>ABC</code> + <code>@abstractmethod</code></b>: a base class that refuses to be instantiated until a subclass fills the marked methods.</li>
+      <li><b>Python <code>lambda x: ...</code></b>: a one-expression anonymous function.</li>
+      <li><b><code>virtual void f() = 0;</code></b> (C++): a pure virtual function: a <code>NULL</code> slot in the ops table that every subclass must fill. <code>override</code> marks the function that fills it.</li>
+      <li><b><code>std::shared_ptr&lt;T&gt;</code></b>: a refcounted pointer, the <code>kref</code> of C++: the object is freed when the last owner drops it.</li>
+    </ul>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c">OOP from C</a>; records, lambdas, generics and the rest also have short entries in <a href="{{BASE}}lld/lld-oop-toolkit">the OOP toolkit</a>.</p>
+  </div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.function.BiPredicate;
+
+// Interpreter: a tiny rule language, e.g.  age &gt;= 18 &amp;&amp; (city == BLR || vip == true) &amp;&amp; !blocked == true
+public class RuleDemo {
+
+    // ---- AbstractExpression ----
+    interface Expr { boolean interpret(Map&lt;String, Object&gt; ctx); }
+
+    // ---- TerminalExpression: one comparison. Operators come from a registry (open for extension) ----
+    static final Map&lt;String, BiPredicate&lt;Object, Object&gt;&gt; OPS = new LinkedHashMap&lt;&gt;();
+    static {
+        OPS.put("==", (a, b) -&gt; String.valueOf(a).equals(String.valueOf(b)));
+        OPS.put("!=", (a, b) -&gt; !String.valueOf(a).equals(String.valueOf(b)));
+        OPS.put("&gt;=", (a, b) -&gt; num(a) &gt;= num(b));
+        OPS.put("&lt;=", (a, b) -&gt; num(a) &lt;= num(b));
+        OPS.put("&gt;",  (a, b) -&gt; num(a) &gt; num(b));
+        OPS.put("&lt;",  (a, b) -&gt; num(a) &lt; num(b));
+    }
+    static double num(Object o) { return Double.parseDouble(String.valueOf(o)); }
+
+    record Compare(String var, String op, String literal) implements Expr {
+        public boolean interpret(Map&lt;String, Object&gt; ctx) {
+            Object actual = ctx.get(var);
+            if (actual == null) return false;                       // unknown field: rule does not match
+            return OPS.get(op).test(actual, literal);
+        }
+        public String toString() { return var + " " + op + " " + literal; }
+    }
+
+    // ---- NonterminalExpressions: one class per grammar rule, each interprets its children ----
+    record And(Expr l, Expr r) implements Expr {
+        public boolean interpret(Map&lt;String, Object&gt; c) { return l.interpret(c) &amp;&amp; r.interpret(c); }
+        public String toString() { return "AND(" + l + ", " + r + ")"; }
+    }
+    record Or(Expr l, Expr r) implements Expr {
+        public boolean interpret(Map&lt;String, Object&gt; c) { return l.interpret(c) || r.interpret(c); }
+        public String toString() { return "OR(" + l + ", " + r + ")"; }
+    }
+    record Not(Expr e) implements Expr {
+        public boolean interpret(Map&lt;String, Object&gt; c) { return !e.interpret(c); }
+        public String toString() { return "NOT(" + e + ")"; }
+    }
+
+    // ---- Parser (not part of the GoF pattern, but you always need one) ----
+    //   or    := and ( "||" and )*
+    //   and   := unary ( "&amp;&amp;" unary )*
+    //   unary := "!" unary | "(" or ")" | IDENT OP VALUE
+    static final class Parser {
+        private final List&lt;String&gt; toks = new ArrayList&lt;&gt;();
+        private int pos = 0;
+
+        Parser(String src) {
+            int i = 0;
+            while (i &lt; src.length()) {
+                char ch = src.charAt(i);
+                if (Character.isWhitespace(ch)) { i++; continue; }
+                String two = i + 1 &lt; src.length() ? src.substring(i, i + 2) : "";
+                if (two.equals("&amp;&amp;") || two.equals("||") || OPS.containsKey(two)) { toks.add(two); i += 2; continue; }
+                if ("()!&lt;&gt;".indexOf(ch) &gt;= 0) { toks.add(String.valueOf(ch)); i++; continue; }
+                int j = i;
+                while (j &lt; src.length() &amp;&amp; (Character.isLetterOrDigit(src.charAt(j)) || src.charAt(j) == '.' || src.charAt(j) == '_')) j++;
+                if (j == i) throw new IllegalArgumentException("bad char '" + ch + "' at " + i);
+                toks.add(src.substring(i, j));
+                i = j;
+            }
+        }
+        private String peek() { return pos &lt; toks.size() ? toks.get(pos) : ""; }
+        private String next() {
+            if (pos &gt;= toks.size()) throw new IllegalArgumentException("unexpected end of rule");
+            return toks.get(pos++);
+        }
+        private void expect(String t) {
+            if (!peek().equals(t)) throw new IllegalArgumentException("expected '" + t + "' but got '" + peek() + "'");
+            pos++;
+        }
+
+        Expr parse() {
+            Expr e = or();
+            if (pos != toks.size()) throw new IllegalArgumentException("unexpected '" + peek() + "'");
+            return e;
+        }
+        private Expr or()  { Expr e = and();   while (peek().equals("||")) { next(); e = new Or(e, and()); }  return e; }
+        private Expr and() { Expr e = unary(); while (peek().equals("&amp;&amp;")) { next(); e = new And(e, unary()); } return e; }
+        private Expr unary() {
+            if (peek().equals("!")) { next(); return new Not(unary()); }
+            if (peek().equals("(")) { next(); Expr e = or(); expect(")"); return e; }
+            String var = next();
+            String op = next();
+            if (!OPS.containsKey(op)) throw new IllegalArgumentException("unknown operator '" + op + "'");
+            return new Compare(var, op, next());
+        }
+    }
+
+    public static void main(String[] args) {
+        String rule = "age &gt;= 18 &amp;&amp; (city == BLR || vip == true) &amp;&amp; !(blocked == true)";
+        Expr tree = new Parser(rule).parse();                     // parse once ...
+        System.out.println("rule : " + rule);
+        System.out.println("tree : " + tree);
+
+        List&lt;Map&lt;String, Object&gt;&gt; users = List.of(
+            Map.of("name", "Asha", "age", 25, "city", "BLR", "vip", false, "blocked", false),
+            Map.of("name", "Ravi", "age", 31, "city", "DEL", "vip", true,  "blocked", false),
+            Map.of("name", "Meena", "age", 16, "city", "BLR", "vip", true, "blocked", false),
+            Map.of("name", "Kabir", "age", 40, "city", "BLR", "vip", false, "blocked", true));
+        for (Map&lt;String, Object&gt; u : users)                       // ... interpret many times
+            System.out.printf("  %-6s -&gt; %b%n", u.get("name"), tree.interpret(u));
+
+        // Extending the language: a new operator is one registry entry, no parser or class change.
+        OPS.put("in", (a, b) -&gt; Arrays.asList(String.valueOf(b).split("_")).contains(String.valueOf(a)));
+        Expr metro = new Parser("city in BLR_MUM_DEL &amp;&amp; age &lt; 30").parse();
+        System.out.println("tree : " + metro);
+        System.out.println("  Asha   -&gt; " + metro.interpret(users.get(0)));
+
+        try { new Parser("age &gt;= 18 &amp;&amp;").parse(); }
+        catch (RuntimeException e) { System.out.println("error: " + e.getMessage()); }
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out RuleDemo.java &amp;&amp; java -cp out RuleDemo
+rule : age &gt;= 18 &amp;&amp; (city == BLR || vip == true) &amp;&amp; !(blocked == true)
+tree : AND(AND(age &gt;= 18, OR(city == BLR, vip == true)), NOT(blocked == true))
+  Asha   -&gt; true
+  Ravi   -&gt; true
+  Meena  -&gt; false
+  Kabir  -&gt; false
+tree : AND(city in BLR_MUM_DEL, age &lt; 30)
+  Asha   -&gt; true
+error: unexpected end of rule</code></pre>
+      <p>Two design choices matter in an interview. <b>Precedence</b> lives in the grammar: <code>&amp;&amp;</code> binds tighter than <code>||</code> because <code>or()</code> calls <code>and()</code>. <b>Extensibility</b>: operators sit in a map, so adding <code>in</code> was one line, with no parser or class change.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Interpreter: a pricing formula language, e.g.  "base * qty - discount" with variables."""
+from abc import ABC, abstractmethod
+
+
+class Expr(ABC):                                 # AbstractExpression
+    @abstractmethod
+    def interpret(self, ctx: dict) -&gt; float: ...
+
+
+class Num(Expr):                                 # TerminalExpression
+    def __init__(self, v):
+        self.v = float(v)
+
+    def interpret(self, ctx):
+        return self.v
+
+    def __repr__(self):
+        return f"{self.v:g}"
+
+
+class Var(Expr):                                 # TerminalExpression
+    def __init__(self, name):
+        self.name = name
+
+    def interpret(self, ctx):
+        if self.name not in ctx:
+            raise KeyError(f"unknown variable '{self.name}'")
+        return float(ctx[self.name])
+
+    def __repr__(self):
+        return self.name
+
+
+class BinOp(Expr):                               # NonterminalExpression
+    FUNCS = {"+": lambda a, b: a + b, "-": lambda a, b: a - b,
+             "*": lambda a, b: a * b, "/": lambda a, b: a / b,
+             "max": max, "min": min}
+
+    def __init__(self, op, left, right):
+        self.op, self.left, self.right = op, left, right
+
+    def interpret(self, ctx):
+        return self.FUNCS[self.op](self.left.interpret(ctx), self.right.interpret(ctx))
+
+    def __repr__(self):
+        return f"({self.left} {self.op} {self.right})"
+
+
+def parse_rpn(text: str) -&gt; Expr:
+    """Reverse Polish notation needs no precedence rules: 'base qty * discount -'."""
+    stack = []
+    for tok in text.split():
+        if tok in BinOp.FUNCS:
+            right, left = stack.pop(), stack.pop()
+            stack.append(BinOp(tok, left, right))
+        elif tok.replace(".", "", 1).isdigit():
+            stack.append(Num(tok))
+        else:
+            stack.append(Var(tok))
+    if len(stack) != 1:
+        raise ValueError("malformed expression")
+    return stack[0]
+
+
+if __name__ == "__main__":
+    # "subtotal minus discount, but never below the minimum order fee"
+    formula = parse_rpn("base qty * discount - fee max")
+    print("tree :", formula)
+    for order in ({"base": 120, "qty": 3, "discount": 50, "fee": 99},
+                  {"base": 40, "qty": 2, "discount": 30, "fee": 99}):
+        print("price:", formula.interpret(order), "for", order)
+    try:
+        formula.interpret({"base": 1})
+    except KeyError as e:
+        print("error:", e)</code></pre>
+<pre class="terminal"><code>$ python interpreter.py
+tree : (((base * qty) - discount) max fee)
+price: 310.0 for {'base': 120, 'qty': 3, 'discount': 50, 'fee': 99}
+price: 99.0 for {'base': 40, 'qty': 2, 'discount': 30, 'fee': 99}
+error: "unknown variable 'qty'"</code></pre>
+      <p>Reverse Polish notation keeps the parser to a dozen lines (no brackets, no precedence), which makes it a good trick when time is short. A missing variable fails loudly instead of silently pricing at zero.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Interpreter in C++14: a tcpdump-like packet filter language, as a tree of expression objects.
+// Filter: (tcp &amp;&amp; dport == 22) || icmp
+// Build: g++ -std=c++14 -Wall interpreter.cpp -o interpreter
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+struct Packet {            // the "context" every expression is evaluated against
+    std::uint8_t proto;    // 1 = ICMP, 6 = TCP, 17 = UDP (IP protocol numbers)
+    std::uint16_t dport;
+    std::string desc;
+};
+
+class Expr {                                     // AbstractExpression
+public:
+    virtual ~Expr() = default;
+    virtual bool interpret(const Packet&amp; p) const = 0;
+    virtual std::string show() const = 0;
+};
+using ExprPtr = std::shared_ptr&lt;const Expr&gt;;
+
+class ProtoIs : public Expr {                    // TerminalExpression: "tcp", "icmp"
+    std::uint8_t proto_; std::string name_;
+public:
+    ProtoIs(std::uint8_t p, std::string n) : proto_(p), name_(std::move(n)) {}
+    bool interpret(const Packet&amp; p) const override { return p.proto == proto_; }
+    std::string show() const override { return name_; }
+};
+
+class DportEq : public Expr {                    // TerminalExpression: "dport == N"
+    std::uint16_t port_;
+public:
+    explicit DportEq(std::uint16_t port) : port_(port) {}
+    bool interpret(const Packet&amp; p) const override { return p.dport == port_; }
+    std::string show() const override { return "dport == " + std::to_string(port_); }
+};
+
+class And : public Expr {                        // NonterminalExpression
+    ExprPtr l_, r_;
+public:
+    And(ExprPtr l, ExprPtr r) : l_(std::move(l)), r_(std::move(r)) {}
+    bool interpret(const Packet&amp; p) const override { return l_-&gt;interpret(p) &amp;&amp; r_-&gt;interpret(p); }
+    std::string show() const override { return "(" + l_-&gt;show() + " &amp;&amp; " + r_-&gt;show() + ")"; }
+};
+
+class Or : public Expr {                         // NonterminalExpression
+    ExprPtr l_, r_;
+public:
+    Or(ExprPtr l, ExprPtr r) : l_(std::move(l)), r_(std::move(r)) {}
+    bool interpret(const Packet&amp; p) const override { return l_-&gt;interpret(p) || r_-&gt;interpret(p); }
+    std::string show() const override { return "(" + l_-&gt;show() + " || " + r_-&gt;show() + ")"; }
+};
+
+int main() {
+    // Built by hand here; a real tool would parse the text into this tree.
+    ExprPtr tcp  = std::make_shared&lt;ProtoIs&gt;(6, "tcp");
+    ExprPtr icmp = std::make_shared&lt;ProtoIs&gt;(1, "icmp");
+    ExprPtr filter = std::make_shared&lt;Or&gt;(std::make_shared&lt;And&gt;(tcp, std::make_shared&lt;DportEq&gt;(22)), icmp);
+
+    std::cout &lt;&lt; "filter: " &lt;&lt; filter-&gt;show() &lt;&lt; "\n";
+    std::vector&lt;Packet&gt; pkts = {
+        {6, 22, "TCP to :22 (ssh)"},
+        {6, 443, "TCP to :443"},
+        {1, 0, "ICMP echo"},
+        {17, 22, "UDP to :22"},
+    };
+    int accepted = 0;
+    for (const auto&amp; p : pkts) {
+        bool ok = filter-&gt;interpret(p);
+        accepted += ok;
+        std::cout &lt;&lt; "  " &lt;&lt; (ok ? "ACCEPT " : "drop   ") &lt;&lt; p.desc &lt;&lt; "\n";
+    }
+    std::cout &lt;&lt; accepted &lt;&lt; " of " &lt;&lt; pkts.size() &lt;&lt; " packets matched\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall interpreter.cpp -o interpreter &amp;&amp; ./interpreter
+filter: ((tcp &amp;&amp; dport == 22) || icmp)
+  ACCEPT TCP to :22 (ssh)
+  drop   TCP to :443
+  ACCEPT ICMP echo
+  drop   UDP to :22
+2 of 4 packets matched</code></pre>
+      <p>The same filter that tcpdump would compile to BPF, here walked as a tree of objects. Sub-trees are <code>shared_ptr&lt;const Expr&gt;</code>, so a common piece (<code>tcp</code>) can be reused in many filters, and the tree is immutable, so many threads can interpret it at once.</p>
+    </div>
+  </div>

@@ -1,0 +1,64 @@
+
+  <h2>Pessimistic, in memory: lock the seat, not the theatre</h2>
+  <p>The simplest correct answer is one lock around the whole booking method (<code>synchronized</code> on the service). It is correct, but every booking for every show in the city now waits in one line. Interviewers will immediately ask "how does this scale?". The better answer is <b>one lock per resource</b>: bookings for different seats never wait for each other.</p>
+<pre><code class="language-java">private final ConcurrentHashMap&lt;String, ReentrantLock&gt; locks = new ConcurrentHashMap&lt;&gt;();
+
+boolean book(String seatId, String user) {
+    ReentrantLock lock = locks.computeIfAbsent(seatId, k -&gt; new ReentrantLock()); // atomic: one lock per seat
+    lock.lock();
+    try {
+        if (owner.containsKey(seatId)) return false;   // check ...
+        owner.put(seatId, user);                       // ... and act, under the SAME lock
+        return true;
+    } finally {
+        lock.unlock();
+    }
+}</code></pre>
+  <p><code>computeIfAbsent</code> matters: a plain <code>get</code>-then-<code>put</code> to create the lock is itself a check-then-act race, and two threads could end up with two different lock objects for the same seat.</p>
+
+  <h3 id="striping">Lock striping: a fixed number of locks</h3>
+  <p>A lock per seat grows without bound (millions of seat-shows). <b>Lock striping</b> uses a fixed array of N locks and maps each seat to <code>stripe = hash(seatId) mod N</code>. Two seats may share a stripe and occasionally wait for each other, but memory is fixed and contention is still spread out. This is how the original <code>ConcurrentHashMap</code> (Java 5 to 7) used 16 segments, and how <code>Striped</code> in Guava works.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 250" role="img" aria-label="Lock striping: many seats hash onto a small fixed array of locks">
+      <text class="label small left" x="20" y="24">seats (millions)</text>
+      <rect class="box client" x="20" y="36" width="90" height="34"/><text class="label small" x="65" y="58">A1</text>
+      <rect class="box client" x="20" y="78" width="90" height="34"/><text class="label small" x="65" y="100">A2</text>
+      <rect class="box client" x="20" y="120" width="90" height="34"/><text class="label small" x="65" y="142">B7</text>
+      <rect class="box client" x="20" y="162" width="90" height="34"/><text class="label small" x="65" y="184">C3</text>
+      <rect class="box client" x="20" y="204" width="90" height="34"/><text class="label small" x="65" y="226">Z9</text>
+      <rect class="box queue" x="250" y="60" width="160" height="150"/>
+      <text class="label" x="330" y="84">hash mod 4</text>
+      <text class="label small" x="330" y="112">same seat always</text>
+      <text class="label small" x="330" y="132">lands on the</text>
+      <text class="label small" x="330" y="152">same stripe</text>
+      <path class="arrow" d="M112 53 L246 90"/>
+      <path class="arrow" d="M112 95 L246 110"/>
+      <path class="arrow" d="M112 137 L246 130"/>
+      <path class="arrow" d="M112 179 L246 160"/>
+      <path class="arrow" d="M112 221 L246 190"/>
+      <rect class="box db" x="560" y="30" width="200" height="38"/><text class="label small" x="660" y="54">stripe 0: A1, C3</text>
+      <rect class="box db" x="560" y="80" width="200" height="38"/><text class="label small" x="660" y="104">stripe 1: A2</text>
+      <rect class="box db" x="560" y="130" width="200" height="38"/><text class="label small" x="660" y="154">stripe 2: B7, Z9</text>
+      <rect class="box db" x="560" y="180" width="200" height="38"/><text class="label small" x="660" y="204">stripe 3: (none yet)</text>
+      <path class="arrow" d="M412 100 L554 50"/>
+      <path class="arrow" d="M412 120 L554 99"/>
+      <path class="arrow" d="M412 150 L554 149"/>
+      <path class="arrow" d="M412 180 L554 199"/>
+    </svg>
+    <figcaption>Fixed memory (N locks), spread contention, rare false sharing of a stripe (A1 and C3 wait for each other although they are different seats). Pick N a few times larger than your thread count.</figcaption>
+  </figure>
+
+  <h3 id="multi">Booking several seats at once (and not deadlocking)</h3>
+  <p>A family books A3, A1 and A2 together. You must take three locks, and if another request takes A2 then A1, you have the ABBA deadlock from <a href="{{BASE}}lld/lld-conc-deadlock#fixes">the deadlock lesson</a>. The rule: <b>sort the seat ids, lock in that order, check all, write all, unlock in reverse</b>. All or nothing: if any seat is taken, book none of them. With striping, sort the distinct stripe indexes instead.</p>
+<pre><code class="language-java">List&lt;String&gt; sorted = new ArrayList&lt;&gt;(seatIds);
+Collections.sort(sorted);                       // global lock order = seat id
+List&lt;ReentrantLock&gt; held = new ArrayList&lt;&gt;();
+try {
+    for (String s : sorted) { ReentrantLock l = lockFor(s); l.lock(); held.add(l); }
+    for (String s : sorted) if (owner.containsKey(s)) return false;   // any taken -&gt; book none
+    for (String s : sorted) owner.put(s, user);
+    return true;
+} finally {
+    for (int i = held.size() - 1; i &gt;= 0; i--) held.get(i).unlock();
+}</code></pre>
+  <div class="callout tip"><p><b>Granularity is the interview conversation.</b> Too coarse (one lock per theatre or per restaurant): simple, safe, slow. Too fine (one lock per seat, plus nesting): fast, but you now own lock ordering and memory growth. A common sweet spot is <b>one lock per show</b>: all seats of one screening share a lock, different shows run in parallel, and multi-seat bookings take only one lock, so deadlock is impossible. Say the options and pick one with a reason.</p></div>

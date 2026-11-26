@@ -1,0 +1,64 @@
+
+  <h2>The NIC ring: a lock-free single-producer single-consumer queue</h2>
+  <p>With <b>exactly one producer and exactly one consumer</b>, you do not need a lock at all. The producer is the only writer of <code>tail</code>; the consumer is the only writer of <code>head</code>. Each side only reads the other's index. All you need is the right memory ordering, so that the consumer cannot see the new <code>tail</code> before it can see the data in the slot. This is the structure of NIC descriptor rings, <code>kfifo</code>, and the Linux tracing ring buffer.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 300" role="img" aria-label="Single producer single consumer ring: producer writes slot then publishes tail with release; consumer reads tail with acquire, reads slot, publishes head">
+      <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="box client" x="20" y="40" width="200" height="90"/>
+      <text class="label big" x="120" y="66">Producer</text>
+      <text class="label small" x="120" y="90">(NIC / one thread)</text>
+      <text class="label small" x="120" y="112">only writes tail</text>
+      <rect class="box client" x="580" y="40" width="200" height="90"/>
+      <text class="label big" x="680" y="66">Consumer</text>
+      <text class="label small" x="680" y="90">(NAPI poll / one thread)</text>
+      <text class="label small" x="680" y="112">only writes head</text>
+      <rect class="box ring" x="260" y="30" width="280" height="110"/>
+      <text class="label" x="400" y="58">slots[N], N = 2^k</text>
+      <text class="label mono" x="400" y="84">atomic head, tail</text>
+      <text class="label small" x="400" y="108">index = counter &amp; (N - 1)</text>
+      <path class="arrow" d="M220 70 L254 70"/>
+      <path class="arrow" d="M540 70 L574 70"/>
+      <rect class="box svc" x="20" y="170" width="370" height="110"/>
+      <text class="label left" x="34" y="194">push: 1. full if tail - head == N</text>
+      <text class="label left" x="34" y="218">2. write slots[tail &amp; mask]</text>
+      <text class="label left" x="34" y="242">3. tail.store(tail+1, release)</text>
+      <text class="label small left" x="34" y="266">release = "data before index" (a doorbell)</text>
+      <rect class="box svc" x="410" y="170" width="370" height="110"/>
+      <text class="label left" x="424" y="194">pop: 1. empty if head == tail(acquire)</text>
+      <text class="label left" x="424" y="218">2. read slots[head &amp; mask]</text>
+      <text class="label left" x="424" y="242">3. head.store(head+1, release)</text>
+      <text class="label small left" x="424" y="266">acquire = "see the data the index promises"</text>
+    </svg>
+    <figcaption>The release store on <code>tail</code> pairs with the consumer's acquire load, exactly like <code>smp_wmb()</code> before a doorbell write and <code>smp_rmb()</code> after reading the hardware's index in a driver.</figcaption>
+  </figure>
+<pre><code class="language-cpp">template &lt;typename T, size_t N&gt;          // N must be a power of two
+class SpscRing {
+public:
+    bool push(const T&amp; v) {               // producer thread only
+        size_t t = tail_.load(std::memory_order_relaxed);
+        if (t - head_.load(std::memory_order_acquire) == N) return false;   // full
+        slots_[t &amp; (N - 1)] = v;                      // 1. write the data
+        tail_.store(t + 1, std::memory_order_release); // 2. then publish the index
+        return true;
+    }
+    bool pop(T&amp; out) {                    // consumer thread only
+        size_t h = head_.load(std::memory_order_relaxed);
+        if (h == tail_.load(std::memory_order_acquire)) return false;       // empty
+        out = slots_[h &amp; (N - 1)];
+        head_.store(h + 1, std::memory_order_release); // give the slot back
+        return true;
+    }
+private:
+    T slots_[N];
+    std::atomic&lt;size_t&gt; head_{0}, tail_{0};           // free-running counters; unsigned wrap is fine
+};
+// Our run: 1,000,000 items through a 256-slot ring, sum checked exactly; the producer
+// sometimes found the ring full and had to retry (a NIC would drop and count instead).</code></pre>
+  <div class="callout warn"><p><b>Only for one-to-one.</b> The moment you have two producers or two consumers, two threads can claim the same slot. Multi-producer lock-free queues need compare-and-swap loops and are much harder to get right (the JDK's <code>ConcurrentLinkedQueue</code> and the LMAX Disruptor are examples). In an interview, use a blocking queue and mention SPSC rings as the high-performance special case; that shows depth without wasting your 45 minutes.</p></div>
+  <p>Other advanced points worth one sentence each in an interview:</p>
+  <ul>
+    <li><b>Batching.</b> <code>drainTo(list, max)</code> takes many items under one lock acquisition, the same reason NAPI processes a budget of packets per poll instead of one interrupt per packet.</li>
+    <li><b>Two locks.</b> <code>LinkedBlockingQueue</code> uses separate put and take locks, so a producer and a consumer can work at the same time when the queue is neither empty nor full.</li>
+    <li><b>False sharing.</b> If <code>head</code> and <code>tail</code> sit on the same cache line, the two cores keep stealing the line from each other. High-performance rings pad them onto separate lines.</li>
+    <li><b>Many queues instead of one.</b> One queue per consumer (or per key hash) removes contention and keeps per-key order, like RSS spreading flows across per-CPU RX queues, or Kafka partitions.</li>
+  </ul>

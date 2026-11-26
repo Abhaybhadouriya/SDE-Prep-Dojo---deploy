@@ -1,0 +1,123 @@
+
+        <h2>CMD vs ENTRYPOINT, shell form vs exec form, and PID 1</h2>
+        <p>This topic causes real production bugs ("why does <code>docker stop</code> always take 10 seconds?") and comes up in almost every Docker interview.</p>
+
+        <h3>ENTRYPOINT is the program, CMD is the default arguments</h3>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Dockerfile</th><th><code>docker run img</code></th><th><code>docker run img -b 0.0.0.0:9000 app:app</code></th></tr></thead>
+            <tbody>
+              <tr><td><code>CMD ["gunicorn","app:app"]</code></td><td><code>gunicorn app:app</code></td><td><code>-b 0.0.0.0:9000 app:app</code> (CMD replaced: Docker tries to run a program called <code>-b</code>, fails)</td></tr>
+              <tr><td><code>ENTRYPOINT ["gunicorn"]</code><br><code>CMD ["app:app"]</code></td><td><code>gunicorn app:app</code></td><td><code>gunicorn -b 0.0.0.0:9000 app:app</code> (CMD replaced, ENTRYPOINT kept)</td></tr>
+              <tr><td><code>ENTRYPOINT ["/server"]</code> only</td><td><code>/server</code></td><td><code>/server -b 0.0.0.0:9000 app:app</code> (arguments appended)</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Rule of thumb: use <code>CMD</code> alone for most apps (easy to override for debugging, for example <code>docker run -it img sh</code>). Use <code>ENTRYPOINT</code> when the image is a single tool, like a CLI, where arguments should be appended. <code>--entrypoint</code> on <code>docker run</code> replaces the ENTRYPOINT.</p>
+
+        <h3>Shell form vs exec form</h3>
+<pre><code class="language-dockerfile"># exec form (JSON list): the program itself becomes PID 1
+CMD ["gunicorn", "-b", "0.0.0.0:8000", "app:app"]
+
+# shell form (plain string): Docker runs /bin/sh -c "..."; for a compound command like this, the SHELL stays PID 1
+CMD echo "starting" &amp;&amp; gunicorn -b 0.0.0.0:8000 app:app</code></pre>
+        <p>Why does it matter? Because of how <code>docker stop</code> works and how Linux treats PID 1.</p>
+        <ul>
+          <li><code>docker stop</code> sends <b>SIGTERM</b> to PID 1 in the container, waits <b>10 seconds</b> (change with <code>-t</code>), then sends <b>SIGKILL</b>.</li>
+          <li>PID 1 of a PID namespace is special: the kernel does <em>not</em> apply default signal actions to it. If PID 1 has no handler for SIGTERM, the signal is simply ignored. Only SIGKILL (sent from outside) always works.</li>
+          <li>With a single simple command some shells (dash, bash) <code>exec</code> it directly, so the bug shows with <code>&amp;&amp;</code> chains, pipes or scripts. Shells differ in how clever they are here, so do not guess: check <code>/proc/1/comm</code> inside the container, as in the lab below.</li>
+          <li>In shell form with a compound command, PID 1 is <code>sh</code>. It has no SIGTERM handler and does not forward the signal to your app. Your app never hears "please shut down", so it cannot finish requests or close connections. After 10 seconds everything is SIGKILLed, and the exit code is 137.</li>
+          <li>PID 1 also has to <b>reap zombies</b>: adopt orphaned child processes and call <code>wait()</code> on them. A normal app does not do that, so a container whose app spawns helper processes can fill up with zombies.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 300" role="img" aria-label="Signal flow: in shell form the SIGTERM stops at sh as PID 1 and the app is killed after 10 seconds; with exec form or tini as PID 1 the app receives SIGTERM and exits cleanly">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label small left" x="20" y="22">shell form</text>
+            <rect class="box client" x="20" y="36" width="150" height="56"/>
+            <text class="label" x="95" y="56">docker stop</text>
+            <text class="label small" x="95" y="76">SIGTERM</text>
+            <rect class="box fail" x="250" y="36" width="160" height="56"/>
+            <text class="label" x="330" y="56">sh -c (PID 1)</text>
+            <text class="label small bad" x="330" y="76">ignores, no forward</text>
+            <rect class="box svc" x="490" y="36" width="140" height="56"/>
+            <text class="label" x="560" y="56">gunicorn</text>
+            <text class="label small" x="560" y="76">PID 7, never told</text>
+            <rect class="box fail" x="660" y="36" width="120" height="56"/>
+            <text class="label small bad" x="720" y="56">10 s later</text>
+            <text class="label small bad" x="720" y="76">SIGKILL, 137</text>
+            <path class="arrow" d="M170 64 L243 64"/>
+            <path class="arrow dashed bad" d="M410 64 L483 64"/>
+            <circle class="packet bad" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M170 64 L250 64"/></circle>
+
+            <text class="label small left" x="20" y="146">exec form (app is PID 1 and handles SIGTERM)</text>
+            <rect class="box client" x="20" y="160" width="150" height="50"/>
+            <text class="label" x="95" y="185">docker stop</text>
+            <rect class="box docker solid" x="250" y="160" width="380" height="50"/>
+            <text class="label white" x="440" y="185">gunicorn (PID 1): drain, close, exit 0</text>
+            <path class="arrow" d="M170 185 L243 185"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M170 185 L330 185"/></circle>
+
+            <text class="label small left" x="20" y="240">--init (tini as PID 1: forwards signals, reaps zombies)</text>
+            <rect class="box client" x="20" y="250" width="150" height="44"/>
+            <text class="label" x="95" y="272">docker stop</text>
+            <rect class="box k8s" x="250" y="250" width="160" height="44"/>
+            <text class="label" x="330" y="272">tini (PID 1)</text>
+            <rect class="box docker solid" x="490" y="250" width="140" height="44"/>
+            <text class="label white" x="560" y="272">node app</text>
+            <path class="arrow" d="M170 272 L243 272"/>
+            <path class="arrow ok" d="M410 272 L483 272"/>
+            <circle class="packet ok" r="6"><animateMotion dur="2.4s" repeatCount="indefinite" path="M170 272 L250 272 L490 272"/></circle>
+          </svg>
+          <figcaption>Red dot: SIGTERM dies at <code>sh</code>, and the app is killed 10 s later. Green dots: the signal reaches a process that knows how to shut down.</figcaption>
+        </figure>
+
+        <p>Measure it yourself. First start two containers that run the same long-lived program, one behind a shell command that has more work after the app (so <code>sh</code> must stay PID 1) and one in exec form. We use <code>sleep</code> as the "app" because it has no SIGTERM handler, so we add <code>--init</code> to the exec-form one to show the fixed behaviour:</p>
+<pre><code class="language-bash"># shell form with a command after the app: sh -c must stay PID 1, sleep is its child
+docker run -d --name shellform alpine:3.24 sh -c 'sleep 1000; echo stopped'
+
+# exec form plus an init: tini is PID 1 and forwards SIGTERM to sleep
+docker run -d --init --name execform alpine:3.24 sleep 1000
+
+# check who is PID 1 in each
+docker exec shellform cat /proc/1/comm
+docker exec execform cat /proc/1/comm</code></pre>
+<pre class="terminal"><code>$ docker exec shellform cat /proc/1/comm
+sh
+$ docker exec execform cat /proc/1/comm
+docker-init</code></pre>
+        <p>Now stop both and compare:</p>
+<pre class="terminal"><code>$ time docker stop shellform
+shellform
+real    0m10.4s
+$ docker inspect -f '{{.State.ExitCode}}' shellform
+137
+$ time docker stop execform
+execform
+real    0m0.6s
+$ docker inspect -f '{{.State.ExitCode}}' execform
+143</code></pre>
+        <p class="muted">Your times will differ slightly. The shell-form container waits the full 10 seconds and is SIGKILLed (137). In the second one the signal reaches <code>sleep</code>, which dies at once; tini reports 128 + 15 = <b>143</b>. A real app with a SIGTERM handler that exits cleanly reports <b>0</b>. Clean up with <code>docker rm shellform execform</code>.</p>
+
+        <div class="callout note">
+          <p><b>Exec form is necessary but not always enough.</b> Even as PID 1 in exec form, a program with no SIGTERM handler ignores SIGTERM (the kernel's PID 1 rule). Node.js and simple Python scripts are common examples. Fixes: handle SIGTERM in your code (<code>process.on('SIGTERM', ...)</code>, Python <code>signal.signal(...)</code>), or run with <code>docker run --init</code>, which starts <b>tini</b> as PID 1 to forward signals and reap zombies. Yelp built <b>dumb-init</b> for exactly this reason in 2016, and Docker later added <code>--init</code>. In Kubernetes, the same SIGTERM, wait, SIGKILL dance happens on every pod shutdown (default grace period 30 seconds).</p>
+        </div>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>PID 1 in a container is <b>init on an embedded board</b>. On your line cards, whatever runs as PID 1 must install signal handlers, reap children and coordinate shutdown, or you get zombies and boards that hang on reboot. In a container, your app is suddenly that init, whether it was written for the job or not. <em>Where it breaks:</em> a board's init usually lives forever; a container's PID 1 exiting ends the whole container immediately, killing every other process in its PID namespace.</p>
+        </div>
+
+        <h3>ARG vs ENV</h3>
+<pre><code class="language-dockerfile"># build-time only; change it with: docker build --build-arg PY_VERSION=3.13 .
+ARG PY_VERSION=3.12
+FROM python:${PY_VERSION}-slim
+# an ARG must be declared again after FROM to be used inside this stage
+ARG APP_VERSION=dev
+# copy it into ENV if the running app needs it
+ENV APP_VERSION=${APP_VERSION}
+# runtime setting: Python log lines appear immediately
+ENV PYTHONUNBUFFERED=1</code></pre>
+        <p class="muted">Note: in a Dockerfile, <code>#</code> starts a comment only at the beginning of a line. A <code>#</code> after an instruction becomes part of its value, so comments always go on their own line.</p>
+        <p><code>ARG</code> exists only while building; <code>ENV</code> is baked into the image config and visible to the running container. Both are readable by anyone with the image (<code>docker history</code>, <code>docker inspect</code>), so neither is safe for passwords or tokens.</p>
+      

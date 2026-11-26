@@ -1,0 +1,68 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Uber's round reports say this part decides the verdict, so know the three races and how each is closed.</p>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two riders race for one driver; the compare-and-set claim lets exactly one win">
+      <rect class="box client" x="20" y="20" width="150" height="44"/><text class="label small" x="95" y="46">Rider u1 thread</text>
+      <rect class="box client" x="20" y="226" width="150" height="44"/><text class="label small" x="95" y="252">Rider u2 thread</text>
+      <rect class="box db" x="320" y="118" width="160" height="64"/><text class="label small" x="400" y="144">Driver p1</text><text class="label small" x="400" y="166">status AVAILABLE</text>
+      <g data-step-only="1">
+        <path class="arrow bad" d="M170 44 L316 128"/><text class="label small left" x="190" y="36">1. reads p1: AVAILABLE</text>
+        <path class="arrow bad" d="M170 246 L316 172"/><text class="label small left" x="190" y="272">1. reads p1: AVAILABLE</text>
+        <rect class="box ring fail" x="320" y="118" width="160" height="64"/>
+        <text class="label bad" x="645" y="140">check, then assign: both book p1</text><text class="label bad" x="645" y="164">one driver, two trips</text>
+      </g>
+      <g data-step="2">
+        <path class="arrow ok" d="M170 44 L316 128"/><text class="label small left ok" x="190" y="36">2. CAS AVAILABLE to ON_TRIP wins</text>
+        <rect class="box ok" x="500" y="20" width="290" height="84"/>
+        <text class="label small" x="645" y="42">Guard: one atomic claim</text><text class="label mono" x="645" y="66">tryReserve() = CAS</text>
+      </g>
+      <g data-step="3">
+        <path class="arrow dashed" d="M170 246 L316 172"/>
+        <rect class="box queue" x="500" y="196" width="290" height="84"/>
+        <text class="label small" x="645" y="218">u2's CAS fails: p1 is ON_TRIP</text><text class="label small" x="645" y="242">u2 tries its next candidate,</text><text class="label small" x="645" y="266">else NoDriverAvailable</text>
+      </g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Both request threads look at p1 in their snapshot and see AVAILABLE. If each then writes "assigned", p1 gets two trips: the check-then-act race.</li>
+      <li>The guard: <code>Driver.tryReserve()</code> is one <code>compareAndSet(AVAILABLE, ON_TRIP)</code> on an <code>AtomicReference</code> (<code>atomic_cmpxchg</code> in kernel terms). Exactly one thread wins it. If any later step fails, the winner calls <code>release()</code>.</li>
+      <li>The loser's CAS returns false because the value is already ON_TRIP. It does not wait for p1; it moves to its next ranked candidate, and with none left it throws NoDriverAvailable and frees its rider.</li>
+    </ol>
+  </div>
+
+  <div class="table-wrap">
+  <table class="table">
+    <thead><tr><th>Race</th><th>What goes wrong</th><th>Our fix</th></tr></thead>
+    <tbody>
+      <tr><td>Two riders, one driver</td><td>Both read "available", both assign: double booking</td><td><code>AtomicReference.compareAndSet(AVAILABLE, ON_TRIP)</code> in <code>tryReserve()</code>; the loser tries the next candidate</td></tr>
+      <tr><td>One rider, two taps</td><td>Two trips for the same rider</td><td><code>busyRiders.add(id)</code> on a concurrent set returns false for the second call; removed on end, cancel or failure</td></tr>
+      <tr><td>Cancel vs start</td><td>Rider cancels while driver presses start; trip ends up CANCELLED but driver thinks it started</td><td>The check-and-set inside <code>Trip.moveTo</code> runs under the trip's lock and is validated; whichever comes second gets an IllegalStateException</td></tr>
+      <tr><td>A listener reads the trip during a change</td><td>A receipts listener sees COMPLETED with fare 0; or a slow listener holds the trip lock and blocks every other caller</td><td><code>complete(fare)</code> sets fare and status together under the lock; listeners are called after the lock is released</td></tr>
+      <tr><td>A step after the claim fails</td><td>The driver stays ON_TRIP with no trip (a leaked claim)</td><td><code>try { build + assign } catch (RuntimeException e) { d.release(); throw e; }</code>, tested in the demo with a failing listener</td></tr>
+      <tr><td>Driver goes offline during matching</td><td>Offline driver gets a trip</td><td><code>goOffline()</code> is also a CAS from AVAILABLE; it cannot succeed once reserved, and reservation fails once offline</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>Why not just synchronize requestRide?</h3>
+  <p>A single lock around the whole request is correct and is a fine first answer. It serialises every booking in the city, though, and the interviewer will ask how it scales. The CAS design keeps the slow parts (scanning, sorting by distance) lock-free and makes only the claim atomic. If the interviewer prefers locks, use one lock per driver (or per geo cell) and say the trade-off: pessimistic locks block, optimistic CAS retries. More on this choice: <a href="{{BASE}}lld/lld-conc-booking">preventing double booking</a> and <a href="{{BASE}}lld/lld-conc-collections">atomics and CAS</a>.</p>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>"Read without a lock, then claim with one atomic instruction, retry on failure" is exactly how lock-free kernel code works: walk an RCU-protected list, pick an entry, then <code>cmpxchg</code> its state. A stale read is harmless because the claim re-checks it. The listener calls are another kernel lesson: do not call slow callbacks while holding a lock you need on the hot path; in production you would hand trip events to a queue (<a href="{{BASE}}lld/lld-conc-producer-consumer">producer-consumer</a>).</p>
+  </div>
+  <h3>Scaling the matcher</h3>
+  <p>Scanning all drivers is O(N) per request. Fine for the round; at 100,000 drivers, index them by location. Divide the city into grid cells (or geohash / H3 hexagons), keep <code>Map&lt;cellId, Set&lt;Driver&gt;&gt;</code> updated on every location ping, and search the pickup cell plus its neighbours, widening the ring until you have enough candidates. The strategy interface does not change; only the candidate source does. The HLD side is in <a href="{{BASE}}hld/p10">geo and proximity queries</a> and <a href="{{BASE}}hld/hld-15">geospatial indexes</a>.</p>
+  <div class="callout warn"><p><b>Java <code>volatile</code> is not C <code>volatile</code>.</b> In C, <code>volatile</code> only stops the compiler from caching the value; it says nothing about other CPUs. In Java, a volatile field gives visibility and ordering between threads: a write behaves like <code>smp_store_release()</code> (a <code>WRITE_ONCE</code> plus a release barrier) and a read like <code>smp_load_acquire()</code>, so everything written before the volatile write is visible to a thread that reads the new value. It does <b>not</b> make <code>count++</code> atomic and takes no lock: use an <code>AtomicLong</code> or a lock for that. Details in <a href="{{BASE}}lld/lld-conc-basics#volatile">Concurrency basics: volatile</a>.</p></div>
+  <div class="bridge">
+    <h4>From your world: the Java primitives on this page</h4>
+    <ul>
+      <li><code>synchronized</code> = a mutex built into every object: locked on entry, unlocked on every exit path, exceptions included (a scoped <code>mutex_lock</code>/<code>mutex_unlock</code>).</li>
+      <li><code>Condition.await</code> / <code>awaitNanos</code>, <code>wait</code> / <code>notifyAll</code> = <code>pthread_cond_wait</code> / <code>pthread_cond_timedwait</code>; always recheck the predicate in a <code>while</code> loop because of spurious wake-ups, as <code>wait_event()</code> does.</li>
+      <li><code>AtomicLong</code>, <code>AtomicReference</code>, <code>compareAndSet</code> = <code>atomic64_t</code> and <code>atomic64_cmpxchg()</code>: one compare-and-swap instruction, no lock.</li>
+      <li><code>ConcurrentHashMap</code>, <code>computeIfAbsent</code>, <code>putIfAbsent</code> = a hash table with per-bucket locking; <code>computeIfAbsent</code> is find-or-insert under the bucket lock, <code>putIfAbsent</code> inserts only if the key is absent, atomically.</li>
+      <li><code>CopyOnWriteArrayList</code> = an RCU-style list: readers walk a snapshot with no lock, writers copy the array and publish it; good for read-mostly listener sets.</li>
+      <li><code>CountDownLatch</code> / <code>Barrier</code> = <code>struct completion</code>: threads wait until a count reaches zero (the tests use it to release all threads at once).</li>
+      <li><code>ExecutorService</code> = a thread pool with a work queue, like a kernel <code>workqueue</code>.</li>
+      <li>Python <code>threading.Lock</code> = a plain mutex; <code>with lock:</code> is lock and unlock on every exit path.</li>
+    </ul>
+    <p>Which collection to use when: <a href="{{BASE}}lld/lld-conc-collections">Concurrent collections</a>.</p>
+  </div>

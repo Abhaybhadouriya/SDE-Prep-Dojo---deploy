@@ -1,0 +1,131 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Never match a player into two games</h3>
+        <p>Matchmaking runs on several instances for availability. At 3,400 queue entries per second, two matchmakers will sometimes pick the same waiting player at the same moment. This is a classic contention problem (see <a href="{{BASE}}hld/p02">Dealing with Contention</a>).</p>
+        <ol class="steps">
+          <li><strong>Naive</strong> Read the queue, pick two players, remove them, create the game. Two instances can both read Bob before either removes him. Bob gets two games.</li>
+          <li><strong>Better: atomic claim</strong> Do the whole "find neighbour + remove both" step in one Redis Lua script. Redis runs a script atomically on a single shard, so only one script can remove Bob. <code>ZREM</code> returns 1 to exactly one caller.</li>
+          <li><strong>Belt and braces: player status lock</strong> Before creating the game, set <code>player:{id}:status</code> from <code>searching</code> to <code>in_game:{gameId}</code> with a compare-and-set. If either set fails, roll back and requeue the other player.</li>
+          <li><strong>Scale out</strong> Shard the queue by <b>time control + region</b> (blitz-EU, blitz-NA, bullet-EU). Each shard is a separate sorted set with one owner, so no cross-shard pairing is needed. Hello Interview asks what to do when matchmaking outgrows Postgres; the answer is this: an in-memory sorted structure per bucket, partitioned so each bucket has a single writer.</li>
+        </ol>
+<p>The caller must already be in the queue (the join API does <code>ZADD mm:blitz:eu &lt;rating&gt; &lt;userId&gt;</code>). The script then removes <b>the caller and the candidate together</b>, and it first checks that the caller is still waiting. Without that first check, a subtle bug remains: Bob's script removes Alice and Bob, then Alice's own matchmaker loop runs the script for Alice, finds Carol and matches Alice a second time. Guarding only the candidate is not enough; you must guard both sides.</p>
+<pre><code class="language-bash">-- KEYS[1] = mm:blitz:eu   ARGV[1] = my userId  ARGV[2] = my rating  ARGV[3] = window
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  return 'ALREADY_MATCHED'                     -- someone else already paired me
+end
+local lo = tonumber(ARGV[2]) - tonumber(ARGV[3])
+local hi = tonumber(ARGV[2]) + tonumber(ARGV[3])
+local cands = redis.call('ZRANGEBYSCORE', KEYS[1], lo, hi, 'LIMIT', 0, 5)
+for _, c in ipairs(cands) do
+  if c ~= ARGV[1] then
+    if redis.call('ZREM', KEYS[1], c, ARGV[1]) == 2 then  -- both removed, atomically
+      return c                                   -- opponent found
+    end
+  end
+end
+return nil                                     -- keep waiting, widen window later</code></pre>
+<p>Because Redis runs the whole script without interleaving other commands, the <code>== 2</code> check is a safety net: inside one script it always holds once the caller passed the first guard. The caller then sets both players' status keys (step 3 above) before creating the game.</p>
+        <p>The rating window should <b>widen with wait time</b>: start at +/- 50, add 25 every 3 seconds, cap at +/- 400. That trades match quality for wait time, and it is a knob product owners love to tune.</p>
+
+        <h3>2. Scaling to 500K concurrent games on many servers</h3>
+        <p>Each game must have exactly one owner, and every message about it must reach that owner. Options:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Approach</th><th>How</th><th>Good</th><th>Bad</th></tr></thead>
+            <tbody>
+              <tr><td>Stateless servers + DB lock per move</td><td>Any server loads the game from Redis, validates, writes back with a version check</td><td>Simple failover</td><td>An extra round trip and a contention point on every move; clocks need a separate timer service</td></tr>
+              <tr><td><b>Sticky owner (actor per game)</b></td><td>Consistent hash on <code>gameId</code> picks the game server; it keeps the game in memory as an actor with its own timer</td><td>One writer, zero locks, microsecond moves, timers are local</td><td>Need routing, ownership leases (a lease is a lock with an expiry: you hold it only while you keep renewing it) and journal-based failover</td></tr>
+              <tr><td>Connect players straight to the game server</td><td>Matchmaker returns the owner's address; clients open a socket to it</td><td>One fewer hop</td><td>Connection storms when a server restarts; hard to put behind a normal LB; mixes connection and game concerns</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Pick the <b>sticky owner</b>. To avoid two owners after a network split, the owner holds a <b>lease</b> for its hash range (for example in etcd or ZooKeeper) and writes a <b>fencing token</b> (the lease epoch) with every journal append. A stale owner that lost its lease gets rejected by the journal. Redis does not check epochs by itself, so the append is a Lua script: read the game's stored epoch, refuse if the writer's epoch is lower, otherwise <code>XADD</code>. Because the script is atomic, the check and the append cannot be split. One more honest caveat: Redis replication is asynchronous, so if the Redis primary fails over, the last few acknowledged moves can be lost. If that is unacceptable, call <code>WAIT 1 &lt;ms&gt;</code> (wait until one replica has the write) before acking, or use a quorum log such as a Raft-backed store. This is the same idea as in <a href="{{BASE}}hld/d55">Distributed Lock Service</a> and <a href="{{BASE}}hld/hld-09">Replication, Consensus &amp; Coordination</a>.</p>
+        <div class="callout note"><p><b>Real-world check:</b> Chess.com ran its live server on literally one machine in Virginia for years and its own help centre says that. Its January 2023 post describes rewriting the live server "from a single server to a distributed service". Its newer Realtime Chess Network now carries more than 99.7% of live games, and its Google Cloud post says gameplay nodes are deployed around the world so each player connects to a nearby node. One machine goes very far; you shard when you must.</p></div>
+
+        <h3>3. Fair clocks over an unfair network</h3>
+        <p>The server owns both clocks. When a move arrives, the server computes <code>elapsed = now - turnStartedAt</code> and subtracts it from the mover's clock. But part of that elapsed time was the move travelling over the network, not the player thinking. Someone on a 300 ms mobile link would be punished on every move.</p>
+        <p>So platforms add <b>lag compensation</b>. Chess.com documents its "lag forgiveness" in detail: travel time to and from the server is credited back, up to a cap per move with a small bank that refills every two moves.</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Time control</th><th>Auto forgiveness per move</th><th>Bank (refills every 2 moves)</th></tr></thead>
+            <tbody>
+              <tr><td>Rapid</td><td>500 ms</td><td>1000 ms</td></tr>
+              <tr><td>Blitz</td><td>300 ms</td><td>400 ms</td></tr>
+              <tr><td>Bullet</td><td>200 ms</td><td>100 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>How to measure lag? The gateway pings the client every few seconds and keeps a moving average of round-trip time; or the client reports its own measured think time and the server trusts it only up to the cap. The cap is the whole point: <b>you can forgive lag, but you cannot let a client invent time</b>. Lichess similarly says its compensation limits depend on the time control and on lag already compensated.</p>
+        <p><b>Detecting flag fall:</b> with 500K games there are up to 500K running clocks. Do not poll. Each game actor schedules one timer at <code>turnStartedAt + remaining</code>; a move cancels it and schedules the opponent's. Implement with a <b>hashed timing wheel</b>: O(1) insert and cancel.</p>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>This is the Linux kernel timer wheel again: millions of TCP retransmit timers that almost always get cancelled before they fire. Chess clocks have the same shape: a timer per game, armed on each move, cancelled on the next move, firing only on a timeout. Same data structure, same O(1) arm/cancel.</p>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 228" role="img" aria-label="Timeline of a move with lag compensation">
+            <path class="arrow none" d="M40 60 L760 60"/>
+            <text class="label small left" x="40" y="16">Server time</text>
+            <path class="arrow none" d="M40 170 L760 170"/>
+            <text class="label small left" x="40" y="200">Bob's phone</text>
+            <path class="arrow" d="M120 60 L220 166"/>
+            <text class="label small left" x="40" y="140">Alice's move arrives</text>
+            <rect class="box svc" x="220" y="150" width="300" height="40"/>
+            <text class="label" x="370" y="170">Bob thinks 10 s</text>
+            <path class="arrow" d="M520 166 L640 64"/>
+            <text class="label small" x="640" y="120">travel 1.2 s</text>
+            <rect class="box cache" x="120" y="22" width="520" height="30"/>
+            <text class="label" x="380" y="38">server saw ~12.2 s pass</text>
+            <text class="label small ok" x="660" y="200">charge ~10 s: travel</text>
+            <text class="label small ok" x="660" y="216">credited back up to the cap</text>
+          </svg>
+          <figcaption>The server sees think time plus network travel. It credits back travel time up to a per-move cap (Chess.com blitz: 300 ms plus a 400 ms bank), so only real thinking is charged.</figcaption>
+        </figure>
+
+        <h3>4. Reconnection and server crashes</h3>
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 260" role="img" aria-label="Game server crash and recovery from journal">
+            <rect class="box client" x="20" y="100" width="120" height="56"/>
+            <text class="label" x="80" y="128">Players</text>
+            <rect class="box svc" x="190" y="100" width="120" height="56"/>
+            <text class="label" x="250" y="128">Gateways</text>
+            <rect class="box cache" x="380" y="190" width="200" height="56"/>
+            <text class="label" x="480" y="210">Redis journal</text>
+            <text class="label small" x="480" y="230">g_9c2: plies 1..22, epoch 4</text>
+            <path class="arrow both" d="M140 128 L184 128"/>
+            <g data-step-only="1">
+              <rect class="box k8s" x="380" y="30" width="200" height="60"/>
+              <text class="label" x="480" y="60">Server 7 (epoch 4)</text>
+              <path class="arrow both" d="M310 120 L374 70"/>
+              <path class="arrow" d="M480 90 L480 184"/>
+            </g>
+            <g data-step="2">
+              <rect class="box fail" x="380" y="30" width="200" height="60"/>
+              <text class="label bad" x="480" y="60">Server 7 crashed</text>
+            </g>
+            <g data-step="3">
+              <rect class="box k8s" x="620" y="100" width="160" height="60"/>
+              <text class="label" x="700" y="122">Server 9</text>
+              <text class="label small" x="700" y="142">new lease, epoch 5</text>
+              <path class="arrow dashed" d="M690 160 L590 210"/>
+              <text class="label small" x="690" y="196">replay</text>
+            </g>
+            <g data-step="4">
+              <path class="arrow both" d="M310 140 C420 170 520 150 614 132"/>
+              <text class="label small" x="460" y="150">sync lastPly=21</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li>Normal play: server 7 owns game g_9c2 under lease epoch 4 and appends every move to the journal before acking.</li>
+            <li>Server 7 dies (OOM, node drain, kernel panic). Its lease in etcd expires after a few seconds. Clocks are frozen for the outage; the server records the pause.</li>
+            <li>The hash ring moves that range to server 9. It takes the lease with epoch 5, reads the journal (22 plies and clock values), rebuilds the board and restarts the timer of the side to move. Any late write from server 7 carries epoch 4 and is rejected.</li>
+            <li>Clients reconnect (with jittered backoff) and send <code>sync lastPly</code>. Server 9 sends the missing plies and current clocks. The game continues.</li>
+          </ol>
+        </div>
+        <p>For a simple network drop on one side, nothing moves: the game stays on its owner, the player's clock keeps running (that is fair, it is their turn), and the opponent sees "Bob disconnected, can claim win in 30 s". The reconnect uses <code>sync</code> to catch up.</p>
+
+        <h3>5. The leaderboard at 10M players</h3>
+        <p>Use a Redis sorted set: <code>ZADD lb:blitz 1734 u_42</code> on each rating change, <code>ZREVRANGE lb:blitz 0 99 WITHSCORES</code> for the top 100, <code>ZREVRANK lb:blitz u_42</code> for "my rank". <code>ZREVRANK</code> is O(log n); <code>ZREVRANGE 0 99</code> is O(log n + 100), because it also walks the 100 members it returns. systemdesign.one notes that computing rank in a relational table needs a <code>COUNT(*) WHERE rating &gt; x</code> style query that can take about 10 seconds on 10M rows even with indexes, which is why the sorted set wins.</p>
+        <p>Two traps. First, update the leaderboard from the <b>rating service</b>, after the rating transaction commits, so the two never disagree for long. Second, many players share the same rating, so break ties (for example score = rating x 10<sup>10</sup> + (10<sup>10</sup> - epochSeconds), so whoever reached the rating first ranks higher and nothing wraps; ratings in the low thousands keep this well inside a double's 53-bit exact range) or accept "tied rank". Rebuild the set nightly from Postgres to repair drift. More detail in <a href="{{BASE}}hld/d22">Real-time Leaderboard</a>.</p>
+      

@@ -1,0 +1,273 @@
+
+  <h2>Code: an order facade, a backup facade, a NIC bring-up facade</h2>
+  <p>Each tab is a complete program that was compiled and run. Java orchestrates four services with rollback on failure. Python wraps five standard library modules behind <code>backup()</code> and <code>verify()</code>, then shows that <code>shutil</code> is itself a facade. C++14 brings a network device up and down, the way a driver's open and stop callbacks hide PHY, DMA and IRQ setup. Files live in <code>lld-code/lld-pat-facade/</code>.</p>
+  <div class="callout tip"><p><b>Map before you read:</b> which class plays which role in the Java tab (<code>FacadeDemo.java</code>). The Python and C++ tabs use the same roles under their own names. Key lines carry a <code>// &lt;-- the pattern</code> comment.</p></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>Pattern role</th><th>Java class</th><th>Lines</th><th>Look for</th></tr></thead><tbody>
+    <tr><td>Subsystem classes</td><td><code>Inventory, PaymentService, Shipping, Notifier</code></td><td>6-39</td><td>still usable directly</td></tr>
+    <tr><td>Facade</td><td><code>OrderFacade</code></td><td>44-68</td><td>placeOrder() runs the steps and undoes on failure</td></tr>
+    <tr><td>Result</td><td><code>OrderResult</code></td><td>42-42</td><td>one simple answer</td></tr>
+    <tr><td>Client</td><td><code>main</code></td><td>70-81</td><td>one call instead of four</td></tr>
+  </tbody></table></div>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+
+public class FacadeDemo {
+
+    // ---------------- Subsystem classes: each does one job, none knows the facade ----------------
+    static final class Inventory {
+        private final Map&lt;String, Integer&gt; stock = new HashMap&lt;&gt;(Map.of("book", 3, "pen", 0));
+        boolean reserve(String sku, int qty) {
+            int have = stock.getOrDefault(sku, 0);
+            if (have &lt; qty) return false;
+            stock.put(sku, have - qty);
+            System.out.println("  inventory: reserved " + qty + " x " + sku);
+            return true;
+        }
+        void release(String sku, int qty) {
+            stock.merge(sku, qty, Integer::sum);
+            System.out.println("  inventory: released " + qty + " x " + sku);
+        }
+    }
+
+    static final class PaymentService {
+        String charge(String user, long paise) {
+            if (paise &gt; 100_000) throw new IllegalStateException("card limit exceeded");
+            System.out.println("  payment: charged " + user + " Rs " + paise / 100);
+            return "PAY-" + Math.abs(user.hashCode() % 1000);
+        }
+        void refund(String paymentId) { System.out.println("  payment: refunded " + paymentId); }
+    }
+
+    static final class Shipping {
+        String book(String address, String sku) {
+            System.out.println("  shipping: pickup booked for " + sku + " to " + address);
+            return "AWB-" + sku.length() + address.length();
+        }
+    }
+
+    static final class Notifier {
+        void send(String user, String msg) { System.out.println("  notify " + user + ": " + msg); }
+    }
+
+    // ---------------- Facade: one simple call for the common use case ----------------
+    record OrderResult(boolean ok, String message) { }
+
+    static final class OrderFacade {
+        private final Inventory inventory;
+        private final PaymentService payments;
+        private final Shipping shipping;
+        private final Notifier notifier;
+
+        OrderFacade(Inventory i, PaymentService p, Shipping s, Notifier n) {   // injected, not new'd
+            inventory = i; payments = p; shipping = s; notifier = n;
+        }
+
+        OrderResult placeOrder(String user, String sku, int qty, long unitPaise, String address) {
+            // &lt;-- the pattern: one call orchestrates the subsystems in order
+            if (!inventory.reserve(sku, qty)) return new OrderResult(false, "out of stock: " + sku);
+            String paymentId;
+            try {
+                paymentId = payments.charge(user, unitPaise * qty);
+            } catch (IllegalStateException e) {
+                inventory.release(sku, qty);                       // undo step 1
+                return new OrderResult(false, "payment failed: " + e.getMessage());
+            }
+            String awb = shipping.book(address, sku);
+            notifier.send(user, "order confirmed, tracking " + awb);
+            return new OrderResult(true, paymentId + " / " + awb);
+        }
+    }
+
+    public static void main(String[] args) {
+        Inventory inv = new Inventory();
+        PaymentService pay = new PaymentService();
+        OrderFacade shop = new OrderFacade(inv, pay, new Shipping(), new Notifier());
+
+        System.out.println("1) " + shop.placeOrder("asha", "book", 1, 49_900, "Pune"));
+        System.out.println("2) " + shop.placeOrder("ravi", "pen", 2, 2_000, "Delhi"));
+        System.out.println("3) " + shop.placeOrder("meera", "book", 2, 60_000, "Goa"));
+
+        // The subsystem is still public: an admin tool can use it directly.
+        pay.refund("PAY-ADMIN");
+    }
+}</code></pre>
+<pre class="terminal"><code>$ javac -d out FacadeDemo.java &amp;&amp; java -cp out FacadeDemo
+  inventory: reserved 1 x book
+  payment: charged asha Rs 499
+  shipping: pickup booked for book to Pune
+  notify asha: order confirmed, tracking AWB-44
+1) OrderResult[ok=true, message=PAY-563 / AWB-44]
+2) OrderResult[ok=false, message=out of stock: pen]
+  inventory: reserved 2 x book
+  inventory: released 2 x book
+3) OrderResult[ok=false, message=payment failed: card limit exceeded]
+  payment: refunded PAY-ADMIN</code></pre>
+      <p>Order 3 shows why the facade earns its place: payment fails and the reservation is released, in one place, for every client. The subsystem objects are passed into the constructor, so a test can hand the facade fakes.</p>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Facade: one backup() call over pathlib, zipfile, hashlib, tempfile and json."""
+import hashlib
+import json
+import tempfile
+import zipfile
+from pathlib import Path
+
+
+class BackupFacade:
+    """The simple entry point. Callers never touch zip, hashing or manifests."""
+
+    def __init__(self, dest_dir: Path):
+        self.dest_dir = dest_dir
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+    def backup(self, src: Path, name: str) -&gt; Path:
+        files = sorted(p for p in src.rglob("*") if p.is_file())
+        archive = self.dest_dir / f"{name}.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+            for f in files:
+                z.write(f, f.relative_to(src).as_posix())
+        manifest = {"archive": archive.name,
+                    "files": len(files),
+                    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest()[:16]}
+        (self.dest_dir / f"{name}.json").write_text(json.dumps(manifest))
+        return archive
+
+    def verify(self, name: str) -&gt; bool:
+        manifest = json.loads((self.dest_dir / f"{name}.json").read_text())
+        digest = hashlib.sha256((self.dest_dir / manifest["archive"]).read_bytes()).hexdigest()[:16]
+        with zipfile.ZipFile(self.dest_dir / manifest["archive"]) as z:
+            return digest == manifest["sha256"] and z.testzip() is None
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp, "project")
+        (src / "net").mkdir(parents=True)
+        (src / "net" / "tcp.c").write_text("int tcp_v4_rcv(void);\n" * 50)
+        (src / "README").write_text("hello\n")
+
+        backups = BackupFacade(Path(tmp, "backups"))      # client code: two calls total
+        archive = backups.backup(src, "nightly")
+        print("archive:", archive.name, "| files listed:",
+              json.loads(Path(tmp, "backups", "nightly.json").read_text())["files"])
+        print("verified:", backups.verify("nightly"))
+
+        # The standard library's own facades: shutil.make_archive does a similar job in one call.
+        import shutil
+        made = shutil.make_archive(str(Path(tmp, "quick")), "zip", src)
+        print("shutil facade made:", Path(made).name)</code></pre>
+<pre class="terminal"><code>$ python facade.py
+archive: nightly.zip | files listed: 2
+verified: True
+shutil facade made: quick.zip</code></pre>
+      <p>The client makes two calls. Walking a tree, zipping, hashing and writing a manifest are hidden. Python's standard library is full of facades like this: <code>shutil</code> over <code>os</code>, <code>subprocess.run()</code> over <code>Popen</code> and pipes, <code>urllib.request.urlopen()</code> over HTTP handlers.</p>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Facade in C++14: bringing a NIC up touches PHY, DMA rings, IRQs and the MAC filter.
+// The driver core exposes one call, like ndo_open() behind "ip link set eth0 up".
+// Build: g++ -std=c++14 -Wall facade.cpp -o facade
+#include &lt;iostream&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+// ---- Subsystem classes (would be separate files in a real driver) ----
+class Phy {
+public:
+    bool linkUp(int mbps) { std::cout &lt;&lt; "  phy: autoneg -&gt; " &lt;&lt; mbps &lt;&lt; " Mb/s full duplex\n"; return true; }
+    void powerDown() { std::cout &lt;&lt; "  phy: power down\n"; }
+};
+
+class DmaRings {
+public:
+    void allocate(int rx, int tx) {
+        if (rx &gt; 4096) throw std::runtime_error("ring too large");
+        std::cout &lt;&lt; "  dma: rx ring " &lt;&lt; rx &lt;&lt; ", tx ring " &lt;&lt; tx &lt;&lt; " descriptors\n";
+    }
+    void release() { std::cout &lt;&lt; "  dma: rings freed\n"; }
+};
+
+class IrqController {
+public:
+    void request(int vector) { std::cout &lt;&lt; "  irq: vector " &lt;&lt; vector &lt;&lt; " requested\n"; }
+    void free(int vector) { std::cout &lt;&lt; "  irq: vector " &lt;&lt; vector &lt;&lt; " freed\n"; }
+};
+
+class MacFilter {
+public:
+    void program(const std::string&amp; mac, bool promisc) {
+        std::cout &lt;&lt; "  mac: filter " &lt;&lt; mac &lt;&lt; (promisc ? " (promiscuous)" : "") &lt;&lt; "\n";
+    }
+};
+
+// ---- Facade: the right order, the right defaults, and cleanup on failure ----
+class NetDevice {
+public:
+    explicit NetDevice(std::string mac) : mac_(std::move(mac)) {}
+
+    bool open(int rxRing = 512) {
+        if (!phy_.linkUp(1000)) return false;
+        try {
+            dma_.allocate(rxRing, 512);
+        } catch (const std::exception&amp; e) {          // unwind in reverse order
+            std::cout &lt;&lt; "  open failed: " &lt;&lt; e.what() &lt;&lt; "\n";
+            phy_.powerDown();
+            return false;
+        }
+        irq_.request(kVector);
+        mac_filter_.program(mac_, false);
+        up_ = true;
+        return true;
+    }
+
+    void stop() {                                     // teardown is the mirror image
+        if (!up_) return;
+        irq_.free(kVector);
+        dma_.release();
+        phy_.powerDown();
+        up_ = false;
+    }
+
+    bool isUp() const { return up_; }
+
+private:
+    static constexpr int kVector = 42;
+    std::string mac_;
+    bool up_ = false;
+    Phy phy_;
+    DmaRings dma_;
+    IrqController irq_;
+    MacFilter mac_filter_;
+};
+
+int main() {
+    NetDevice eth0("02:00:5e:10:00:01");
+    std::cout &lt;&lt; "ip link set eth0 up\n";
+    std::cout &lt;&lt; "up = " &lt;&lt; std::boolalpha &lt;&lt; eth0.open() &lt;&lt; "\n";
+    std::cout &lt;&lt; "ip link set eth0 down\n";
+    eth0.stop();
+
+    NetDevice eth1("02:00:5e:10:00:02");
+    std::cout &lt;&lt; "ethtool -G eth1 rx 8192, then up\n";
+    std::cout &lt;&lt; "up = " &lt;&lt; eth1.open(8192) &lt;&lt; "\n";
+    return 0;
+}</code></pre>
+<pre class="terminal"><code>$ g++ -std=c++14 -Wall facade.cpp -o facade &amp;&amp; ./facade
+ip link set eth0 up
+  phy: autoneg -&gt; 1000 Mb/s full duplex
+  dma: rx ring 512, tx ring 512 descriptors
+  irq: vector 42 requested
+  mac: filter 02:00:5e:10:00:01
+up = true
+ip link set eth0 down
+  irq: vector 42 freed
+  dma: rings freed
+  phy: power down
+ethtool -G eth1 rx 8192, then up
+  phy: autoneg -&gt; 1000 Mb/s full duplex
+  open failed: ring too large
+  phy: power down
+up = false</code></pre>
+      <p>This is the shape of a real driver's <code>ndo_open</code> / <code>ndo_stop</code>: the networking core calls one function, and the driver sets up hardware in order and unwinds in reverse on failure (the C version is the familiar <code>goto err_free_rings;</code> ladder). Nothing outside needs to know there is a PHY.</p>
+    </div>
+  </div>

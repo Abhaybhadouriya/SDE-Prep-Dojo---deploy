@@ -1,0 +1,72 @@
+
+  <h2>Concurrency and thread safety</h2>
+  <p>Two races and one deadlock hide in this problem. Name all three in the interview.</p>
+  <h3>Race 1: two people, one room, one slot</h3>
+  <p>The classic check-then-act: both requests check Focus 10:00-11:00, both see it free, both insert. The fix is to make the check and the insert one atomic step under the room's lock: <code>tryReserveAll</code> holds <code>RoomCalendar.lock</code> while it checks every occurrence and inserts them. The demo fires 50 threads at Huddle for the same hour: exactly 1 wins and 49 are told the room is taken. With "any room", 40 threads and 3 rooms produce exactly 3 bookings in 3 different rooms, because a loser of one room simply moves on to the next candidate.</p>
+  <h3>Race 2: a person double-booked by two organizers</h3>
+  <p>With the REJECT policy, "is chen free?" and "add the meeting to chen's calendar" must also be atomic, or two organizers can both see chen free at 10:00 and both book him, in two different rooms. Room locks do not help here (different rooms). So we lock every participant's calendar for the whole schedule call.</p>
+  <h3>The deadlock this creates, and the fix</h3>
+  <div class="stepper" data-stepper>
+    <svg viewBox="0 0 800 300" role="img" aria-label="Two threads lock participants in opposite order and deadlock; sorting by user id fixes it">
+      <rect class="box client" x="20" y="30" width="170" height="44"/><text class="label small" x="105" y="52">Thread 1: alice + bob</text>
+      <rect class="box client" x="20" y="200" width="170" height="44"/><text class="label small" x="105" y="222">Thread 2: bob + alice</text>
+      <rect class="box db" x="420" y="30" width="140" height="44"/><text class="label small" x="490" y="52">alice's lock</text>
+      <rect class="box db" x="420" y="200" width="140" height="44"/><text class="label small" x="490" y="222">bob's lock</text>
+      <g data-step="1"><path class="arrow" d="M190 52 L414 52"/><text class="label small" x="300" y="44">1. holds alice</text>
+        <path class="arrow" d="M190 222 L414 222"/><text class="label small" x="300" y="214">1. holds bob</text></g>
+      <g data-step-only="2"><path class="arrow bad" d="M190 66 L414 210"/><path class="arrow bad" d="M190 208 L414 66"/>
+        <text class="label bad" x="680" y="140">2. each waits</text><text class="label bad" x="680" y="164">for the other</text></g>
+      <g data-step="3"><rect class="box ok" x="590" y="230" width="200" height="60"/>
+        <text class="label small" x="690" y="254">Fix: sort by user id</text><text class="label small" x="690" y="276">both lock alice first</text></g>
+    </svg>
+    <ol class="stepper-captions">
+      <li>Thread 1 schedules a meeting for alice and bob and locks alice first. Thread 2 schedules one for bob and alice and locks bob first.</li>
+      <li>Each now waits for the lock the other holds. Neither ever proceeds: a deadlock. No exception, the threads just hang.</li>
+      <li>The fix is a global lock order. We sort participants by user id before locking, then take the room lock last. Every thread acquires locks in the same order, so a cycle of waiting is impossible. The demo runs 200 such pairs on 8 threads and finishes.</li>
+    </ol>
+  </div>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>This is <code>double_rq_lock()</code> in the Linux scheduler: to lock two runqueues it always takes the one with the lower address first. Lockdep exists to catch exactly the "A then B here, B then A there" pattern. Our ordering key is the user id instead of an address, and the hierarchy "participants, then room" is the same idea as the kernel's documented lock nesting levels.</p>
+  </div>
+  <h3>Every shared thing and how it is protected</h3>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Shared state</th><th>Race</th><th>Protection in our code</th></tr></thead>
+      <tbody>
+        <tr><td>A room's bookings</td><td>Two bookings in one slot</td><td><code>RoomCalendar.lock</code> around check + insert (<code>tryReserveAll</code>)</td></tr>
+        <tr><td>A person's calendar</td><td>Double-booked person (REJECT policy)</td><td><code>UserCalendar.lock</code>, held for the whole schedule call</td></tr>
+        <tr><td>Locks on many calendars</td><td>Deadlock</td><td>Sort participants by id; room lock always last</td></tr>
+        <tr><td>Meeting registry</td><td>Lost updates, double cancel</td><td><code>ConcurrentHashMap</code>; <code>remove(id, meeting)</code> so only one cancel wins</td></tr>
+        <tr><td>Meeting id counter</td><td>Duplicate ids</td><td><code>AtomicLong</code> (Python: a small lock)</td></tr>
+        <tr><td>RSVP map</td><td>Concurrent responses</td><td><code>ConcurrentHashMap</code> inside <code>Meeting</code></td></tr>
+        <tr><td>Strategy reference</td><td>Stale read after switch</td><td><code>volatile</code></td></tr>
+        <tr><td>Listener list</td><td>Add while notifying</td><td><code>CopyOnWriteArrayList</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3>Trade-offs you should say out loud</h3>
+  <ul>
+    <li><b>Lock granularity:</b> one global lock would be correct and simplest, but every booking in the company would queue behind it. Per-room plus per-person locks let unrelated bookings run in parallel.</li>
+    <li><b>Lock hold time:</b> the participant locks are held while we try rooms one by one. With 500 rooms that could be long; an optimisation is to pre-filter free rooms without locks, then lock and re-check (check, lock, re-check).</li>
+    <li><b>ALLOW policy:</b> if people may double-book (most real calendars just warn), we can skip participant locks entirely and only the room lock remains. That is a big simplification; ask early.</li>
+    <li><b>In a database:</b> a unique or exclusion constraint does the room check for you. PostgreSQL can reject overlapping ranges per room with an exclusion constraint, but mixing <code>room_id</code> equality with range overlap in one GiST index needs the <code>btree_gist</code> extension: <code>CREATE EXTENSION IF NOT EXISTS btree_gist; ALTER TABLE booking ADD CONSTRAINT no_overlap EXCLUDE USING gist (room_id WITH =, slot WITH &amp;&amp;);</code> where <code>slot</code> is a <code>tstzrange</code> built with <code>'[)'</code> bounds, the same half-open rule as <code>TimeSlot</code>; otherwise lock the room row with <code>SELECT ... FOR UPDATE</code> before inserting. More on this in <a href="{{BASE}}lld/lld-conc-booking">booking concurrency</a>.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world: the Java concurrency words in kernel terms</h4>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>Java (used on this page)</th><th>Kernel / C equivalent</th></tr></thead>
+      <tbody>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code></td><td>A sleeping mutex (<code>struct mutex</code>), not a spinlock: a waiter blocks and is woken. Reentrant: the owner may lock it again.</td></tr>
+        <tr><td><code>Condition.await()</code> / <code>signal()</code></td><td><code>wait_event()</code> / <code>wake_up()</code>, with the same lost-wakeup rule: test the condition under the lock and re-test in a <code>while</code> loop after every wake.</td></tr>
+        <tr><td><code>AtomicInteger.incrementAndGet()</code></td><td><code>atomic_inc_return()</code>; <code>compareAndSet(old, new)</code> is <code>atomic_cmpxchg()</code>.</td></tr>
+        <tr><td><code>map.putIfAbsent(k, v)</code></td><td>A cmpxchg on one slot: insert only if the slot is still empty, and tell me who won.</td></tr>
+        <tr><td><code>ConcurrentHashMap</code></td><td>A hash table with per-bucket locking for writers and lock-free readers (think RCU hash lists).</td></tr>
+        <tr><td><code>CopyOnWriteArrayList</code></td><td>An RCU-style list: a writer copies the array, edits the copy and swaps one pointer; readers iterate the old array without any lock.</td></tr>
+        <tr><td>Java <code>volatile</code></td><td><b>Not</b> C's <code>volatile</code>. It means visibility plus ordering: every read is like <code>READ_ONCE()</code> with acquire semantics and every write like <code>WRITE_ONCE()</code> with release semantics (<code>smp_load_acquire</code>/<code>smp_store_release</code>). It does not make <code>x++</code> atomic. See <a href="{{BASE}}lld/lld-conc-basics#volatile">volatile in Concurrency basics</a>.</td></tr>
+        <tr><td><code>ExecutorService</code> / <code>Thread</code></td><td><code>ExecutorService</code> is a workqueue with N kworkers; <code>new Thread(r).start()</code> is <code>kthread_run()</code>; <code>join()</code> is <code>pthread_join()</code>.</td></tr>
+        <tr><td><code>CountDownLatch</code></td><td><code>struct completion</code> with a count: <code>countDown()</code> is <code>complete()</code>, <code>await()</code> is <code>wait_for_completion()</code>.</td></tr>
+      </tbody>
+    </table></div>
+    
+  </div>

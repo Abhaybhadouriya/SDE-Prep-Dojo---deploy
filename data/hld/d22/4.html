@@ -1,0 +1,67 @@
+
+        <h2>Data model</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Data</th><th>Shape</th><th>Store and why</th></tr></thead>
+            <tbody>
+              <tr><td>Score events (source of truth)</td><td>(match_id PK, user_id, board_id, points, ts)</td><td>Relational DB (MySQL/Postgres) or Kafka + object storage. Durable, auditable, can rebuild Redis from it.</td></tr>
+              <tr><td>Live board</td><td>sorted set <code>lb:&lt;boardId&gt;</code>: member = user_id, score = total</td><td>Redis. Keeps order on every write, O(log N) rank and range.</td></tr>
+              <tr><td>Processed match IDs</td><td><code>seen:&lt;boardId&gt;</code> set or key <code>seen:&lt;match_id&gt;</code> with TTL</td><td>Redis, checked in the same Lua script as the increment.</td></tr>
+              <tr><td>User profile</td><td>(user_id, display_name, avatar_url, region)</td><td>Relational DB + a small cache for the top players' names.</td></tr>
+              <tr><td>Monthly history</td><td>(board_id, rank, user_id, score) for the top N + each user's final rank</td><td>Relational DB or object storage, written when the month closes.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p><b>Why not just SQL?</b> The rank query in SQL is "count everyone with a higher score": <code>SELECT COUNT(*) FROM scores WHERE board_id = ? AND score &gt; ?</code>. With an index on (board_id, score) it is a range scan - fine for thousands of rows, but at millions of rows and thousands of updates per second every update also rewrites the index, and every rank read walks a large part of it. The book reports a full rank over millions of rows taking tens of seconds. A sorted set keeps the order <i>incrementally</i>, so a rank is a walk down a few levels instead of a count.</p>
+
+        <h3>Inside a Redis sorted set</h3>
+        <p>A sorted set is two structures glued together: a <b>hash table</b> (member to score, so "what is Mary's score?" is O(1)) and a <b>skip list</b> (score order, so "rank" and "range" are O(log N)). A <b>skip list</b> is a sorted linked list with extra "express lanes" on top: each higher lane skips more nodes, like taking the highway and getting off near your exit. Redis also stores, on each express-lane link, how many nodes it skips (the "span"), so while it walks to a member it can add up the spans and get the rank for free. Small sets (up to <code>zset-max-listpack-entries</code>, 128 by default) use a compact <b>listpack</b> instead.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Sorted set = hash table from member to score plus a skip list ordered by score">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="zone cache" x="16" y="16" width="220" height="268"/>
+            <text class="zone-label" x="28" y="38">Hash table: member -&gt; score</text>
+            <rect class="box cache" x="32" y="56" width="188" height="34"/><text class="label small" x="126" y="78">ravi -&gt; 120</text>
+            <rect class="box cache" x="32" y="98" width="188" height="34"/><text class="label small" x="126" y="120">mary -&gt; 119</text>
+            <rect class="box cache" x="32" y="140" width="188" height="34"/><text class="label small" x="126" y="162">anu -&gt; 118</text>
+            <rect class="box cache" x="32" y="182" width="188" height="34"/><text class="label small" x="126" y="204">joe -&gt; 117</text>
+            <text class="label small" x="126" y="250">ZSCORE = O(1)</text>
+
+            <rect class="zone kafka" x="256" y="16" width="590" height="268"/>
+            <text class="zone-label" x="268" y="38">Skip list ordered by score (express lanes on top)</text>
+            <text class="label small left" x="268" y="78">L3</text>
+            <text class="label small left" x="268" y="138">L2</text>
+            <text class="label small left" x="268" y="198">L1</text>
+            <text class="label small left" x="268" y="252">L0</text>
+            <!-- L0 nodes -->
+            <rect class="box kafka" x="300" y="232" width="80" height="32"/><text class="label small" x="340" y="253">joe 117</text>
+            <rect class="box kafka" x="410" y="232" width="80" height="32"/><text class="label small" x="450" y="253">anu 118</text>
+            <rect class="box kafka" x="520" y="232" width="80" height="32"/><text class="label small" x="560" y="253">mary 119</text>
+            <rect class="box kafka" x="630" y="232" width="80" height="32"/><text class="label small" x="670" y="253">ravi 120</text>
+            <rect class="box ghost" x="740" y="232" width="90" height="32"/><text class="label small" x="785" y="253">NIL</text>
+            <path class="arrow" d="M380 248 L405 248"/><path class="arrow" d="M490 248 L515 248"/><path class="arrow" d="M600 248 L625 248"/><path class="arrow" d="M710 248 L735 248"/>
+            <!-- L1 -->
+            <rect class="box" x="300" y="182" width="80" height="30"/><text class="label small" x="340" y="202">joe</text>
+            <rect class="box" x="520" y="182" width="80" height="30"/><text class="label small" x="560" y="202">mary</text>
+            <rect class="box" x="630" y="182" width="80" height="30"/><text class="label small" x="670" y="202">ravi</text>
+            <path class="arrow" d="M380 197 L515 197"/><path class="arrow" d="M600 197 L625 197"/><path class="arrow" d="M710 197 L735 240"/>
+            <text class="label small" x="448" y="190">span 2</text>
+            <!-- L2 -->
+            <rect class="box" x="300" y="122" width="80" height="30"/><text class="label small" x="340" y="142">joe</text>
+            <rect class="box" x="630" y="122" width="80" height="30"/><text class="label small" x="670" y="142">ravi</text>
+            <path class="arrow" d="M380 137 L625 137"/>
+            <text class="label small" x="505" y="130">span 3</text>
+            <!-- L3 -->
+            <rect class="box" x="300" y="62" width="80" height="30"/><text class="label small" x="340" y="82">joe</text>
+            <path class="arrow dashed" d="M380 77 L735 77"/>
+            <text class="label small" x="560" y="70">span 4 (to the end)</text>
+            <circle class="packet" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M340 77 L340 137 L560 137 L560 197 L560 232"/></circle>
+          </svg>
+          <figcaption>Finding "mary": start in the top lane, move right while the next node is not past her, drop a lane, repeat. Adding the spans you jumped over gives her position. Redis orders ascending, so <code>ZREVRANK</code> (highest first) is just N - 1 - position. The hash table on the left answers "what is her score?" without walking at all.</figcaption>
+        </figure>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>A skip list is the same idea as a multi-level lookup you have seen in routing tables and page tables: a coarse index on top, finer below, so a lookup touches O(log N) entries instead of scanning. It is randomised (each node picks its height by coin flips) instead of balanced by rotations, which keeps inserts simple and lock-free friendly. <b>Where the analogy breaks:</b> a trie / page table indexes by <i>key bits</i>; a skip list indexes by <i>sort order</i>, which is exactly what "rank" needs.</p>
+        </div>
+      

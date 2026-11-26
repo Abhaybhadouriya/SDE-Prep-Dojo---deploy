@@ -1,0 +1,53 @@
+
+  <h2>Drill 2: a thread-safe token-bucket rate limiter</h2>
+  <p>A <b>token bucket</b> holds up to <code>capacity</code> tokens and gains <code>rate</code> tokens per second. Each request takes one token; with no token, it is rejected. Capacity sets the allowed <b>burst</b>; rate sets the long-term average. The full design with other algorithms is <a href="{{BASE}}hld/d02">the distributed rate limiter</a>; here we focus on making one in-process limiter correct under threads.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 800 280" role="img" aria-label="Rate limiter: a ConcurrentHashMap from user key to TokenBucket; each bucket refills lazily from the clock and takes a token under its own lock">
+      <rect class="box client" x="20" y="30" width="150" height="40"/><text class="label small" x="95" y="55">allow("user42")</text>
+      <rect class="box client" x="20" y="90" width="150" height="40"/><text class="label small" x="95" y="115">allow("user42")</text>
+      <rect class="box client" x="20" y="150" width="150" height="40"/><text class="label small" x="95" y="175">allow("user7")</text>
+      <rect class="box svc" x="230" y="40" width="230" height="160"/>
+      <text class="label" x="345" y="62">RateLimiter</text>
+      <line class="line" x1="230" y1="74" x2="460" y2="74"/>
+      <text class="label small mono left" x="239" y="94">- buckets: ConcurrentHashMap</text>
+      <text class="label small mono left" x="239" y="113">- clock: LongSupplier</text>
+      <line class="line" x1="230" y1="126" x2="460" y2="126"/>
+      <text class="label small mono left" x="239" y="146">+ allow(key): boolean</text>
+      <text class="label small mono left" x="239" y="166">  computeIfAbsent(key)</text>
+      <text class="label small mono left" x="239" y="186">    .tryAcquire()</text>
+      <path class="arrow" d="M172 50 L226 90"/><path class="arrow" d="M172 110 L226 110"/><path class="arrow" d="M172 170 L226 140"/>
+      <rect class="box ok" x="530" y="20" width="250" height="126"/>
+      <text class="label" x="655" y="40">TokenBucket (user42)</text>
+      <line class="line" x1="530" y1="52" x2="780" y2="52"/>
+      <text class="label small mono left" x="539" y="70">- capacity, ratePerSec</text>
+      <text class="label small mono left" x="539" y="89">- tokens: double, last: long</text>
+      <line class="line" x1="530" y1="100" x2="780" y2="100"/>
+      <text class="label small mono left" x="539" y="118">+ synchronized tryAcquire()</text>
+      <text class="label small mono left" x="539" y="137">  refill, check, take</text>
+      <rect class="box ok" x="530" y="170" width="250" height="44"/>
+      <text class="label small" x="655" y="197">TokenBucket (user7): own lock</text>
+      <path class="arrow" d="M462 100 L526 84"/>
+      <path class="arrow" d="M462 170 L526 190"/>
+      <text class="label small" x="400" y="250">Different users never wait for each other; one user's requests serialise on one tiny lock.</text>
+    </svg>
+    <figcaption>Lock per key: the map hands out one bucket per user atomically, and each bucket protects its own two fields. No background refill thread: tokens are computed from elapsed time when a request arrives.</figcaption>
+  </figure>
+<pre><code class="language-java">synchronized boolean tryAcquire() {             // refill + check + take = one atomic step
+    long now = clock.getAsLong();
+    tokens = Math.min(capacity, tokens + (now - last) * refillPerNano);   // lazy refill
+    last = now;
+    if (tokens &gt;= 1) { tokens -= 1; return true; }
+    return false;
+}</code></pre>
+  <ul>
+    <li><b>Why the whole method is one critical section:</b> <code>tokens</code> and <code>last</code> form one invariant. If refill and take were separate, two threads could both see 1 token and both take it, letting 11 requests through a limit of 10. The drill fires 800 concurrent requests at a full bucket of 10 and gets exactly 10.</li>
+    <li><b>Lazy refill:</b> no timer thread per bucket (a million users would mean a million timers). Elapsed time times rate gives the refill on demand. This is also how the kernel's TBF and most libraries work.</li>
+    <li><b>Inject the clock:</b> <code>LongSupplier</code> for nanoseconds. Tests set time to 0, then 1 s, and check exactly 5 tokens came back. Never test rate limiters with <code>Thread.sleep</code>. Use <code>System.nanoTime()</code> (monotonic) in production, not wall-clock time that can jump.</li>
+    <li><b>Bucket creation:</b> <code>computeIfAbsent</code> creates exactly one bucket per key even under a race. A <code>get</code> then <code>put</code> could create two buckets and double the user's limit.</li>
+    <li><b>Memory:</b> buckets for idle users pile up. Evict buckets that are full and idle (a full bucket is the same as a new one, so dropping it changes nothing), for example with a periodic sweep or an expiring cache as the map.</li>
+    <li><b>Lock-free variant:</b> pack <code>(tokens, last)</code> into one immutable object in an <code>AtomicReference</code> and CAS-loop. It avoids blocking but retries under contention; the per-bucket lock is simpler and usually fast enough.</li>
+  </ul>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The <code>tbf</code> qdisc's <code>rate</code> and <code>burst</code> are exactly <code>ratePerSec</code> and <code>capacity</code> here, and <code>__ratelimit()</code> (behind <code>printk_ratelimited()</code>) is a simple interval-plus-burst limiter protected by its own spinlock. A per-key bucket map is the same idea as a per-flow policer.</p>
+  </div>

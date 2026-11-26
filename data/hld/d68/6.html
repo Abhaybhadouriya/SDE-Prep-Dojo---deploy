@@ -1,0 +1,110 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Search scoped to one dark store</h3>
+        <p>A normal e-commerce search ranks the whole catalogue. Here a result is useless unless it is in stock <i>at this store</i>, now. Three designs, with different trade-offs:</p>
+        <div class="table-wrap"><table class="table">
+          <thead><tr><th>Design</th><th>How</th><th>Pros</th><th>Cons</th></tr></thead>
+          <tbody>
+            <tr><td><b>A. One doc per (store, SKU)</b></td><td>Index 6M documents with <code>store_id</code> and <code>in_stock</code>; query filters <code>store_id = X AND in_stock</code></td><td>One query, exact filtering and paging, ranking can use store sales</td><td>Every stock flip is an index update (refresh about 1 s); 1,000x duplicated product text; heavy reindex</td></tr>
+            <tr><td><b>B. Catalogue index + stock filter</b></td><td>ES returns top 200 product ids (one doc per SKU); a filter removes ids not in the store's in-stock set in Redis; return top 20</td><td>Small index; stock changes touch only Redis; very fresh</td><td>Deep pages may run out of in-stock hits (fetch more); two hops</td></tr>
+            <tr><td><b>C. Per-store in-memory index</b></td><td>Each store's ~6K SKUs fit in a few MB; a search service holds them in memory, sharded by store</td><td>Fastest; per-store ranking easy</td><td>You build and run a custom search tier</td></tr>
+          </tbody>
+        </table></div>
+        <p><b>My pick and why:</b> B for text search (the store's 6,000 SKUs are a small subset of the catalogue, so 200 candidates almost always contain 20 in stock), and precomputed per-store category pages (a store's "Dairy" shelf is a short list rebuilt on every stock event and cached). Flag in-stock flips with a few seconds of delay at most; the reservation step catches the rest.</p>
+        <div class="callout tip"><p><b>Short TTL plus invalidation, both.</b> The Swiggy SDE-3 report mentions exactly this: a short-TTL inventory cache with invalidation on dark-store updates (<a href="https://leetcode.com/discuss/post/7377393/" target="_blank" rel="noopener">post</a>). Invalidation alone is fragile (a lost event means a wrong answer forever); TTL alone is either stale or expensive. Events give freshness; the TTL bounds the damage when an event is lost.</p></div>
+
+        <h3>2. Reserving stock: the last packet of milk</h3>
+        <p>Two customers check out the last two packets of milk at once, with carts of 8 lines each. Options:</p>
+        <ul>
+          <li><b>Conditional update per line (my default):</b> in one transaction on the store's shard, for each line <code>UPDATE store_inventory SET reserved = reserved + :q WHERE store_id = :s AND sku_id = :k AND on_hand - reserved - safety_buf &gt;= :q</code>. Lock lines in sku_id order to avoid deadlocks. If any line returns 0 rows, roll back and return the short lines. Each row lock is held for microseconds.</li>
+          <li><b>Pessimistic</b> (<code>SELECT ... FOR UPDATE</code> on all lines, check, update): same correctness, longer locks, more deadlock risk; only worth it if the check needs logic SQL cannot express (bundles, substitutions).</li>
+          <li><b>Optimistic with versions:</b> read all rows, compute, write <code>WHERE version = :v</code>, retry on conflict. Fine for slow-moving SKUs; bad for milk at 7 am, where most attempts conflict and retry.</li>
+          <li><b>Redis-first reservation</b> (Lua script decrementing a per-store counter): fastest, but Redis becomes a second copy of the truth that must be reconciled after every failover. Use it only as a gate if one SKU is extremely hot (a viral launch), with the database still the record.</li>
+        </ul>
+        <p><b>When to reserve?</b> At add-to-cart (hold early) or at checkout (hold late)? Holding at add-to-cart locks stock in thousands of abandoned carts. Holding at checkout risks "sorry, gone" at the last step. Most quick-commerce apps reserve at checkout with a short timer and show live "only 2 left" hints earlier. Say this trade-off out loud.</p>
+        <p><b>Release:</b> unpaid reservations expire after a few minutes (a sweeper with <code>SKIP LOCKED</code>), cancellations release at once, and every reserve/release is an <code>inventory_movement</code> row with a unique id so a retried message is applied once.</p>
+
+        <h3>3. Keeping inventory consistent across WMS, store and app</h3>
+        <p>This was the focus of a Swiggy SDE-2 Instamart round: design the warehouse system and keep inventory consistent across systems (<a href="https://leetcode.com/discuss/post/6421018/" target="_blank" rel="noopener">post</a>). The trap is having three systems that each think they own the number.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 270" role="img" aria-label="Single writer inventory service with a movement ledger feeding caches and search">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="15" y="20" width="150" height="46"/><text class="label small" x="90" y="48">WMS: GRN, damage</text>
+            <rect class="box svc" x="15" y="110" width="150" height="46"/><text class="label small" x="90" y="138">Picker scans</text>
+            <rect class="box svc" x="15" y="200" width="150" height="46"/><text class="label small" x="90" y="228">Order: reserve/release</text>
+            <rect class="box db" x="250" y="90" width="190" height="86"/>
+            <text class="label" x="345" y="120">Inventory service</text>
+            <text class="label small" x="345" y="142">single writer per store</text>
+            <text class="label small" x="345" y="160">row + movement ledger</text>
+            <rect class="box queue" x="500" y="110" width="140" height="46"/><text class="label small" x="570" y="138">Kafka stock.changed</text>
+            <rect class="box cache" x="700" y="20" width="145" height="46"/><text class="label small" x="772" y="48">Redis in-stock set</text>
+            <rect class="box svc" x="700" y="110" width="145" height="46"/><text class="label small" x="772" y="138">Category pages</text>
+            <rect class="box svc" x="700" y="200" width="145" height="46"/><text class="label small" x="772" y="228">Analytics / reorder</text>
+            <path class="arrow" d="M165 43 L244 110"/>
+            <path class="arrow" d="M165 133 L244 133"/>
+            <path class="arrow" d="M165 223 L244 160"/>
+            <path class="arrow" d="M440 133 L494 133"/>
+            <path class="arrow" d="M640 125 L694 48"/>
+            <path class="arrow" d="M640 133 L694 133"/>
+            <path class="arrow" d="M640 141 L694 220"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M165 43 L250 110 L440 133 L500 133 L640 125 L700 48"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite" path="M165 223 L250 160 L440 133 L500 133 L640 141 L700 220"/></circle>
+          </svg>
+          <figcaption>One writer, one ledger, many readers. The WMS, the pickers and the order flow never write stock numbers directly into each other; they send movements to the inventory service, which publishes the result.</figcaption>
+        </figure>
+        <ol class="steps">
+          <li><strong>One writer.</strong> The inventory service owns <code>on_hand</code> and <code>reserved</code>. The WMS and picker apps send <i>movements</i> (GRN +48, PICK -1, DAMAGE -2, COUNT_ADJUST -3), never absolute numbers. Absolute "set stock to 17" messages from two systems overwrite each other; deltas with ids compose.</li>
+          <li><strong>A ledger.</strong> Every movement is a row with a unique id, applied in the same transaction as the counter change, plus an outbox row. Replaying the ledger rebuilds the number; a duplicate message hits the unique id and is ignored.</li>
+          <li><strong>Per-store ordering.</strong> Movements and stock.changed events are keyed by store_id on Kafka, so consumers see a store's changes in order; each event carries the row's version, and consumers drop anything older than what they have.</li>
+          <li><strong>Reality wins.</strong> The physical shelf is the final truth. Cycle counts and picker "bin empty" reports create COUNT_ADJUST movements. Track the <b>shrinkage</b> rate (system says more than the shelf) per store as a key metric.</li>
+          <li><strong>Safety buffer.</strong> For SKUs with frequent count drift, hide 1-2 units from ATP. It trades a little lost sales for far fewer "ordered but missing" refunds. Tune per SKU from the miss rate.</li>
+          <li><strong>Inbound.</strong> A GRN adds stock only after the truck is counted in and shelved, not when it leaves the mother warehouse; in-transit stock is a separate number used for forecasting, not for selling.</li>
+        </ol>
+
+        <h3>4. Pickers, riders and the peak-time queue</h3>
+        <p>At 8 pm on a match day, orders arrive faster than pickers can pick. The Zepto interviewer added "prioritise orders for fast delivery at peak" (<a href="https://leetcode.com/discuss/post/5796138/" target="_blank" rel="noopener">post</a>). Treat each store as a little scheduling problem:</p>
+        <ul>
+          <li><b>Priority = slack.</b> <code>slack = promised_by - now - (pick_estimate + ride_eta)</code>. The order with the least slack goes first (earliest-deadline-first). A plain FIFO lets a far-away order miss its promise while a nearby one waits needlessly.</li>
+          <li><b>Admission control at the front door.</b> When a store's queue makes the ETA exceed, say, 20 minutes, serviceability raises the shown ETA, adds a surge fee, or shrinks the service radius so far addresses fall to a neighbour store or "not serviceable now". Better than accepting orders you will deliver late.</li>
+          <li><b>Picker assignment:</b> a store-local scheduler (one instance per store, chosen by consistent hashing on store_id) pulls from the priority queue when a picker becomes free; pick lists are sorted by bin walking order. Batch picking (one picker, two small orders on the same aisle) helps at peak.</li>
+          <li><b>Rider assignment:</b> assign when the order is about 1 minute from packed, not at order time, so riders are not idle at the counter. Choose by arrival time back at the store and current load; batch two orders only if both still meet their promises. Rider GPS lives in Redis GEO (latest point only).</li>
+          <li><b>Payments at peak:</b> COD orders skip the payment wait; prepaid orders enter the pick queue only after payment success, but the reservation is already made, so a slow PSP never sells their stock to someone else. Each method is a strategy behind one <code>PaymentProcessor</code> interface (the LLD part the Zepto round also asked for).</li>
+        </ul>
+
+        <h3>5. Variant: medicine delivery with prescriptions</h3>
+        <p>An October 2026 startup SDE-1 round asked for this, and the report says the focus was the state machine, stock concurrency and edge cases rather than boxes (<a href="https://leetcode.com/discuss/post/8578101/" target="_blank" rel="noopener">post</a>).</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 220" role="img" aria-label="Medicine order state machine from prescription upload to delivery">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="30" width="120" height="46"/><text class="label small" x="70" y="58">Rx uploaded</text>
+            <rect class="box svc" x="160" y="30" width="130" height="46"/><text class="label small" x="225" y="58">AI extracted</text>
+            <rect class="box queue" x="320" y="30" width="150" height="46"/><text class="label small" x="395" y="58">Pharmacist verified</text>
+            <rect class="box svc" x="500" y="30" width="150" height="46"/><text class="label small" x="575" y="58">Pharmacy matched</text>
+            <rect class="box db solid" x="680" y="30" width="165" height="46"/><text class="label small" x="762" y="58">Paid + accepted</text>
+            <rect class="box svc" x="680" y="140" width="165" height="46"/><text class="label small" x="762" y="168">Packed -&gt; delivered</text>
+            <rect class="box plain" x="320" y="140" width="150" height="46"/><text class="label small" x="395" y="168">Rejected / re-upload</text>
+            <rect class="box plain" x="500" y="140" width="150" height="46"/><text class="label small" x="575" y="168">Next pharmacy</text>
+            <path class="arrow" d="M130 53 L154 53"/>
+            <path class="arrow" d="M290 53 L314 53"/>
+            <path class="arrow" d="M470 53 L494 53"/>
+            <path class="arrow" d="M650 53 L674 53"/>
+            <path class="arrow" d="M762 76 L762 134"/>
+            <path class="arrow bad dashed" d="M395 76 L395 134"/>
+            <path class="arrow bad dashed" d="M700 76 L620 134"/>
+            <path class="arrow dashed" d="M560 140 L560 82"/>
+            <text class="label small bad start" x="405" y="110">unreadable / invalid</text>
+            <text class="label small start" x="610" y="110">timeout</text>
+            <circle class="packet" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M130 53 L680 53 L762 53 L762 140"/></circle>
+          </svg>
+          <figcaption>Medicine orders add a human check and a hand-off to a third-party pharmacy that may refuse or time out, so the state machine has more failure arrows than a grocery order.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Upload:</b> the app gets a presigned URL and uploads the image directly to object storage (encrypted; it is health data with access logs and a retention policy).</li>
+          <li><b>Extract:</b> an OCR + LLM job (async, on a queue) returns medicine names, strengths and quantities with a confidence score; names are matched to the drug catalogue by brand and salt (generic) name.</li>
+          <li><b>Verify:</b> a licensed pharmacist reviews the extraction before checkout. The AI speeds the work up; it does not make the medical decision. Low confidence or a controlled drug always goes to a human.</li>
+          <li><b>Find pharmacies:</b> Elasticsearch <code>geo_distance</code> over partner pharmacies within a radius, filtered by those reporting stock for <i>all</i> lines (or allow a split order across two), ranked by distance and acceptance rate.</li>
+          <li><b>Stock concurrency:</b> partner stock feeds are stale, so the order is <i>offered</i> to the best pharmacy with an accept timeout (for example 2 minutes); on reject or timeout, offer it to the next. Payment is authorised up front and captured only on acceptance, or refunded.</li>
+          <li><b>Scale to many cities:</b> shard by city; each city's pharmacies and orders live together.</li>
+        </ul>
+      

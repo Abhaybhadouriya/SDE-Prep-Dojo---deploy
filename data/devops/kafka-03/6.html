@@ -1,0 +1,74 @@
+
+        <h2>Retries and the idempotent producer</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain batching, keys and <code>acks</code>, you are in good shape for most SDE-1 rounds. Everything from here down is what SDE-2 interviewers probe: what goes wrong on retries, timeouts and backpressure.</p></div>
+        <p>Networks fail in an annoying way: sometimes a request <b>arrives and is written</b>, but the reply is lost on the way back. The producer cannot tell this apart from "the request never arrived". So it does the only sensible thing and <b>retries</b>. Without protection, that retry writes the same batch a second time: a <b>duplicate</b>.</p>
+        <p>Retries also cause a second problem: <b>reordering</b>. A producer can have several requests "in flight" to the same broker at once (<code>max.in.flight.requests.per.connection</code>, default 5). If batch 1 fails and batch 2 succeeds, then batch 1 is retried, the log ends up as 2, 1.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="A producer with producer ID 7 sends a batch with sequence 0, the ack is lost, the producer retries, and the broker recognises the duplicate sequence and does not write it again. Without idempotence the retry would create a duplicate record.">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="90" width="170" height="90"/>
+            <text class="label" x="105" y="114">Producer</text>
+            <text class="label small" x="105" y="138">PID 7, epoch 0</text>
+            <text class="label small mono" x="105" y="160">P1 next seq: 0</text>
+            <rect class="zone kafka" x="430" y="40" width="350" height="190"/>
+            <text class="zone-label" x="446" y="62">leader of P1</text>
+            <text class="label small left" x="446" y="92">last seq from PID 7 on P1:</text>
+            <text class="label small mono left" x="650" y="92" data-step-only="1">none</text>
+            <rect class="cell filled" x="446" y="120" width="56" height="44"/><text class="label small" x="474" y="142">40</text>
+            <rect class="cell filled" x="507" y="120" width="56" height="44"/><text class="label small" x="535" y="142">41</text>
+            <g data-step="1">
+              <path class="arrow kafka" d="M190 115 L424 115"/>
+              <text class="label small left" x="200" y="100">batch "o-3 paid", seq 0</text>
+            </g>
+            <g data-step="2">
+              <rect class="cell new" x="568" y="120" width="56" height="44"/><text class="label small white" x="596" y="142">42</text>
+              <text class="label small mono left" x="650" y="92">0</text>
+              <path class="arrow bad dashed" d="M424 165 L196 165"/>
+              <text class="label bad" x="310" y="190">ack lost on the way back</text>
+            </g>
+            <g data-step="3">
+              <path class="arrow kafka" d="M190 135 L424 135"/>
+              <text class="label small left" x="200" y="148">retry: same batch, seq 0</text>
+            </g>
+            <g data-step-only="4">
+              <text class="label ok" x="605" y="196">seq 0 already written:</text>
+              <text class="label small ok" x="605" y="216">no new copy, reply OK (offset 42)</text>
+              <path class="arrow ok" d="M424 175 L196 175"/>
+            </g>
+            <g data-step-only="5">
+              <rect class="cell new" x="629" y="120" width="56" height="44" style="fill:var(--bad)"/><text class="label small white" x="657" y="142">43</text>
+              <text class="label bad" x="605" y="196">idempotence OFF:</text>
+              <text class="label small bad" x="605" y="216">"o-3 paid" stored twice</text>
+            </g>
+            <text class="label small muted left" x="20" y="262">The broker keeps the recent sequence numbers per (producer ID, partition).</text>
+            <text class="label small muted left" x="20" y="284">A repeat is acknowledged but not written; a gap is rejected as out of order.</text>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>Send.</b> At start-up, the idempotent producer gets a <b>producer ID (PID)</b> and an <b>epoch</b> from the cluster. Every batch it sends to a partition carries the PID and a <b>sequence number</b> that increases per partition: 0, 1, 2...</li>
+            <li><b>Written, but the ack is lost.</b> The leader appends the batch at offset 42 and remembers "PID 7, P1, last sequence 0". The reply never reaches the producer (a timeout, a dropped connection, a leader change).</li>
+            <li><b>Retry.</b> The producer does not know the batch was written, so it sends the same batch again with the <b>same sequence number 0</b>.</li>
+            <li><b>Duplicate detected.</b> The broker sees sequence 0 from PID 7 again, does not append anything, and answers success. The record exists exactly once. If a sequence number arrives with a <b>gap</b> (say 2 before 1), the broker rejects it, which is how ordering is kept with up to 5 requests in flight.</li>
+            <li><b>Without idempotence</b>, the retry looks like brand-new data and gets offset 43. Every consumer now sees "o-3 paid" twice. This is why idempotence became the default.</li>
+          </ol>
+        </div>
+
+        <p>Idempotence (<code>enable.idempotence=true</code>) has been the <b>default in the Java client since Kafka 3.0</b>. It needs <code>acks=all</code>, <code>retries &gt; 0</code> and <code>max.in.flight.requests.per.connection &lt;= 5</code>. The limit of 5 exists because the broker remembers the metadata of the last 5 batches per producer and partition; that window is what lets it detect duplicates and gaps among in-flight requests. In practice, idempotence is close to free: it adds a few bytes per batch.</p>
+
+        <div class="callout danger"><p><b>Silent downgrade:</b> in the Java client, if you did <i>not</i> set <code>enable.idempotence</code> yourself and you set a conflicting option such as <code>acks=1</code>, idempotence is quietly switched off. If you set <code>enable.idempotence=true</code> explicitly together with a conflicting option, the producer refuses to start with a config error. And in librdkafka clients (Python, .NET, Go-confluent) <code>enable.idempotence</code> defaults to <b>false</b>; you must turn it on. When safety matters, set it explicitly.</p></div>
+
+        <h3>What idempotence does NOT cover</h3>
+        <p>This is the part interviewers love, because many candidates over-claim. The idempotent producer removes duplicates caused by <b>its own internal retries, within one producer session, per partition</b>. It does not help with:</p>
+        <ul>
+          <li><b>Your application resending.</b> If your code catches an error and calls <code>send()</code> again, that is a new record with a new sequence number. The broker cannot know it is the "same" order event.</li>
+          <li><b>A restarted process.</b> A new producer instance gets a new PID, so the broker has no memory of what the old one sent. If the old process crashed after sending but before recording that it sent, the restarted one may send again.</li>
+          <li><b>Atomic writes to several partitions or topics.</b> "Write to <code>orders</code> and <code>payments</code>, all or nothing" needs <b>transactions</b>, which add a stable <code>transactional.id</code> and fence "zombie" instances. That is <a href="{{BASE}}devops/kafka-06">page 06</a>.</li>
+          <li><b>Consumers.</b> A consumer can still process a record twice after a crash or a rebalance (<a href="{{BASE}}devops/kafka-04">page 04</a>). End-to-end "exactly once" needs idempotent consumers too.</li>
+        </ul>
+        <p>The practical rule: keep idempotence on, and also give every business event its own <b>event ID</b> (for example <code>orderId + status</code> or a UUID chosen once, before the first attempt) so consumers can drop repeats. That event-ID habit is what payment systems rely on; see <a href="{{BASE}}hld/d10">Design a Payment System</a>.</p>
+
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The PID plus per-partition sequence number is <b>TCP's sequence number</b>, one level up: the receiver drops a segment it already has and notices a gap. The producer epoch is like a <b>connection generation</b> (think of a new ISN after a reconnect). <b>Where this breaks:</b> TCP state dies with the connection, but Kafka keeps producer state on the broker across reconnects and leader changes (it is saved with the log), so a retry to a <i>new</i> leader is still de-duplicated. What is lost is the producer's identity when <i>your process</i> restarts.</p>
+        </div>
+      

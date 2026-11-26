@@ -1,0 +1,127 @@
+
+        <h2>Deep dives: the hard parts</h2>
+        <div class="callout note"><p><b>Stop here for SDE-1?</b> If you can explain the stepper, the estimation and push vs pull below, you have a solid SDE-1 answer. SDE-2 candidates should lead at least two of the other deep dives without being asked.</p></div>
+
+        <h3>1. Push vs pull vs hybrid (the celebrity problem)</h3>
+        <p>This is the question behind the question. Compare the three options on the same picture:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Three columns comparing push, pull and hybrid fan-out: where the work happens and what breaks">
+            <rect class="zone" x="10" y="10" width="270" height="280"/>
+            <text class="zone-label" x="26" y="32">Push (fan-out on write)</text>
+            <rect class="box client" x="30" y="50" width="90" height="40"/>
+            <text class="label small" x="75" y="75">author</text>
+            <rect class="box cache" x="170" y="44" width="90" height="28"/>
+            <rect class="box cache" x="170" y="80" width="90" height="28"/>
+            <rect class="box cache" x="170" y="116" width="90" height="28"/>
+            <path class="arrow" d="M120 64 L165 58"/>
+            <path class="arrow" d="M120 70 L165 94"/>
+            <path class="arrow" d="M120 76 L165 130"/>
+            <text class="label small ok" x="145" y="180">Read: 1 cache call</text>
+            <text class="label small bad" x="145" y="205">Write: N followers</text>
+            <text class="label small" x="145" y="235">Breaks on 50M</text>
+            <text class="label small" x="145" y="255">followers</text>
+
+            <rect class="zone" x="295" y="10" width="270" height="280"/>
+            <text class="zone-label" x="311" y="32">Pull (fan-out on read)</text>
+            <rect class="box db" x="315" y="44" width="90" height="28"/>
+            <rect class="box db" x="315" y="80" width="90" height="28"/>
+            <rect class="box db" x="315" y="116" width="90" height="28"/>
+            <rect class="box client" x="455" y="74" width="90" height="40"/>
+            <text class="label small" x="500" y="99">reader</text>
+            <path class="arrow" d="M405 58 L450 86"/>
+            <path class="arrow" d="M405 94 L450 94"/>
+            <path class="arrow" d="M405 130 L450 102"/>
+            <text class="label small ok" x="430" y="180">Write: 1 row</text>
+            <text class="label small bad" x="430" y="205">Read: M followees</text>
+            <text class="label small" x="430" y="235">Breaks when you</text>
+            <text class="label small" x="430" y="255">follow 2,000 people</text>
+
+            <rect class="zone kafka" x="580" y="10" width="270" height="280"/>
+            <text class="zone-label" x="596" y="32">Hybrid (what big apps do)</text>
+            <rect class="box cache" x="600" y="50" width="110" height="36"/>
+            <text class="label small" x="655" y="73">pushed feed</text>
+            <rect class="box hot" x="600" y="110" width="110" height="36"/>
+            <text class="label small" x="655" y="133">celeb posts</text>
+            <rect class="box svc" x="740" y="78" width="95" height="40"/>
+            <text class="label small" x="787" y="103">merge</text>
+            <path class="arrow" d="M710 68 L735 90"/>
+            <path class="arrow dashed" d="M710 128 L735 108"/>
+            <text class="label small ok" x="715" y="180">Normal users: push</text>
+            <text class="label small ok" x="715" y="205">Celebrities: pull</text>
+            <text class="label small" x="715" y="235">Cost: two code</text>
+            <text class="label small" x="715" y="255">paths to maintain</text>
+          </svg>
+          <figcaption>Push pays at write time, pull pays at read time, hybrid pays each cost only where it is small.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Where is the line?</b> Pick a follower threshold (for example 10K-100K followers, an assumption to tune) and store an <code>is_celebrity</code> flag. Re-evaluate it in a daily job, and use hysteresis (a gap between the "turn on" and "turn off" thresholds) so accounts near the line do not flip back and forth.</li>
+          <li><b>Inactive followers:</b> do not push to people who have not opened the app in 30 days (assumption). When they come back, build their feed by pull once (a "cold start"), then switch them back to push. This alone can cut fan-out work a lot, because many follower lists are full of dormant accounts.</li>
+          <li><b>Reader-side cost of pull:</b> a typical user follows only a handful of celebrities, and celebrity post lists are the most cache-friendly data in the system (millions of readers, one key). So the pull part is a few cache hits, not a database scan.</li>
+          <li><b>Real-world:</b> Twitter's 2012 design pushed tweets into Redis timelines (about 800 entries each, replicated 3x) and treated very large accounts specially, merging them at read time. LinkedIn's FollowFeed went the other way, to a pull-based indexed feed with ranking at read time, because ranking needed fresh features. Both are valid; say which pressure drives the choice.</li>
+        </ul>
+
+        <h3>2. Hydration and caching: making 20 posts appear in 200 ms</h3>
+        <p>A feed page is "20 ids, then 20 lookups, then counters, then who-liked". Done naively that is 60+ round trips. The fixes:</p>
+        <ol class="steps">
+          <li><strong>Batch everything</strong> One <code>MGET</code> (or pipelined calls) per data type, issued in parallel. Latency becomes the slowest single call, not the sum.</li>
+          <li><strong>Cache the post once</strong> A celebrity post read by 10M people is one cache key read 10M times. That is great for hit rate but makes a <b>hot key</b>: replicate hot keys across several cache nodes, or keep a tiny in-process cache (a few seconds TTL) inside each feed service pod.</li>
+          <li><strong>Counters are separate</strong> Like counts change constantly. Keep them in their own counter store (sharded counters updated from a Kafka stream of like events), and accept that the count may be a few seconds behind. See <a href="{{BASE}}hld/d39">Distributed Counter</a>.</li>
+          <li><strong>Avoid the thundering herd</strong> When a hot post's cache entry expires, thousands of requests miss at once and stampede the DB. Use request coalescing (one request refills, others wait), or leases as in Facebook's memcache paper, plus jittered TTLs.</li>
+        </ol>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>Hydration is a <b>scatter-gather</b>, the same shape as reading counters from 20 line cards: you fire all requests at once and the answer time is the slowest card, so the tail (p99) of each dependency matters more than its average. A hot key is like an elephant flow pinned by ECMP hashing to one link: hashing cannot spread a single key, so you replicate it instead. <i>Where it breaks:</i> unlike a link, a cache replica can be stale, so hot-key copies need short TTLs.</p>
+        </div>
+
+        <h3>3. Ranking: from "newest first" to "most relevant first"</h3>
+        <p>Chronological feeds are simple: score = time. Ranked feeds (Facebook, Instagram, LinkedIn) use a funnel so the expensive model only scores a few hundred items:</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 820 230" role="img" aria-label="Ranking funnel: thousands of candidates, light filter to hundreds, heavy model to a ranked list, re-ranking rules to the final 20">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box db" x="15" y="40" width="170" height="150"/>
+            <text class="label" x="100" y="90">Candidates</text>
+            <text class="label small" x="100" y="115">~1,000s of ids</text>
+            <text class="label small" x="100" y="138">push feed + pulls</text>
+            <rect class="box svc" x="225" y="60" width="160" height="110"/>
+            <text class="label" x="305" y="100">Light filter</text>
+            <text class="label small" x="305" y="125">~500, cheap rules</text>
+            <rect class="box k8s" x="425" y="75" width="160" height="80"/>
+            <text class="label" x="505" y="105">Heavy model</text>
+            <text class="label small" x="505" y="130">P(like), P(comment)</text>
+            <rect class="box cache" x="625" y="90" width="180" height="50"/>
+            <text class="label" x="715" y="112">Re-rank: 20</text>
+            <text class="label small" x="715" y="130">diversity, rules</text>
+            <path class="arrow" d="M185 115 L218 115"/>
+            <path class="arrow" d="M385 115 L418 115"/>
+            <path class="arrow" d="M585 115 L618 115"/>
+            <circle class="packet" r="6"><animateMotion dur="3s" repeatCount="indefinite" path="M100 115 L305 115 L505 115 L715 115"/></circle>
+          </svg>
+          <figcaption>Each stage is more expensive per item and sees fewer items. The final re-rank enforces rules such as "not three posts in a row from one author".</figcaption>
+        </figure>
+        <ul>
+          <li><b>Candidate generation</b>: the push feed plus celebrity pulls (plus, for discovery feeds, recommended posts; see <a href="{{BASE}}hld/d48">Recommendation System</a>).</li>
+          <li><b>Features</b> such as "how often Sara likes Mia's posts" or "post age" come from a <b>feature store</b> fed by Kafka streams of likes, views and comments.</li>
+          <li><b>Score once, cache briefly</b>: ranking on every scroll is costly. Rank the top few hundred on app open and cache that ranked list for the session (minutes).</li>
+          <li><b>Cursor with ranking</b>: rankings change between pages, so the cursor should point into the <i>cached ranked list</i> for that session, not re-rank on every page (otherwise you get duplicates).</li>
+          <li><b>Fallback</b>: if the ranking service is slow or down, return chronological order. A worse feed is better than no feed. Twitter open-sourced its ranking pipeline (<a href="https://github.com/twitter/the-algorithm" target="_blank" rel="noopener">the-algorithm</a>) if you want to see a real one.</li>
+        </ul>
+
+        <h3>4. Consistency: deletes, unfollows, privacy and "where is my post?"</h3>
+        <ul>
+          <li><b>Read-your-own-writes</b>: the client shows its own post immediately, and the feed service always merges "my newest posts" from <code>posts_by_author</code> for the reader. Do not wait for fan-out.</li>
+          <li><b>Delete</b>: mark <code>deleted=true</code> and evict the post cache. Do not chase 50M feed entries; the hydration step drops deleted ids. A background job can clean feeds lazily.</li>
+          <li><b>Unfollow</b>: remove the followee's ids lazily at read time (filter by the current following set), and optionally run an async cleanup. Rebuilding is cheap because the feed is a cache.</li>
+          <li><b>Privacy / blocks</b>: always re-check visibility during hydration. Precomputed feeds are a <i>hint</i>, never the authority on who may see what.</li>
+          <li><b>Ordering</b>: use server-assigned Snowflake ids, not phone clocks, so a phone with the wrong time cannot jump to the top.</li>
+        </ul>
+
+        <h3>5. Fan-out at scale: making 116K inserts/s boring</h3>
+        <ul>
+          <li><b>Chunk the follower list</b>: a worker turns one <code>PostCreated</code> event into many <code>FanoutChunk(post_id, follower_range)</code> tasks of ~1,000 followers each. Chunks run in parallel across workers and retry independently.</li>
+          <li><b>Pipeline Redis writes</b>: group the <code>ZADD</code> + trim commands by cache shard and send them in one round trip per shard.</li>
+          <li><b>Idempotent by design</b>: <code>ZADD</code> with the same member and score is a no-op, so a retried chunk does no harm. This is why at-least-once delivery from Kafka is fine here.</li>
+          <li><b>Back-pressure</b>: if consumer lag grows, the feed is just a bit late. Scale workers out, and drop the push for borderline accounts first.</li>
+          <li><b>Cache loss</b>: if a feed cache shard dies, its users get a pull-built feed (slower, but correct) while the shard refills. That is why we called the cache "rebuildable".</li>
+        </ul>
+        <div class="callout warn"><p><b>The classic outage:</b> a celebrity flag is wrong (or the threshold is too high), and one post with tens of millions of followers floods the fan-out queue. Every other user's posts now wait behind it, so feeds look "frozen". Defence: separate topics or priority lanes for big accounts, a per-post fan-out cap, and alerts on consumer lag.</p></div>
+      

@@ -1,0 +1,242 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. Votes: one per person, changeable, never double counted</h3>
+        <p>Store the vote as <b>state</b>, keyed by <code>(user_id, thing_id)</code>, with direction -1, 0 or +1. To process a new vote:</p>
+        <ol>
+          <li>Read the old direction (0 if none) <b>and</b> write the new direction (upsert) as one atomic step. Same direction again = no-op.</li>
+          <li>Compute the delta: up-count changes by (new == 1) - (old == 1), down-count by (new == -1) - (old == -1).</li>
+          <li>Emit the delta to the queue with the vote's version (for example a timestamp), so a replayed message can be detected and skipped.</li>
+        </ol>
+        <div class="callout warn"><p><b>Why step 1 must be atomic.</b> If the same user votes from two devices at once and "read old" and "write new" are separate, both reads can see the same old value (say 0) and the counter gets two +1 deltas for one state change. That is the same lost-update race the <a href="{{BASE}}hld/d40">Hotel Booking</a> page warns about. Fix it with a single conditional upsert that returns the previous value, for example in Postgres a CTE that selects the old row <code>FOR UPDATE</code> and then runs <code>INSERT ... ON CONFLICT (user_id, thing_id) DO UPDATE ... RETURNING</code>, or a Cassandra lightweight transaction (LWT, a compare-and-set). Or serialise all votes for one <code>(user_id, thing_id)</code> through one queue partition. Then the delta is always computed from the true previous state.</p></div>
+        <p>Never store a counter that you only "increment" from the client. Counters are derived, and you can always rebuild them from vote records. Reddit kept a relational copy of votes in Postgres for exactly this: backups, batch jobs, and regenerating the Cassandra data if needed (High Scalability).</p>
+        <p><b>"What did I vote on this page?"</b> A thread page shows up to hundreds of comments, each with your arrow state. With votes partitioned by <code>user_id</code>, that is one partition read with an <code>IN</code> list. Reddit got a further speed-up from Cassandra's <b>Bloom filters</b> (a compact bit array that says "definitely not present" or "maybe present"): most comments on a page were never voted on by you, and the Bloom filter answers "no" without a disk read.</p>
+        <p>Counts at huge scale (one viral post, thousands of votes per second) are a separate problem: shard the counter or aggregate in a stream. That is the subject of <a href="{{BASE}}hld/d39">Distributed Counter</a> and the <a href="{{BASE}}hld/p09">Counting &amp; Aggregation pattern</a>.</p>
+
+        <h3>2. Ranking: hot, best, top, controversial</h3>
+        <p>Reddit open-sourced its old code, so we can read the real formulas in <code>r2/lib/db/_sorts.pyx</code> (<a href="https://github.com/reddit-archive/reddit" target="_blank" rel="noopener">reddit-archive/reddit</a>). Here is the hot formula, re-written in plain Python:</p>
+        <pre><code class="language-python">import math
+
+REDDIT_EPOCH = 1134028003          # 8 Dec 2005, 07:46:43 UTC, per the source
+
+def hot(ups: int, downs: int, created_unix: float) -&gt; float:
+    s = ups - downs                          # net score
+    order = math.log10(max(abs(s), 1))       # 10 votes = 1, 100 = 2, 1000 = 3
+    sign = (s &gt; 0) - (s &lt; 0)                 # +1, 0 or -1
+    seconds = created_unix - REDDIT_EPOCH
+    return round(sign * order + seconds / 45000, 7)</code></pre>
+        <p>Read it slowly:</p>
+        <ul>
+          <li><b>log10 of the score.</b> The first 10 votes count as much as the next 90, and as much as the 900 after that. Early votes matter most, so a new post can compete.</li>
+          <li><b>Creation time divided by 45,000.</b> 45,000 s = 12.5 hours. A post created 12.5 hours later gets +1 for free, which equals 10x the votes. A post 25 hours newer with 10 votes ties a post with 1,000 votes.</li>
+          <li><b>The score depends on creation time, not on "now".</b> So a post's hot value only changes when it gets a vote. Old posts do not need to be rescored every minute; they simply fall behind newer ones. That is what makes precomputing listings cheap.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 800 380" role="img" aria-label="Hot rank compared at the same moment: older posts need ten times the votes per 12.5 hours of age">
+            <line class="arrow none" x1="80" y1="350" x2="760" y2="350"/>
+            <line class="arrow none" x1="80" y1="30" x2="80" y2="350"/>
+            <text class="label small" x="420" y="372">age of post right now (hours)</text>
+            <text class="label small" x="80" y="366">0</text>
+            <text class="label small" x="252" y="366">12.5</text>
+            <text class="label small" x="424" y="366">25</text>
+            <text class="label small" x="595" y="366">37.5</text>
+            <text class="label small" x="740" y="366">48</text>
+            <text class="label small" x="45" y="44">3</text>
+            <text class="label small" x="45" y="104">2</text>
+            <text class="label small" x="45" y="164">1</text>
+            <text class="label small" x="45" y="224">0</text>
+            <text class="label small" x="45" y="284">-1</text>
+            <text class="label small" x="40" y="20">relative hot</text>
+            <path class="arrow kafka none" d="M80 40 L740 270"/>
+            <text class="label small" x="630" y="215">score 1,000</text>
+            <path class="arrow ok none" d="M80 100 L740 330"/>
+            <text class="label small" x="300" y="200">score 100</text>
+            <path class="arrow bad none" d="M80 160 L596 340"/>
+            <text class="label small" x="160" y="215">score 10</text>
+            <path class="arrow dashed none" d="M80 160 L424 160"/>
+            <circle class="packet gold" cx="80" cy="160" r="7"/>
+            <circle class="packet gold" cx="424" cy="160" r="7"/>
+            <text class="label small" x="560" y="140">tie: fresh 10-vote post</text>
+            <text class="label small" x="560" y="158">= 25-hour-old 1,000-vote post</text>
+          </svg>
+          <figcaption>Compared at the same moment, each 12.5 hours of age costs one "order of magnitude" of votes. The lines are parallel: age drags every post down at the same speed.</figcaption>
+        </figure>
+
+        <p><b>Best (for comments).</b> Sorting comments by net score buries new good replies; sorting by percentage up puts a 1-up, 0-down comment above a 100-up, 1-down one. Evan Miller's well-known essay explains both mistakes and recommends the <b>lower bound of the Wilson score interval</b>: "given these votes, what is the lowest the true upvote ratio is likely to be?" (<a href="https://www.evanmiller.org/how-not-to-sort-by-average-rating.html" target="_blank" rel="noopener">How Not To Sort By Average Rating</a>). Reddit's <code>_confidence</code> function implements it with z = 1.281551565545, which is 80% confidence, and precomputes a lookup table for up to 400 ups and 100 downs. Worked values (our own calculation with that z):</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Ups</th><th>Downs</th><th>Upvote ratio</th><th>"Best" score (Wilson lower bound, 80%)</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>0</td><td>100%</td><td>0.38</td></tr>
+              <tr><td>10</td><td>0</td><td>100%</td><td>0.86</td></tr>
+              <tr><td>9</td><td>1</td><td>90%</td><td>0.72</td></tr>
+              <tr><td>100</td><td>1</td><td>99%</td><td>0.97</td></tr>
+              <tr><td>600</td><td>400</td><td>60%</td><td>0.58</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>Few votes mean wide uncertainty, so the lower bound is low. Many votes shrink the interval. Unlike hot, "best" has no time term, which suits comments inside a single thread.</p>
+        <p><b>Controversial</b> in the same file: if either ups or downs is zero the score is 0, otherwise <code>(ups + downs) ** balance</code> where balance is the smaller count divided by the larger. Lots of votes, evenly split, wins. <b>Top</b> is plain net score within a time window (hour, day, week, all), which you build with windowed aggregation (see <a href="{{BASE}}hld/d35">Top-K / Heavy Hitters</a>). <b>New</b> is just creation time, which an ID that sorts by time (see <a href="{{BASE}}hld/d31">Unique ID Generator</a>) gives for free.</p>
+        <div class="callout note"><p><b>Quora is different.</b> Quora ranks answers inside a question with a machine-learned quality model, not only votes. Its engineering blog has a post on an end-to-end ML approach to ranking answers (listed in awesome-scalability). In an interview: "votes are one feature among many: author credibility on this topic, answer length and formatting, early engagement." The feed then becomes a <a href="{{BASE}}hld/d48">recommendation system</a>.</p></div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1.</b> Votes as state (one row per user and item, delta computed from the old value) plus the hot and Wilson formulas are the interview-sufficient core. Deep dives 3-6 (Reddit's lock contention story, comment trees for megathreads, caching, the home feed) are SDE-2 depth.</p></div>
+
+        <h3>3. Precomputed listings and the vote-queue pile-up</h3>
+        <p>Reddit's 2017 QCon talk tells this as a story, and it is the best deep dive you can bring to an interview (<a href="https://www.infoq.com/presentations/reddit-architecture-evolution" target="_blank" rel="noopener">InfoQ talk</a>, <a href="https://qconsf.com/sf2017/system/files/presentation-slides/qconsf-20171113-reddits-architecture.pdf" target="_blank" rel="noopener">slides</a>):</p>
+        <ol>
+          <li><b>Naive:</b> <code>SELECT * FROM links ORDER BY hot(ups, downs)</code> per page view. Far too slow.</li>
+          <li><b>Cache the result:</b> store the list of IDs, invalidate it on new posts and votes, rerun the query.</li>
+          <li><b>Mutate in place:</b> things change too fast even to rerun the query, so store <code>(id, sort value)</code> pairs and edit the cached list directly when a vote arrives. This needs a <b>lock</b> (read, modify, write).</li>
+          <li><b>It is now an index:</b> the list is persisted in Cassandra, reads still come from memcached.</li>
+        </ol>
+        <p>Then, in mid-2012, vote queues began filling at peak hours and some votes waited <b>hours</b>. Adding more consumer processes made it <b>worse</b>. Timers showed the time went into waiting for the listing mutation lock: many workers were trying to edit r/news at once. The fix was to <b>partition the queue by subreddit</b> (InfoQ transcript: subreddit ID modulo 10, same total workers). Later in 2012 things slowed again, but averages looked fine. The p99 timers showed the culprit: a vote also updates listings unrelated to the subreddit, such as the listing for the link's <b>domain</b>, and one very popular domain was posted across many subreddits. The fix was to split each vote into separate messages per query type (subreddit, domain, profile), each partitioned so no job ever works across partitions.</p>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 330" role="img" aria-label="Before: one queue, many workers fighting over one lock. After: votes hashed by subreddit to separate queues and workers">
+            <text class="label title" x="210" y="24">Before: one queue</text>
+            <rect class="box queue" x="20" y="120" width="120" height="60"/>
+            <text class="label" x="80" y="146">votes</text>
+            <text class="label small" x="80" y="166">one queue</text>
+            <rect class="box hot" x="190" y="45" width="100" height="40"/>
+            <text class="label small" x="240" y="70">worker 1</text>
+            <rect class="box hot" x="190" y="105" width="100" height="40"/>
+            <text class="label small" x="240" y="130">worker 2</text>
+            <rect class="box hot" x="190" y="165" width="100" height="40"/>
+            <text class="label small" x="240" y="190">worker 3</text>
+            <rect class="box hot" x="190" y="225" width="100" height="40"/>
+            <text class="label small" x="240" y="250">worker 4</text>
+            <path class="arrow" d="M140 150 L188 65"/>
+            <path class="arrow" d="M140 150 L188 125"/>
+            <path class="arrow" d="M140 150 L188 185"/>
+            <path class="arrow" d="M140 150 L188 245"/>
+            <rect class="box fail" x="330" y="120" width="100" height="60"/>
+            <text class="label small" x="380" y="145">r/news lock</text>
+            <text class="label small" x="380" y="165">waiting...</text>
+            <path class="arrow bad" d="M290 65 L328 135"/>
+            <path class="arrow bad" d="M290 125 L328 145"/>
+            <path class="arrow bad" d="M290 185 L328 155"/>
+            <path class="arrow bad" d="M290 245 L328 165"/>
+            <circle class="packet bad" r="6"><animateMotion dur="2.2s" repeatCount="indefinite" path="M140 150 L240 65 L330 135"/></circle>
+            <circle class="packet bad" r="6"><animateMotion dur="2.2s" begin="0.7s" repeatCount="indefinite" path="M140 150 L240 245 L330 165"/></circle>
+
+            <line class="zone" x1="455" y1="20" x2="455" y2="310"/>
+            <text class="label title" x="660" y="24">After: hash(subreddit) mod N</text>
+            <rect class="box svc" x="470" y="120" width="90" height="60"/>
+            <text class="label small" x="515" y="146">router</text>
+            <text class="label small" x="515" y="166">mod 4</text>
+            <rect class="box queue" x="600" y="45" width="100" height="40"/>
+            <text class="label small" x="650" y="70">q0 r/news</text>
+            <rect class="box queue" x="600" y="105" width="100" height="40"/>
+            <text class="label small" x="650" y="130">q1 r/funny</text>
+            <rect class="box queue" x="600" y="165" width="100" height="40"/>
+            <text class="label small" x="650" y="190">q2 r/science</text>
+            <rect class="box queue" x="600" y="225" width="100" height="40"/>
+            <text class="label small" x="650" y="250">q3 r/india</text>
+            <rect class="box highlight" x="740" y="45" width="100" height="40"/>
+            <text class="label small" x="790" y="70">worker 0</text>
+            <rect class="box highlight" x="740" y="105" width="100" height="40"/>
+            <text class="label small" x="790" y="130">worker 1</text>
+            <rect class="box highlight" x="740" y="165" width="100" height="40"/>
+            <text class="label small" x="790" y="190">worker 2</text>
+            <rect class="box highlight" x="740" y="225" width="100" height="40"/>
+            <text class="label small" x="790" y="250">worker 3</text>
+            <path class="arrow" d="M560 150 L598 65"/>
+            <path class="arrow" d="M560 150 L598 125"/>
+            <path class="arrow" d="M560 150 L598 185"/>
+            <path class="arrow" d="M560 150 L598 245"/>
+            <path class="arrow ok" d="M700 65 L738 65"/>
+            <path class="arrow ok" d="M700 125 L738 125"/>
+            <path class="arrow ok" d="M700 185 L738 185"/>
+            <path class="arrow ok" d="M700 245 L738 245"/>
+            <circle class="packet ok" r="6"><animateMotion dur="1.6s" repeatCount="indefinite" path="M470 150 L560 150 L650 65 L790 65"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="1.6s" begin="0.5s" repeatCount="indefinite" path="M470 150 L560 150 L650 185 L790 185"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="1.6s" begin="1s" repeatCount="indefinite" path="M470 150 L560 150 L650 245 L790 245"/></circle>
+            <text class="label small" x="660" y="300">each listing has one writer: no lock fight</text>
+          </svg>
+          <figcaption>More workers on one queue increased lock contention. Partitioning by subreddit gave each listing a single writer, the same trick as a Kafka partition with one consumer.</figcaption>
+        </figure>
+        <div class="callout interview"><p>Two lessons Reddit spelled out, and both are interview gold: "timers give you a cross section, p99 shows you problem cases", and "locks are bad news for throughput; if you must, partition to reduce contention." Say them when you talk about monitoring and hot keys.</p></div>
+
+        <h3>4. Comment trees</h3>
+        <p>A thread is a tree: each comment has a <code>parent_id</code>. Four classic ways to store a tree in a database:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Approach</th><th>How</th><th>Read a whole thread</th><th>Insert a reply</th></tr></thead>
+            <tbody>
+              <tr><td>Adjacency list</td><td><code>parent_id</code> column</td><td>One query by <code>post_id</code>, build the tree in memory</td><td>Cheap: one row</td></tr>
+              <tr><td>Materialized path</td><td><code>path = '0001.0007.0003'</code></td><td>Prefix range scan, subtree by prefix</td><td>Cheap; moving a subtree is costly</td></tr>
+              <tr><td>Closure table</td><td>Row per (ancestor, descendant)</td><td>Fast subtree queries</td><td>O(depth) rows per insert</td></tr>
+              <tr><td>Precomputed tree (Reddit)</td><td>A stored map parent -&gt; [children], per post</td><td>One read gives the shape, then fetch only the visible comments</td><td>Expensive, so it is queued and batched</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 820 290" role="img" aria-label="Comment tree and its precomputed children map">
+            <rect class="box db" x="40" y="20" width="110" height="40"/>
+            <text class="label" x="95" y="45">post</text>
+            <rect class="box client" x="20" y="100" width="70" height="38"/>
+            <text class="label" x="55" y="124">c1</text>
+            <rect class="box client" x="110" y="100" width="70" height="38"/>
+            <text class="label" x="145" y="124">c4</text>
+            <rect class="box client" x="20" y="175" width="70" height="38"/>
+            <text class="label" x="55" y="199">c2</text>
+            <rect class="box client" x="110" y="175" width="70" height="38"/>
+            <text class="label" x="145" y="199">c5</text>
+            <rect class="box client" x="20" y="245" width="70" height="38"/>
+            <text class="label" x="55" y="269">c3</text>
+            <path class="arrow" d="M80 60 L58 98"/>
+            <path class="arrow" d="M110 60 L140 98"/>
+            <path class="arrow" d="M55 138 L55 173"/>
+            <path class="arrow" d="M145 138 L145 173"/>
+            <path class="arrow" d="M55 213 L55 243"/>
+            <rect class="box queue" x="250" y="40" width="250" height="200"/>
+            <text class="label" x="375" y="66">children map (stored)</text>
+            <text class="label mono" x="375" y="100">root -&gt; [c1, c4]</text>
+            <text class="label mono" x="375" y="128">c1 -&gt; [c2]</text>
+            <text class="label mono" x="375" y="156">c2 -&gt; [c3]</text>
+            <text class="label mono" x="375" y="184">c4 -&gt; [c5]</text>
+            <text class="label small" x="375" y="220">+ sort keys per child (best, top, new)</text>
+            <rect class="box svc" x="540" y="40" width="260" height="200"/>
+            <text class="label" x="670" y="66">render a page</text>
+            <text class="label small" x="670" y="100">1. read the map (one key)</text>
+            <text class="label small" x="670" y="128">2. walk it by "best", stop at</text>
+            <text class="label small" x="670" y="150">200 comments or depth 8</text>
+            <text class="label small" x="670" y="178">3. multi-get only those bodies</text>
+            <text class="label small" x="670" y="206">4. the rest become</text>
+            <text class="label small" x="670" y="226">"load more comments" stubs</text>
+            <path class="arrow" d="M500 140 L538 140"/>
+          </svg>
+          <figcaption>Reddit precomputes the tree shape because computing it per request was too expensive; the page then fetches only the comments it will show.</figcaption>
+        </figure>
+
+        <p>Facts from Reddit's talk about running this in production:</p>
+        <ul>
+          <li>Updating the stored tree is expensive, so it is deferred to job queues and <b>batched</b> to cut the number of separate changes.</li>
+          <li>Updates are <b>order sensitive</b>: a reply cannot join the tree if its parent is not there yet. Inconsistencies trigger an automatic recompute.</li>
+          <li>Massive threads hog resources, so a manually flagged thread can be moved to a dedicated <b>fastlane</b> queue.</li>
+          <li><b>Early 2016 incident:</b> a huge news thread was fastlaned, then the fastlane queue grew exponentially and filled the broker's memory. Every site action that used queues (voting, commenting, posting) froze. The cause: the main queue was backed up, so fastlaned messages skipped ahead of their parents; the tree looked inconsistent, and every page view queued yet another recompute. The broker had to be restarted, losing messages. The fix was <b>queue quotas</b>: a maximum length per queue, so one queue can never take all resources.</li>
+        </ul>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The fastlane is a strict-priority queue on a switch port, and the 2016 incident is a buffer-exhaustion story: one class grew without bound and starved shared buffer memory for every other class. Queue quotas are per-queue buffer limits with tail drop. The recompute-per-page-view loop is a broadcast storm: a reaction to inconsistency that creates more inconsistency.</p>
+        </div>
+
+        <h3>5. Caching a read-heavy site</h3>
+        <ul>
+          <li><b>Logged-out users</b> get fully cached pages from the CDN. Old threads are archived (locked to new votes and comments), and their rendered pages are cached, which keeps old data out of the hot database (High Scalability).</li>
+          <li><b>Write-through objects.</b> r2 serialises whole Thing objects into memcached and writes changes to memcached at the same time as Postgres, rather than deleting the key, so the next read does not have to repopulate it (InfoQ transcript).</li>
+          <li><b>Batch your cache calls.</b> After moving to EC2, memcached latency rose about 10x to roughly 1 ms per call, so Reddit batched calls into multi-gets instead of about 1,000 separate round trips per page (High Scalability).</li>
+          <li><b><a href="{{BASE}}interview/glossary#consistent-hashing">Consistent hashing</a></b> for the cache tier so you can add nodes without remapping everything (see <a href="{{BASE}}hld/d17">Distributed Cache</a>).</li>
+          <li><b>Cold cache is an outage.</b> In mid-2016 a migration mistake made Reddit's autoscaler terminate hundreds of servers including many caches; the caches came back cold and Postgres was "completely slammed with reads", so caches had to be re-warmed gently (QCon slides). Plan request coalescing and warm-up for cache nodes; more in the <a href="{{BASE}}hld/p04">Scaling Reads pattern</a>.</li>
+        </ul>
+
+        <h3>6. The home feed</h3>
+        <p>A user joins maybe 50 communities. Two options (see <a href="{{BASE}}hld/p08">Fan-out: push vs pull</a> and <a href="{{BASE}}hld/d05">News Feed</a>):</p>
+        <ul>
+          <li><b>Pull and merge (fan-out on read; fan-out = copying one item to many readers):</b> read the top ~100 of each joined community's precomputed hot listing and merge by hot score. Works well here because the listings already exist and are shared by everyone in that community; no per-user inbox to maintain.</li>
+          <li><b>Push (fan-out on write):</b> write each new post into every subscriber's feed. Bad for Reddit: a large subreddit has millions of subscribers, so one post would mean millions of writes.</li>
+        </ul>
+        <p>So Reddit-style feeds lean on pull + merge, with a short per-user cache of the merged result. Quora-style feeds are personalized ranking problems: candidate generation from followed topics and people, then an ML ranker.</p>
+      

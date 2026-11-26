@@ -1,0 +1,130 @@
+
+        <h2>Where Kafka, Kubernetes and Docker fit</h2>
+
+        <h3>Kafka</h3>
+        <p>Kafka carries two very different streams. Uber is one of the largest Kafka users in the world (its engineering blog reports trillions of messages and multiple petabytes a day), and ride hailing shows why. New to these words? Read <a href="{{BASE}}devops/kafka-02">Core Concepts</a>.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 280" role="img" aria-label="driver-locations topic feeds surge, tracking, trace archive and ETA training; trip-events topic feeds payments, notifications, analytics">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="15" y="40" width="150" height="60"/>
+            <text class="label" x="90" y="66">Location svc</text>
+            <text class="label small" x="90" y="86">250K msgs/s</text>
+            <rect class="box svc" x="15" y="180" width="150" height="60"/>
+            <text class="label" x="90" y="206">Ride service</text>
+            <text class="label small" x="90" y="226">outbox</text>
+            <rect class="box kafka" x="230" y="40" width="230" height="60"/>
+            <text class="label" x="345" y="64">driver-locations</text>
+            <text class="label small" x="345" y="86">key=driver_id, hours of retention</text>
+            <rect class="box kafka" x="230" y="180" width="230" height="60"/>
+            <text class="label" x="345" y="204">trip-events</text>
+            <text class="label small" x="345" y="226">key=trip_id, days of retention</text>
+            <rect class="box k8s" x="540" y="10" width="300" height="34"/><text class="label small" x="690" y="32">surge (Flink, per H3 hexagon)</text>
+            <rect class="box k8s" x="540" y="52" width="300" height="34"/><text class="label small" x="690" y="74">live tracking -&gt; rider's stream</text>
+            <rect class="box k8s" x="540" y="94" width="300" height="34"/><text class="label small" x="690" y="116">trace archiver -&gt; object storage</text>
+            <rect class="box k8s" x="540" y="160" width="300" height="34"/><text class="label small" x="690" y="182">payments (idempotent per trip)</text>
+            <rect class="box k8s" x="540" y="202" width="300" height="34"/><text class="label small" x="690" y="224">notifications (SMS / push)</text>
+            <rect class="box k8s" x="540" y="244" width="300" height="34"/><text class="label small" x="690" y="266">analytics, fraud, ETA training</text>
+            <path class="arrow kafka" d="M165 70 L223 70"/>
+            <path class="arrow kafka" d="M165 210 L223 210"/>
+            <path class="arrow" d="M460 62 L533 27"/><path class="arrow" d="M460 70 L533 69"/><path class="arrow" d="M460 78 L533 111"/>
+            <path class="arrow" d="M460 202 L533 177"/><path class="arrow" d="M460 210 L533 219"/><path class="arrow" d="M460 218 L533 261"/>
+            <circle class="packet ok" r="6"><animateMotion dur="1.6s" repeatCount="indefinite" path="M165 70 L345 70 L460 62 L540 27"/></circle>
+            <circle class="packet ok" r="6"><animateMotion dur="1.6s" begin="0.8s" repeatCount="indefinite" path="M165 70 L345 70 L460 78 L540 111"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.6s" repeatCount="indefinite" path="M165 210 L345 210 L460 202 L540 177"/></circle>
+          </svg>
+          <figcaption>High-volume, loss-tolerant location data on top; low-volume, must-not-lose trip events below. Different topics, different settings.</figcaption>
+        </figure>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Topic</th><th>Key</th><th>Settings (examples)</th><th>Why</th></tr></thead>
+            <tbody>
+              <tr><td><code>driver-locations</code></td><td><code>driver_id</code></td><td>Many partitions, <code>acks=1</code> (this turns off the idempotent producer, which needs <code>acks=all</code>; fine here because a duplicate or lost ping is harmless), lz4 compression, <code>linger.ms</code> 5-20, retention a few hours</td><td>Per-driver order; throughput over durability; a lost ping is replaced in 4 s</td></tr>
+              <tr><td><code>driver-latest</code> (optional)</td><td><code>driver_id</code></td><td><code>cleanup.policy=compact</code></td><td>Keeps only the newest position per driver, so a restarting geo index can rebuild fast</td></tr>
+              <tr><td><code>trip-events</code></td><td><code>trip_id</code></td><td><code>acks=all</code>, <code>min.insync.replicas=2</code>, idempotent producer, retention days</td><td>Money and state: no loss, per-trip order, consumers dedupe by event id</td></tr>
+            </tbody>
+          </table>
+        </div>
+<pre class="terminal"><code>$ kafka-topics.sh --bootstrap-server localhost:9092 --create --topic driver-latest \
+    --partitions 24 --replication-factor 3 --config cleanup.policy=compact
+Created topic driver-latest.
+$ kafka-console-producer.sh --bootstrap-server localhost:9092 --topic driver-latest \
+    --property parse.key=true --property key.separator=:
+&gt;d42:{"lat":12.97231,"lng":77.59410,"ts":1763920801000}
+&gt;d42:{"lat":12.97302,"lng":77.59488,"ts":1763920805000}</code></pre>
+        <p class="muted">After compaction runs, only the second (newest) value for key <code>d42</code> remains. Compaction is lazy, so consumers may still see older values for a while. Read <a href="{{BASE}}devops/kafka-07">Storage Internals</a> for how it works.</p>
+        <ul>
+          <li><b>Why key by driver, not by cell?</b> A driver moves between cells; keying by cell would split one driver's pings across partitions and reorder them. Consumers that need cells (surge) compute the cell themselves.</li>
+          <li><b>Retries without blocking</b>: a payment consumer that fails on one trip should not block the partition. Uber's "reliable reprocessing" design moves failures to retry topics with growing delays and finally a dead-letter topic. See <a href="{{BASE}}devops/pipeline-03">Stream Processing, Retries &amp; DLQ</a>.</li>
+          <li><b>Outbox</b>: the ride service writes the trip row and an outbox row in one transaction, and a relay (or Debezium CDC) publishes to <code>trip-events</code>. No dual write.</li>
+        </ul>
+
+        <h3>Kubernetes</h3>
+        <p>Most services (ride, ETA, payments, notification) are stateless Deployments with autoscaling. The interesting ones are the <b>location and matching servers</b>, because each owns a slice of the map in memory:</p>
+<pre><code class="language-yaml">apiVersion: apps/v1
+kind: StatefulSet                 # stable names: matching-blr-0, -1, -2 own fixed cell ranges
+metadata:
+  name: matching-blr
+spec:
+  serviceName: matching-blr
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector: { matchLabels: { app: matching, city: blr } }
+  template:
+    metadata: { labels: { app: matching, city: blr } }
+    spec:
+      topologySpreadConstraints:              # one replica per zone
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector: { matchLabels: { app: matching, city: blr } }
+      containers:
+      - name: matching
+        image: registry.example.com/matching:5.2.0
+        env:
+        - { name: CITY, value: "blr" }
+        - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }  # decides which cells this pod owns
+        readinessProbe:
+          httpGet: { path: /ready, port: 8080 }    # ready only after the geo index is warmed from driver-latest
+        resources:
+          requests: { cpu: "4", memory: "8Gi" }
+          limits:   { memory: "8Gi" }</code></pre>
+        <ul>
+          <li><b>Readiness after warm-up</b>: a new matching pod reads the compacted <code>driver-latest</code> topic (or simply waits one or two ping intervals) before it reports ready. Otherwise it would answer "no drivers nearby".</li>
+          <li><b>Headless Service</b> gives each pod a stable DNS name (<code>matching-blr-0.matching-blr</code>), so the ride service can route a request to the owner of a cell. See <a href="{{BASE}}devops/k8s-10">StatefulSets &amp; Operators</a>.</li>
+          <li><b>The control plane is not on the hot path</b>: if the Kubernetes API server is down, running pods keep matching. Only new scheduling stops. See <a href="{{BASE}}devops/k8s-02">K8s Architecture</a>.</li>
+          <li><b>Scale ahead of known peaks</b> (New Year's Eve, festivals, big matches): autoscalers react in minutes, crowds arrive in seconds.</li>
+        </ul>
+
+        <h3>Docker</h3>
+        <p>Every service is an image. For learning, a Compose file with Redis, a single KRaft Kafka broker and a tiny fake-driver simulator lets you watch GEOSEARCH answers change as cars move:</p>
+<pre><code class="language-yaml"># compose.yaml - local ride-hailing lab
+services:
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+  kafka:
+    image: apache/kafka:4.3.2            # Kafka 4.x: KRaft only (same image as Build It Locally)
+    ports: ["29092:29092"]               # host tools: localhost:29092; containers: kafka:9092
+    environment:                         # set any KAFKA_* and the image needs the full set
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+  driver-sim:
+    build: ./driver-sim                  # sends GEOADD + Kafka pings for 200 fake drivers every 4 s
+    environment: { REDIS_URL: "redis://redis:6379", KAFKA_BOOTSTRAP: "kafka:9092", DRIVERS: "200" }
+    depends_on: [redis, kafka]
+  matching:
+    build: ./matching
+    ports: ["8080:8080"]
+    environment: { REDIS_URL: "redis://redis:6379" }
+    depends_on: [redis]</code></pre>
+        <p>Why the long Kafka block: with default settings the image advertises <code>localhost:9092</code>, so <code>driver-sim</code> (which bootstraps to <code>kafka:9092</code>) would be told to reconnect to its own localhost and fail. <code>KAFKA_ADVERTISED_LISTENERS</code> gives containers <code>kafka:9092</code> and your laptop <code>localhost:29092</code>. See <a href="{{BASE}}devops/docker-07">Docker Compose</a> and the <a href="{{BASE}}devops/pipeline-02">Build It Locally</a> lab, which uses the same image, for a full working setup.</p>
+      

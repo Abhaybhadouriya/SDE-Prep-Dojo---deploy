@@ -1,0 +1,135 @@
+
+        <h2>Windowed analytics: revenue per minute</h2>
+        <p>The analytics service answers one question: "how much money did we take in each minute?" That sounds easy until you remember three facts about streams: events arrive <b>out of order</b>, some arrive <b>late</b>, and the stream <b>never ends</b>, so you can never say "now I have everything".</p>
+        <div class="eli5">
+          <h4>Explain like I'm 5</h4>
+          <p>You have a row of jars, one for each minute on the clock. Each coin has the time it was earned stamped on it. You drop each coin in the jar for <em>its</em> minute, even if the coin reaches you a bit late. You cannot wait forever to close a jar, so you follow a rule: "when I see coins stamped 10 seconds after a jar's minute ended, I close that jar and write its total on the board." A coin for a closed jar is too late: you count it as "late" and set it aside.</p>
+        </div>
+        <ul>
+          <li><b>Tumbling window:</b> fixed, non-overlapping buckets. <code>[12:00, 12:01)</code>, <code>[12:01, 12:02)</code>... Every event is in exactly one.</li>
+          <li><b>Event time:</b> the time the thing happened (<code>created_at</code> written by the order-api). <b>Processing time</b> is when our code reads it. They differ by network delay, retries and lag. ShopStream buckets by <a href="{{BASE}}interview/glossary#event-time">event time</a>, so a retried order still counts in the minute it was placed.</li>
+          <li><b>Watermark:</b> the processor's belief "I have probably seen everything up to time T". ShopStream's <a href="{{BASE}}interview/glossary#watermark">watermark</a> is simply the largest event time seen so far.</li>
+          <li><b>Allowed lateness:</b> keep a window open this long after the watermark passes its end (10 seconds here) to catch slightly late events.</li>
+        </ul>
+
+        <figure class="diagram">
+          <svg viewBox="0 0 860 300" role="img" aria-label="Three one-minute windows on a time line, events falling into them by event time, the watermark line, and one late event that misses a closed window">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M30 230 L840 230"/>
+            <text class="label small" x="60" y="252">12:00</text>
+            <text class="label small" x="300" y="252">12:01</text>
+            <text class="label small" x="540" y="252">12:02</text>
+            <text class="label small" x="780" y="252">12:03</text>
+            <text class="label small end" x="845" y="278">event time</text>
+
+            <rect class="box client" x="60" y="150" width="236" height="70"/>
+            <text class="label" x="178" y="172">window 12:00-12:01</text>
+            <text class="label small ok" x="178" y="198">CLOSED: 3 orders</text>
+            <rect class="box kafka" x="300" y="150" width="236" height="70"/>
+            <text class="label" x="418" y="172">window 12:01-12:02</text>
+            <text class="label small" x="418" y="198">open: 2 so far</text>
+            <rect class="box ghost svc" x="540" y="150" width="236" height="70"/>
+            <text class="label" x="658" y="172">window 12:02-12:03</text>
+            <text class="label small" x="658" y="198">open: 1 so far</text>
+
+            <path class="arrow none dashed" d="M560 30 L560 240"/>
+            <text class="label small" x="560" y="20">watermark 12:02:05</text>
+            <path class="arrow none dashed" d="M340 60 L340 140"/>
+            <text class="label small" x="340" y="48">12:01:10: closes 12:00 window</text>
+            <path class="arrow none dashed" d="M580 60 L580 140"/>
+            <text class="label small left" x="590" y="70">12:02:10: will close</text>
+            <text class="label small left" x="590" y="88">the 12:01 window</text>
+
+            <circle class="packet ok" r="7"><animateMotion dur="3s" repeatCount="indefinite" path="M110 40 L110 185"/></circle>
+            <circle class="packet" r="7"><animateMotion dur="3s" begin="0.7s" repeatCount="indefinite" path="M420 40 L420 185"/></circle>
+            <circle class="packet" r="7"><animateMotion dur="3s" begin="1.4s" repeatCount="indefinite" path="M550 40 L550 185"/></circle>
+            <circle class="packet bad" r="7"><animateMotion dur="3s" begin="2.1s" repeatCount="indefinite" path="M200 40 L200 120 L230 140"/></circle>
+            <text class="label small bad" x="200" y="100">late!</text>
+          </svg>
+          <figcaption>Scale: 240 px per minute, so 10 s is 40 px. Events drop into the window for their own timestamp. The rule is "close a window when the watermark reaches its end + 10 s". When the watermark passed 12:01:10, the first window closed and its total went to Prometheus. The watermark is now 12:02:05, so the 12:01 window is still open; it closes at 12:02:10. The red event is stamped 12:00-something but arrived after that, so it is counted as late and dropped.</figcaption>
+        </figure>
+
+        <p>The whole windowing engine is one small function:</p>
+<pre><code class="language-python"># services/analytics/analytics.py (excerpt)
+def add(order: dict):
+    global watermark_ms
+    ts = event_time_ms(order)                       # from created_at, not "now"
+    start = ts - (ts % WINDOW_MS)                   # which 1-minute bucket
+    with lock:
+        if start + WINDOW_MS + ALLOWED_LATENESS_MS &lt;= watermark_ms:
+            LATE.inc()                              # window already closed
+            return
+        w = open_windows.setdefault(start, {"revenue": 0, "orders": 0})
+        w["revenue"] += order["total_cents"]
+        w["orders"] += 1
+        REV_TOTAL.inc(order["total_cents"])
+        watermark_ms = max(watermark_ms, ts)
+        # Close every window the watermark has passed (plus lateness).
+        for s in sorted(k for k in open_windows if k + WINDOW_MS + ALLOWED_LATENESS_MS &lt;= watermark_ms):
+            done = open_windows.pop(s)
+            ...
+            log.info("WINDOW %s orders=%d revenue=INR %.2f", row["window"], done["orders"], done["revenue"] / 100)</code></pre>
+        <p>Run some load and read the results:</p>
+<pre><code class="language-bash">python loadgen/loadgen.py --rps 20 --seconds 180
+curl -s localhost:8001/windows
+docker compose logs --tail 5 analytics</code></pre>
+<pre class="terminal"><code>$ curl -s localhost:8001/windows
+{
+  "closed": [
+    {
+      "window": "10:15:00-10:16:00",
+      "revenue": 466351200,
+      "orders": 1197
+    },
+    ...
+  ],
+  "open": { ... }
+}
+$ docker compose logs --tail 5 analytics
+analytics-1  | ... INFO  analytics WINDOW 10:15:00-10:16:00 orders=1197 revenue=INR 4663512.00</code></pre>
+        <p>The numbers are random each run, because the load generator picks random products. The shape is what matters: about 60 seconds times your requests per second orders per closed window.</p>
+        <div class="callout tip"><p><b>Estimation exercise:</b> the load generator picks 1 to 3 items (mean 2), quantity 1 to 3 (mean 2), from an 8-product catalog whose mean price is about INR 974. So one order is worth about 2 x 2 x 974 = INR 3,896 on average, and 1,197 orders should be about INR 4.66 million. If your window is far off that, something is being dropped or double-counted.</p></div>
+
+        <h3>The window family</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 280" role="img" aria-label="Tumbling, hopping, sliding and session windows compared on one time line">
+            <text class="label left" x="10" y="35">Tumbling</text>
+            <rect class="box kafka" x="150" y="18" width="160" height="34"/><rect class="box kafka" x="314" y="18" width="160" height="34"/><rect class="box kafka" x="478" y="18" width="160" height="34"/><rect class="box kafka" x="642" y="18" width="160" height="34"/>
+            <text class="label small" x="230" y="35">0-60 s</text><text class="label small" x="394" y="35">60-120 s</text><text class="label small" x="558" y="35">120-180 s</text><text class="label small" x="722" y="35">180-240 s</text>
+
+            <text class="label left" x="10" y="100">Hopping</text>
+            <rect class="box svc" x="150" y="78" width="320" height="22"/><rect class="box svc" x="314" y="104" width="320" height="22"/><rect class="box svc" x="478" y="78" width="320" height="22"/>
+            <text class="label small" x="310" y="140">size 2 min, advance 1 min: windows overlap, one event counts twice</text>
+
+            <text class="label left" x="10" y="185">Sliding</text>
+            <rect class="box cache ghost" x="250" y="168" width="320" height="34"/>
+            <text class="label small" x="410" y="185">"last 2 minutes", moves with each event</text>
+
+            <text class="label left" x="10" y="245">Session</text>
+            <rect class="box client" x="150" y="228" width="150" height="34"/><rect class="box client" x="420" y="228" width="90" height="34"/><rect class="box client" x="610" y="228" width="190" height="34"/>
+            <text class="label small" x="360" y="245">gap</text><text class="label small" x="560" y="245">gap</text>
+            <text class="label small" x="225" y="245">user active</text><text class="label small" x="705" y="245">user active</text>
+          </svg>
+          <figcaption>ShopStream uses tumbling windows. Hopping windows give smooth moving averages, sliding windows answer "in the last N minutes", session windows group bursts of activity separated by an idle gap (for example one shopping visit).</figcaption>
+        </figure>
+
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Question</th><th>Window</th><th>Example</th></tr></thead>
+            <tbody>
+              <tr><td>"Revenue per minute"</td><td>Tumbling</td><td>Dashboards, billing buckets</td></tr>
+              <tr><td>"5-minute average, updated every minute"</td><td>Hopping</td><td>Smoothed alert signals</td></tr>
+              <tr><td>"More than 3 failed logins in any 10 minutes"</td><td>Sliding</td><td>Fraud and abuse rules</td></tr>
+              <tr><td>"How long was this visit?"</td><td>Session</td><td>Clickstream, user journeys</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Where the toy version stops</h3>
+        <p>ShopStream's analytics keeps its windows in a Python dict. The code's own comment admits the cost: committing offsets while state lives only in memory means a crash loses open windows. Real stream processors solve this with <b>state stores backed by a changelog</b>:</p>
+        <ul>
+          <li><b>Kafka Streams</b> (a Java library inside your app) keeps state in a local RocksDB store and writes every change to a compacted <b>changelog topic</b>. A restarted instance replays the changelog to rebuild its state. With <code>processing.guarantee=exactly_once_v2</code>, state updates, outputs and offsets commit together. Windows have a <b>grace period</b> for late data, like our allowed lateness.</li>
+          <li><b>Apache Flink</b> (a separate cluster) takes periodic <b>checkpoints</b> of all operator state using barriers that flow through the stream, and its watermarks are generated per source partition, so one slow partition holds the watermark back instead of letting its events be called late.</li>
+        </ul>
+        <p>That last point exposes a real bug class in hand-written processors like ours: ShopStream's watermark is one global "max timestamp seen", taken across all partitions it reads. If one partition is behind (say a hot partition with lots of lag), its events will look late once the other partitions push the watermark ahead. A per-partition watermark (the minimum across partitions) fixes that. It is a good thing to mention in an interview to show you understand <em>why</em> frameworks exist. For heavy windowed counting at scale, see <a href="{{BASE}}hld/d35">Top-K Heavy Hitters</a> and <a href="{{BASE}}hld/hld-12">Big Data &amp; Streaming</a>.</p>
+      

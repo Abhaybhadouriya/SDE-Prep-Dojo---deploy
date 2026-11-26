@@ -1,0 +1,956 @@
+
+  <h2>Full code (runs as is)</h2>
+  <p>Java and Python are complete (three policies, TTL, read-through, write-through and write-back, two levels, a concurrency test). The C++14 version has the three policies on the same interface; LRU uses <code>std::list::splice</code>, the idiomatic O(1) move-to-front. Source: <code>lld-code/lld-case-lru-cache/</code>.</p>
+  <div class="callout tip"><p><b>Read in this order</b> (the files are long; this is the 10-minute path):</p><ol><li><code>Main.main</code>: the a, b, c, get a, put d example for each policy.</li><li><code>Cache.get</code> and <code>put</code>: the facade with TTL, read-through and write policies.</li><li><code>LruPolicy</code>: sentinel nodes, <code>unlink</code>, <code>pushFront</code>, <code>evict</code>. About 20 lines and the heart of the answer.</li><li><code>LfuPolicy</code>: frequency buckets and <code>minFreq</code>; then <code>FifoPolicy</code>.</li><li>Skip on first read: <code>Clock</code>, <code>ManualClock</code>, <code>FakeDb</code>.</li></ol></div>
+  <div class="bridge">
+    <h4>From your world: reading this Java as a C programmer</h4>
+    <ul>
+      <li><code>interface Foo { int bar(int x); }</code> is a struct of function pointers (an ops table like <code>struct file_operations</code>); a class that <code>implements Foo</code> fills the table in.</li>
+      <li><code>x -&gt; expr</code> is a <b>lambda</b>, not a pointer dereference: an anonymous function. Read it as "a function pointer plus the context it captured" (the <code>void *data</code> you pass with a callback). <code>k -&gt; new ArrayDeque&lt;&gt;()</code> means "given k, make an empty deque". Inside a <code>switch</code>, <code>case X -&gt; ...</code> is a case with no fallthrough, so no <code>break</code>.</li>
+      <li><code>Foo::bar</code> is a method reference: a function pointer to <code>bar</code> (<code>obj::bar</code> also binds the object, like passing <code>obj</code> as the first argument).</li>
+      <li><code>record Point(int x, int y)</code> is a const struct whose constructor, <code>equals</code>, <code>hashCode</code> and <code>toString</code> are generated.</li>
+      <li>Generics such as <code>Map&lt;K, V&gt;</code> are a type-checked <code>void *</code>: one implementation, and the compiler checks what goes in and comes out.</li>
+      <li><code>Optional&lt;T&gt;</code> is a "may be NULL" return made explicit in the type. <code>EnumMap</code> is an array indexed by an enum. A <code>sealed</code> interface allows only the listed implementations (a closed tagged union).</li>
+      <li><code>final</code> on a field means "assigned once", like <code>const</code> after init. There is no <code>free()</code>: the garbage collector reclaims objects nothing points to.</li>
+      <li><code>volatile</code> in Java is <b>not</b> C's <code>volatile</code> (see the concurrency section), and <code>synchronized</code> is a mutex built into every object.</li>
+    </ul>
+    <p>The longer version is <a href="{{BASE}}lld/lld-oop-from-c">OOP for C programmers</a>.</p>
+  </div>
+
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
+
+// ---------- eviction strategy ----------
+interface EvictionPolicy&lt;K&gt; {
+    void onPut(K key);          // a new key entered the cache
+    void onAccess(K key);       // an existing key was read or overwritten
+    void onRemove(K key);       // a key left for another reason (remove, expiry)
+    K evict();                  // choose a victim, forget it, return it
+}
+
+/** LRU: hash map + hand-written doubly linked list. Head = most recent, tail = victim. All O(1). */
+final class LruPolicy&lt;K&gt; implements EvictionPolicy&lt;K&gt; {
+    private static final class Node&lt;K&gt; { K key; Node&lt;K&gt; prev, next; Node(K k) { key = k; } }
+    private final Map&lt;K, Node&lt;K&gt;&gt; nodes = new HashMap&lt;&gt;();
+    private final Node&lt;K&gt; head = new Node&lt;&gt;(null), tail = new Node&lt;&gt;(null);   // sentinels: no null checks
+    LruPolicy() { head.next = tail; tail.prev = head; }
+
+    private void unlink(Node&lt;K&gt; n) { n.prev.next = n.next; n.next.prev = n.prev; }
+    private void pushFront(Node&lt;K&gt; n) { n.next = head.next; n.prev = head; head.next.prev = n; head.next = n; }
+
+    public void onPut(K k) { Node&lt;K&gt; n = new Node&lt;&gt;(k); nodes.put(k, n); pushFront(n); }
+    public void onAccess(K k) { Node&lt;K&gt; n = nodes.get(k); if (n != null) { unlink(n); pushFront(n); } }
+    public void onRemove(K k) { Node&lt;K&gt; n = nodes.remove(k); if (n != null) unlink(n); }
+    public K evict() {
+        Node&lt;K&gt; n = tail.prev;
+        if (n == head) throw new IllegalStateException("nothing to evict");
+        unlink(n); nodes.remove(n.key);
+        return n.key;
+    }
+}
+
+/** LFU: freq per key + one insertion-ordered bucket per frequency + minFreq. Ties broken by LRU. */
+final class LfuPolicy&lt;K&gt; implements EvictionPolicy&lt;K&gt; {
+    private final Map&lt;K, Integer&gt; freq = new HashMap&lt;&gt;();
+    private final Map&lt;Integer, LinkedHashSet&lt;K&gt;&gt; buckets = new HashMap&lt;&gt;();
+    private int minFreq = 0;
+
+    private void addTo(int f, K k) { buckets.computeIfAbsent(f, x -&gt; new LinkedHashSet&lt;&gt;()).add(k); }
+    private void dropFrom(int f, K k) {
+        LinkedHashSet&lt;K&gt; b = buckets.get(f);
+        b.remove(k);
+        if (b.isEmpty()) buckets.remove(f);
+    }
+    public void onPut(K k) { freq.put(k, 1); addTo(1, k); minFreq = 1; }
+    public void onAccess(K k) {
+        Integer f = freq.get(k);
+        if (f == null) return;
+        dropFrom(f, k);
+        if (f == minFreq &amp;&amp; !buckets.containsKey(f)) minFreq = f + 1;
+        freq.put(k, f + 1); addTo(f + 1, k);
+    }
+    public void onRemove(K k) {
+        Integer f = freq.remove(k);
+        if (f != null) dropFrom(f, k);          // minFreq may now be stale; evict() repairs it
+    }
+    public K evict() {
+        if (freq.isEmpty()) throw new IllegalStateException("nothing to evict");
+        if (!buckets.containsKey(minFreq)) minFreq = Collections.min(buckets.keySet());   // rare path after onRemove
+        K victim = buckets.get(minFreq).iterator().next();   // oldest key at the lowest frequency
+        dropFrom(minFreq, victim); freq.remove(victim);
+        return victim;
+    }
+}
+
+/** FIFO: evict in insertion order, ignore reads. Shows how cheap a new policy is. */
+final class FifoPolicy&lt;K&gt; implements EvictionPolicy&lt;K&gt; {
+    private final LinkedHashSet&lt;K&gt; order = new LinkedHashSet&lt;&gt;();
+    public void onPut(K k) { order.add(k); }
+    public void onAccess(K k) { }
+    public void onRemove(K k) { order.remove(k); }
+    public K evict() { Iterator&lt;K&gt; it = order.iterator(); K k = it.next(); it.remove(); return k; }
+}
+
+// ---------- collaborators ----------
+interface Clock { long nowMillis(); }
+final class ManualClock implements Clock {                 // tests move time by hand: no sleeps, no flakiness
+    private final AtomicLong now = new AtomicLong();
+    public long nowMillis() { return now.get(); }
+    void advance(long ms) { now.addAndGet(ms); }
+}
+
+interface DataStore&lt;K, V&gt; { V load(K key); void save(K key, V value); void delete(K key); }
+
+final class FakeDb&lt;K, V&gt; implements DataStore&lt;K, V&gt; {
+    final Map&lt;K, V&gt; rows = new ConcurrentHashMap&lt;&gt;();
+    final AtomicInteger loads = new AtomicInteger(), saves = new AtomicInteger();
+    public V load(K k) { loads.incrementAndGet(); return rows.get(k); }
+    public void save(K k, V v) { saves.incrementAndGet(); rows.put(k, v); }
+    public void delete(K k) { rows.remove(k); }
+}
+
+enum WritePolicy { WRITE_THROUGH, WRITE_BACK }
+
+// ---------- the cache ----------
+final class Cache&lt;K, V&gt; implements DataStore&lt;K, V&gt; {        // a cache is also a store: that is how levels chain
+    private static final class Entry&lt;V&gt; {
+        V value; long expiresAt; boolean dirty;
+        Entry(V v, long exp) { value = v; expiresAt = exp; }
+    }
+    private final int capacity;
+    private final EvictionPolicy&lt;K&gt; policy;
+    private final DataStore&lt;K, V&gt; store;                    // may be null: pure in-memory cache
+    private final WritePolicy writePolicy;
+    private final long ttlMillis;                           // 0 = never expire
+    private final Clock clock;
+    private final Map&lt;K, Entry&lt;V&gt;&gt; map = new HashMap&lt;&gt;();
+    private final ReentrantLock lock = new ReentrantLock(); // even get() mutates LRU order: one lock, not a RW lock
+    long hits, misses, evictions;
+
+    Cache(int capacity, EvictionPolicy&lt;K&gt; policy, DataStore&lt;K, V&gt; store, WritePolicy wp, long ttlMillis, Clock clock) {
+        if (capacity &lt;= 0) throw new IllegalArgumentException("capacity must be &gt; 0");
+        this.capacity = capacity; this.policy = policy; this.store = store;
+        this.writePolicy = wp; this.ttlMillis = ttlMillis; this.clock = clock;
+    }
+    static &lt;K, V&gt; Cache&lt;K, V&gt; inMemory(int capacity, EvictionPolicy&lt;K&gt; p) {
+        return new Cache&lt;&gt;(capacity, p, null, WritePolicy.WRITE_THROUGH, 0, System::currentTimeMillis);
+    }
+
+    public V get(K key) {
+        lock.lock();
+        try {
+            Entry&lt;V&gt; e = live(key);
+            if (e != null) { hits++; policy.onAccess(key); return e.value; }
+            misses++;
+            if (store == null) return null;
+        } finally { lock.unlock(); }
+        V loaded = store.load(key);                         // slow I/O outside the lock
+        if (loaded == null) return null;
+        lock.lock();
+        try {
+            Entry&lt;V&gt; e = live(key);
+            if (e != null) return e.value;                  // another thread filled it meanwhile: keep theirs
+            insert(key, loaded, false);
+            return loaded;
+        } finally { lock.unlock(); }
+    }
+
+    public void put(K key, V value) {
+        lock.lock();
+        try {
+            Entry&lt;V&gt; e = live(key);
+            boolean back = writePolicy == WritePolicy.WRITE_BACK &amp;&amp; store != null;
+            if (e != null) {
+                e.value = value; e.expiresAt = expiry(); e.dirty |= back;
+                policy.onAccess(key);
+            } else {
+                insert(key, value, back);
+            }
+            if (!back &amp;&amp; store != null) store.save(key, value);   // write-through: store before returning
+        } finally { lock.unlock(); }
+    }
+
+    public void delete(K key) { remove(key); }
+    public V load(K key) { return get(key); }
+    public void save(K key, V value) { put(key, value); }
+
+    public boolean remove(K key) {
+        lock.lock();
+        try {
+            Entry&lt;V&gt; e = map.remove(key);
+            if (e == null) return false;
+            policy.onRemove(key);
+            if (store != null) store.delete(key);
+            return true;
+        } finally { lock.unlock(); }
+    }
+
+    /** Write every dirty entry to the store (write-back). Call on shutdown or from a timer. */
+    public void flush() {
+        lock.lock();
+        try {
+            for (Map.Entry&lt;K, Entry&lt;V&gt;&gt; me : map.entrySet())
+                if (me.getValue().dirty) { store.save(me.getKey(), me.getValue().value); me.getValue().dirty = false; }
+        } finally { lock.unlock(); }
+    }
+
+    /** Active expiry: a background sweeper can call this; get() also expires lazily. */
+    public int purgeExpired() {
+        lock.lock();
+        try {
+            List&lt;K&gt; dead = new ArrayList&lt;&gt;();
+            for (Map.Entry&lt;K, Entry&lt;V&gt;&gt; me : map.entrySet()) if (expired(me.getValue())) dead.add(me.getKey());
+            for (K k : dead) drop(k);
+            return dead.size();
+        } finally { lock.unlock(); }
+    }
+
+    public int size() { lock.lock(); try { return map.size(); } finally { lock.unlock(); } }
+    public String stats() { lock.lock(); try { return "hits=" + hits + " misses=" + misses + " evictions=" + evictions + " size=" + map.size(); } finally { lock.unlock(); } }
+
+    // ----- helpers, called with the lock held -----
+    private long expiry() { return ttlMillis == 0 ? Long.MAX_VALUE : clock.nowMillis() + ttlMillis; }
+    private boolean expired(Entry&lt;V&gt; e) { return clock.nowMillis() &gt;= e.expiresAt; }
+    private Entry&lt;V&gt; live(K key) {
+        Entry&lt;V&gt; e = map.get(key);
+        if (e != null &amp;&amp; expired(e)) { drop(key); return null; }   // lazy expiry
+        return e;
+    }
+    private void drop(K key) {
+        Entry&lt;V&gt; e = map.remove(key);
+        policy.onRemove(key);
+        if (e.dirty) store.save(key, e.value);              // never lose a write-back value
+    }
+    private void insert(K key, V value, boolean dirty) {
+        if (map.size() &gt;= capacity) {
+            K victim = policy.evict();
+            Entry&lt;V&gt; old = map.remove(victim);
+            if (old.dirty) store.save(victim, old.value);
+            evictions++;
+        }
+        Entry&lt;V&gt; e = new Entry&lt;&gt;(value, expiry());
+        e.dirty = dirty;
+        map.put(key, e);
+        policy.onPut(key);
+    }
+}
+
+// ---------- driver + assertions ----------
+public class Main {
+    static int passed = 0;
+    static void check(boolean ok, String what) { if (!ok) throw new AssertionError("FAILED: " + what); passed++; }
+
+    public static void main(String[] args) throws Exception {
+        Cache&lt;String, Integer&gt; lru = Cache.inMemory(3, new LruPolicy&lt;&gt;());
+        lru.put("a", 1); lru.put("b", 2); lru.put("c", 3);
+        lru.get("a");                                       // a becomes most recent; b is now least recent
+        lru.put("d", 4);
+        System.out.println("LRU  after a,b,c, get a, put d -&gt; b evicted: " + (lru.get("b") == null));
+        check(lru.get("b") == null &amp;&amp; lru.get("a") == 1, "LRU evicts b");
+
+        Cache&lt;String, Integer&gt; lfu = Cache.inMemory(3, new LfuPolicy&lt;&gt;());
+        lfu.put("a", 1); lfu.put("b", 2); lfu.put("c", 3);
+        lfu.get("a"); lfu.get("a"); lfu.get("b");           // freq a=3, b=2, c=1
+        lfu.put("d", 4);                                    // evicts c (lowest frequency)
+        lfu.put("e", 5);                                    // evicts d (freq 1, only one at 1)
+        System.out.println("LFU  c evicted: " + (lfu.get("c") == null) + ", d evicted: " + (lfu.get("d") == null));
+        check(lfu.get("c") == null &amp;&amp; lfu.get("d") == null &amp;&amp; lfu.get("a") == 1, "LFU evicts c then d");
+
+        Cache&lt;String, Integer&gt; fifo = Cache.inMemory(3, new FifoPolicy&lt;&gt;());
+        fifo.put("a", 1); fifo.put("b", 2); fifo.put("c", 3); fifo.get("a"); fifo.put("d", 4);
+        System.out.println("FIFO a evicted despite the read: " + (fifo.get("a") == null));
+        check(fifo.get("a") == null, "FIFO evicts a");
+
+        ManualClock clock = new ManualClock();
+        Cache&lt;String, String&gt; ttl = new Cache&lt;&gt;(10, new LruPolicy&lt;&gt;(), null, WritePolicy.WRITE_THROUGH, 1000, clock);
+        ttl.put("otp", "4711");
+        clock.advance(999);
+        check("4711".equals(ttl.get("otp")), "alive at 999 ms");
+        clock.advance(1);
+        check(ttl.get("otp") == null, "expired at 1000 ms");
+        System.out.println("TTL  value gone after 1000 ms: " + (ttl.get("otp") == null));
+
+        FakeDb&lt;String, String&gt; db = new FakeDb&lt;&gt;();
+        db.rows.put("user:1", "Asha");
+        Cache&lt;String, String&gt; readThrough = new Cache&lt;&gt;(2, new LruPolicy&lt;&gt;(), db, WritePolicy.WRITE_THROUGH, 0, clock);
+        readThrough.get("user:1"); readThrough.get("user:1");
+        System.out.println("READ-THROUGH db loads for two gets: " + db.loads.get());
+        check(db.loads.get() == 1, "second get is a hit");
+        readThrough.put("user:2", "Ben");
+        check("Ben".equals(db.rows.get("user:2")), "write-through reaches the db at once");
+
+        FakeDb&lt;String, String&gt; db2 = new FakeDb&lt;&gt;();
+        Cache&lt;String, String&gt; back = new Cache&lt;&gt;(2, new LruPolicy&lt;&gt;(), db2, WritePolicy.WRITE_BACK, 0, clock);
+        back.put("k1", "v1"); back.put("k2", "v2");
+        check(db2.rows.isEmpty(), "write-back defers the db write");
+        back.put("k3", "v3");                               // evicts k1, which is dirty, so it is saved now
+        check("v1".equals(db2.rows.get("k1")) &amp;&amp; !db2.rows.containsKey("k2"), "dirty victim flushed on eviction");
+        back.flush();
+        System.out.println("WRITE-BACK db rows after eviction + flush: " + new TreeMap&lt;&gt;(db2.rows));
+        check(db2.rows.size() == 3, "flush writes the rest");
+
+        FakeDb&lt;String, String&gt; db3 = new FakeDb&lt;&gt;();
+        for (int i = 0; i &lt; 10; i++) db3.rows.put("p" + i, "page" + i);
+        Cache&lt;String, String&gt; l2 = new Cache&lt;&gt;(4, new LfuPolicy&lt;&gt;(), db3, WritePolicy.WRITE_THROUGH, 0, clock);
+        Cache&lt;String, String&gt; l1 = new Cache&lt;&gt;(2, new LruPolicy&lt;&gt;(), l2, WritePolicy.WRITE_THROUGH, 0, clock);
+        l1.get("p1"); l1.get("p2"); l1.get("p3");          // p1 falls out of L1 but stays in L2
+        int before = db3.loads.get();
+        l1.get("p1");
+        System.out.println("MULTI-LEVEL p1 served by L2 without a db load: " + (db3.loads.get() == before));
+        check(db3.loads.get() == before, "L2 hit");
+
+        Cache&lt;Integer, Integer&gt; shared = Cache.inMemory(100, new LruPolicy&lt;&gt;());
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        AtomicLong gets = new AtomicLong();
+        List&lt;Future&lt;?&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; 8; t++) {
+            final int seed = t;
+            fs.add(pool.submit(() -&gt; {
+                Random r = new Random(seed);
+                for (int i = 0; i &lt; 20_000; i++) {
+                    int k = r.nextInt(300);
+                    if (r.nextBoolean()) shared.put(k, k); else { shared.get(k); gets.incrementAndGet(); }
+                }
+            }));
+        }
+        for (Future&lt;?&gt; f : fs) f.get();
+        pool.shutdown();
+        System.out.println("CONCURRENT 8 threads x 20000 ops: " + shared.stats());
+        check(shared.size() &lt;= 100, "capacity never exceeded");
+        check(shared.hits + shared.misses == gets.get(), "no lost stat updates: hits + misses == gets");
+
+        System.out.println("All " + passed + " checks passed");
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Cache with pluggable eviction (LRU / LFU / FIFO), TTL, read-through, write-through / write-back, levels."""
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections import OrderedDict
+from enum import Enum
+
+# ---------- eviction strategy ----------
+class EvictionPolicy(ABC):
+    @abstractmethod
+    def on_put(self, key): ...
+    @abstractmethod
+    def on_access(self, key): ...
+    @abstractmethod
+    def on_remove(self, key): ...
+    @abstractmethod
+    def evict(self): ...
+
+class _Node:
+    __slots__ = ("key", "prev", "next")
+
+    def __init__(self, key=None):
+        self.key, self.prev, self.next = key, None, None
+
+class LruPolicy(EvictionPolicy):
+    """Dict + hand-written doubly linked list with sentinels. head.next = most recent."""
+
+    def __init__(self):
+        self._nodes = {}
+        self._head, self._tail = _Node(), _Node()
+        self._head.next, self._tail.prev = self._tail, self._head
+
+    def _unlink(self, n):
+        n.prev.next, n.next.prev = n.next, n.prev
+
+    def _push_front(self, n):
+        n.next, n.prev = self._head.next, self._head
+        self._head.next.prev = n
+        self._head.next = n
+
+    def on_put(self, key):
+        n = _Node(key)
+        self._nodes[key] = n
+        self._push_front(n)
+
+    def on_access(self, key):
+        n = self._nodes.get(key)
+        if n:
+            self._unlink(n)
+            self._push_front(n)
+
+    def on_remove(self, key):
+        n = self._nodes.pop(key, None)
+        if n:
+            self._unlink(n)
+
+    def evict(self):
+        n = self._tail.prev
+        if n is self._head:
+            raise LookupError("nothing to evict")
+        self._unlink(n)
+        del self._nodes[n.key]
+        return n.key
+
+class LfuPolicy(EvictionPolicy):
+    """freq per key, one insertion-ordered bucket per frequency, min_freq. Ties broken by LRU."""
+
+    def __init__(self):
+        self._freq = {}
+        self._buckets = {}          # freq -&gt; OrderedDict used as an ordered set
+        self._min = 0
+
+    def _add(self, f, key):
+        self._buckets.setdefault(f, OrderedDict())[key] = None
+
+    def _drop(self, f, key):
+        b = self._buckets[f]
+        del b[key]
+        if not b:
+            del self._buckets[f]
+
+    def on_put(self, key):
+        self._freq[key] = 1
+        self._add(1, key)
+        self._min = 1
+
+    def on_access(self, key):
+        f = self._freq.get(key)
+        if f is None:
+            return
+        self._drop(f, key)
+        if f == self._min and f not in self._buckets:
+            self._min = f + 1
+        self._freq[key] = f + 1
+        self._add(f + 1, key)
+
+    def on_remove(self, key):
+        f = self._freq.pop(key, None)
+        if f is not None:
+            self._drop(f, key)
+
+    def evict(self):
+        if not self._freq:
+            raise LookupError("nothing to evict")
+        if self._min not in self._buckets:          # rare: repair after on_remove
+            self._min = min(self._buckets)
+        victim = next(iter(self._buckets[self._min]))
+        self._drop(self._min, victim)
+        del self._freq[victim]
+        return victim
+
+class FifoPolicy(EvictionPolicy):
+    def __init__(self):
+        self._order = OrderedDict()
+
+    def on_put(self, key): self._order[key] = None
+    def on_access(self, key): pass
+    def on_remove(self, key): self._order.pop(key, None)
+    def evict(self): return self._order.popitem(last=False)[0]
+
+# ---------- collaborators ----------
+class ManualClock:
+    def __init__(self): self.now = 0.0
+    def __call__(self): return self.now
+    def advance(self, s): self.now += s
+
+class FakeDb:
+    def __init__(self):
+        self.rows, self.loads, self.saves = {}, 0, 0
+
+    def load(self, k):
+        self.loads += 1
+        return self.rows.get(k)
+
+    def save(self, k, v):
+        self.saves += 1
+        self.rows[k] = v
+
+    def delete(self, k):
+        self.rows.pop(k, None)
+
+class WritePolicy(Enum):
+    WRITE_THROUGH = 1
+    WRITE_BACK = 2
+
+class _Entry:
+    __slots__ = ("value", "expires_at", "dirty")
+
+    def __init__(self, value, expires_at, dirty=False):
+        self.value, self.expires_at, self.dirty = value, expires_at, dirty
+
+class Cache:
+    """A cache is also a store (load/save/delete), so levels chain: L1 -&gt; L2 -&gt; db."""
+
+    def __init__(self, capacity, policy, store=None, write_policy=WritePolicy.WRITE_THROUGH, ttl=0, clock=time.monotonic):
+        if capacity &lt;= 0:
+            raise ValueError("capacity must be &gt; 0")
+        self.capacity, self.policy, self.store = capacity, policy, store
+        self.write_policy, self.ttl, self.clock = write_policy, ttl, clock
+        self._map = {}
+        self._lock = threading.Lock()       # get() also mutates order: one lock, not a reader-writer lock
+        self.hits = self.misses = self.evictions = 0
+
+    def get(self, key):
+        with self._lock:
+            e = self._live(key)
+            if e is not None:
+                self.hits += 1
+                self.policy.on_access(key)
+                return e.value
+            self.misses += 1
+            if self.store is None:
+                return None
+        loaded = self.store.load(key)        # slow I/O outside the lock
+        if loaded is None:
+            return None
+        with self._lock:
+            e = self._live(key)
+            if e is not None:
+                return e.value
+            self._insert(key, loaded, False)
+            return loaded
+
+    def put(self, key, value):
+        with self._lock:
+            back = self.write_policy is WritePolicy.WRITE_BACK and self.store is not None
+            e = self._live(key)
+            if e is not None:
+                e.value, e.expires_at, e.dirty = value, self._expiry(), e.dirty or back
+                self.policy.on_access(key)
+            else:
+                self._insert(key, value, back)
+            if not back and self.store is not None:
+                self.store.save(key, value)
+
+    def remove(self, key):
+        with self._lock:
+            if self._map.pop(key, None) is None:
+                return False
+            self.policy.on_remove(key)
+            if self.store is not None:
+                self.store.delete(key)
+            return True
+
+    # store interface, so a Cache can sit behind another Cache
+    load = get
+    save = put
+    delete = remove
+
+    def flush(self):
+        with self._lock:
+            for k, e in self._map.items():
+                if e.dirty:
+                    self.store.save(k, e.value)
+                    e.dirty = False
+
+    def purge_expired(self):
+        with self._lock:
+            dead = [k for k, e in self._map.items() if self._expired(e)]
+            for k in dead:
+                self._drop(k)
+            return len(dead)
+
+    def __len__(self):
+        with self._lock:
+            return len(self._map)
+
+    # ----- helpers, lock held -----
+    def _expiry(self):
+        return float("inf") if self.ttl == 0 else self.clock() + self.ttl
+
+    def _expired(self, e):
+        return self.clock() &gt;= e.expires_at
+
+    def _live(self, key):
+        e = self._map.get(key)
+        if e is not None and self._expired(e):
+            self._drop(key)
+            return None
+        return e
+
+    def _drop(self, key):
+        e = self._map.pop(key)
+        self.policy.on_remove(key)
+        if e.dirty:
+            self.store.save(key, e.value)
+
+    def _insert(self, key, value, dirty):
+        if len(self._map) &gt;= self.capacity:
+            victim = self.policy.evict()
+            old = self._map.pop(victim)
+            if old.dirty:
+                self.store.save(victim, old.value)
+            self.evictions += 1
+        self._map[key] = _Entry(value, self._expiry(), dirty)
+        self.policy.on_put(key)
+
+def demo():
+    lru = Cache(3, LruPolicy())
+    for k, v in (("a", 1), ("b", 2), ("c", 3)):
+        lru.put(k, v)
+    lru.get("a")
+    lru.put("d", 4)
+    print("LRU  b evicted:", lru.get("b") is None)
+
+    lfu = Cache(3, LfuPolicy())
+    for k, v in (("a", 1), ("b", 2), ("c", 3)):
+        lfu.put(k, v)
+    lfu.get("a"); lfu.get("a"); lfu.get("b")
+    lfu.put("d", 4)
+    print("LFU  c evicted:", lfu.get("c") is None)
+
+    clock = ManualClock()
+    ttl = Cache(10, LruPolicy(), ttl=1.0, clock=clock)
+    ttl.put("otp", "4711")
+    clock.advance(1.0)
+    print("TTL  expired after 1 s:", ttl.get("otp") is None)
+
+    db = FakeDb()
+    back = Cache(2, LruPolicy(), db, WritePolicy.WRITE_BACK)
+    back.put("k1", "v1"); back.put("k2", "v2"); back.put("k3", "v3")
+    print("WRITE-BACK db after eviction:", db.rows)
+    back.flush()
+    print("WRITE-BACK db after flush:", dict(sorted(db.rows.items())))
+
+if __name__ == "__main__":
+    demo()</code></pre>
+<p>Tests (<code>python -m unittest test_main</code>):</p>
+<pre><code class="language-python">import random
+import threading
+import unittest
+
+from main import Cache, FakeDb, FifoPolicy, LfuPolicy, LruPolicy, ManualClock, WritePolicy
+
+def filled(policy, cap=3):
+    c = Cache(cap, policy)
+    for k, v in (("a", 1), ("b", 2), ("c", 3)):
+        c.put(k, v)
+    return c
+
+class EvictionTest(unittest.TestCase):
+    def test_lru(self):
+        c = filled(LruPolicy())
+        c.get("a")
+        c.put("d", 4)
+        self.assertIsNone(c.get("b"))
+        self.assertEqual(c.get("a"), 1)
+
+    def test_lru_overwrite_counts_as_use(self):
+        c = filled(LruPolicy())
+        c.put("a", 10)
+        c.put("d", 4)
+        self.assertEqual(c.get("a"), 10)
+        self.assertIsNone(c.get("b"))
+
+    def test_lfu_with_lru_tiebreak(self):
+        c = filled(LfuPolicy())
+        c.get("a"); c.get("a"); c.get("b")
+        c.put("d", 4)
+        self.assertIsNone(c.get("c"))
+        c.put("e", 5)
+        self.assertIsNone(c.get("d"))
+        self.assertEqual(c.get("a"), 1)
+
+    def test_lfu_after_remove(self):
+        c = filled(LfuPolicy())
+        c.get("b"); c.get("c")
+        c.remove("a")                      # min_freq bucket disappears
+        c.put("d", 4)
+        c.put("e", 5)                      # must evict d (freq 1), not crash
+        self.assertIsNone(c.get("d"))
+
+    def test_fifo(self):
+        c = filled(FifoPolicy())
+        c.get("a")
+        c.put("d", 4)
+        self.assertIsNone(c.get("a"))
+
+    def test_capacity_one(self):
+        c = Cache(1, LruPolicy())
+        c.put("x", 1); c.put("y", 2)
+        self.assertIsNone(c.get("x"))
+        self.assertEqual(len(c), 1)
+
+    def test_bad_capacity(self):
+        with self.assertRaises(ValueError):
+            Cache(0, LruPolicy())
+
+class TtlAndStoreTest(unittest.TestCase):
+    def test_ttl_boundary(self):
+        clock = ManualClock()
+        c = Cache(10, LruPolicy(), ttl=1.0, clock=clock)
+        c.put("k", "v")
+        clock.advance(0.999)
+        self.assertEqual(c.get("k"), "v")
+        clock.advance(0.001)
+        self.assertIsNone(c.get("k"))
+        self.assertEqual(len(c), 0)
+
+    def test_purge_expired(self):
+        clock = ManualClock()
+        c = Cache(10, LruPolicy(), ttl=5, clock=clock)
+        for i in range(4):
+            c.put(i, i)
+        clock.advance(5)
+        self.assertEqual(c.purge_expired(), 4)
+
+    def test_read_through_and_write_through(self):
+        db = FakeDb()
+        db.rows["user:1"] = "Asha"
+        c = Cache(2, LruPolicy(), db)
+        c.get("user:1"); c.get("user:1")
+        self.assertEqual(db.loads, 1)
+        c.put("user:2", "Ben")
+        self.assertEqual(db.rows["user:2"], "Ben")
+        self.assertIsNone(c.get("nobody"))  # miss in cache and db
+
+    def test_write_back(self):
+        db = FakeDb()
+        c = Cache(2, LruPolicy(), db, WritePolicy.WRITE_BACK)
+        c.put("k1", "v1"); c.put("k2", "v2")
+        self.assertEqual(db.rows, {})
+        c.put("k3", "v3")
+        self.assertEqual(db.rows, {"k1": "v1"})
+        c.flush()
+        self.assertEqual(len(db.rows), 3)
+
+    def test_two_levels(self):
+        db = FakeDb()
+        db.rows.update({f"p{i}": i for i in range(10)})
+        l2 = Cache(4, LfuPolicy(), db)
+        l1 = Cache(2, LruPolicy(), l2)
+        for k in ("p1", "p2", "p3"):
+            l1.get(k)
+        before = db.loads
+        self.assertEqual(l1.get("p1"), 1)
+        self.assertEqual(db.loads, before)
+
+class ConcurrencyTest(unittest.TestCase):
+    def test_parallel_mixed_ops(self):
+        c = Cache(50, LruPolicy())
+        gets = [0] * 8
+
+        def work(t):
+            r = random.Random(t)
+            for _ in range(5000):
+                k = r.randrange(150)
+                if r.random() &lt; 0.5:
+                    c.put(k, k)
+                else:
+                    c.get(k)
+                    gets[t] += 1
+
+        ts = [threading.Thread(target=work, args=(t,)) for t in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertLessEqual(len(c), 50)
+        self.assertEqual(c.hits + c.misses, sum(gets))
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Cache with pluggable eviction - C++14 core (LRU, LFU, FIFO). TTL and write policies are in the Java/Python versions.
+#include &lt;cstdlib&gt;
+#include &lt;iostream&gt;
+#include &lt;list&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+
+template &lt;typename K&gt;
+struct EvictionPolicy {                       // the "ops table"
+    virtual ~EvictionPolicy() {}
+    virtual void onPut(const K&amp; k) = 0;
+    virtual void onAccess(const K&amp; k) = 0;
+    virtual void onRemove(const K&amp; k) = 0;
+    virtual K evict() = 0;
+};
+
+// LRU: std::list keeps recency order, the map points at list nodes; splice() moves a node in O(1)
+template &lt;typename K&gt;
+class LruPolicy : public EvictionPolicy&lt;K&gt; {
+    std::list&lt;K&gt; order_;                                          // front = most recent
+    std::unordered_map&lt;K, typename std::list&lt;K&gt;::iterator&gt; pos_;
+public:
+    void onPut(const K&amp; k) override { order_.push_front(k); pos_[k] = order_.begin(); }
+    void onAccess(const K&amp; k) override {
+        auto it = pos_.find(k);
+        if (it != pos_.end()) order_.splice(order_.begin(), order_, it-&gt;second);
+    }
+    void onRemove(const K&amp; k) override {
+        auto it = pos_.find(k);
+        if (it != pos_.end()) { order_.erase(it-&gt;second); pos_.erase(it); }
+    }
+    K evict() override {
+        if (order_.empty()) throw std::logic_error("nothing to evict");
+        K k = order_.back(); order_.pop_back(); pos_.erase(k); return k;
+    }
+};
+
+// LFU: frequency buckets, each an LRU list; minFreq points at the bucket to evict from
+template &lt;typename K&gt;
+class LfuPolicy : public EvictionPolicy&lt;K&gt; {
+    struct Info { int freq; typename std::list&lt;K&gt;::iterator it; };
+    std::unordered_map&lt;K, Info&gt; info_;
+    std::map&lt;int, std::list&lt;K&gt;&gt; buckets_;                         // freq -&gt; keys, front = newest
+    int minFreq_ = 0;
+    void drop(const Info&amp; in) {
+        auto b = buckets_.find(in.freq);
+        b-&gt;second.erase(in.it);
+        if (b-&gt;second.empty()) buckets_.erase(b);
+    }
+public:
+    void onPut(const K&amp; k) override {
+        buckets_[1].push_front(k); info_[k] = Info{1, buckets_[1].begin()}; minFreq_ = 1;
+    }
+    void onAccess(const K&amp; k) override {
+        auto it = info_.find(k);
+        if (it == info_.end()) return;
+        int f = it-&gt;second.freq;
+        drop(it-&gt;second);
+        if (f == minFreq_ &amp;&amp; !buckets_.count(f)) minFreq_ = f + 1;
+        buckets_[f + 1].push_front(k);
+        it-&gt;second = Info{f + 1, buckets_[f + 1].begin()};
+    }
+    void onRemove(const K&amp; k) override {
+        auto it = info_.find(k);
+        if (it == info_.end()) return;
+        drop(it-&gt;second); info_.erase(it);
+    }
+    K evict() override {
+        if (info_.empty()) throw std::logic_error("nothing to evict");
+        if (!buckets_.count(minFreq_)) minFreq_ = buckets_.begin()-&gt;first;   // repair after onRemove
+        std::list&lt;K&gt;&amp; b = buckets_[minFreq_];
+        K k = b.back();                                           // oldest at the lowest frequency
+        b.pop_back();
+        if (b.empty()) buckets_.erase(minFreq_);
+        info_.erase(k);
+        return k;
+    }
+};
+
+template &lt;typename K&gt;
+class FifoPolicy : public EvictionPolicy&lt;K&gt; {
+    std::list&lt;K&gt; order_;
+    std::unordered_map&lt;K, typename std::list&lt;K&gt;::iterator&gt; pos_;
+public:
+    void onPut(const K&amp; k) override { order_.push_back(k); pos_[k] = std::prev(order_.end()); }
+    void onAccess(const K&amp;) override {}
+    void onRemove(const K&amp; k) override { auto it = pos_.find(k); if (it != pos_.end()) { order_.erase(it-&gt;second); pos_.erase(it); } }
+    K evict() override { K k = order_.front(); order_.pop_front(); pos_.erase(k); return k; }
+};
+
+template &lt;typename K, typename V&gt;
+class Cache {
+    size_t capacity_;
+    std::unique_ptr&lt;EvictionPolicy&lt;K&gt;&gt; policy_;
+    std::unordered_map&lt;K, V&gt; map_;
+public:
+    long hits = 0, misses = 0, evictions = 0;
+    Cache(size_t cap, std::unique_ptr&lt;EvictionPolicy&lt;K&gt;&gt; p) : capacity_(cap), policy_(std::move(p)) {
+        if (cap == 0) throw std::invalid_argument("capacity must be &gt; 0");
+    }
+    bool get(const K&amp; k, V&amp; out) {
+        auto it = map_.find(k);
+        if (it == map_.end()) { ++misses; return false; }
+        ++hits; policy_-&gt;onAccess(k); out = it-&gt;second; return true;
+    }
+    void put(const K&amp; k, const V&amp; v) {
+        auto it = map_.find(k);
+        if (it != map_.end()) { it-&gt;second = v; policy_-&gt;onAccess(k); return; }
+        if (map_.size() &gt;= capacity_) { map_.erase(policy_-&gt;evict()); ++evictions; }
+        map_[k] = v; policy_-&gt;onPut(k);
+    }
+    bool remove(const K&amp; k) {
+        if (!map_.erase(k)) return false;
+        policy_-&gt;onRemove(k); return true;
+    }
+    bool contains(const K&amp; k) const { return map_.count(k) != 0; }
+    size_t size() const { return map_.size(); }
+};
+
+static int passed = 0;
+static void check(bool ok, const char* what) { if (!ok) { std::cerr &lt;&lt; "FAILED: " &lt;&lt; what &lt;&lt; "\n"; std::exit(1); } ++passed; }
+
+int main() {
+    int v = 0;
+    Cache&lt;std::string, int&gt; lru(3, std::unique_ptr&lt;EvictionPolicy&lt;std::string&gt;&gt;(new LruPolicy&lt;std::string&gt;()));
+    lru.put("a", 1); lru.put("b", 2); lru.put("c", 3); lru.get("a", v); lru.put("d", 4);
+    std::cout &lt;&lt; "LRU  b evicted: " &lt;&lt; std::boolalpha &lt;&lt; !lru.contains("b") &lt;&lt; "\n";
+    check(!lru.contains("b") &amp;&amp; lru.contains("a"), "LRU evicts b");
+
+    Cache&lt;std::string, int&gt; lfu(3, std::unique_ptr&lt;EvictionPolicy&lt;std::string&gt;&gt;(new LfuPolicy&lt;std::string&gt;()));
+    lfu.put("a", 1); lfu.put("b", 2); lfu.put("c", 3);
+    lfu.get("a", v); lfu.get("a", v); lfu.get("b", v);
+    lfu.put("d", 4); lfu.put("e", 5);
+    std::cout &lt;&lt; "LFU  c and d evicted: " &lt;&lt; (!lfu.contains("c") &amp;&amp; !lfu.contains("d")) &lt;&lt; "\n";
+    check(!lfu.contains("c") &amp;&amp; !lfu.contains("d") &amp;&amp; lfu.contains("a"), "LFU evicts c then d");
+
+    lfu.remove("a");                                   // exercise the minFreq repair path
+    lfu.put("f", 6); lfu.put("g", 7);
+    check(lfu.size() == 3, "LFU size stays at capacity after remove + puts");
+
+    Cache&lt;std::string, int&gt; fifo(3, std::unique_ptr&lt;EvictionPolicy&lt;std::string&gt;&gt;(new FifoPolicy&lt;std::string&gt;()));
+    fifo.put("a", 1); fifo.put("b", 2); fifo.put("c", 3); fifo.get("a", v); fifo.put("d", 4);
+    std::cout &lt;&lt; "FIFO a evicted despite the read: " &lt;&lt; !fifo.contains("a") &lt;&lt; "\n";
+    check(!fifo.contains("a"), "FIFO evicts a");
+
+    Cache&lt;int, int&gt; big(100, std::unique_ptr&lt;EvictionPolicy&lt;int&gt;&gt;(new LruPolicy&lt;int&gt;()));
+    unsigned seed = 7; long gets = 0;
+    for (int i = 0; i &lt; 100000; ++i) {
+        seed = seed * 1103515245u + 12345u;
+        int k = (int)((seed &gt;&gt; 8) % 300);
+        if ((seed &gt;&gt; 16) &amp; 1) big.put(k, k); else { big.get(k, v); ++gets; }
+    }
+    std::cout &lt;&lt; "STRESS hits=" &lt;&lt; big.hits &lt;&lt; " misses=" &lt;&lt; big.misses &lt;&lt; " evictions=" &lt;&lt; big.evictions &lt;&lt; " size=" &lt;&lt; big.size() &lt;&lt; "\n";
+    check(big.size() &lt;= 100 &amp;&amp; big.hits + big.misses == gets, "capacity and stats hold");
+    std::cout &lt;&lt; "All " &lt;&lt; passed &lt;&lt; " checks passed\n";
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it</h3>
+<pre class="terminal"><code>$ javac -d out Main.java &amp;&amp; java -cp out Main
+LRU  after a,b,c, get a, put d -&gt; b evicted: true
+LFU  c evicted: true, d evicted: true
+FIFO a evicted despite the read: true
+TTL  value gone after 1000 ms: true
+READ-THROUGH db loads for two gets: 1
+WRITE-BACK db rows after eviction + flush: {k1=v1, k2=v2, k3=v3}
+MULTI-LEVEL p1 served by L2 without a db load: true
+CONCURRENT 8 threads x 20000 ops: hits=26473 misses=53502 evictions=53285 size=100
+All 13 checks passed
+
+$ python main.py
+LRU  b evicted: True
+LFU  c evicted: True
+TTL  expired after 1 s: True
+WRITE-BACK db after eviction: {'k1': 'v1'}
+WRITE-BACK db after flush: {'k1': 'v1', 'k2': 'v2', 'k3': 'v3'}
+
+$ python -m unittest test_main
+.............
+----------------------------------------------------------------------
+Ran 13 tests in 0.060s
+
+OK
+
+$ g++ -std=c++14 -Wall -Wextra main.cpp -o main &amp;&amp; ./main
+LRU  b evicted: true
+LFU  c and d evicted: true
+FIFO a evicted despite the read: true
+STRESS hits=16641 misses=33496 evictions=33242 size=100
+All 5 checks passed</code></pre>
+  <div class="callout note"><p>The CONCURRENT line changes from run to run (threads interleave differently); the checks after it do not: size never exceeds 100, and hits plus misses always equals the number of gets.</p></div>
+  <h3>The 10-line answer you should also know</h3>
+<pre><code class="language-java">class LruCache&lt;K, V&gt; extends LinkedHashMap&lt;K, V&gt; {
+    private final int capacity;
+    LruCache(int capacity) { super(16, 0.75f, true); this.capacity = capacity; }   // true = access order
+    @Override protected boolean removeEldestEntry(Map.Entry&lt;K, V&gt; eldest) { return size() &gt; capacity; }
+}</code></pre>
+  <p>Mention it to show you know the JDK (Python: <code>OrderedDict.move_to_end</code>, or <code>functools.lru_cache</code> for functions). Then say you will write the list by hand, because that is what most interviewers want to see, and because it does not give you pluggable policies, TTL or write-back.</p>

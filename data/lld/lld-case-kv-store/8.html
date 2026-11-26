@@ -1,0 +1,1360 @@
+
+  <h2>Full code</h2>
+  <p>The same files as in <code>lld-code/lld-case-kv-store/</code>. The Java demo runs nine scenes with 30 checks: CRUD, TTL at the exact deadline, stale heap items, nested rollback and commit, TTL inside a transaction, a conflict and its retry, snapshot and restore, 8 threads doing 4,000 transactional increments, and TTL writers, readers and a purger running together, followed by an invariant check.</p>
+  <details class="callout note">
+    <summary><b>Java you will see here (for C programmers)</b>: open it if a line looks strange</summary>
+    <div class="table-wrap"><table class="table">
+      <thead><tr><th>You will see</th><th>Read it as</th></tr></thead>
+      <tbody>
+        <tr><td><code>list.stream().filter(..).map(..).collect(..)</code></td><td>A <code>for</code> loop that builds a new list: keep the items the filter accepts, transform each one, gather the results. <code>.count()</code>, <code>.sorted(..)</code> and <code>.anyMatch(..)</code> are the same loop with a different ending.</td></tr>
+        <tr><td><code>x -&gt; expr</code>, <code>(a, b) -&gt; ..</code> (lambda)</td><td>A small anonymous function that can capture local variables: a callback and its <code>void *ctx</code> in one value. <code>(a, b) -&gt; a.x - b.x</code> is the <code>cmp</code> you hand to <code>qsort()</code>.</td></tr>
+        <tr><td><code>Type::method</code> (method reference)</td><td>A function pointer to that method: <code>Integer::sum</code> is <code>int sum(int a, int b)</code>, <code>want::contains</code> is "call <code>want.contains(x)</code>".</td></tr>
+        <tr><td><code>Predicate&lt;T&gt;</code>, <code>p.and(q)</code></td><td>A function pointer returning bool; <code>and</code> builds a new one that calls both.</td></tr>
+        <tr><td><code>map.merge(k, 1, Integer::sum)</code></td><td><code>counts[k]++</code>, inserting 1 when the key is missing. <code>computeIfAbsent(k, ..)</code> is "look up, create the entry if missing, return it".</td></tr>
+        <tr><td><code>record Point(int x, int y)</code></td><td>An immutable struct; the compiler writes the constructor, getters, <code>equals</code> and <code>hashCode</code> (compare by value, usable as a map key).</td></tr>
+        <tr><td><code>Optional&lt;T&gt;</code></td><td>A pointer that may be NULL, with the NULL check forced by the type (<code>isPresent</code>, <code>orElse</code>, <code>orElseThrow</code>).</td></tr>
+        <tr><td><code>synchronized</code>, <code>ReentrantLock</code>, <code>AtomicLong</code></td><td>A mutex taken on entry and released on every exit (even on an exception); an explicit mutex object; an integer updated with CAS, like <code>atomic64_t</code>.</td></tr>
+      </tbody>
+    </table></div>
+    <p>The longer walk-through is <a href="{{BASE}}lld/lld-oop-from-c#reading-java">Reading Java as a C programmer</a>.</p>
+  </details>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Java">
+      <p><b>KvStore.java</b> - the interface, entries, the store with its expiry heap and read-write lock, the Memento, and the transactional session.</p>
+<pre><code class="language-java">import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.PriorityQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/** What every caller sees: the store itself and a transactional session both implement it. */
+interface KeyValueStore {
+    Optional&lt;String&gt; get(String key);
+    void set(String key, String value);                 // no TTL; clears an existing TTL (like Redis SET)
+    void set(String key, String value, Duration ttl);
+    boolean delete(String key);
+    boolean expire(String key, Duration ttl);           // false if the key does not exist
+    long ttlMillis(String key);                         // -2 = no such key, -1 = no TTL, else ms left
+}
+
+interface Clock { long millis(); }
+
+final class ManualClock implements Clock {
+    private final AtomicLong now;
+    ManualClock(long start) { now = new AtomicLong(start); }
+    public long millis() { return now.get(); }
+    void advance(Duration d) { now.addAndGet(d.toMillis()); }
+}
+
+/** Observer: told about keys removed because their TTL ran out (like Redis keyspace notifications). */
+interface ExpiryListener { void onExpired(String key, String value); }
+
+class NoTransactionException extends IllegalStateException { NoTransactionException() { super("no open transaction"); } }
+
+class ConflictException extends RuntimeException { ConflictException(String key) { super("conflict on key " + key); } }
+
+/** Immutable value cell. value == null marks a delete inside a transaction layer (tombstone). */
+record Entry(String value, long expiresAt, long version) {
+    static final long NEVER = Long.MAX_VALUE;
+    boolean liveAt(long now) { return value != null &amp;&amp; now &lt; expiresAt; }
+}
+
+/** A min-heap item: "key may expire at time t, if it is still at this version". */
+record ExpiryRef(long expiresAt, String key, long version) {}
+
+final class InMemoryStore implements KeyValueStore {
+    private static final int PURGE_PER_WRITE = 16;      // incremental active expiry, bounded work per write
+
+    private final Clock clock;
+    private final Map&lt;String, Entry&gt; data = new HashMap&lt;&gt;();
+    private final PriorityQueue&lt;ExpiryRef&gt; expiries = new PriorityQueue&lt;&gt;((a, b) -&gt; Long.compare(a.expiresAt(), b.expiresAt()));
+    private final ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+    private final List&lt;ExpiryListener&gt; listeners = new CopyOnWriteArrayList&lt;&gt;();
+    private long versionSeq = 0;                        // guarded by the write lock
+
+    InMemoryStore(Clock clock) { this.clock = clock; }
+
+    void addListener(ExpiryListener l) { listeners.add(l); }
+
+    Session session() { return new Session(this); }
+
+    // ---------------- reads: shared lock, expired = absent (lazy expiry, no removal) ----------------
+
+    public Optional&lt;String&gt; get(String key) {
+        Entry e = read(key);
+        return e == null ? Optional.empty() : Optional.of(e.value());
+    }
+
+    public long ttlMillis(String key) {
+        Entry e = read(key);
+        if (e == null) return -2;
+        return e.expiresAt() == Entry.NEVER ? -1 : e.expiresAt() - clock.millis();
+    }
+
+    /** Live entry or null; package-private for Session. */
+    Entry read(String key) {
+        rw.readLock().lock();
+        try {
+            Entry e = data.get(key);
+            return e != null &amp;&amp; e.liveAt(clock.millis()) ? e : null;
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    /** Number of live keys. Purges first, so the count is exact. */
+    int size() {
+        purgeExpired(Integer.MAX_VALUE);
+        rw.readLock().lock();
+        try {
+            return data.size();
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    // ---------------- writes: exclusive lock ----------------
+
+    public void set(String key, String value) { set(key, value, null); }
+
+    public void set(String key, String value, Duration ttl) {
+        if (key == null || value == null) throw new IllegalArgumentException("key and value must not be null");
+        long exp = expiryFor(ttl);
+        write(() -&gt; put(key, value, exp));
+    }
+
+    public boolean delete(String key) {
+        boolean[] found = {false};
+        write(() -&gt; {
+            Entry e = data.remove(key);                  // an expired leftover is removed too, but reported as absent
+            found[0] = e != null &amp;&amp; e.liveAt(clock.millis());
+        });
+        return found[0];
+    }
+
+    public boolean expire(String key, Duration ttl) {
+        long exp = expiryFor(ttl);
+        boolean[] ok = {false};
+        write(() -&gt; {
+            Entry e = data.get(key);
+            if (e != null &amp;&amp; e.liveAt(clock.millis())) { put(key, e.value(), exp); ok[0] = true; }
+        });
+        return ok[0];
+    }
+
+    /** Active expiry: pop heap items that are due; skip stale ones whose key was rewritten. Returns keys removed. */
+    int purgeExpired(int max) {
+        List&lt;Entry&gt; gone = new ArrayList&lt;&gt;();
+        List&lt;String&gt; goneKeys = new ArrayList&lt;&gt;();
+        rw.writeLock().lock();
+        try {
+            purgeLocked(max, gone, goneKeys);
+        } finally {
+            rw.writeLock().unlock();
+        }
+        notifyExpired(goneKeys, gone);
+        return goneKeys.size();
+    }
+
+    // ---------------- Memento ----------------
+
+    /** Memento: an opaque, immutable copy. Only InMemoryStore can look inside. */
+    static final class Snapshot {
+        private final Map&lt;String, Entry&gt; copy;
+        private final long takenAt;
+        private Snapshot(Map&lt;String, Entry&gt; copy, long takenAt) { this.copy = copy; this.takenAt = takenAt; }
+        long takenAt() { return takenAt; }
+        int keyCount() { return copy.size(); }
+    }
+
+    Snapshot snapshot() {
+        rw.readLock().lock();
+        try {
+            long now = clock.millis();
+            Map&lt;String, Entry&gt; copy = new HashMap&lt;&gt;();
+            for (Map.Entry&lt;String, Entry&gt; me : data.entrySet())
+                if (me.getValue().liveAt(now)) copy.put(me.getKey(), me.getValue()); // Entry is immutable: share it
+            return new Snapshot(Map.copyOf(copy), now);
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+
+    /** Restores the data of a snapshot. Expiry times are absolute, so a key that expired meanwhile stays gone. */
+    void restore(Snapshot s) {
+        write(() -&gt; {
+            data.clear();
+            expiries.clear();
+            for (Map.Entry&lt;String, Entry&gt; me : s.copy.entrySet()) put(me.getKey(), me.getValue().value(), me.getValue().expiresAt());
+        });
+    }
+
+    // ---------------- transaction commit (called by Session) ----------------
+
+    /**
+     * Applies a transaction's write set atomically, after checking that every key it read from the store
+     * still has the version it saw (optimistic concurrency, first committer wins).
+     */
+    void commit(Map&lt;String, Long&gt; readVersions, Map&lt;String, Entry&gt; writes) {
+        write(() -&gt; {
+            long now = clock.millis();
+            for (Map.Entry&lt;String, Long&gt; r : readVersions.entrySet()) {
+                Entry cur = data.get(r.getKey());
+                long curVersion = cur != null &amp;&amp; cur.liveAt(now) ? cur.version() : 0;
+                if (curVersion != r.getValue()) throw new ConflictException(r.getKey());
+            }
+            for (Map.Entry&lt;String, Entry&gt; w : writes.entrySet()) {
+                if (w.getValue().value() == null) data.remove(w.getKey());
+                else put(w.getKey(), w.getValue().value(), w.getValue().expiresAt());
+            }
+        });
+    }
+
+    long now() { return clock.millis(); }
+
+    long expiryFor(Duration ttl) {
+        if (ttl == null) return Entry.NEVER;
+        if (ttl.isNegative() || ttl.isZero()) throw new IllegalArgumentException("ttl must be positive");
+        return clock.millis() + ttl.toMillis();
+    }
+
+    // ---------------- internals, write lock held ----------------
+
+    private void write(Runnable body) {
+        List&lt;Entry&gt; gone = new ArrayList&lt;&gt;();
+        List&lt;String&gt; goneKeys = new ArrayList&lt;&gt;();
+        rw.writeLock().lock();
+        try {
+            body.run();
+            purgeLocked(PURGE_PER_WRITE, gone, goneKeys);
+        } finally {
+            rw.writeLock().unlock();
+        }
+        notifyExpired(goneKeys, gone);   // listeners run with no lock held
+    }
+
+    private void put(String key, String value, long expiresAt) {
+        Entry e = new Entry(value, expiresAt, ++versionSeq);
+        data.put(key, e);
+        if (expiresAt != Entry.NEVER) expiries.add(new ExpiryRef(expiresAt, key, e.version()));
+    }
+
+    private void purgeLocked(int max, List&lt;Entry&gt; gone, List&lt;String&gt; goneKeys) {
+        long now = clock.millis();
+        while (max-- &gt; 0 &amp;&amp; !expiries.isEmpty() &amp;&amp; expiries.peek().expiresAt() &lt;= now) {
+            ExpiryRef ref = expiries.poll();
+            Entry cur = data.get(ref.key());
+            if (cur != null &amp;&amp; cur.version() == ref.version()) {   // still the same write: really expired
+                data.remove(ref.key());
+                gone.add(cur);
+                goneKeys.add(ref.key());
+            }                                                       // else stale heap item: ignore
+        }
+    }
+
+    private void notifyExpired(List&lt;String&gt; keys, List&lt;Entry&gt; entries) {
+        for (int i = 0; i &lt; keys.size(); i++)
+            for (ExpiryListener l : listeners) l.onExpired(keys.get(i), entries.get(i).value());
+    }
+
+    /** Test hook: every live TTL entry has a heap item at its version; no expired entry is reachable via get. */
+    void checkInvariants() {
+        rw.readLock().lock();
+        try {
+            Map&lt;String, Long&gt; inHeap = new HashMap&lt;&gt;();
+            for (ExpiryRef r : expiries) inHeap.merge(r.key() + "#" + r.version(), 1L, Long::sum);
+            for (Map.Entry&lt;String, Entry&gt; me : data.entrySet()) {
+                Entry e = me.getValue();
+                if (e.value() == null) throw new AssertionError("tombstone leaked into the store: " + me.getKey());
+                if (e.expiresAt() != Entry.NEVER &amp;&amp; !inHeap.containsKey(me.getKey() + "#" + e.version()))
+                    throw new AssertionError("TTL key without heap item: " + me.getKey());
+            }
+        } finally {
+            rw.readLock().unlock();
+        }
+    }
+}
+
+/**
+ * One client's view of the store, with nested transactions.
+ * Outside a transaction every call goes straight to the store (autocommit).
+ * Inside, writes go to the top layer; reads look down the layers, then at the store.
+ */
+final class Session implements KeyValueStore {
+    private final InMemoryStore store;
+    private final Deque&lt;Map&lt;String, Entry&gt;&gt; layers = new ArrayDeque&lt;&gt;();   // top = innermost transaction
+    private final Map&lt;String, Long&gt; readVersions = new HashMap&lt;&gt;();        // first version seen per key, 0 = absent
+
+    Session(InMemoryStore store) { this.store = store; }
+
+    void begin() { layers.push(new LinkedHashMap&lt;&gt;()); }
+
+    int depth() { return layers.size(); }
+
+    /** Inner commit merges into the parent layer; the outermost commit applies everything to the store. */
+    void commit() {
+        if (layers.isEmpty()) throw new NoTransactionException();
+        Map&lt;String, Entry&gt; top = layers.pop();
+        if (!layers.isEmpty()) { layers.peek().putAll(top); return; }
+        try {
+            store.commit(readVersions, top);
+        } finally {
+            readVersions.clear();       // success or conflict: the transaction is over
+        }
+    }
+
+    /** Throws away the innermost transaction only. */
+    void rollback() {
+        if (layers.isEmpty()) throw new NoTransactionException();
+        layers.pop();
+        if (layers.isEmpty()) readVersions.clear();
+    }
+
+    public Optional&lt;String&gt; get(String key) {
+        Entry e = visible(key);
+        return e == null ? Optional.empty() : Optional.of(e.value());
+    }
+
+    public long ttlMillis(String key) {
+        Entry e = visible(key);
+        if (e == null) return -2;
+        return e.expiresAt() == Entry.NEVER ? -1 : e.expiresAt() - store.now();
+    }
+
+    public void set(String key, String value) { set(key, value, null); }
+
+    public void set(String key, String value, Duration ttl) {
+        if (layers.isEmpty()) { store.set(key, value, ttl); return; }
+        if (key == null || value == null) throw new IllegalArgumentException("key and value must not be null");
+        layers.peek().put(key, new Entry(value, store.expiryFor(ttl), 0));
+    }
+
+    public boolean delete(String key) {
+        if (layers.isEmpty()) return store.delete(key);
+        boolean existed = visible(key) != null;
+        layers.peek().put(key, new Entry(null, Entry.NEVER, 0));       // tombstone hides lower layers and the store
+        return existed;
+    }
+
+    public boolean expire(String key, Duration ttl) {
+        if (layers.isEmpty()) return store.expire(key, ttl);
+        Entry e = visible(key);
+        if (e == null) return false;
+        layers.peek().put(key, new Entry(e.value(), store.expiryFor(ttl), 0));
+        return true;
+    }
+
+    /** Own writes first (innermost wins), then the committed store; records what was read from the store. */
+    private Entry visible(String key) {
+        long now = store.now();
+        for (Map&lt;String, Entry&gt; layer : layers) {                         // iterates top to bottom
+            Entry e = layer.get(key);
+            if (e != null) return e.liveAt(now) ? e : null;
+        }
+        Entry e = store.read(key);
+        if (!layers.isEmpty()) readVersions.putIfAbsent(key, e == null ? 0L : e.version());
+        return e;
+    }
+}</code></pre>
+      <p><b>Main.java</b> - demo driver with checks and the two thread tests.</p>
+<pre><code class="language-java">import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class Main {
+    static int checks = 0;
+
+    static void check(boolean ok, String what) {
+        if (!ok) throw new AssertionError("FAILED: " + what);
+        checks++;
+    }
+
+    static void expectThrows(Class&lt;? extends RuntimeException&gt; type, Runnable r, String what) {
+        try {
+            r.run();
+        } catch (RuntimeException e) {
+            check(type.isInstance(e), what + " (got " + e.getClass().getSimpleName() + ")");
+            System.out.println("  rejected as expected: " + e.getMessage());
+            return;
+        }
+        throw new AssertionError("FAILED: expected " + type.getSimpleName() + " for " + what);
+    }
+
+    static Duration s(long seconds) { return Duration.ofSeconds(seconds); }
+
+    /** Read-modify-write with retry: the standard way to use an optimistic store. */
+    static int addWithRetry(InMemoryStore store, String key, int delta) {
+        for (int attempt = 1; ; attempt++) {
+            Session tx = store.session();
+            tx.begin();
+            int v = Integer.parseInt(tx.get(key).orElse("0"));
+            tx.set(key, String.valueOf(v + delta));
+            try {
+                tx.commit();
+                return attempt;
+            } catch (ConflictException e) {
+                // someone else committed this key first: read again and retry
+            }
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        ManualClock clock = new ManualClock(1_000_000);
+        InMemoryStore store = new InMemoryStore(clock);
+        List&lt;String&gt; expired = new ArrayList&lt;&gt;();
+        store.addListener((k, v) -&gt; expired.add(k + "=" + v));
+
+        System.out.println("== 1. get / set / delete ==");
+        store.set("user:1", "asha");
+        store.set("user:2", "ravi");
+        store.set("user:1", "asha.k");
+        System.out.println("  user:1 = " + store.get("user:1").orElse("(nil)") + ", size " + store.size());
+        check(store.get("user:1").equals(Optional.of("asha.k")), "overwrite");
+        check(store.delete("user:2") &amp;&amp; !store.delete("user:2"), "delete is true once, then false");
+        check(store.get("user:2").isEmpty() &amp;&amp; store.size() == 1, "deleted key is gone");
+        expectThrows(IllegalArgumentException.class, () -&gt; store.set("k", null), "null value");
+
+        System.out.println("== 2. TTL: lazy on read, active on purge ==");
+        store.set("otp:42", "918273", s(30));
+        clock.advance(s(29));
+        System.out.println("  after 29 s: otp = " + store.get("otp:42").orElse("(nil)") + ", ttl " + store.ttlMillis("otp:42") + " ms");
+        check(store.ttlMillis("otp:42") == 1000, "1 s left");
+        clock.advance(s(1));
+        System.out.println("  after 30 s: otp = " + store.get("otp:42").orElse("(nil)") + ", ttl " + store.ttlMillis("otp:42"));
+        check(store.get("otp:42").isEmpty() &amp;&amp; store.ttlMillis("otp:42") == -2, "expired key reads as absent at exactly its deadline");
+        int purged = store.purgeExpired(100);
+        System.out.println("  purge removed " + purged + " key(s); listener saw " + expired);
+        check(purged == 1 &amp;&amp; expired.equals(List.of("otp:42=918273")), "active expiry removes it and notifies once");
+        check(store.ttlMillis("user:1") == -1, "no TTL = -1");
+        check(store.expire("user:1", s(5)) &amp;&amp; store.ttlMillis("user:1") == 5000, "EXPIRE adds a TTL");
+        store.set("user:1", "asha.k");
+        check(store.ttlMillis("user:1") == -1, "plain SET clears the TTL, like Redis");
+        check(!store.expire("nobody", s(5)), "EXPIRE on a missing key is false");
+
+        System.out.println("== 3. stale heap items are skipped ==");
+        store.set("session:9", "a", s(5));
+        store.set("session:9", "b", s(60));   // the 5 s heap item is now stale
+        clock.advance(s(10));
+        expired.clear();
+        check(store.purgeExpired(100) == 0 &amp;&amp; store.get("session:9").equals(Optional.of("b")), "rewrite with a longer TTL survives");
+        System.out.println("  session:9 = " + store.get("session:9").get() + " (ttl " + store.ttlMillis("session:9") / 1000 + " s)");
+        store.checkInvariants();
+
+        System.out.println("== 4. nested transactions ==");
+        store.set("a", "10");
+        store.set("b", "20");
+        Session tx = store.session();
+        tx.begin();                       // T1
+        tx.set("a", "11");
+        tx.begin();                       // T2 inside T1
+        tx.set("a", "12");
+        tx.delete("b");
+        tx.set("c", "30");
+        System.out.println("  inside T2: a=" + tx.get("a").get() + " b=" + tx.get("b").orElse("(nil)") + " c=" + tx.get("c").get() + "; store a=" + store.get("a").get());
+        check(store.get("a").equals(Optional.of("10")), "uncommitted writes are invisible to others");
+        tx.rollback();                    // undo T2 only
+        System.out.println("  after T2 rollback: a=" + tx.get("a").get() + " b=" + tx.get("b").orElse("(nil)") + " c=" + tx.get("c").orElse("(nil)") + " depth " + tx.depth());
+        check(tx.get("a").equals(Optional.of("11")) &amp;&amp; tx.get("b").equals(Optional.of("20")) &amp;&amp; tx.get("c").isEmpty(), "T1 state is back");
+        tx.begin();                       // T3 inside T1
+        tx.set("d", "40");
+        tx.commit();                      // merges T3 into T1, nothing reaches the store yet
+        check(store.get("d").isEmpty() &amp;&amp; tx.get("d").equals(Optional.of("40")) &amp;&amp; tx.depth() == 1, "inner commit merges into the parent");
+        tx.commit();                      // T1 commits: a=11, d=40 applied atomically
+        System.out.println("  after T1 commit: store a=" + store.get("a").get() + " b=" + store.get("b").get() + " d=" + store.get("d").get());
+        check(store.get("a").equals(Optional.of("11")) &amp;&amp; store.get("d").equals(Optional.of("40")), "outer commit applies everything");
+        expectThrows(NoTransactionException.class, tx::commit, "commit with no transaction");
+        expectThrows(NoTransactionException.class, tx::rollback, "rollback with no transaction");
+
+        System.out.println("== 5. TTL and delete inside a transaction ==");
+        tx.begin();
+        tx.set("cart:7", "3 items", s(20));
+        tx.delete("d");
+        clock.advance(s(5));
+        check(tx.ttlMillis("cart:7") == 15000 &amp;&amp; tx.get("d").isEmpty(), "TTL counts from the SET, tombstone hides d");
+        tx.commit();
+        check(store.ttlMillis("cart:7") == 15000 &amp;&amp; store.get("d").isEmpty(), "both applied at commit");
+        System.out.println("  cart:7 ttl " + store.ttlMillis("cart:7") / 1000 + " s, d = " + store.get("d").orElse("(nil)"));
+
+        System.out.println("== 6. optimistic conflict: first committer wins ==");
+        store.set("balance", "100");
+        Session alice = store.session(), bob = store.session();
+        alice.begin();
+        int seen = Integer.parseInt(alice.get("balance").get());   // alice reads version v
+        bob.set("balance", "50");                                  // bob autocommits: version moves on
+        alice.set("balance", String.valueOf(seen + 10));
+        expectThrows(ConflictException.class, alice::commit, "alice read a stale balance");
+        check(store.get("balance").equals(Optional.of("50")) &amp;&amp; alice.depth() == 0, "bob's write kept, alice's transaction is over");
+        int attempts = addWithRetry(store, "balance", 10);
+        System.out.println("  retry after conflict: balance = " + store.get("balance").get() + " (" + attempts + " attempt)");
+        check(store.get("balance").equals(Optional.of("60")), "retry applies on the fresh value");
+        Session blind = store.session();
+        blind.begin();
+        blind.set("balance", "999");                               // write without reading: no read-set entry
+        store.set("balance", "70");
+        blind.commit();
+        check(store.get("balance").equals(Optional.of("999")), "blind writes do not conflict (last writer wins)");
+
+        System.out.println("== 7. Memento: snapshot and restore ==");
+        InMemoryStore.Snapshot snap = store.snapshot();
+        store.set("a", "changed");
+        store.delete("balance");
+        store.set("temp", "x");
+        System.out.println("  snapshot has " + snap.keyCount() + " keys; store now a=" + store.get("a").get() + ", balance=" + store.get("balance").orElse("(nil)"));
+        check(snap.keyCount() == 6, "snapshot keeps its own copy");
+        Session open = store.session();
+        open.begin();
+        open.get("a");                                             // an open transaction that read "a"
+        store.restore(snap);
+        System.out.println("  restored: a=" + store.get("a").get() + ", balance=" + store.get("balance").get() + ", temp=" + store.get("temp").orElse("(nil)"));
+        check(store.get("a").equals(Optional.of("11")) &amp;&amp; store.get("balance").equals(Optional.of("999")) &amp;&amp; store.get("temp").isEmpty(), "restore");
+        open.set("a", "late");
+        expectThrows(ConflictException.class, open::commit, "restore gives new versions, so open readers conflict");
+        clock.advance(s(20));
+        check(store.get("cart:7").isEmpty(), "restored TTL is absolute: cart:7 still expires on time");
+        store.checkInvariants();
+
+        System.out.println("== 8. threads: 8 x 500 increments through transactions ==");
+        store.set("counter", "0");
+        AtomicInteger retries = new AtomicInteger();
+        runConcurrently(8, i -&gt; {
+            for (int n = 0; n &lt; 500; n++) retries.addAndGet(addWithRetry(store, "counter", 1) - 1);
+        });
+        System.out.println("  counter = " + store.get("counter").get() + " (" + retries.get() + " retries after conflicts)");
+        check(store.get("counter").equals(Optional.of("4000")), "no lost update");
+
+        System.out.println("== 9. threads: TTL writers, readers and a purger together ==");
+        AtomicInteger badReads = new AtomicInteger();
+        runConcurrently(6, i -&gt; {
+            Random r = new Random(i);
+            for (int n = 0; n &lt; 2000; n++) {
+                String k = "k" + r.nextInt(200);
+                switch (i % 3) {
+                    case 0 -&gt; store.set(k, "v" + n, Duration.ofMillis(1 + r.nextInt(50)));
+                    case 1 -&gt; { if (store.get(k).map(v -&gt; !v.startsWith("v")).orElse(false)) badReads.incrementAndGet(); }
+                    default -&gt; { store.purgeExpired(10); clock.advance(Duration.ofMillis(1)); }
+                }
+            }
+        });
+        store.checkInvariants();
+        clock.advance(s(1));
+        int left = store.size();
+        System.out.println("  bad reads " + badReads.get() + ", live keys after the k* TTLs ran out: " + left);
+        check(badReads.get() == 0 &amp;&amp; left == 6, "every k* key expired; the 6 earlier keys remain");
+
+        System.out.println("ALL " + checks + " CHECKS PASSED");
+    }
+
+    interface Task { void run(int i) throws Exception; }
+
+    static void runConcurrently(int n, Task task) throws Exception {
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        CountDownLatch start = new CountDownLatch(1);
+        List&lt;Future&lt;Object&gt;&gt; futures = new ArrayList&lt;&gt;();
+        for (int i = 0; i &lt; n; i++) {
+            final int id = i;
+            futures.add(pool.submit(() -&gt; {
+                start.await();
+                task.run(id);
+                return null;
+            }));
+        }
+        start.countDown();
+        for (Future&lt;Object&gt; f : futures) f.get(60, TimeUnit.SECONDS);
+        pool.shutdown();
+    }
+}</code></pre>
+      <p>Build and run: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>. The retry count in scene 8 changes from run to run (it depends on how the threads interleave); the final counter is always 4000.</p>
+<pre class="terminal"><code>== 1. get / set / delete ==
+  user:1 = asha.k, size 2
+  rejected as expected: key and value must not be null
+== 2. TTL: lazy on read, active on purge ==
+  after 29 s: otp = 918273, ttl 1000 ms
+  after 30 s: otp = (nil), ttl -2
+  purge removed 1 key(s); listener saw [otp:42=918273]
+== 3. stale heap items are skipped ==
+  session:9 = b (ttl 50 s)
+== 4. nested transactions ==
+  inside T2: a=12 b=(nil) c=30; store a=10
+  after T2 rollback: a=11 b=20 c=(nil) depth 1
+  after T1 commit: store a=11 b=20 d=40
+  rejected as expected: no open transaction
+  rejected as expected: no open transaction
+== 5. TTL and delete inside a transaction ==
+  cart:7 ttl 15 s, d = (nil)
+== 6. optimistic conflict: first committer wins ==
+  rejected as expected: conflict on key balance
+  retry after conflict: balance = 60 (1 attempt)
+== 7. Memento: snapshot and restore ==
+  snapshot has 6 keys; store now a=changed, balance=(nil)
+  restored: a=11, balance=999, temp=(nil)
+  rejected as expected: conflict on key a
+== 8. threads: 8 x 500 increments through transactions ==
+  counter = 4000 (1652 retries after conflicts)
+== 9. threads: TTL writers, readers and a purger together ==
+  bad reads 0, live keys after the k* TTLs ran out: 6
+ALL 30 CHECKS PASSED</code></pre>
+    </div>
+  </div>
+  <h3>The same design in Python and C++14</h3>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Python">
+      <p><b>kvstore.py</b> - store, session, snapshot. Python's standard library has no read-write lock, so one <code>threading.Lock</code> guards the store; the sections are tiny dict operations.</p>
+<pre><code class="language-python">"""In-memory key-value store: TTL (lazy + active expiry), nested transactions with optimistic
+commit, Memento snapshots, expiry listeners. Same design as the Java version."""
+from __future__ import annotations
+
+import heapq
+import itertools
+import threading
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+NEVER = float("inf")
+PURGE_PER_WRITE = 16
+
+
+class NoTransaction(RuntimeError):
+    pass
+
+
+class Conflict(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Entry:
+    value: Optional[str]          # None = tombstone (delete inside a transaction)
+    expires_at: float
+    version: int
+
+    def live_at(self, now: float) -&gt; bool:
+        return self.value is not None and now &lt; self.expires_at
+
+
+class ManualClock:
+    def __init__(self, start: float = 1_000.0):
+        self._now = start
+        self._lock = threading.Lock()
+
+    def __call__(self) -&gt; float:
+        return self._now
+
+    def advance(self, seconds: float) -&gt; None:
+        with self._lock:
+            self._now += seconds
+
+
+class Snapshot:
+    """Memento: opaque to callers; only Store reads _copy."""
+    __slots__ = ("_copy", "taken_at")
+
+    def __init__(self, copy: dict, taken_at: float):
+        self._copy = copy
+        self.taken_at = taken_at
+
+    def key_count(self) -&gt; int:
+        return len(self._copy)
+
+
+class Store:
+    """Python has no read-write lock in the standard library, so one lock guards everything.
+    Reads are dict lookups, so the critical sections stay tiny."""
+
+    def __init__(self, clock: Callable[[], float]):
+        self.clock = clock
+        self._data: dict[str, Entry] = {}
+        self._heap: list[tuple[float, int, str, int]] = []   # (expires_at, tie, key, version)
+        self._tie = itertools.count()
+        self._version = itertools.count(1)
+        self._lock = threading.Lock()
+        self._listeners: list[Callable[[str, str], None]] = []
+
+    def add_listener(self, fn) -&gt; None:
+        self._listeners.append(fn)
+
+    def session(self) -&gt; "Session":
+        return Session(self)
+
+    # -- reads: expired = absent, nothing removed --
+    def read(self, key: str) -&gt; Optional[Entry]:
+        with self._lock:
+            e = self._data.get(key)
+            return e if e is not None and e.live_at(self.clock()) else None
+
+    def get(self, key: str) -&gt; Optional[str]:
+        e = self.read(key)
+        return None if e is None else e.value
+
+    def ttl(self, key: str) -&gt; float:
+        """-2 = no key, -1 = no TTL, else seconds left."""
+        e = self.read(key)
+        if e is None:
+            return -2
+        return -1 if e.expires_at == NEVER else e.expires_at - self.clock()
+
+    def size(self) -&gt; int:
+        self.purge_expired(10**9)
+        with self._lock:
+            return len(self._data)
+
+    # -- writes --
+    def expiry_for(self, ttl: Optional[float]) -&gt; float:
+        if ttl is None:
+            return NEVER
+        if ttl &lt;= 0:
+            raise ValueError("ttl must be positive")
+        return self.clock() + ttl
+
+    def set(self, key: str, value: str, ttl: Optional[float] = None) -&gt; None:
+        if key is None or value is None:
+            raise ValueError("key and value must not be None")
+        exp = self.expiry_for(ttl)
+        self._write(lambda: self._put(key, value, exp))
+
+    def delete(self, key: str) -&gt; bool:
+        found = []
+        self._write(lambda: found.append(self._pop_live(key)))
+        return found[0]
+
+    def expire(self, key: str, ttl: float) -&gt; bool:
+        exp = self.expiry_for(ttl)
+        ok = []
+
+        def body():
+            e = self._data.get(key)
+            if e is not None and e.live_at(self.clock()):
+                self._put(key, e.value, exp)
+                ok.append(True)
+        self._write(body)
+        return bool(ok)
+
+    def purge_expired(self, limit: int) -&gt; int:
+        with self._lock:
+            gone = self._purge_locked(limit)
+        self._notify(gone)
+        return len(gone)
+
+    # -- Memento --
+    def snapshot(self) -&gt; Snapshot:
+        with self._lock:
+            now = self.clock()
+            return Snapshot({k: e for k, e in self._data.items() if e.live_at(now)}, now)
+
+    def restore(self, s: Snapshot) -&gt; None:
+        def body():
+            self._data.clear()
+            self._heap.clear()
+            for k, e in s._copy.items():
+                self._put(k, e.value, e.expires_at)
+        self._write(body)
+
+    # -- transaction commit --
+    def commit(self, read_versions: dict[str, int], writes: dict[str, Entry]) -&gt; None:
+        def body():
+            now = self.clock()
+            for k, seen in read_versions.items():
+                cur = self._data.get(k)
+                cur_v = cur.version if cur is not None and cur.live_at(now) else 0
+                if cur_v != seen:
+                    raise Conflict(f"conflict on key {k}")
+            for k, e in writes.items():
+                if e.value is None:
+                    self._data.pop(k, None)
+                else:
+                    self._put(k, e.value, e.expires_at)
+        self._write(body)
+
+    # -- internals, lock held --
+    def _write(self, body) -&gt; None:
+        with self._lock:
+            body()
+            gone = self._purge_locked(PURGE_PER_WRITE)
+        self._notify(gone)              # listeners run with no lock held
+
+    def _put(self, key: str, value: str, expires_at: float) -&gt; None:
+        e = Entry(value, expires_at, next(self._version))
+        self._data[key] = e
+        if expires_at != NEVER:
+            heapq.heappush(self._heap, (expires_at, next(self._tie), key, e.version))
+
+    def _pop_live(self, key: str) -&gt; bool:
+        e = self._data.pop(key, None)
+        return e is not None and e.live_at(self.clock())
+
+    def _purge_locked(self, limit: int) -&gt; list[tuple[str, str]]:
+        now, gone = self.clock(), []
+        while limit &gt; 0 and self._heap and self._heap[0][0] &lt;= now:
+            limit -= 1
+            _, _, key, version = heapq.heappop(self._heap)
+            cur = self._data.get(key)
+            if cur is not None and cur.version == version:   # else: stale heap item
+                del self._data[key]
+                gone.append((key, cur.value))
+        return gone
+
+    def _notify(self, gone) -&gt; None:
+        for key, value in gone:
+            for fn in self._listeners:
+                fn(key, value)
+
+    def check_invariants(self) -&gt; None:
+        with self._lock:
+            in_heap = {(k, v) for _, _, k, v in self._heap}
+            for k, e in self._data.items():
+                assert e.value is not None, "tombstone leaked"
+                assert e.expires_at == NEVER or (k, e.version) in in_heap, f"TTL key {k} has no heap item"
+
+
+class Session:
+    """One client's view. No transaction open = autocommit. Layers: list, last = innermost."""
+
+    def __init__(self, store: Store):
+        self.store = store
+        self.layers: list[dict[str, Entry]] = []
+        self.read_versions: dict[str, int] = {}
+
+    def begin(self) -&gt; None:
+        self.layers.append({})
+
+    def depth(self) -&gt; int:
+        return len(self.layers)
+
+    def commit(self) -&gt; None:
+        if not self.layers:
+            raise NoTransaction("no open transaction")
+        top = self.layers.pop()
+        if self.layers:
+            self.layers[-1].update(top)
+            return
+        try:
+            self.store.commit(self.read_versions, top)
+        finally:
+            self.read_versions = {}
+
+    def rollback(self) -&gt; None:
+        if not self.layers:
+            raise NoTransaction("no open transaction")
+        self.layers.pop()
+        if not self.layers:
+            self.read_versions = {}
+
+    def _visible(self, key: str) -&gt; Optional[Entry]:
+        now = self.store.clock()
+        for layer in reversed(self.layers):
+            if key in layer:
+                e = layer[key]
+                return e if e.live_at(now) else None
+        e = self.store.read(key)
+        if self.layers:
+            self.read_versions.setdefault(key, 0 if e is None else e.version)
+        return e
+
+    def get(self, key: str) -&gt; Optional[str]:
+        e = self._visible(key)
+        return None if e is None else e.value
+
+    def ttl(self, key: str) -&gt; float:
+        e = self._visible(key)
+        if e is None:
+            return -2
+        return -1 if e.expires_at == NEVER else e.expires_at - self.store.clock()
+
+    def set(self, key: str, value: str, ttl: Optional[float] = None) -&gt; None:
+        if not self.layers:
+            return self.store.set(key, value, ttl)
+        if key is None or value is None:
+            raise ValueError("key and value must not be None")
+        self.layers[-1][key] = Entry(value, self.store.expiry_for(ttl), 0)
+
+    def delete(self, key: str) -&gt; bool:
+        if not self.layers:
+            return self.store.delete(key)
+        existed = self._visible(key) is not None
+        self.layers[-1][key] = Entry(None, NEVER, 0)
+        return existed
+
+    def expire(self, key: str, ttl: float) -&gt; bool:
+        if not self.layers:
+            return self.store.expire(key, ttl)
+        e = self._visible(key)
+        if e is None:
+            return False
+        self.layers[-1][key] = Entry(e.value, self.store.expiry_for(ttl), 0)
+        return True
+
+
+def add_with_retry(store: Store, key: str, delta: int) -&gt; int:
+    """Read-modify-write in a transaction, retried on conflict. Returns attempts used."""
+    attempt = 0
+    while True:
+        attempt += 1
+        tx = store.session()
+        tx.begin()
+        tx.set(key, str(int(tx.get(key) or "0") + delta))
+        try:
+            tx.commit()
+            return attempt
+        except Conflict:
+            continue</code></pre>
+      <p><b>main.py</b> - demo driver.</p>
+<pre><code class="language-python">"""Demo driver for kvstore.py: run with  python main.py"""
+import threading
+
+from kvstore import Conflict, ManualClock, NoTransaction, Store, add_with_retry
+
+
+def check(cond, msg="check failed"):
+    """Like assert, but never stripped by python -O: the call inside it always runs."""
+    if not cond:
+        raise AssertionError(msg)
+
+
+def main() -&gt; None:
+    clock = ManualClock()
+    store = Store(clock)
+    expired = []
+    store.add_listener(lambda k, v: expired.append(f"{k}={v}"))
+
+    print("== get / set / delete ==")
+    store.set("user:1", "asha")
+    store.set("user:1", "asha.k")
+    store.set("user:2", "ravi")
+    check(store.delete("user:2") and not store.delete("user:2"))
+    print("  user:1 =", store.get("user:1"), "size", store.size())
+
+    print("== TTL ==")
+    store.set("otp:42", "918273", ttl=30)
+    clock.advance(29)
+    print("  after 29 s:", store.get("otp:42"), "ttl", store.ttl("otp:42"))
+    clock.advance(1)
+    check(store.get("otp:42") is None and store.ttl("otp:42") == -2)
+    print("  after 30 s:", store.get("otp:42"), "| purged", store.purge_expired(100), "| listener", expired)
+    store.set("session:9", "a", ttl=5)
+    store.set("session:9", "b", ttl=60)
+    clock.advance(10)
+    check(store.purge_expired(100) == 0 and store.get("session:9") == "b")
+    print("  stale heap item skipped: session:9 =", store.get("session:9"))
+
+    print("== nested transactions ==")
+    store.set("a", "10")
+    store.set("b", "20")
+    tx = store.session()
+    tx.begin()
+    tx.set("a", "11")
+    tx.begin()
+    tx.set("a", "12")
+    tx.delete("b")
+    print("  inside T2: a =", tx.get("a"), "b =", tx.get("b"), "| store a =", store.get("a"))
+    tx.rollback()
+    print("  after T2 rollback: a =", tx.get("a"), "b =", tx.get("b"))
+    tx.commit()
+    print("  after T1 commit: store a =", store.get("a"))
+    try:
+        tx.rollback()
+    except NoTransaction as e:
+        print("  rejected as expected:", e)
+
+    print("== optimistic conflict ==")
+    store.set("balance", "100")
+    alice = store.session()
+    alice.begin()
+    seen = int(alice.get("balance"))
+    store.set("balance", "50")
+    alice.set("balance", str(seen + 10))
+    try:
+        alice.commit()
+    except Conflict as e:
+        print("  rejected as expected:", e)
+    add_with_retry(store, "balance", 10)
+    print("  after retry: balance =", store.get("balance"))
+
+    print("== Memento ==")
+    snap = store.snapshot()
+    store.set("a", "changed")
+    store.delete("balance")
+    store.restore(snap)
+    print("  snapshot keys", snap.key_count(), "| restored a =", store.get("a"), "balance =", store.get("balance"))
+
+    print("== 8 threads x 500 increments ==")
+    store.set("counter", "0")
+    threads = [threading.Thread(target=lambda: [add_with_retry(store, "counter", 1) for _ in range(500)]) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check(store.get("counter") == "4000")
+    store.check_invariants()
+    print("  counter =", store.get("counter"))
+    print("PYTHON DEMO OK")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+      <p><b>test_kvstore.py</b> - unit tests, including a 6-thread increment test.</p>
+<pre><code class="language-python">import threading
+import unittest
+
+from kvstore import Conflict, ManualClock, NoTransaction, Store, add_with_retry
+
+
+class KvStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = ManualClock()
+        self.s = Store(self.clock)
+
+    def test_ttl_lazy_and_active(self):
+        seen = []
+        self.s.add_listener(lambda k, v: seen.append(k))
+        self.s.set("k", "v", ttl=10)
+        self.clock.advance(10)
+        self.assertIsNone(self.s.get("k"))          # lazy: invisible at the deadline
+        self.assertEqual(self.s.purge_expired(10), 1)
+        self.assertEqual(seen, ["k"])
+        self.s.check_invariants()
+
+    def test_set_clears_ttl_and_expire_adds_one(self):
+        self.s.set("k", "v", ttl=5)
+        self.s.set("k", "w")
+        self.assertEqual(self.s.ttl("k"), -1)
+        self.assertTrue(self.s.expire("k", 3))
+        self.assertEqual(self.s.ttl("k"), 3)
+        self.assertFalse(self.s.expire("missing", 3))
+
+    def test_stale_heap_item(self):
+        self.s.set("k", "a", ttl=1)
+        self.s.set("k", "b", ttl=100)
+        self.clock.advance(2)
+        self.assertEqual(self.s.purge_expired(10), 0)
+        self.assertEqual(self.s.get("k"), "b")
+
+    def test_nested_rollback_and_commit(self):
+        self.s.set("a", "1")
+        tx = self.s.session()
+        tx.begin()
+        tx.set("a", "2")
+        tx.begin()
+        tx.delete("a")
+        self.assertIsNone(tx.get("a"))
+        tx.rollback()
+        self.assertEqual(tx.get("a"), "2")
+        self.assertEqual(self.s.get("a"), "1")
+        tx.commit()
+        self.assertEqual(self.s.get("a"), "2")
+        with self.assertRaises(NoTransaction):
+            tx.commit()
+
+    def test_inner_commit_merges_only(self):
+        tx = self.s.session()
+        tx.begin()
+        tx.begin()
+        tx.set("x", "1")
+        tx.commit()
+        self.assertIsNone(self.s.get("x"))
+        tx.rollback()                               # outer rollback discards the merged write
+        self.assertIsNone(self.s.get("x"))
+
+    def test_conflict_and_blind_write(self):
+        self.s.set("k", "1")
+        a = self.s.session()
+        a.begin()
+        a.get("k")
+        self.s.set("k", "2")
+        a.set("k", "3")
+        with self.assertRaises(Conflict):
+            a.commit()
+        b = self.s.session()
+        b.begin()
+        b.set("k", "9")                             # never read: no conflict
+        self.s.set("k", "4")
+        b.commit()
+        self.assertEqual(self.s.get("k"), "9")
+
+    def test_memento_is_a_copy(self):
+        self.s.set("a", "1", ttl=10)
+        snap = self.s.snapshot()
+        self.s.set("a", "2")
+        self.s.set("b", "x")
+        self.s.restore(snap)
+        self.assertEqual(self.s.get("a"), "1")
+        self.assertIsNone(self.s.get("b"))
+        self.clock.advance(10)
+        self.assertIsNone(self.s.get("a"))          # absolute expiry kept
+
+    def test_concurrent_increments(self):
+        self.s.set("c", "0")
+        ts = [threading.Thread(target=lambda: [add_with_retry(self.s, "c", 1) for _ in range(200)]) for _ in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(self.s.get("c"), "1200")
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+      <p>Run: <code>python main.py</code> and <code>python -m unittest -v test_kvstore</code></p>
+<pre class="terminal"><code>== get / set / delete ==
+  user:1 = asha.k size 1
+== TTL ==
+  after 29 s: 918273 ttl 1.0
+  after 30 s: None | purged 1 | listener ['otp:42=918273']
+  stale heap item skipped: session:9 = b
+== nested transactions ==
+  inside T2: a = 12 b = None | store a = 10
+  after T2 rollback: a = 11 b = 20
+  after T1 commit: store a = 11
+  rejected as expected: no open transaction
+== optimistic conflict ==
+  rejected as expected: conflict on key balance
+  after retry: balance = 60
+== Memento ==
+  snapshot keys 5 | restored a = 11 balance = 60
+== 8 threads x 500 increments ==
+  counter = 4000
+PYTHON DEMO OK</code></pre>
+<pre class="terminal"><code>test_concurrent_increments (test_kvstore.KvStoreTest.test_concurrent_increments) ... ok
+test_conflict_and_blind_write (test_kvstore.KvStoreTest.test_conflict_and_blind_write) ... ok
+test_inner_commit_merges_only (test_kvstore.KvStoreTest.test_inner_commit_merges_only) ... ok
+test_memento_is_a_copy (test_kvstore.KvStoreTest.test_memento_is_a_copy) ... ok
+test_nested_rollback_and_commit (test_kvstore.KvStoreTest.test_nested_rollback_and_commit) ... ok
+test_set_clears_ttl_and_expire_adds_one (test_kvstore.KvStoreTest.test_set_clears_ttl_and_expire_adds_one) ... ok
+test_stale_heap_item (test_kvstore.KvStoreTest.test_stale_heap_item) ... ok
+test_ttl_lazy_and_active (test_kvstore.KvStoreTest.test_ttl_lazy_and_active) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.006s
+
+OK</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+      <p><b>main.cpp</b> - the same core with <code>std::priority_queue</code> for expiry, a vector of maps for the layers, and a friend-only Snapshot. Single-threaded; the top comment says which lock goes where.</p>
+<pre><code class="language-cpp">// In-memory KV store in C++14: TTL with lazy + heap-based active expiry, nested transactions
+// (layered write sets with tombstones), optimistic commit, and a Memento snapshot.
+// Single-threaded demo. In a server, Store's public methods take a std::shared_timed_mutex
+// (C++14): shared for get/ttl/snapshot, exclusive for writes, commit and purge.
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;queue&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+
+#define CHECK(x) do { if (!(x)) { std::cerr &lt;&lt; "FAILED: " #x "\n"; return 1; } } while (0)
+
+static const int64_t NEVER = INT64_MAX;
+
+struct Entry {
+    std::string value;
+    int64_t expiresAt = NEVER;
+    uint64_t version = 0;
+    bool tombstone = false;
+    bool liveAt(int64_t now) const { return !tombstone &amp;&amp; now &lt; expiresAt; }
+};
+
+struct ExpiryRef {
+    int64_t at; std::string key; uint64_t version;
+    bool operator&gt;(const ExpiryRef&amp; o) const { return at &gt; o.at; }
+};
+
+struct ConflictError : std::runtime_error { explicit ConflictError(const std::string&amp; k) : std::runtime_error("conflict on key " + k) {} };
+
+class Store {
+public:
+    // Memento: the copy is private; only Store (a friend) can read it or make one.
+    class Snapshot {
+        friend class Store;
+        std::unordered_map&lt;std::string, Entry&gt; copy_;
+    public:
+        size_t keyCount() const { return copy_.size(); }
+    };
+
+    explicit Store(const int64_t* clock) : now_(clock) {}
+
+    const Entry* read(const std::string&amp; k) const {
+        auto it = data_.find(k);
+        return it != data_.end() &amp;&amp; it-&gt;second.liveAt(*now_) ? &amp;it-&gt;second : nullptr;
+    }
+    std::string get(const std::string&amp; k) const { const Entry* e = read(k); return e ? e-&gt;value : "(nil)"; }
+    int64_t ttl(const std::string&amp; k) const {
+        const Entry* e = read(k);
+        if (!e) return -2;
+        return e-&gt;expiresAt == NEVER ? -1 : e-&gt;expiresAt - *now_;
+    }
+    void set(const std::string&amp; k, const std::string&amp; v, int64_t ttl = 0) { put(k, v, ttl &gt; 0 ? *now_ + ttl : NEVER); purge(16); }
+    bool del(const std::string&amp; k) {
+        auto it = data_.find(k);
+        bool live = it != data_.end() &amp;&amp; it-&gt;second.liveAt(*now_);
+        if (it != data_.end()) data_.erase(it);
+        purge(16);
+        return live;
+    }
+    int purge(int max) {                    // pop due heap items, skip stale ones
+        int n = 0;
+        while (max-- &gt; 0 &amp;&amp; !heap_.empty() &amp;&amp; heap_.top().at &lt;= *now_) {
+            ExpiryRef r = heap_.top(); heap_.pop();
+            auto it = data_.find(r.key);
+            if (it != data_.end() &amp;&amp; it-&gt;second.version == r.version) { data_.erase(it); ++n; }
+        }
+        return n;
+    }
+    size_t size() { purge(1 &lt;&lt; 30); return data_.size(); }
+
+    Snapshot snapshot() const {
+        Snapshot s;
+        for (auto&amp; kv : data_) if (kv.second.liveAt(*now_)) s.copy_[kv.first] = kv.second;
+        return s;
+    }
+    void restore(const Snapshot&amp; s) {
+        data_.clear();
+        heap_ = decltype(heap_)();
+        for (auto&amp; kv : s.copy_) put(kv.first, kv.second.value, kv.second.expiresAt);
+    }
+
+    // Optimistic commit: every key read must still be at the version seen (0 = absent).
+    void commit(const std::map&lt;std::string, uint64_t&gt;&amp; reads, const std::map&lt;std::string, Entry&gt;&amp; writes) {
+        for (auto&amp; r : reads) {
+            const Entry* e = read(r.first);
+            if ((e ? e-&gt;version : 0) != r.second) throw ConflictError(r.first);
+        }
+        for (auto&amp; w : writes) {
+            if (w.second.tombstone) data_.erase(w.first);
+            else put(w.first, w.second.value, w.second.expiresAt);
+        }
+    }
+    int64_t now() const { return *now_; }
+
+private:
+    void put(const std::string&amp; k, const std::string&amp; v, int64_t exp) {
+        Entry e; e.value = v; e.expiresAt = exp; e.version = ++seq_;
+        data_[k] = e;
+        if (exp != NEVER) heap_.push(ExpiryRef{exp, k, e.version});
+    }
+    const int64_t* now_;
+    uint64_t seq_ = 0;
+    std::unordered_map&lt;std::string, Entry&gt; data_;
+    std::priority_queue&lt;ExpiryRef, std::vector&lt;ExpiryRef&gt;, std::greater&lt;ExpiryRef&gt;&gt; heap_;
+};
+
+class Session {
+public:
+    explicit Session(Store&amp; s) : store_(s) {}
+    void begin() { layers_.emplace_back(); }
+    size_t depth() const { return layers_.size(); }
+    void commit() {
+        if (layers_.empty()) throw std::logic_error("no open transaction");
+        std::map&lt;std::string, Entry&gt; top = std::move(layers_.back());
+        layers_.pop_back();
+        if (!layers_.empty()) { for (auto&amp; kv : top) layers_.back()[kv.first] = kv.second; return; }
+        std::map&lt;std::string, uint64_t&gt; reads; reads.swap(reads_);
+        store_.commit(reads, top);
+    }
+    void rollback() {
+        if (layers_.empty()) throw std::logic_error("no open transaction");
+        layers_.pop_back();
+        if (layers_.empty()) reads_.clear();
+    }
+    std::string get(const std::string&amp; k) { const Entry* e = visible(k); return e ? e-&gt;value : "(nil)"; }
+    void set(const std::string&amp; k, const std::string&amp; v, int64_t ttl = 0) {
+        if (layers_.empty()) { store_.set(k, v, ttl); return; }
+        Entry e; e.value = v; e.expiresAt = ttl &gt; 0 ? store_.now() + ttl : NEVER;
+        layers_.back()[k] = e;
+    }
+    bool del(const std::string&amp; k) {
+        if (layers_.empty()) return store_.del(k);
+        bool existed = visible(k) != nullptr;
+        Entry t; t.tombstone = true;
+        layers_.back()[k] = t;
+        return existed;
+    }
+
+private:
+    const Entry* visible(const std::string&amp; k) {
+        for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {   // innermost first
+            auto f = it-&gt;find(k);
+            if (f != it-&gt;end()) return f-&gt;second.liveAt(store_.now()) ? &amp;f-&gt;second : nullptr;
+        }
+        const Entry* e = store_.read(k);
+        if (!layers_.empty() &amp;&amp; !reads_.count(k)) reads_[k] = e ? e-&gt;version : 0;
+        return e;
+    }
+    Store&amp; store_;
+    std::vector&lt;std::map&lt;std::string, Entry&gt;&gt; layers_;
+    std::map&lt;std::string, uint64_t&gt; reads_;
+};
+
+int main() {
+    int64_t clock = 1000000;                 // milliseconds, advanced by hand
+    Store store(&amp;clock);
+
+    store.set("otp", "918273", 30000);
+    clock += 29000;
+    std::cout &lt;&lt; "  after 29 s: otp=" &lt;&lt; store.get("otp") &lt;&lt; " ttl=" &lt;&lt; store.ttl("otp") &lt;&lt; " ms\n";
+    clock += 1000;
+    CHECK(store.get("otp") == "(nil)" &amp;&amp; store.purge(10) == 1);
+    std::cout &lt;&lt; "  after 30 s: otp=" &lt;&lt; store.get("otp") &lt;&lt; " (purged)\n";
+
+    store.set("s", "a", 5000);
+    store.set("s", "b", 60000);
+    clock += 10000;
+    CHECK(store.purge(10) == 0 &amp;&amp; store.get("s") == "b");
+    std::cout &lt;&lt; "  stale heap item skipped: s=" &lt;&lt; store.get("s") &lt;&lt; "\n";
+
+    store.set("a", "10"); store.set("b", "20");
+    Session tx(store);
+    tx.begin(); tx.set("a", "11");
+    tx.begin(); tx.set("a", "12"); tx.del("b");
+    std::cout &lt;&lt; "  inside T2: a=" &lt;&lt; tx.get("a") &lt;&lt; " b=" &lt;&lt; tx.get("b") &lt;&lt; " | store a=" &lt;&lt; store.get("a") &lt;&lt; "\n";
+    tx.rollback();
+    std::cout &lt;&lt; "  after T2 rollback: a=" &lt;&lt; tx.get("a") &lt;&lt; " b=" &lt;&lt; tx.get("b") &lt;&lt; "\n";
+    tx.commit();
+    CHECK(store.get("a") == "11" &amp;&amp; store.get("b") == "20" &amp;&amp; tx.depth() == 0);
+    std::cout &lt;&lt; "  after T1 commit: store a=" &lt;&lt; store.get("a") &lt;&lt; "\n";
+
+    store.set("balance", "100");
+    Session alice(store);
+    alice.begin();
+    int seen = std::stoi(alice.get("balance"));
+    store.set("balance", "50");
+    alice.set("balance", std::to_string(seen + 10));
+    bool conflict = false;
+    try { alice.commit(); } catch (const ConflictError&amp; e) { conflict = true; std::cout &lt;&lt; "  rejected as expected: " &lt;&lt; e.what() &lt;&lt; "\n"; }
+    CHECK(conflict &amp;&amp; store.get("balance") == "50");
+
+    Store::Snapshot snap = store.snapshot();
+    store.set("a", "changed"); store.del("balance");
+    store.restore(snap);
+    CHECK(store.get("a") == "11" &amp;&amp; store.get("balance") == "50" &amp;&amp; snap.keyCount() == 4);
+    std::cout &lt;&lt; "  restored from snapshot (" &lt;&lt; snap.keyCount() &lt;&lt; " keys): a=" &lt;&lt; store.get("a") &lt;&lt; " balance=" &lt;&lt; store.get("balance") &lt;&lt; "\n";
+    std::cout &lt;&lt; "C++ demo OK\n";
+    return 0;
+}</code></pre>
+      <p>Build: <code>g++ -std=c++14 -Wall -O2 main.cpp -o kv &amp;&amp; ./kv</code></p>
+<pre class="terminal"><code>  after 29 s: otp=918273 ttl=1000 ms
+  after 30 s: otp=(nil) (purged)
+  stale heap item skipped: s=b
+  inside T2: a=12 b=(nil) | store a=10
+  after T2 rollback: a=11 b=20
+  after T1 commit: store a=11
+  rejected as expected: conflict on key balance
+  restored from snapshot (4 keys): a=11 balance=50
+C++ demo OK</code></pre>
+    </div>
+  </div>

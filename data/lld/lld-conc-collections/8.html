@@ -1,0 +1,345 @@
+
+  <h2>Code: runnable demos</h2>
+  <p>Every tab is a complete file from <code>lld-code/lld-conc-collections/</code>, followed by its real output: <code>CollectionsDemo.java</code> (the Java numbers quoted on this page come from runs of it), <code>atomics.cpp</code> and <code>counters.py</code>.</p>
+  <p class="small"><b>How these were run.</b> Java 21 and Python 3.11 on Windows. The C++ needs a POSIX-threads compiler: we built it with <code>g++ -std=c++14 -O2 -Wall -pthread</code> (g++ 13.3) in WSL Ubuntu 24.04; any Linux works, as does MinGW-w64 with the "posix" thread model. The MinGW.org g++ 6.3 that ships on many Windows machines uses the win32 thread model and has no <code>std::thread</code> or <code>std::mutex</code>, so it fails with "<code>'mutex' in namespace 'std' does not name a type</code>". Each output below is the captured run (<code>run-*.txt</code> in the same folder, made by <code>lld-code/_gen/run_all.py</code>); counts from deliberate races and all timings change on every run.</p>
+  <div class="tabs" data-tabs="lang">
+    <div class="tab-panel" data-title="Java">
+<pre><code class="language-java">import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+
+/**
+ * Concurrent collections and atomics, for the SDE Prep Dojo page
+ * "Concurrent Collections &amp; Atomics (CAS)".
+ * Run: javac CollectionsDemo.java &amp;&amp; java CollectionsDemo
+ */
+public class CollectionsDemo {
+    static final int THREADS = 8, PER_THREAD = 100_000;
+
+    /** Start THREADS threads at the same moment, each running body PER_THREAD times. */
+    static long race(Runnable body) throws InterruptedException {
+        CountDownLatch go = new CountDownLatch(1);
+        List&lt;Thread&gt; ts = new ArrayList&lt;&gt;();
+        for (int t = 0; t &lt; THREADS; t++) {
+            Thread th = new Thread(() -&gt; {
+                try { go.await(); } catch (InterruptedException e) { return; }
+                for (int i = 0; i &lt; PER_THREAD; i++) body.run();
+            });
+            ts.add(th); th.start();
+        }
+        long t0 = System.nanoTime();
+        go.countDown();
+        for (Thread th : ts) th.join();
+        return (System.nanoTime() - t0) / 1_000_000;
+    }
+
+    public static void main(String[] args) throws Exception {
+        int expected = THREADS * PER_THREAD;
+
+        System.out.println("1) check-then-act on a ConcurrentHashMap is still a race");
+        ConcurrentHashMap&lt;String, Integer&gt; chm = new ConcurrentHashMap&lt;&gt;();
+        chm.put("views", 0);
+        race(() -&gt; chm.put("views", chm.get("views") + 1));        // get, add, put: three steps
+        System.out.println("  get+put : " + chm.get("views") + " / " + expected);
+        chm.put("views", 0);
+        race(() -&gt; chm.merge("views", 1, Integer::sum));            // one atomic step per key
+        System.out.println("  merge   : " + chm.get("views") + " / " + expected);
+
+        System.out.println("2) computeIfAbsent builds a per-key value exactly once");
+        ConcurrentHashMap&lt;String, Set&lt;String&gt;&gt; followers = new ConcurrentHashMap&lt;&gt;();
+        AtomicInteger builds = new AtomicInteger();
+        race(() -&gt; followers.computeIfAbsent("asha", k -&gt; { builds.incrementAndGet(); return ConcurrentHashMap.newKeySet(); })
+                            .add(Thread.currentThread().getName()));
+        System.out.println("  sets built for 'asha': " + builds.get() + ", followers: " + followers.get("asha").size());
+
+        System.out.println("3) counters under contention (8 threads x 100k, times are from one run)");
+        Object lock = new Object();
+        long[] plain = {0};
+        long tSync = race(() -&gt; { synchronized (lock) { plain[0]++; } });
+        AtomicLong atomic = new AtomicLong();
+        long tAtomic = race(atomic::incrementAndGet);
+        LongAdder adder = new LongAdder();
+        long tAdder = race(adder::increment);
+        System.out.printf("  synchronized %d (%d ms), AtomicLong %d (%d ms), LongAdder %d (%d ms)%n",
+                plain[0], tSync, atomic.get(), tAtomic, adder.sum(), tAdder);
+
+        System.out.println("4) CAS loop: take stock only if enough is left (never below zero)");
+        AtomicInteger stock = new AtomicInteger(1000);
+        AtomicInteger sold = new AtomicInteger();
+        race(() -&gt; { if (tryTake(stock, 1)) sold.incrementAndGet(); });
+        System.out.println("  sold=" + sold.get() + " left=" + stock.get() + " (800k attempts on 1000 units)");
+
+        System.out.println("5) ABA: a plain CAS cannot see A -&gt; B -&gt; A, a stamped one can");
+        abaDemo();
+
+        System.out.println("6) CopyOnWriteArrayList iterates a snapshot");
+        List&lt;String&gt; listeners = new CopyOnWriteArrayList&lt;&gt;(List.of("email", "sms"));
+        for (String l : listeners) if (l.equals("email")) listeners.add("push");   // no exception
+        System.out.println("  after loop: " + listeners);
+        List&lt;String&gt; plainList = new ArrayList&lt;&gt;(List.of("email", "sms"));
+        try {
+            for (String l : plainList) if (l.equals("email")) plainList.add("push");
+        } catch (ConcurrentModificationException e) {
+            System.out.println("  ArrayList: ConcurrentModificationException");
+        }
+
+        System.out.println("7) ConcurrentSkipListMap: a sorted, concurrent order book");
+        ConcurrentSkipListMap&lt;Integer, Integer&gt; asks = new ConcurrentSkipListMap&lt;&gt;();
+        asks.merge(101, 5, Integer::sum); asks.merge(99, 3, Integer::sum); asks.merge(100, 7, Integer::sum);
+        System.out.println("  best ask=" + asks.firstKey() + ", asks &lt;= 100: " + asks.headMap(100, true));
+
+        System.out.println("8) code review: fixed-window rate limiter, limit 1000 per window");
+        BuggyLimiter buggy = new BuggyLimiter(1000, 60_000);
+        AtomicInteger okBuggy = new AtomicInteger();
+        race(() -&gt; { if (buggy.allow("u1")) okBuggy.incrementAndGet(); });
+        FixedLimiter fixed = new FixedLimiter(1000, 60_000);
+        AtomicInteger okFixed = new AtomicInteger();
+        race(() -&gt; { if (fixed.allow("u1")) okFixed.incrementAndGet(); });
+        System.out.println("  buggy allowed " + okBuggy.get() + ", fixed allowed " + okFixed.get());
+
+        System.out.println("9) nulls are not allowed in ConcurrentHashMap");
+        try { chm.put("x", null); } catch (NullPointerException e) { System.out.println("  put(k, null) -&gt; NullPointerException"); }
+    }
+
+    /** Classic CAS loop: read, compute, compareAndSet, retry on conflict. */
+    static boolean tryTake(AtomicInteger stock, int n) {
+        while (true) {
+            int cur = stock.get();
+            if (cur &lt; n) return false;                    // not enough: give up, no write
+            if (stock.compareAndSet(cur, cur - n)) return true;
+            // someone else changed it between get and CAS: loop and re-read
+        }
+    }
+
+    static void abaDemo() throws InterruptedException {
+        AtomicReference&lt;String&gt; top = new AtomicReference&lt;&gt;("A");
+        AtomicStampedReference&lt;String&gt; stamped = new AtomicStampedReference&lt;&gt;("A", 0);
+        CountDownLatch read = new CountDownLatch(1), changed = new CountDownLatch(1);
+
+        Thread slow = new Thread(() -&gt; {
+            String seen = top.get();
+            int[] stampHolder = new int[1];
+            String seenS = stamped.get(stampHolder);
+            int seenStamp = stampHolder[0];
+            read.countDown();
+            try { changed.await(); } catch (InterruptedException e) { return; }
+            System.out.println("  plain CAS(A -&gt; C) succeeded: " + top.compareAndSet(seen, "C"));
+            System.out.println("  stamped CAS(A,0 -&gt; C) succeeded: " + stamped.compareAndSet(seenS, "C", seenStamp, seenStamp + 1)
+                    + " (stamp is now " + stamped.getStamp() + ")");
+        });
+        slow.start();
+        read.await();
+        // the fast thread: A -&gt; B -&gt; A
+        top.set("B"); top.set("A");
+        int s = stamped.getStamp();
+        stamped.compareAndSet("A", "B", s, s + 1);
+        stamped.compareAndSet("B", "A", s + 1, s + 2);
+        changed.countDown();
+        slow.join();
+    }
+
+    /** The shape often posted for review: an atomic counter plus a plain field, reset under a lock. */
+    static final class BuggyLimiter {
+        static final class Window { final AtomicInteger left = new AtomicInteger(); long start; }   // start is not volatile
+        final ConcurrentHashMap&lt;String, Window&gt; windows = new ConcurrentHashMap&lt;&gt;();
+        final int limit; final long windowMs;
+        BuggyLimiter(int limit, long windowMs) { this.limit = limit; this.windowMs = windowMs; }
+        boolean allow(String key) {
+            Window w = windows.computeIfAbsent(key, k -&gt; new Window());
+            long now = System.currentTimeMillis();
+            if (now - w.start &gt;= windowMs) {                 // unsynchronised read of start
+                synchronized (w) {
+                    if (now - w.start &gt;= windowMs) { w.start = now; w.left.set(limit); }
+                }
+            }
+            return w.left.getAndDecrement() &gt;= 0;            // &gt;= 0 lets limit + 1 through
+        }
+    }
+
+    /** Fix: the whole window is one immutable value, replaced atomically per key by compute(). */
+    static final class FixedLimiter {
+        record Window(long start, int used) {}
+        final ConcurrentHashMap&lt;String, Window&gt; windows = new ConcurrentHashMap&lt;&gt;();
+        final int limit; final long windowMs;
+        FixedLimiter(int limit, long windowMs) { this.limit = limit; this.windowMs = windowMs; }
+        boolean allow(String key) {
+            long now = System.currentTimeMillis();
+            boolean[] ok = new boolean[1];
+            windows.compute(key, (k, w) -&gt; {
+                if (w == null || now - w.start() &gt;= windowMs) w = new Window(now, 0);
+                ok[0] = w.used() &lt; limit;
+                return ok[0] ? new Window(w.start(), w.used() + 1) : w;
+            });
+            return ok[0];
+        }
+    }
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Java output">
+<pre class="terminal"><code>$ javac -d out CollectionsDemo.java &amp;&amp; java -cp out CollectionsDemo
+1) check-then-act on a ConcurrentHashMap is still a race
+  get+put : 166964 / 800000
+  merge   : 800000 / 800000
+2) computeIfAbsent builds a per-key value exactly once
+  sets built for 'asha': 1, followers: 8
+3) counters under contention (8 threads x 100k, times are from one run)
+  synchronized 800000 (53 ms), AtomicLong 800000 (17 ms), LongAdder 800000 (9 ms)
+4) CAS loop: take stock only if enough is left (never below zero)
+  sold=1000 left=0 (800k attempts on 1000 units)
+5) ABA: a plain CAS cannot see A -&gt; B -&gt; A, a stamped one can
+  plain CAS(A -&gt; C) succeeded: true
+  stamped CAS(A,0 -&gt; C) succeeded: false (stamp is now 2)
+6) CopyOnWriteArrayList iterates a snapshot
+  after loop: [email, sms, push]
+  ArrayList: ConcurrentModificationException
+7) ConcurrentSkipListMap: a sorted, concurrent order book
+  best ask=99, asks &lt;= 100: {99=3, 100=7}
+8) code review: fixed-window rate limiter, limit 1000 per window
+  buggy allowed 1001, fixed allowed 1000
+9) nulls are not allowed in ConcurrentHashMap
+  put(k, null) -&gt; NullPointerException</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14">
+<pre><code class="language-cpp">// Atomics, CAS loops and a per-thread sharded counter in C++14, for the SDE Prep Dojo page
+// "Concurrent Collections &amp; Atomics (CAS)".
+// Build: g++ -std=c++14 -O2 -Wall -Wextra -pthread atomics.cpp -o atomics &amp;&amp; ./atomics
+// Needs a POSIX-threads g++ (Linux, WSL, or MinGW-w64 "posix"). We built and ran it with g++ 13.3 in
+// WSL Ubuntu 24.04. The MinGW.org g++ 6.3 on Windows (win32 thread model) has no std::thread or std::mutex.
+#include &lt;atomic&gt;
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+constexpr int kThreads = 8;
+constexpr int kPerThread = 200000;
+
+template &lt;class F&gt;
+void race(F body) {
+    std::vector&lt;std::thread&gt; ts;
+    for (int t = 0; t &lt; kThreads; ++t)
+        ts.emplace_back([&amp;body, t] { for (int i = 0; i &lt; kPerThread; ++i) body(t); });
+    for (auto&amp; th : ts) th.join();
+}
+
+// CAS loop: decrement only while the value stays &gt;= n.
+bool try_take(std::atomic&lt;int&gt;&amp; stock, int n) {
+    int cur = stock.load(std::memory_order_relaxed);
+    while (cur &gt;= n) {
+        // On failure compare_exchange_weak reloads cur for us; "weak" may also fail spuriously, so loop.
+        if (stock.compare_exchange_weak(cur, cur - n, std::memory_order_acq_rel, std::memory_order_relaxed))
+            return true;
+    }
+    return false;
+}
+
+// Like the kernel's percpu_counter / Java's LongAdder: one padded slot per thread, sum on read.
+struct alignas(64) Slot { std::atomic&lt;long&gt; v{0}; };   // 64 = typical cache line; avoids false sharing
+struct ShardedCounter {
+    Slot slots[kThreads];
+    void add(int shard) { slots[shard].v.fetch_add(1, std::memory_order_relaxed); }
+    long sum() const {
+        long s = 0;
+        for (const auto&amp; sl : slots) s += sl.v.load(std::memory_order_relaxed);
+        return s;                                       // not a snapshot while writers run
+    }
+};
+
+int main() {
+    const long expected = 1L * kThreads * kPerThread;
+
+    // DATA RACE on purpose: undefined behaviour in C++ (TSan reports this line). It is here only to
+    // show the symptom (lost updates). volatile is NOT atomic and gives no ordering either.
+    volatile long racy = 0;
+    race([&amp;](int) { racy = racy + 1; });
+    std::cout &lt;&lt; "plain ++     : " &lt;&lt; racy &lt;&lt; " / " &lt;&lt; expected &lt;&lt; "\n";
+
+    std::atomic&lt;long&gt; counter{0};
+    race([&amp;](int) { counter.fetch_add(1, std::memory_order_relaxed); });   // lock xadd on x86
+    std::cout &lt;&lt; "atomic fetch_add: " &lt;&lt; counter.load() &lt;&lt; " / " &lt;&lt; expected &lt;&lt; "\n";
+
+    ShardedCounter sharded;
+    race([&amp;](int t) { sharded.add(t); });
+    std::cout &lt;&lt; "sharded sum  : " &lt;&lt; sharded.sum() &lt;&lt; " / " &lt;&lt; expected &lt;&lt; "\n";
+
+    std::atomic&lt;int&gt; stock{1000};
+    std::atomic&lt;int&gt; sold{0};
+    race([&amp;](int) { if (try_take(stock, 1)) sold.fetch_add(1); });
+    std::cout &lt;&lt; "CAS take     : sold=" &lt;&lt; sold.load() &lt;&lt; " left=" &lt;&lt; stock.load() &lt;&lt; "\n";
+
+    // Tagged value: pack a 32-bit version next to a 32-bit value so A-&gt;B-&gt;A is visible.
+    std::atomic&lt;std::uint64_t&gt; tagged{0};
+    auto pack = [](std::uint32_t ver, std::uint32_t val) { return (std::uint64_t(ver) &lt;&lt; 32) | val; };
+    tagged = pack(0, 'A');
+    std::uint64_t seen = tagged.load();
+    tagged = pack(1, 'B');
+    tagged = pack(2, 'A');                              // same value, new version
+    bool ok = tagged.compare_exchange_strong(seen, pack(3, 'C'));
+    std::cout &lt;&lt; "tagged CAS after A-&gt;B-&gt;A succeeded: " &lt;&lt; std::boolalpha &lt;&lt; ok &lt;&lt; "\n";
+    std::cout &lt;&lt; "lock-free 64-bit atomic: " &lt;&lt; tagged.is_lock_free() &lt;&lt; "\n";
+}</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++ output">
+<pre class="terminal"><code>$ g++ -std=c++14 -O2 -Wall -pthread atomics.cpp -o atomics &amp;&amp; ./atomics
+plain ++     : 677256 / 1600000
+atomic fetch_add: 1600000 / 1600000
+sharded sum  : 1600000 / 1600000
+CAS take     : sold=1000 left=0
+tagged CAS after A-&gt;B-&gt;A succeeded: false
+lock-free 64-bit atomic: true</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python">
+<pre><code class="language-python">"""Thread-safe counting in Python, for the SDE Prep Dojo page
+"Concurrent Collections &amp; Atomics (CAS)".  Run: python counters.py
+
+Python has no user-level CAS. The GIL makes single bytecodes atomic, but `d[k] += 1`
+is several bytecodes (load, add, store), so a thread switch in the middle can lose an update.
+Free-threaded builds (PEP 703, Python 3.13+) remove the GIL, which makes locks matter even more.
+"""
+import threading
+from collections import Counter
+
+THREADS, PER_THREAD = 8, 50_000
+
+
+def race(body):
+    ts = [threading.Thread(target=lambda: [body() for _ in range(PER_THREAD)]) for _ in range(THREADS)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+
+class LockedCounter:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._c = Counter()
+
+    def incr(self, key, n=1):
+        with self._lock:              # read-modify-write as one critical section
+            self._c[key] += n
+
+    def get(self, key):
+        with self._lock:
+            return self._c[key]
+
+
+if __name__ == "__main__":
+    expected = THREADS * PER_THREAD
+    lc = LockedCounter()
+    race(lambda: lc.incr("views"))
+    print(f"LockedCounter: {lc.get('views')} / {expected}")
+
+    # setdefault is a single C call on a dict, so "create once" is safe under the GIL,
+    # but do not rely on that for anything bigger than one call.
+    groups = {}
+    race(lambda: groups.setdefault("asha", set()).add(threading.get_ident()))
+    print(f"setdefault built one set with {len(groups['asha'])} thread ids")</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python output">
+<pre class="terminal"><code>$ python counters.py
+LockedCounter: 400000 / 400000
+setdefault built one set with 8 thread ids</code></pre>
+    </div>
+  </div>
+  <div class="callout warn"><p><b>The C++ "plain ++" line is undefined behaviour, not just lost updates.</b> Two threads writing a <code>volatile long</code> with no synchronisation is a data race, and a data race is UB in C++ (ThreadSanitizer flags that line). <code>volatile</code> gives neither atomicity nor ordering; the kernel has the same rule, which is why it uses <code>READ_ONCE</code>/<code>WRITE_ONCE</code> and atomics. The line is there only to show the symptom. To show lost updates without UB, use a <code>std::atomic&lt;long&gt;</code> with a separate <code>load()</code> and <code>store()</code>: each access is atomic, the increment is not.</p></div>

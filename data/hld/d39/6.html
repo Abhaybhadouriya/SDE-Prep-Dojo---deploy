@@ -1,0 +1,157 @@
+
+        <h2>Deep dives</h2>
+
+        <h3>1. The hot key: why one row cannot keep up</h3>
+        <p>An increment is a read-modify-write. To be correct, the database must serialise every update to the same row: a row lock in MySQL/Postgres, a compare-and-swap loop, or one leader replica for that partition key. Adding machines does not help - the key lives on <b>one</b> partition. Netflix's write-up names the same three problems with "a single row per counter": heavy contention, no idempotency, and the need for secondary keys (buckets) to spread load.</p>
+        <p>The ladder of fixes, from cheapest to most complex:</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>Fix</th><th>How</th><th>Write cost</th><th>Read cost</th><th>Breaks when</th></tr></thead>
+            <tbody>
+              <tr><td><b>Atomic increment</b></td><td><code>UPDATE ... SET n = n + 1</code> or Redis <code>INCR</code></td><td>1 op, serialised</td><td>1 op</td><td>One key's rate exceeds one node's limit</td></tr>
+              <tr><td><b>Sharded counter</b></td><td>N sub-keys, write a random one</td><td>1 op, parallel</td><td>N ops (or read a rollup)</td><td>N is wrong: too small = contention, too big = slow reads</td></tr>
+              <tr><td><b>Write batching</b></td><td>Sum in memory / stream, flush every T</td><td>1 op per T per key</td><td>1 op</td><td>Crash loses the in-memory batch (unless the stream is durable)</td></tr>
+              <tr><td><b>Event log + rollup</b></td><td>Store every delta, aggregate in background</td><td>1 append</td><td>1 op (rollup) + optional delta</td><td>Storage and ops cost; lag of seconds</td></tr>
+              <tr><td><b>CRDT counter</b></td><td>Each region/replica keeps its own tally; merge = sum</td><td>Local only</td><td>Sum of replica slots</td><td>Need exactly-once per replica; replica set grows</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>2. Sharded counters done right</h3>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 280" role="img" aria-label="Sharded counter: writes to random shards, background rollup produces a total for reads">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box svc" x="20" y="110" width="140" height="56"/>
+            <text class="label" x="90" y="133">Writer</text>
+            <text class="label small" x="90" y="153">shard = rand(0..N-1)</text>
+            <rect class="zone db" x="210" y="20" width="230" height="240"/>
+            <text class="zone-label" x="222" y="40">counter:post42</text>
+            <rect class="box db" x="230" y="55" width="190" height="34"/><text class="label mono" x="325" y="77">#0  = 18,201</text>
+            <rect class="box db" x="230" y="100" width="190" height="34"/><text class="label mono" x="325" y="122">#1  = 18,177</text>
+            <rect class="box db" x="230" y="145" width="190" height="34"/><text class="label mono" x="325" y="167">...</text>
+            <rect class="box db" x="230" y="190" width="190" height="34"/><text class="label mono" x="325" y="212">#63 = 18,240</text>
+            <path class="arrow" d="M160 130 L222 74"/>
+            <path class="arrow" d="M160 138 L222 118"/>
+            <path class="arrow" d="M160 146 L222 205"/>
+            <circle class="packet" r="6"><animateMotion dur="1.8s" repeatCount="indefinite" path="M160 130 L230 74"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="1.8s" begin="0.9s" repeatCount="indefinite" path="M160 146 L230 205"/></circle>
+            <rect class="box queue" x="490" y="110" width="140" height="56"/>
+            <text class="label" x="560" y="133">Rollup job</text>
+            <text class="label small" x="560" y="153">sum every 1-10 s</text>
+            <path class="arrow" d="M440 138 L483 138"/>
+            <rect class="box cache" x="660" y="110" width="120" height="56"/>
+            <text class="label" x="720" y="133">total</text>
+            <text class="label small" x="720" y="153">1,164,890 @ t</text>
+            <path class="arrow ok" d="M630 138 L653 138"/>
+            <text class="label small" x="640" y="215">readers do 1 point read,</text>
+            <text class="label small" x="640" y="235">not 64</text>
+          </svg>
+          <figcaption>Writes go to one of N shards in parallel. A rollup job sums the shards into one cached total, so the 1M reads/s never fan out.</figcaption>
+        </figure>
+        <ul>
+          <li><b>Random vs calculated shard.</b> AWS's DynamoDB guide shows both: a <b>random suffix</b> (say 1-200) spreads writes best, but reads must query every suffix; a <b>calculated suffix</b> (hash of something you know) lets you find one item again. For counters you never read one shard alone, so random (or round-robin per writer) is right.</li>
+          <li><b>How many shards?</b> Write rate on the key / safe rate per shard. Google's Firestore sample notes each shard document handles roughly one increment per second, so 10 shards give about 10x; DynamoDB's partition limit is 1,000 writes/s. Our 50K/s post needs at least 50 on DynamoDB; on Redis (much higher per-key rate) far fewer.</li>
+          <li><b>Do not shard everything.</b> TAO's numbers say most counts are tiny. Start every counter with 1 shard and <b>split hot keys dynamically</b>: when a key's write rate crosses a threshold, raise its shard count in a small metadata map that writers cache. Shrinking is a merge: stop writing old shards, fold them into one.</li>
+          <li><b>Reads.</b> Firestore's own doc warns that read cost grows linearly with shards and suggests a separate roll-up document. That is the rollup box above.</li>
+        </ul>
+        <div class="callout note"><p>systemdesign.one's version of the same trick appends a random two-digit suffix to the page id, splitting one key into 100 keys, and accepts that a read must touch all 100. The rollup removes that read cost.</p></div>
+
+        <div class="callout note"><p><b>Stop here for SDE-1 / Level 3.</b> If you can explain why one counter row melts under a viral post and how sharded counters (N rows, sum on read, cache the sum) fix it, you have the interview-sufficient core of this page. Deep dives 3-6 below are Level 4 material: Netflix-style immutable-window rollups, end-to-end idempotency, HyperLogLog for unique viewers and multi-region reads. Read them when you are aiming at SDE-2 or have time.</p></div>
+
+        <!-- ============ LEVEL 4 ============ -->
+        <div class="level-up" data-level="4">Level 4 - Advanced (deep dives 3-6)</div>
+
+        <h3>3. Batching and the "immutable window" (Netflix's approach)</h3>
+        <p>Netflix (Nov 2024) tried four simpler designs before settling on one. Per-instance in-memory aggregation lost data on crashes and deployments. A durable queue (Kafka partitions keyed by counter) fixed loss but made auditing and recounting impossible once counts were pre-aggregated. A raw log of every increment was auditable but made reads slow and partitions wide. Their final design <b>combines</b> them:</p>
+        <ol class="steps">
+          <li><strong>Log every delta</strong> as an event with <code>event_time + event_id</code> in their TimeSeries store (Cassandra underneath), split by <code>time_bucket</code> and <code>event_bucket</code> so one hot counter does not create one giant partition. The time + id pair is the <b>idempotency key</b>: a retried write lands on the same row.</li>
+          <li><strong>Send a tiny "rollup event"</strong> (just namespace + counter name, no delta) to an in-memory queue on a rollup server. A fast hash (XXHash) sends the same counter to the same queue, and events are drained into a <b>set</b>, so a counter touched 10,000 times in a window is rolled up once.</li>
+          <li><strong>Aggregate only inside an immutable window</strong>: from <code>lastRollupTs</code> up to "now minus a safety lag". The store rejects events with timestamps beyond an <code>accept_limit</code> (5 s in their sample config), so nothing new can land inside a window being summed. Races between two rollup servers are then harmless - both compute the same answer.</li>
+          <li><strong>Store the result</strong> (count + rollup timestamp together) in a rollup table and cache it in EVCache. Reads are one point read. The "experimental accurate" counter adds the delta since the last rollup at read time.</li>
+        </ol>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 220" role="img" aria-label="Timeline of an immutable aggregation window between last rollup and now minus lag">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <path class="arrow" d="M30 120 L770 120"/>
+            <text class="label small" x="760" y="145">time</text>
+            <rect class="box ghost" x="40" y="95" width="200" height="50"/>
+            <text class="label small" x="140" y="85">already rolled up</text>
+            <rect class="box highlight" x="240" y="95" width="330" height="50"/>
+            <text class="label" x="405" y="125">immutable window: safe to sum</text>
+            <rect class="box hot" x="570" y="95" width="170" height="50"/>
+            <text class="label small" x="655" y="125">still receiving</text>
+            <path class="arrow dashed" d="M240 60 L240 160"/>
+            <text class="label small" x="240" y="180">lastRollupTs</text>
+            <path class="arrow dashed" d="M570 60 L570 160"/>
+            <text class="label small" x="570" y="180">now - lag (accept limit + skew)</text>
+            <path class="arrow dashed" d="M740 60 L740 160"/>
+            <text class="label small" x="740" y="50">now</text>
+            <circle class="packet gold" r="6"><animateMotion dur="4s" repeatCount="indefinite" path="M770 108 L580 108"/></circle>
+            <text class="label small" x="405" y="210">count = lastRollupCount + sum(deltas in window)</text>
+          </svg>
+          <figcaption>New events (gold) arrive only to the right of "now - lag". The rollup sums the green window, which can no longer change, so retries and duplicate rollup workers give the same result.</figcaption>
+        </figure>
+        <p>Netflix reports this service handling close to <b>75K count requests per second</b> globally with <b>single-digit millisecond</b> latency. The cost is lag: counts trail reality by seconds. Their sample config keeps raw events for 7 days, then relies on the rollups.</p>
+
+        <h3>4. Idempotency: count every like exactly once</h3>
+        <p>Networks retry. A mobile client times out and resends; a Kafka consumer crashes after writing but before committing its offset and reprocesses. Each turns into a double count unless the design is idempotent at every hop:</p>
+        <ul>
+          <li><b>Client to like service:</b> the edge table's unique key <code>(post, user)</code> makes "like" naturally idempotent. For views, a client-generated <code>event_id</code> does the same job.</li>
+          <li><b>Service to Kafka:</b> only emit when the edge insert actually created a row. Use the <b>outbox</b> table or CDC so "row written" and "event sent" cannot diverge (see <a href="{{BASE}}hld/hld-10">Distributed transactions &amp; events</a> and <a href="{{BASE}}hld/d28">CDC pipeline</a>).</li>
+          <li><b>Consumer to counter store:</b> either use Kafka transactions / exactly-once (read-process-write with offsets committed in the same transaction - see <a href="{{BASE}}devops/kafka-06">Delivery semantics</a>), or store the <b>last applied offset per partition</b> next to the counter and skip anything older.</li>
+          <li><b>Repair:</b> because edges are the truth, a nightly batch can recount <code>COUNT(*)</code> per post and correct drift. SoundCloud's "Stitch" did exactly this: a speed layer with Cassandra counters for live numbers plus Hadoop batch jobs that regenerate correct buckets after bugs or outages.</li>
+        </ul>
+        <div class="callout warn"><p>Redis <code>INCR</code> and Cassandra counters are atomic but <b>not idempotent</b>. "Atomic" means two increments never collide; it does not mean a retried increment is ignored. Interviewers like to probe this difference.</p></div>
+
+        <h3>5. Views and unique viewers: HyperLogLog</h3>
+        <p>"How many different people watched this?" needs deduplication. An exact set costs memory proportional to viewers (8 bytes per 64-bit id, so 80 MB for 10M viewers - per video, per day). <b>HyperLogLog (HLL)</b> hashes each id and remembers, per bucket, the longest run of leading zeros it has seen; rare long runs mean many distinct items. Redis documents its HLL as using <b>at most 12 KB</b> with a <b>0.81% standard error</b>, able to count up to 2^64 items, with <code>PFADD</code> (add), <code>PFCOUNT</code> (estimate) and <code>PFMERGE</code> (union).</p>
+<pre><code class="language-bash">PFADD  hll:video:9f2:2026-11-23  user:101 user:202 user:101   # duplicate ignored
+PFCOUNT hll:video:9f2:2026-11-23                              # -&gt; 2 (approx)
+PFMERGE hll:video:9f2:week  hll:video:9f2:2026-11-17 hll:video:9f2:2026-11-23</code></pre>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 200" role="img" aria-label="Reddit style view counting pipeline: Kafka, rules filter, Kafka, counter, Redis HLL, Cassandra">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="10" y="70" width="100" height="50"/><text class="label" x="60" y="100">views</text>
+            <rect class="box kafka" x="140" y="70" width="100" height="50"/><text class="label" x="190" y="100">Kafka</text>
+            <rect class="box queue" x="270" y="70" width="120" height="50"/><text class="label" x="330" y="92">rules filter</text><text class="label small" x="330" y="110">count it?</text>
+            <rect class="box kafka" x="420" y="70" width="100" height="50"/><text class="label" x="470" y="100">Kafka</text>
+            <rect class="box cache" x="550" y="70" width="110" height="50"/><text class="label" x="605" y="92">Redis HLL</text><text class="label small" x="605" y="110">per post</text>
+            <rect class="box db" x="690" y="70" width="100" height="50"/><text class="label" x="740" y="92">Cassandra</text><text class="label small" x="740" y="110">every 10 s</text>
+            <path class="arrow" d="M110 95 L133 95"/><path class="arrow kafka" d="M240 95 L263 95"/><path class="arrow kafka" d="M390 95 L413 95"/><path class="arrow kafka" d="M520 95 L543 95"/><path class="arrow dashed" d="M660 95 L683 95"/>
+            <circle class="packet" r="6"><animateMotion dur="3.5s" repeatCount="indefinite" path="M60 95 L190 95 L330 95 L470 95 L605 95"/></circle>
+            <text class="label small" x="400" y="160">filter drops bots and repeat refreshes before counting</text>
+          </svg>
+          <figcaption>The shape Reddit described in 2017 (see Reddit's own post <a href="https://www.redditinc.com/blog/view-counting-at-reddit/" target="_blank" rel="noopener">View Counting at Reddit</a> and its QCon.ai 2018 talk): a rules consumer marks which views count, a counting consumer updates a Redis HLL per post, and HLLs are persisted to Cassandra about every 10 s so a Redis eviction does not lose them.</figcaption>
+        </figure>
+        <p>Limits to say out loud: HLL cannot <b>remove</b> an item (no "unview"), so it suits views, not likes. Count-min sketch can add and subtract amounts but over-estimates. Netflix explicitly chose <b>not</b> to use probabilistic structures for its general counters because they do not natively support resets or TTLs per key. For billing, never approximate.</p>
+
+        <h3>6. Read-your-writes and multi-region</h3>
+        <ul>
+          <li><b>Your own like must stick.</b> The total may lag seconds, but if you like a post and refresh, the heart must still be red. Two cheap tricks: (a) <code>liked_by_me</code> comes from the edge table (read from the leader or the same region for a short time after a write), and (b) the client adds its own pending +1 to the displayed number until the server count catches up.</li>
+          <li><b>Monotonic reads.</b> Do not show 1,204 then 1,198 because two replicas lag differently. Pin a session to one replica/region, or never display a value older than one already shown (keep <code>last_rollup_ts</code> with the count).</li>
+          <li><b>Multi-region.</b> Each region counts locally and replicates its own tally: a <b>G-counter</b> (grow-only) or <b>PN-counter</b> (separate positive and negative tallies) CRDT. Merge = per-region max, then sum, which is commutative and idempotent, so duplicate replication messages do no harm. Cloudflare's rate limiter makes the same choice for request counts: it counts <b>locally in each data centre</b>, because anycast keeps a client on one PoP and a global counter would add latency and an availability risk.</li>
+        </ul>
+        <figure class="diagram">
+          <svg viewBox="0 0 800 210" role="img" aria-label="PN-counter CRDT with two regions merging their own slots">
+            <rect class="zone" x="20" y="20" width="230" height="170"/>
+            <text class="zone-label" x="32" y="40">Region US</text>
+            <text class="label mono start" x="40" y="80">P = {US: 900, EU: 300}</text>
+            <text class="label mono start" x="40" y="110">N = {US:  10, EU:   5}</text>
+            <text class="label small start" x="40" y="150">count = 1200 - 15 = 1185</text>
+            <rect class="zone" x="550" y="20" width="230" height="170"/>
+            <text class="zone-label" x="562" y="40">Region EU</text>
+            <text class="label mono start" x="570" y="80">P = {US: 880, EU: 320}</text>
+            <text class="label mono start" x="570" y="110">N = {US:  10, EU:   6}</text>
+            <text class="label small start" x="570" y="150">count = 1200 - 16 = 1184</text>
+            <rect class="box svc" x="320" y="75" width="160" height="60"/>
+            <text class="label" x="400" y="100">merge</text>
+            <text class="label small" x="400" y="120">max per slot, then sum</text>
+            <path class="arrow both" d="M250 105 L313 105"/>
+            <path class="arrow both" d="M480 105 L543 105"/>
+            <circle class="packet" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M250 105 L550 105"/></circle>
+            <circle class="packet alt" r="6"><animateMotion dur="2.5s" begin="1.2s" repeatCount="indefinite" path="M550 105 L250 105"/></circle>
+            <text class="label small" x="400" y="180">after merge both show P={900,320}, N={10,6} -&gt; 1204</text>
+          </svg>
+          <figcaption>A PN-counter: each region only increments its own slot. Merging takes the max per slot, so replaying the same message twice changes nothing.</figcaption>
+        </figure>
+      

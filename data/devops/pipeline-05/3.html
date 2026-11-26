@@ -1,0 +1,66 @@
+
+        <h2>Consumer lag, properly</h2>
+        <p><b>Lag</b> for one partition and one consumer group is: <b>log end offset</b> (the offset the next new record will get) minus the group's <b>committed offset</b> (the next record the group will read). It is the number of records written but not yet processed.</p>
+        <figure class="diagram">
+          <svg viewBox="0 0 860 220" role="img" aria-label="A partition log with records 0 to 13; the committed offset of group postgres-sink is at 8, the log end offset is 14, so lag is 6; a different group, analytics, is at 13 with lag 1">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <text class="label left" x="20" y="30">orders.enriched, partition 2</text>
+            <rect class="cell filled" x="20" y="60" width="50" height="44"/><text class="label small" x="45" y="82">0</text>
+            <rect class="cell filled" x="74" y="60" width="50" height="44"/><text class="label small" x="99" y="82">1</text>
+            <rect class="cell filled" x="128" y="60" width="50" height="44"/><text class="label small" x="153" y="82">2</text>
+            <rect class="cell filled" x="182" y="60" width="50" height="44"/><text class="label small" x="207" y="82">...</text>
+            <rect class="cell filled" x="236" y="60" width="50" height="44"/><text class="label small" x="261" y="82">7</text>
+            <rect class="cell" x="290" y="60" width="50" height="44"/><text class="label small" x="315" y="82">8</text>
+            <rect class="cell" x="344" y="60" width="50" height="44"/><text class="label small" x="369" y="82">9</text>
+            <rect class="cell" x="398" y="60" width="50" height="44"/><text class="label small" x="423" y="82">10</text>
+            <rect class="cell" x="452" y="60" width="50" height="44"/><text class="label small" x="477" y="82">11</text>
+            <rect class="cell" x="506" y="60" width="50" height="44"/><text class="label small" x="531" y="82">12</text>
+            <rect class="cell new" x="560" y="60" width="50" height="44"/><text class="label small" x="585" y="82">13</text>
+            <rect class="box ghost kafka" x="614" y="60" width="50" height="44"/><text class="label small" x="639" y="82">14</text>
+
+            <path class="arrow ok" d="M290 140 L290 110"/>
+            <text class="label small" x="290" y="158">postgres-sink</text>
+            <text class="label small" x="290" y="176">committed = 8</text>
+            <path class="arrow" d="M614 140 L614 110"/>
+            <text class="label small" x="640" y="158">log end offset = 14</text>
+            <path class="arrow both none" d="M295 200 L610 200"/>
+            <text class="label bad" x="452" y="192">lag = 14 - 8 = 6</text>
+            <path class="arrow k8s" d="M560 30 L560 55"/>
+            <text class="label small left" x="572" y="36">analytics committed = 13, lag 1</text>
+            <circle class="packet alt" r="6"><animateMotion dur="2.5s" repeatCount="indefinite" path="M700 82 L670 82 L640 82"/></circle>
+          </svg>
+          <figcaption>Each group has its own committed offset (its own read pointer) on the same log. Lag is per partition per group; dashboards usually sum it per group and also show the per-partition breakdown.</figcaption>
+        </figure>
+        <p>The command-line view is the most useful tool you will learn on this page:</p>
+<pre><code class="language-bash">docker compose exec kafka-1 /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka-1:19092 --describe --group enricher</code></pre>
+<pre class="terminal"><code>GROUP     TOPIC          PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  CONSUMER-ID            HOST         CLIENT-ID
+enricher  orders.created 0          1204            1204            0    0d3c1a9e7f21-8b2f...   /172.18.0.9  0d3c1a9e7f21
+enricher  orders.created 1          1187            1189            2    0d3c1a9e7f21-8b2f...   /172.18.0.9  0d3c1a9e7f21
+enricher  orders.created 2          1251            1251            0    0d3c1a9e7f21-8b2f...   /172.18.0.9  0d3c1a9e7f21
+...</code></pre>
+        <p>The <code>CLIENT-ID</code> is the container hostname, because the shared config sets <code>client.id</code> to <code>HOSTNAME</code>. That makes it easy to see which instance owns which partition.</p>
+
+        <h3>"What lag number is bad?"</h3>
+        <p>There is no magic number, and saying one in an interview is a small red flag. Think about it the way you think about a buffer:</p>
+        <ol class="steps">
+          <li><strong>Trend beats size.</strong> Lag of 5,000 that is shrinking is a consumer catching up after a restart. Lag of 500 that grows every minute is a consumer that is slower than the <a href="{{BASE}}interview/glossary#producer">producer</a>, and it will never catch up on its own.</li>
+          <li><strong>Convert to time.</strong> Lag divided by the consume rate is roughly "how many seconds behind are we". 10,000 messages at 5,000 per second is 2 seconds, fine for a dashboard. 100 messages at 1 per second is nearly 2 minutes, maybe too slow for fraud checks.</li>
+          <li><strong>Compare to retention.</strong> If lag in time approaches the topic's retention (7 days for <code>orders.created</code>), the oldest unread records will be <em>deleted before they are read</em>. That is real data loss.</li>
+          <li><strong>Look per partition.</strong> If one partition holds most of the lag, adding consumers will not help (see the hot-partition drill).</li>
+        </ol>
+        <p>ShopStream's alert is a simple threshold with a duration, which is a reasonable start:</p>
+<pre><code class="language-yaml"># infra/prometheus/alerts.yml (excerpt)
+      - alert: EnricherLagHigh
+        expr: sum(kafka_consumergroup_lag{consumergroup="enricher"}) &gt; 1000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "enricher is {{ $value }} messages behind on orders.created"
+      - alert: UnderReplicatedPartitions
+        expr: sum(kafka_topic_partition_under_replicated_partition) &gt; 0
+        for: 1m
+        labels: {severity: critical}</code></pre>
+        <p>The <code>for: 2m</code> means "only fire if it stays true for 2 minutes", so a short burst during a deploy does not page anyone. The third rule, <code>DLQReceivingMessages</code>, fires when the DLQ end offset is still growing.</p>
+        <div class="callout tip"><p><b>Better lag tooling:</b> LinkedIn's <a href="https://github.com/linkedin/Burrow" target="_blank" rel="noopener">Burrow</a> evaluates lag over a sliding window and reports a status (OK, warning, stalled) instead of a raw number, which turns "is it growing?" into an alert you can trust. <a href="{{BASE}}interview/glossary#strimzi">Strimzi</a> on Kubernetes runs the same kafka-exporter for you (<code>kafkaExporter:</code> in the Kafka resource).</p></div>
+      

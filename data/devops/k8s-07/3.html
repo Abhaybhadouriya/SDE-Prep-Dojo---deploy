@@ -1,0 +1,93 @@
+
+        <h2>When does a change reach the running pod?</h2>
+        <div class="chips"><span class="chip accent">Good to know (SDE-2)</span></div>
+        <p>This is the question that bites everyone in production. You edit a ConfigMap. What happens?</p>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>How it is consumed</th><th>Does the pod see the change?</th><th>When</th></tr></thead>
+            <tbody>
+              <tr><td>Environment variable (<code>env</code>, <code>envFrom</code>)</td><td><b>No</b></td><td>Only when the container is (re)started</td></tr>
+              <tr><td>Volume mount (whole ConfigMap or <code>items</code>)</td><td><b>Yes, eventually</b></td><td>On a later kubelet sync, typically within a minute or so (sync period plus cache delay); not instant</td></tr>
+              <tr><td>Volume with <code>subPath</code></td><td><b>Never</b></td><td>subPath mounts are a one-time copy</td></tr>
+              <tr><td><code>immutable: true</code></td><td>Cannot change at all</td><td>Create a new object (e.g. <code>shop-config-v2</code>) and point pods at it</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>And even when the file changes, your <b>app</b> must notice. Many apps read config once at startup. So the usual pattern is: <b>treat a config change like a deploy</b> - trigger a rolling restart so the change is gradual, observable and reversible.</p>
+
+        <div class="stepper" data-stepper>
+          <svg viewBox="0 0 800 300" role="img" aria-label="Editing a ConfigMap: the API server stores it, the kubelet notices on sync, writes a new timestamped directory and atomically swaps the ..data symlink">
+            <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+            <rect class="box client" x="20" y="30" width="140" height="56"/>
+            <text class="label" x="90" y="52">you</text>
+            <text class="label small" x="90" y="74">kubectl apply</text>
+            <rect class="box k8s solid" x="220" y="30" width="150" height="56"/>
+            <text class="label white" x="295" y="58">API server</text>
+            <rect class="box db" x="220" y="130" width="150" height="50"/>
+            <text class="label" x="295" y="155">etcd</text>
+            <rect class="box k8s" x="430" y="30" width="150" height="56"/>
+            <text class="label" x="505" y="52">kubelet</text>
+            <text class="label small" x="505" y="74">node-2</text>
+            <rect class="zone docker" x="430" y="110" width="350" height="180"/>
+            <text class="zone-label" x="446" y="130">pod volume /etc/shop</text>
+            <rect class="box plain" x="450" y="145" width="150" height="40"/>
+            <text class="label small" x="525" y="165">..data symlink</text>
+            <rect class="box docker" x="620" y="145" width="140" height="40"/>
+            <text class="label small" x="690" y="165">..10_02 (old)</text>
+
+            <g data-step="1">
+              <path class="arrow" d="M160 58 L215 58"/>
+              <path class="arrow" d="M295 86 L295 126"/>
+            </g>
+            <g data-step="2">
+              <path class="arrow dashed" d="M370 50 L425 50"/>
+              <text class="label small" x="400" y="102">sync / watch</text>
+            </g>
+            <g data-step="3">
+              <rect class="box docker hot" x="620" y="200" width="140" height="40"/>
+              <text class="label small" x="690" y="220">..10_05 (new)</text>
+              <path class="arrow" d="M505 86 L640 196"/>
+            </g>
+            <g data-step-only="3">
+              <path class="arrow" d="M600 165 L615 165"/>
+            </g>
+            <g data-step="4">
+              <path class="arrow ok thick" d="M600 172 L615 215"/>
+              <rect class="box fail" x="620" y="145" width="140" height="40"/>
+              <text class="label bad" x="690" y="165">old removed</text>
+            </g>
+            <g data-step="5">
+              <rect class="box plain" x="450" y="250" width="310" height="32"/>
+              <text class="label small" x="605" y="266">app must re-read, or you restart pods</text>
+            </g>
+          </svg>
+          <ol class="stepper-captions">
+            <li><b>You change it.</b> <code>kubectl apply</code> sends the new ConfigMap to the API server, which validates it and stores it in etcd. Running pods do not know yet.</li>
+            <li><b>The kubelet notices.</b> Each kubelet periodically resyncs the pods on its node and checks whether mounted ConfigMaps/Secrets are fresh (by watch or a cached GET, depending on configuration). This is why there is a delay.</li>
+            <li><b>Write the new version beside the old.</b> The kubelet writes all keys into a new timestamped directory inside the volume.</li>
+            <li><b>Atomic swap.</b> It repoints the <code>..data</code> symlink to the new directory with an atomic rename, then deletes the old directory. A reader never sees half-old, half-new files.</li>
+            <li><b>Your app's turn.</b> The files are new, but the process may still hold the old values in memory. Either watch the file (inotify) and reload, or do <code>kubectl rollout restart</code>. Env vars never change without a restart.</li>
+          </ol>
+        </div>
+        <div class="bridge">
+          <h4>From your world</h4>
+          <p>The <code>..data</code> trick is the classic Unix atomic-update pattern: write to a temp location, then <code>rename(2)</code> a symlink over the old one, because rename is atomic within a filesystem. Reloading on change is like sending a daemon SIGHUP after editing its config. Where it breaks: if your app watches the file itself with inotify, watch the <i>directory</i>, because the file you opened is replaced through a symlink, not modified in place.</p>
+        </div>
+        <h3>Making config changes roll out safely</h3>
+<pre><code class="language-bash"># simplest: restart pods with a rolling update after changing config
+kubectl rollout restart deployment/shop-api -n shop
+
+# Helm / Kustomize pattern: put a hash of the config in the pod template,
+# so any config change changes the template and triggers a normal rollout
+#   annotations:
+#     checksum/config: 3f2a9c...   (Helm: sha256sum of the rendered ConfigMap)
+# Kustomize's configMapGenerator does the same by adding a hash suffix to the name.</code></pre>
+<pre><code class="language-yaml">apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-config-v7          # new name per version
+immutable: true                 # cannot be edited; kubelet stops watching it (less API load)
+data:
+  LOG_LEVEL: "info"</code></pre>
+        <div class="callout interview"><p><b>Interviewers love this:</b> "Env vars are read once at container start; mounted files update eventually except with subPath; and in either case I treat config as part of the release - versioned names or a checksum annotation, so a config change is a <a href="{{BASE}}interview/glossary#rolling-update">rolling update</a> I can watch and roll back."</p></div>
+      

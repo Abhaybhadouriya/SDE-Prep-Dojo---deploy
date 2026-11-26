@@ -1,0 +1,1044 @@
+<h3>Python and C++14</h3>
+  <div class="tabs" data-tabs>
+    <div class="tab-panel" data-title="Python: rental.py">
+<pre><code class="language-python">"""Rental search: listings + inverted text index + location index, Specification filters,
+ranking strategies and pagination. Same design as the Java version."""
+from __future__ import annotations
+
+import itertools
+import re
+import threading
+from bisect import bisect_left
+from dataclasses import dataclass, field, replace
+from enum import Enum
+from typing import Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
+
+
+class ListingType(Enum):
+    RENT = "RENT"
+    SELL = "SELL"
+
+
+class Status(Enum):
+    AVAILABLE = "AVAILABLE"
+    SOLD = "SOLD"
+
+
+# ---------------- units ----------------
+def parse_price(s: str) -&gt; int:
+    t = s.strip().lower().replace(",", "")
+    mult = 1
+    for suffix, m in (("cr", 10_000_000), ("l", 100_000), ("k", 1_000)):
+        if t.endswith(suffix):
+            t, mult = t[: -len(suffix)], m
+            break
+    try:
+        v = float(t)
+    except ValueError:
+        raise ValueError(f"bad price: {s}") from None
+    if v &lt;= 0:
+        raise ValueError(f"price must be &gt; 0: {s}")
+    return round(v * mult)
+
+
+def parse_size_sqft(s: str) -&gt; int:
+    t = s.strip().lower().replace(" ", "").replace(".", "")
+    factor = 1.0
+    for suffix, f in (("sqm", 10.7639), ("sqyd", 9.0), ("sqft", 1.0)):
+        if t.endswith(suffix):
+            t, factor = t[: -len(suffix)], f
+            break
+    try:
+        return round(float(t) * factor)
+    except ValueError:
+        raise ValueError(f"bad size: {s}") from None
+
+
+def parse_price_range(s: str) -&gt; Tuple[int, float]:
+    parts = s.split("-")
+    if len(parts) == 1:
+        return parse_price(parts[0]), float("inf")
+    lo, hi = parse_price(parts[0]), parse_price(parts[1])
+    if lo &gt; hi:
+        raise ValueError(f"empty range: {s}")
+    return lo, hi
+
+
+# ---------------- model ----------------
+@dataclass(frozen=True)
+class Listing:
+    id: int
+    owner: str
+    title: str
+    description: str
+    location: str
+    nearby: FrozenSet[str]
+    type: ListingType
+    price: int
+    size_sqft: int
+    bhk: int
+    status: Status = Status.AVAILABLE
+    created_at: int = 0
+    updated_at: int = 0
+
+    def __post_init__(self):
+        if self.price &lt;= 0 or self.size_sqft &lt;= 0 or self.bhk &lt;= 0:
+            raise ValueError("price, size and bhk must be &gt; 0")
+        object.__setattr__(self, "location", self.location.strip().lower())
+        object.__setattr__(self, "nearby", frozenset(n.strip().lower() for n in self.nearby))
+
+
+@dataclass(frozen=True)
+class Hit:
+    listing: Listing
+    score: float
+    nearby_only: bool
+
+
+@dataclass(frozen=True)
+class Page:
+    items: List[Hit]
+    total: int
+    page: int
+    size: int
+
+    @property
+    def has_next(self) -&gt; bool:
+        return (self.page + 1) * self.size &lt; self.total
+
+
+# ---------------- specification ----------------
+class Spec:
+    def __init__(self, fn: Callable[[Listing], bool]):
+        self.fn = fn
+
+    def __call__(self, x) -&gt; bool:
+        return self.fn(x)
+
+    def __and__(self, o: "Spec") -&gt; "Spec":
+        return Spec(lambda x: self(x) and o(x))
+
+    def __or__(self, o: "Spec") -&gt; "Spec":
+        return Spec(lambda x: self(x) or o(x))
+
+    def __invert__(self) -&gt; "Spec":
+        return Spec(lambda x: not self(x))
+
+
+def available() -&gt; Spec: return Spec(lambda l: l.status is Status.AVAILABLE)
+def of_type(t: ListingType) -&gt; Spec: return Spec(lambda l: l.type is t)
+def price_between(lo, hi) -&gt; Spec: return Spec(lambda l: lo &lt;= l.price &lt;= hi)
+def size_between(lo, hi) -&gt; Spec: return Spec(lambda l: lo &lt;= l.size_sqft &lt;= hi)
+def bhk_in(bhks) -&gt; Spec: return Spec(lambda l: l.bhk in bhks)
+
+
+def location_in(locs, include_nearby) -&gt; Spec:
+    return Spec(lambda l: l.location in locs or (include_nearby and bool(l.nearby &amp; locs)))
+
+
+# ---------------- ranking ----------------
+SORTS: Dict[str, Callable[[Hit], tuple]] = {
+    "relevance": lambda h: (-h.score, -h.listing.updated_at),
+    "price": lambda h: (h.listing.price,),
+    "size": lambda h: (h.listing.size_sqft,),
+    "newest": lambda h: (-h.listing.updated_at,),
+}
+
+
+@dataclass
+class SearchQuery:
+    text: str = ""
+    prefix_last: bool = False
+    locations: Set[str] = field(default_factory=set)
+    include_nearby: bool = False
+    type: Optional[ListingType] = None
+    price: Tuple[float, float] = (0, float("inf"))
+    size: Tuple[float, float] = (0, float("inf"))
+    bhks: Set[int] = field(default_factory=set)
+    sort_by: str = "relevance"
+    page: int = 0
+    page_size: int = 10
+
+    def __post_init__(self):
+        if self.page &lt; 0 or not 0 &lt; self.page_size &lt;= 100:
+            raise ValueError(f"bad page {self.page}/{self.page_size}")
+        if self.sort_by not in SORTS:
+            raise ValueError(f"unknown sort {self.sort_by}")
+        self.locations = {l.strip().lower() for l in self.locations}
+
+    def to_spec(self) -&gt; Spec:
+        s = available()
+        if self.type:
+            s = s &amp; of_type(self.type)
+        if self.locations:
+            s = s &amp; location_in(self.locations, self.include_nearby)
+        if self.price != (0, float("inf")):
+            s = s &amp; price_between(*self.price)
+        if self.size != (0, float("inf")):
+            s = s &amp; size_between(*self.size)
+        if self.bhks:
+            s = s &amp; bhk_in(self.bhks)
+        return s
+
+    def order(self) -&gt; Callable[[Hit], tuple]:
+        key = SORTS[self.sort_by]
+        return lambda h: (h.nearby_only,) + key(h) + (h.listing.id,)
+
+
+# ---------------- inverted index ----------------
+TITLE_WEIGHT, BODY_WEIGHT = 3, 1
+
+
+def tokenize(text: str) -&gt; List[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+class TextIndex:
+    """term -&gt; {doc_id: weighted tf}, plus doc_id -&gt; terms for exact removal. Not thread-safe alone."""
+
+    def __init__(self):
+        self.postings: Dict[str, Dict[int, int]] = {}
+        self.forward: Dict[int, Dict[str, int]] = {}
+        self._sorted_terms: Optional[List[str]] = None        # built lazily for prefix scans
+
+    def add(self, doc_id: int, title: str, body: str = "") -&gt; None:
+        if doc_id in self.forward:
+            self.remove(doc_id)
+        tf: Dict[str, int] = {}
+        for t in tokenize(title):
+            tf[t] = tf.get(t, 0) + TITLE_WEIGHT
+        for t in tokenize(body):
+            tf[t] = tf.get(t, 0) + BODY_WEIGHT
+        self.forward[doc_id] = tf
+        for term, w in tf.items():
+            self.postings.setdefault(term, {})[doc_id] = w
+        self._sorted_terms = None
+
+    def remove(self, doc_id: int) -&gt; None:
+        tf = self.forward.pop(doc_id, None)
+        if tf is None:
+            return
+        for term in tf:
+            p = self.postings[term]
+            del p[doc_id]
+            if not p:
+                del self.postings[term]
+        self._sorted_terms = None
+
+    def _prefix(self, prefix: str) -&gt; Dict[int, int]:
+        if self._sorted_terms is None:
+            self._sorted_terms = sorted(self.postings)
+        merged: Dict[int, int] = {}
+        i = bisect_left(self._sorted_terms, prefix)
+        while i &lt; len(self._sorted_terms) and self._sorted_terms[i].startswith(prefix):
+            for d, w in self.postings[self._sorted_terms[i]].items():
+                merged[d] = merged.get(d, 0) + w
+            i += 1
+        return merged
+
+    def match_all(self, terms: List[str], prefix_last: bool = False) -&gt; Dict[int, float]:
+        if not terms:
+            return {}
+        lists = []
+        for i, t in enumerate(terms):
+            p = self._prefix(t) if prefix_last and i == len(terms) - 1 else self.postings.get(t)
+            if not p:
+                return {}
+            lists.append(p)
+        lists.sort(key=len)                                   # intersect from the rarest term
+        out = {}
+        for d, w in lists[0].items():
+            ws = [p.get(d) for p in lists[1:]]
+            if all(x is not None for x in ws):
+                out[d] = float(w + sum(ws))
+        return out
+
+
+# ---------------- engine ----------------
+class RWLock:
+    """Many readers or one writer, writer-preferring: once a writer waits, new readers queue behind it,
+    so a steady stream of readers cannot starve writers (Java's ReentrantReadWriteLock does the same)."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0                 # new readers yield to a queued writer
+
+    def acquire_read(self):
+        with self._cond:
+            while self._writer or self._waiting_writers:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self):
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self):
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+
+    def release_write(self):
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
+class ListingSearchEngine:
+    def __init__(self):
+        self._rw = RWLock()
+        self._by_id: Dict[int, Listing] = {}
+        self._text = TextIndex()
+        self._by_location: Dict[str, Set[int]] = {}
+
+    def upsert(self, l: Listing) -&gt; None:
+        self._rw.acquire_write()
+        try:
+            old = self._by_id.get(l.id)
+            if old:
+                self._unindex_location(old)
+            self._by_id[l.id] = l
+            for k in {l.location} | l.nearby:
+                self._by_location.setdefault(k, set()).add(l.id)
+            self._text.add(l.id, l.title, l.description)
+        finally:
+            self._rw.release_write()
+
+    def remove(self, listing_id: int) -&gt; bool:
+        self._rw.acquire_write()
+        try:
+            old = self._by_id.pop(listing_id, None)
+            if old is None:
+                return False
+            self._unindex_location(old)
+            self._text.remove(listing_id)
+            return True
+        finally:
+            self._rw.release_write()
+
+    def get(self, listing_id: int) -&gt; Optional[Listing]:
+        self._rw.acquire_read()
+        try:
+            return self._by_id.get(listing_id)
+        finally:
+            self._rw.release_read()
+
+    def find(self, spec: Callable[[Listing], bool]) -&gt; List[Listing]:
+        self._rw.acquire_read()
+        try:
+            return sorted((l for l in self._by_id.values() if spec(l)), key=lambda l: l.id)
+        finally:
+            self._rw.release_read()
+
+    def search(self, q: SearchQuery) -&gt; Page:
+        self._rw.acquire_read()
+        try:
+            terms = tokenize(q.text)
+            scores = self._text.match_all(terms, q.prefix_last) if terms else None
+            if scores is not None:
+                candidates: Iterable[int] = scores.keys()
+            elif q.locations:
+                candidates = set().union(*(self._by_location.get(loc, set()) for loc in q.locations))
+            else:
+                candidates = self._by_id.keys()
+            spec = q.to_spec()
+            hits = [Hit(l, scores[i] if scores else 0.0, bool(q.locations) and l.location not in q.locations)
+                    for i in candidates for l in (self._by_id[i],) if spec(l)]
+        finally:
+            self._rw.release_read()
+        hits.sort(key=q.order())
+        start = q.page * q.page_size
+        return Page(hits[start:start + q.page_size], len(hits), q.page, q.page_size)
+
+    def __len__(self) -&gt; int:
+        return len(self._by_id)
+
+    def _unindex_location(self, l: Listing) -&gt; None:
+        for k in {l.location} | l.nearby:
+            s = self._by_location.get(k)
+            if s is not None:
+                s.discard(l.id)
+                if not s:
+                    del self._by_location[k]
+
+
+# ---------------- facade ----------------
+class RentalPlatform:
+    def __init__(self):
+        self.engine = ListingSearchEngine()
+        self._users: Set[str] = set()
+        self._active: Set[str] = set()
+        self._shortlists: Dict[str, List[int]] = {}
+        self._ids = itertools.count(1)
+        self._clock = itertools.count(1)
+        self._lock = threading.Lock()
+
+    def register(self, user):
+        with self._lock:
+            if user in self._users:
+                raise ValueError(f"user exists: {user}")
+            self._users.add(user)
+
+    def login(self, user):
+        if user not in self._users:
+            raise ValueError(f"unknown user {user}")
+        self._active.add(user)
+
+    def logout(self, user):
+        self._active.discard(user)
+
+    def list(self, owner, title, description, location, nearby_csv, type_, price, size, bhk) -&gt; Listing:
+        self._require_active(owner)
+        now = next(self._clock)
+        l = Listing(next(self._ids), owner, title, description, location,
+                    frozenset(n for n in nearby_csv.split(",") if n.strip()), type_,
+                    parse_price(price), parse_size_sqft(size), bhk, Status.AVAILABLE, now, now)
+        self.engine.upsert(l)
+        return l
+
+    def mark_sold(self, owner, listing_id):
+        self.engine.upsert(replace(self._owned(owner, listing_id), status=Status.SOLD, updated_at=next(self._clock)))
+
+    def change_price(self, owner, listing_id, price):
+        self.engine.upsert(replace(self._owned(owner, listing_id), price=parse_price(price), updated_at=next(self._clock)))
+
+    def search(self, q: SearchQuery) -&gt; Page:
+        return self.engine.search(q)
+
+    def shortlist(self, user, listing_id):
+        self._require_active(user)
+        if self.engine.get(listing_id) is None:
+            raise ValueError(f"no listing {listing_id}")
+        with self._lock:
+            s = self._shortlists.setdefault(user, [])
+            if listing_id not in s:
+                s.append(listing_id)
+
+    def shortlisted(self, user) -&gt; List[Listing]:
+        with self._lock:
+            ids = list(self._shortlists.get(user, []))
+        return [l for l in (self.engine.get(i) for i in ids) if l]
+
+    def listed_by(self, owner) -&gt; List[Listing]:
+        return self.engine.find(lambda l: l.owner == owner)
+
+    def _owned(self, owner, listing_id) -&gt; Listing:
+        self._require_active(owner)
+        l = self.engine.get(listing_id)
+        if l is None:
+            raise ValueError(f"no listing {listing_id}")
+        if l.owner != owner:
+            raise ValueError(f"{owner} does not own listing {listing_id}")
+        return l
+
+    def _require_active(self, user):
+        if user not in self._active:
+            raise PermissionError(f"{user} is not logged in")</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: main.py">
+<pre><code class="language-python">"""Demo driver: Flipkart "Property Hunt" style searches plus the Razorpay blog-search variant."""
+from rental import (ListingType, RentalPlatform, SearchQuery, TextIndex, parse_price_range,
+                    parse_size_sqft, tokenize)
+
+
+def show(title, page):
+    print(f"== {title} ({page.total} found) ==")
+    for h in page.items:
+        l = h.listing
+        extra = (f"  score={h.score:.0f}" if h.score else "") + ("  (nearby)" if h.nearby_only else "")
+        print(f"  #{l.id} {l.title:&lt;32} {l.location:&lt;11} {l.type.value} {l.price:&gt;10,} {l.size_sqft:&gt;5} sqft "
+              f"{l.bhk}BHK{'  [SOLD]' if l.status.value == 'SOLD' else ''}{extra}")
+
+
+def main():
+    app = RentalPlatform()
+    for u in ("asha", "ravi", "meera"):
+        app.register(u)
+        app.login(u)
+    R, S = ListingType.RENT, ListingType.SELL
+    a = app.list("asha", "2BHK near lake with balcony", "gym, pool, covered parking", "Bellandur", "Sarjapur Road, HSR Layout", R, "32k", "1100 sqft", 2)
+    app.list("asha", "Spacious 3BHK family flat", "gated society, gym, kids pool, pool view", "Bellandur", "", R, "45k", "1650 sqft", 3)
+    app.list("ravi", "Cosy 1BHK for bachelors", "metro 5 min, wifi", "HSR Layout", "Koramangala", R, "18000", "550 sqft", 1)
+    app.list("ravi", "2BHK budget flat", "no gym, quiet street", "Bellandur", "", R, "24k", "100 sqm", 2)
+    app.list("meera", "3BHK villa for sale", "private garden, pool", "Whitefield", "", S, "1.8Cr", "2400 sqft", 3)
+    app.list("meera", "2BHK apartment for sale", "balcony facing park", "HSR Layout", "Bellandur", S, "95L", "1200 sqft", 2)
+    app.list("ravi", "2BHK with balcony, pet friendly", "pool, gym", "Koramangala", "HSR Layout", R, "38k", "1000 sqft", 2)
+
+    show("Rent in Bellandur, 20k-40k, 2/3 BHK, by price",
+         app.search(SearchQuery(locations={"bellandur"}, type=R, price=parse_price_range("20k-40k"), bhks={2, 3}, sort_by="price")))
+    show('Text "pool gym" (AND), by relevance', app.search(SearchQuery(text="pool gym", type=R)))
+    show("Rent in HSR Layout incl. nearby (nearby last)",
+         app.search(SearchQuery(locations={"HSR Layout"}, include_nearby=True, type=R, sort_by="price")))
+    show('Typeahead "balc"', app.search(SearchQuery(text="balc", prefix_last=True)))
+    show("At least 100 sq m, 2BHK, by size",
+         app.search(SearchQuery(size=(parse_size_sqft("100 sqm"), float("inf")), bhks={2}, sort_by="size")))
+
+    app.shortlist("meera", a.id)
+    app.mark_sold("asha", a.id)
+    print("== Shortlist after the owner marked #1 sold ==")
+    for l in app.shortlisted("meera"):
+        print(f"  #{l.id} {l.title} [{l.status.value}]")
+
+    print("== Blog search with the same TextIndex ==")
+    blog = TextIndex()
+    blog.add(1, "Kafka at scale", "kafka partitions and kafka consumers")
+    blog.add(2, "Intro to Java", "java streams and kafka clients")
+    blog.add(3, "Postgres tips", "indexes and vacuum")
+    r = blog.match_all(tokenize("kafka"))
+    print("  'kafka' by frequency:", sorted(r, key=lambda d: -r[d]), r)
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="Python: tests">
+<pre><code class="language-python">import random
+import threading
+import unittest
+from dataclasses import replace
+
+from rental import (RWLock, Listing, ListingSearchEngine, ListingType, RentalPlatform, SearchQuery, TextIndex,
+                    parse_price, parse_price_range, parse_size_sqft, tokenize)
+
+R, S = ListingType.RENT, ListingType.SELL
+
+
+class RentalTests(unittest.TestCase):
+    def setUp(self):
+        self.app = RentalPlatform()
+        for u in ("asha", "ravi", "meera"):
+            self.app.register(u)
+            self.app.login(u)
+        L = self.app.list
+        self.a = L("asha", "2BHK near lake with balcony", "gym, pool", "Bellandur", "HSR Layout", R, "32k", "1100 sqft", 2)
+        self.b = L("asha", "Spacious 3BHK", "gym, kids pool, pool view", "Bellandur", "", R, "45k", "1650", 3)
+        self.c = L("ravi", "Cosy 1BHK", "metro", "HSR Layout", "", R, "18000", "550", 1)
+        self.d = L("ravi", "2BHK budget flat", "no gym", "Bellandur", "", R, "24k", "100 sqm", 2)
+        self.e = L("meera", "Villa", "garden, pool", "Whitefield", "", S, "1.8Cr", "2400", 3)
+
+    def ids(self, page):
+        return [h.listing.id for h in page.items]
+
+    def test_units(self):
+        self.assertEqual(parse_price("40k"), 40_000)
+        self.assertEqual(parse_price("60L"), 6_000_000)
+        self.assertEqual(parse_price("2Cr"), 20_000_000)
+        self.assertEqual(parse_size_sqft("100 sqm"), 1076)
+        self.assertEqual(parse_size_sqft("150 sqyd"), 1350)
+        self.assertEqual(parse_price_range("50L"), (5_000_000, float("inf")))
+        for bad in ("abc", "-5", "0"):
+            with self.assertRaises(ValueError):
+                parse_price(bad)
+        with self.assertRaises(ValueError):
+            parse_price_range("40k-20k")
+
+    def test_combined_filters_and_price_sort(self):
+        q = SearchQuery(locations={"Bellandur"}, type=R, price=parse_price_range("20k-40k"), bhks={2, 3}, sort_by="price")
+        self.assertEqual(self.ids(self.app.search(q)), [self.d.id, self.a.id])
+
+    def test_and_text_search_and_relevance(self):
+        page = self.app.search(SearchQuery(text="pool gym"))
+        self.assertEqual(set(self.ids(page)), {self.a.id, self.b.id})
+        self.assertEqual(page.items[0].listing.id, self.b.id)          # pool twice
+
+    def test_nearby_ranked_last(self):
+        page = self.app.search(SearchQuery(locations={"hsr layout"}, include_nearby=True))
+        self.assertEqual(self.ids(page), [self.c.id, self.a.id])
+        self.assertTrue(page.items[1].nearby_only)
+
+    def test_prefix_typeahead(self):
+        self.assertEqual(self.ids(self.app.search(SearchQuery(text="balc", prefix_last=True))), [self.a.id])
+        self.assertEqual(self.app.search(SearchQuery(text="balc")).total, 0)   # exact word only
+
+    def test_pagination_is_stable_and_complete(self):
+        seen, page = [], 0
+        while True:
+            p = self.app.search(SearchQuery(type=R, sort_by="newest", page=page, page_size=2))
+            seen += self.ids(p)
+            if not p.has_next:
+                break
+            page += 1
+        self.assertEqual(seen, [self.d.id, self.c.id, self.b.id, self.a.id])
+        with self.assertRaises(ValueError):
+            SearchQuery(page=-1)
+
+    def test_sold_hidden_from_search_but_kept_in_shortlist(self):
+        self.app.shortlist("meera", self.a.id)
+        self.app.mark_sold("asha", self.a.id)
+        self.assertNotIn(self.a.id, self.ids(self.app.search(SearchQuery(locations={"bellandur"}))))
+        self.assertEqual(self.app.shortlisted("meera")[0].status.value, "SOLD")
+        self.assertEqual(len(self.app.listed_by("asha")), 2)
+
+    def test_price_change_reindexes(self):
+        self.app.change_price("ravi", self.d.id, "28k")
+        self.assertEqual(self.app.search(SearchQuery(price=(20_000, 25_000))).total, 0)
+        self.assertEqual(self.ids(self.app.search(SearchQuery(price=(26_000, 30_000)))), [self.d.id])
+
+    def test_remove_cleans_every_index(self):
+        self.assertTrue(self.app.engine.remove(self.c.id))
+        self.assertEqual(self.app.search(SearchQuery(text="metro")).total, 0)
+        self.assertEqual(self.app.search(SearchQuery(locations={"hsr layout"})).total, 0)
+        self.assertFalse(self.app.engine.remove(self.c.id))
+
+    def test_permissions(self):
+        with self.assertRaises(ValueError):
+            self.app.mark_sold("asha", self.c.id)
+        self.app.logout("ravi")
+        with self.assertRaises(PermissionError):
+            self.app.mark_sold("ravi", self.c.id)
+
+    def test_blog_variant_frequency_and_delete(self):
+        idx = TextIndex()
+        idx.add(1, "Kafka at scale", "kafka partitions and kafka consumers")
+        idx.add(2, "Intro to Java", "java streams and kafka clients")
+        r = idx.match_all(tokenize("kafka"))
+        self.assertEqual(sorted(r, key=lambda d: -r[d]), [1, 2])
+        self.assertEqual(set(idx.match_all(tokenize("java kafka"))), {2})
+        idx.remove(1)
+        self.assertEqual(idx.match_all(tokenize("partitions")), {})
+        self.assertNotIn("partitions", idx.postings)
+
+    def test_readers_never_see_half_updates(self):
+        eng = ListingSearchEngine()
+        for i in range(1, 101):
+            eng.upsert(Listing(i, "o", f"flat {i}", "gym", "bellandur", frozenset(), R, 10_000 + (i * 397) % 80_000, 900, 2))
+        stop, bad = threading.Event(), []
+
+        def writer(seed):
+            rnd, tick = random.Random(seed), 1000
+            while not stop.is_set():
+                old = eng.get(rnd.randint(1, 100))
+                eng.upsert(replace(old, price=rnd.randint(10_000, 90_000), updated_at=tick))
+                tick += 1
+
+        def reader():
+            q = SearchQuery(text="gym", price=(20_000, 40_000), page_size=100)
+            while not stop.is_set():
+                bad.extend(h for h in eng.search(q).items if not 20_000 &lt;= h.listing.price &lt;= 40_000)
+
+        ts = [threading.Thread(target=writer, args=(s,)) for s in range(3)] + [threading.Thread(target=reader) for _ in range(3)]
+        for t in ts:
+            t.start()
+        stop.wait(0.3)
+        stop.set()
+        for t in ts:
+            t.join()
+        self.assertEqual(bad, [])
+        self.assertEqual(len(eng), 100)
+
+
+class RWLockTests(unittest.TestCase):
+    def test_new_reader_waits_behind_a_queued_writer(self):
+        import time
+        rw = RWLock()
+        order = []
+        rw.acquire_read()                                   # reader 1 holds the lock
+
+        def writer():
+            rw.acquire_write()
+            order.append("writer")
+            rw.release_write()
+
+        def reader2():
+            rw.acquire_read()
+            order.append("reader2")
+            rw.release_read()
+
+        w = threading.Thread(target=writer)
+        w.start()
+        while rw._waiting_writers == 0:                     # the writer is queued
+            time.sleep(0.001)
+        r = threading.Thread(target=reader2)
+        r.start()
+        time.sleep(0.05)
+        self.assertEqual(order, [])                         # reader 2 did not overtake the writer
+        rw.release_read()
+        w.join(2)
+        r.join(2)
+        self.assertEqual(order, ["writer", "reader2"])
+
+
+if __name__ == "__main__":
+    unittest.main()</code></pre>
+    </div>
+    <div class="tab-panel" data-title="C++14: main.cpp">
+<pre><code class="language-cpp">// Rental search in C++14: listings, inverted index (std::map, so prefix = lower_bound scan),
+// Specification filters as composable std::function, ranking comparators and pagination.
+// Single-threaded build (our MinGW g++ 6.3 has no std::thread); READ and WRITE mark where a multi-threaded
+// build takes a reader-writer lock: std::shared_timed_mutex in C++14 (std::shared_mutex is C++17). Build: g++ -std=c++14 -Wall -Wextra main.cpp
+#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;cmath&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;map&gt;
+#include &lt;memory&gt;
+#include &lt;set&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+#include &lt;cstdlib&gt;
+// CHECK, not assert: assert() and any call inside it vanish under -DNDEBUG; CHECK always runs.
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed (line %d): %s\n", __LINE__, #x); std::exit(1); } } while (0)
+
+enum class Type { RENT, SELL };
+enum class Status { AVAILABLE, SOLD };
+
+static std::string lower(std::string s) {
+    for (auto&amp; c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
+
+static long long parsePrice(const std::string&amp; in) {
+    std::string t = lower(in);
+    t.erase(std::remove(t.begin(), t.end(), ','), t.end());
+    double mult = 1;
+    auto ends = [&amp;](const std::string&amp; suf) { return t.size() &gt; suf.size() &amp;&amp; t.compare(t.size() - suf.size(), suf.size(), suf) == 0; };
+    if (ends("cr")) { mult = 1e7; t.resize(t.size() - 2); }
+    else if (ends("l")) { mult = 1e5; t.resize(t.size() - 1); }
+    else if (ends("k")) { mult = 1e3; t.resize(t.size() - 1); }
+    size_t used = 0;
+    double v = 0;
+    try { v = std::stod(t, &amp;used); } catch (...) { throw std::invalid_argument("bad price: " + in); }
+    if (used != t.size() || v &lt;= 0) throw std::invalid_argument("bad price: " + in);
+    return (long long)std::llround(v * mult);
+}
+
+static int parseSizeSqft(const std::string&amp; in) {
+    std::string t;
+    for (char c : lower(in)) if (c != ' ' &amp;&amp; c != '.') t += c;
+    double f = 1;
+    auto strip = [&amp;](const std::string&amp; suf, double fac) {
+        if (t.size() &gt; suf.size() &amp;&amp; t.compare(t.size() - suf.size(), suf.size(), suf) == 0) { t.resize(t.size() - suf.size()); f = fac; return true; }
+        return false;
+    };
+    if (!strip("sqm", 10.7639) &amp;&amp; !strip("sqyd", 9.0)) strip("sqft", 1.0);
+    return (int)std::lround(std::stod(t) * f);
+}
+
+struct Listing {
+    long long id; std::string owner, title, description, location; std::set&lt;std::string&gt; nearby;
+    Type type; long long price; int sizeSqft, bhk; Status status; long long updatedAt;
+};
+using ListingPtr = std::shared_ptr&lt;const Listing&gt;;      // immutable; an edit makes a new one
+
+struct Hit { ListingPtr l; double score; bool nearbyOnly; };
+
+// ---- Specification ----
+using Spec = std::function&lt;bool(const Listing&amp;)&gt;;
+static Spec operator&amp;&amp;(Spec a, Spec b) { return [a, b](const Listing&amp; l) { return a(l) &amp;&amp; b(l); }; }
+
+// ---- Inverted index ----
+static std::vector&lt;std::string&gt; tokenize(const std::string&amp; s) {
+    std::vector&lt;std::string&gt; out; std::string cur;
+    for (char c : lower(s)) {
+        if (std::isalnum((unsigned char)c)) cur += c;
+        else if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+class TextIndex {
+public:
+    void add(long long id, const std::string&amp; title, const std::string&amp; body) {
+        remove(id);
+        std::map&lt;std::string, int&gt; tf;
+        for (auto&amp; t : tokenize(title)) tf[t] += 3;
+        for (auto&amp; t : tokenize(body)) tf[t] += 1;
+        for (auto&amp; kv : tf) postings_[kv.first][id] = kv.second;
+        forward_[id] = tf;
+    }
+    void remove(long long id) {
+        auto it = forward_.find(id);
+        if (it == forward_.end()) return;
+        for (auto&amp; kv : it-&gt;second) {
+            auto p = postings_.find(kv.first);
+            p-&gt;second.erase(id);
+            if (p-&gt;second.empty()) postings_.erase(p);
+        }
+        forward_.erase(it);
+    }
+    // AND of all terms; the last one may be a prefix. Empty result if any term is missing.
+    std::unordered_map&lt;long long, double&gt; matchAll(const std::vector&lt;std::string&gt;&amp; terms, bool prefixLast) const {
+        std::vector&lt;std::unordered_map&lt;long long, int&gt;&gt; lists;
+        for (size_t i = 0; i &lt; terms.size(); ++i) {
+            std::unordered_map&lt;long long, int&gt; p;
+            if (prefixLast &amp;&amp; i + 1 == terms.size()) {
+                for (auto it = postings_.lower_bound(terms[i]); it != postings_.end() &amp;&amp; it-&gt;first.compare(0, terms[i].size(), terms[i]) == 0; ++it)
+                    for (auto&amp; d : it-&gt;second) p[d.first] += d.second;
+            } else {
+                auto it = postings_.find(terms[i]);
+                if (it != postings_.end()) p.insert(it-&gt;second.begin(), it-&gt;second.end());
+            }
+            if (p.empty()) return {};
+            lists.push_back(std::move(p));
+        }
+        std::unordered_map&lt;long long, double&gt; out;
+        if (lists.empty()) return out;
+        std::sort(lists.begin(), lists.end(), [](const std::unordered_map&lt;long long, int&gt;&amp; a, const std::unordered_map&lt;long long, int&gt;&amp; b) { return a.size() &lt; b.size(); });
+        for (auto&amp; d : lists[0]) {
+            double s = d.second; bool all = true;
+            for (size_t i = 1; i &lt; lists.size() &amp;&amp; all; ++i) {
+                auto f = lists[i].find(d.first);
+                if (f == lists[i].end()) all = false; else s += f-&gt;second;
+            }
+            if (all) out[d.first] = s;
+        }
+        return out;
+    }
+    size_t terms() const { return postings_.size(); }
+private:
+    std::map&lt;std::string, std::map&lt;long long, int&gt;&gt; postings_;
+    std::unordered_map&lt;long long, std::map&lt;std::string, int&gt;&gt; forward_;
+};
+
+struct Query {
+    std::string text; bool prefixLast = false;
+    std::set&lt;std::string&gt; locations; bool includeNearby = false;
+    bool anyType = true; Type type = Type::RENT;
+    long long minPrice = 0, maxPrice = (1LL &lt;&lt; 62);
+    std::set&lt;int&gt; bhks;
+    std::string sortBy = "relevance";
+    int page = 0, pageSize = 10;
+    Spec toSpec() const {
+        Spec s = [](const Listing&amp; l) { return l.status == Status::AVAILABLE; };
+        if (!anyType) { Type t = type; s = s &amp;&amp; Spec([t](const Listing&amp; l) { return l.type == t; }); }
+        if (!locations.empty()) {
+            auto locs = locations; bool nb = includeNearby;
+            s = s &amp;&amp; Spec([locs, nb](const Listing&amp; l) {
+                if (locs.count(l.location)) return true;
+                if (nb) for (auto&amp; n : l.nearby) if (locs.count(n)) return true;
+                return false;
+            });
+        }
+        long long lo = minPrice, hi = maxPrice;
+        s = s &amp;&amp; Spec([lo, hi](const Listing&amp; l) { return l.price &gt;= lo &amp;&amp; l.price &lt;= hi; });
+        if (!bhks.empty()) { auto b = bhks; s = s &amp;&amp; Spec([b](const Listing&amp; l) { return b.count(l.bhk) &gt; 0; }); }
+        return s;
+    }
+};
+
+struct Page { std::vector&lt;Hit&gt; items; size_t total; bool hasNext; };
+
+class Engine {
+public:
+    void upsert(const Listing&amp; in) {                              // WRITE
+        auto l = std::make_shared&lt;const Listing&gt;(in);
+        auto old = byId_.find(l-&gt;id);
+        if (old != byId_.end()) unindex(*old-&gt;second);
+        byId_[l-&gt;id] = l;
+        byLoc_[l-&gt;location].insert(l-&gt;id);
+        for (auto&amp; n : l-&gt;nearby) byLoc_[n].insert(l-&gt;id);
+        text_.add(l-&gt;id, l-&gt;title, l-&gt;description);
+    }
+    bool remove(long long id) {                                   // WRITE
+        auto it = byId_.find(id);
+        if (it == byId_.end()) return false;
+        unindex(*it-&gt;second);
+        text_.remove(id);
+        byId_.erase(it);
+        return true;
+    }
+    ListingPtr get(long long id) const { auto it = byId_.find(id); return it == byId_.end() ? nullptr : it-&gt;second; }   // READ
+    Page search(const Query&amp; q) const {                           // READ
+        if (q.page &lt; 0 || q.pageSize &lt;= 0) throw std::invalid_argument("bad page");
+        auto terms = tokenize(q.text);
+        bool useText = !terms.empty();
+        auto scores = useText ? text_.matchAll(terms, q.prefixLast) : std::unordered_map&lt;long long, double&gt;();
+        std::set&lt;long long&gt; cand;
+        if (useText) for (auto&amp; s : scores) cand.insert(s.first);
+        else if (!q.locations.empty()) { for (auto&amp; loc : q.locations) { auto f = byLoc_.find(loc); if (f != byLoc_.end()) cand.insert(f-&gt;second.begin(), f-&gt;second.end()); } }
+        else for (auto&amp; kv : byId_) cand.insert(kv.first);
+        Spec spec = q.toSpec();
+        std::vector&lt;Hit&gt; hits;
+        for (long long id : cand) {
+            ListingPtr l = byId_.at(id);
+            if (!spec(*l)) continue;
+            hits.push_back(Hit{l, useText ? scores.at(id) : 0.0, !q.locations.empty() &amp;&amp; !q.locations.count(l-&gt;location)});
+        }
+        std::string by = q.sortBy;
+        std::sort(hits.begin(), hits.end(), [&amp;by](const Hit&amp; a, const Hit&amp; b) {   // nearby last, then the strategy, then id
+            if (a.nearbyOnly != b.nearbyOnly) return !a.nearbyOnly;
+            if (by == "price" &amp;&amp; a.l-&gt;price != b.l-&gt;price) return a.l-&gt;price &lt; b.l-&gt;price;
+            if (by == "size" &amp;&amp; a.l-&gt;sizeSqft != b.l-&gt;sizeSqft) return a.l-&gt;sizeSqft &lt; b.l-&gt;sizeSqft;
+            if (by == "newest" &amp;&amp; a.l-&gt;updatedAt != b.l-&gt;updatedAt) return a.l-&gt;updatedAt &gt; b.l-&gt;updatedAt;
+            if (by == "relevance") {
+                if (a.score != b.score) return a.score &gt; b.score;
+                if (a.l-&gt;updatedAt != b.l-&gt;updatedAt) return a.l-&gt;updatedAt &gt; b.l-&gt;updatedAt;
+            }
+            return a.l-&gt;id &lt; b.l-&gt;id;
+        });
+        size_t from = std::min(hits.size(), (size_t)q.page * q.pageSize), to = std::min(hits.size(), from + q.pageSize);
+        return Page{std::vector&lt;Hit&gt;(hits.begin() + from, hits.begin() + to), hits.size(), to &lt; hits.size()};
+    }
+    size_t terms() const { return text_.terms(); }
+private:
+    void unindex(const Listing&amp; l) {
+        std::set&lt;std::string&gt; keys(l.nearby);
+        keys.insert(l.location);
+        for (auto&amp; k : keys) { auto f = byLoc_.find(k); if (f != byLoc_.end()) { f-&gt;second.erase(l.id); if (f-&gt;second.empty()) byLoc_.erase(f); } }
+    }
+    std::map&lt;long long, ListingPtr&gt; byId_;
+    TextIndex text_;
+    std::unordered_map&lt;std::string, std::set&lt;long long&gt;&gt; byLoc_;
+};
+
+static std::vector&lt;long long&gt; ids(const Page&amp; p) {
+    std::vector&lt;long long&gt; v;
+    for (auto&amp; h : p.items) v.push_back(h.l-&gt;id);
+    return v;
+}
+
+static void show(const char* title, const Page&amp; p) {
+    std::printf("== %s (%u found) ==\n", title, (unsigned)p.total);
+    for (auto&amp; h : p.items)
+        std::printf("  #%s %-32s %-11s %s %10s %5d sqft %dBHK%s\n", std::to_string(h.l-&gt;id).c_str(), h.l-&gt;title.c_str(), h.l-&gt;location.c_str(),
+                    h.l-&gt;type == Type::RENT ? "RENT" : "SELL", std::to_string(h.l-&gt;price).c_str(), h.l-&gt;sizeSqft, h.l-&gt;bhk, h.nearbyOnly ? "  (nearby)" : "");
+}
+
+int main() {
+    Engine e;
+    long long tick = 0;
+    auto add = [&amp;](long long id, const char* title, const char* desc, const char* loc, std::set&lt;std::string&gt; nb, Type t, const char* price, const char* size, int bhk) {
+        e.upsert(Listing{id, "o", title, desc, lower(loc), nb, t, parsePrice(price), parseSizeSqft(size), bhk, Status::AVAILABLE, ++tick});
+    };
+    add(1, "2BHK near lake with balcony", "gym, pool, covered parking", "Bellandur", {"sarjapur road", "hsr layout"}, Type::RENT, "32k", "1100 sqft", 2);
+    add(2, "Spacious 3BHK family flat", "gated society, gym, kids pool, pool view", "Bellandur", {}, Type::RENT, "45k", "1650 sqft", 3);
+    add(3, "Cosy 1BHK for bachelors", "metro 5 min, wifi", "HSR Layout", {"koramangala"}, Type::RENT, "18000", "550 sqft", 1);
+    add(4, "2BHK budget flat", "no gym, quiet street", "Bellandur", {}, Type::RENT, "24k", "100 sqm", 2);
+    add(5, "3BHK villa for sale", "private garden, pool", "Whitefield", {}, Type::SELL, "1.8Cr", "2400 sqft", 3);
+    add(7, "2BHK with balcony, pet friendly", "pool, gym", "Koramangala", {"hsr layout"}, Type::RENT, "38k", "1000 sqft", 2);
+
+    CHECK(parsePrice("60L") == 6000000 &amp;&amp; parsePrice("2Cr") == 20000000 &amp;&amp; parseSizeSqft("150 sqyd") == 1350);
+    try { parsePrice("abc"); CHECK(!"expected bad price"); } catch (const std::invalid_argument&amp; ex) { std::printf("  rejected: %s\n", ex.what()); }
+
+    Query q1; q1.locations = {"bellandur"}; q1.anyType = false; q1.minPrice = 20000; q1.maxPrice = 40000; q1.bhks = {2, 3}; q1.sortBy = "price";
+    Page p1 = e.search(q1); show("Rent in Bellandur, 20k-40k, 2/3 BHK, by price", p1);
+    CHECK((ids(p1) == std::vector&lt;long long&gt;{4, 1}));
+
+    Query q2; q2.text = "pool gym";
+    Page p2 = e.search(q2); show("Text \"pool gym\" (AND), by relevance", p2);
+    CHECK(p2.items.front().l-&gt;id == 2 &amp;&amp; p2.total == 3);
+
+    Query q3; q3.locations = {"hsr layout"}; q3.includeNearby = true; q3.sortBy = "price";
+    Page p3 = e.search(q3); show("HSR Layout incl. nearby (nearby last)", p3);
+    CHECK((ids(p3) == std::vector&lt;long long&gt;{3, 1, 7}));
+
+    Query q4; q4.text = "balc"; q4.prefixLast = true;
+    CHECK(e.search(q4).total == 2);
+
+    std::puts("== Paging, 2 per page, newest first ==");
+    std::vector&lt;long long&gt; seen;
+    for (int pg = 0;; ++pg) {
+        Query q; q.sortBy = "newest"; q.page = pg; q.pageSize = 2;
+        Page p = e.search(q);
+        for (auto id : ids(p)) seen.push_back(id);
+        if (!p.hasNext) break;
+    }
+    CHECK((seen == std::vector&lt;long long&gt;{7, 5, 4, 3, 2, 1}));
+
+    Listing sold = *e.get(1); sold.status = Status::SOLD; sold.updatedAt = ++tick;
+    e.upsert(sold);
+    CHECK(e.search(q1).total == 1);                               // only #4 left
+
+    size_t before = e.terms();
+    CHECK(e.remove(3) &amp;&amp; !e.remove(3));
+    Query q5; q5.text = "metro";
+    CHECK(e.search(q5).total == 0 &amp;&amp; e.terms() &lt; before);
+    std::puts("all C++ checks passed");
+    return 0;
+}</code></pre>
+    </div>
+  </div>
+  <h3>Run it and see the output</h3>
+  <p>Run it: <code>javac -d out *.java &amp;&amp; java -cp out Main</code>, or <code>python main.py</code> and <code>python -m unittest -v test_rental</code>, or <code>g++ -std=c++14 -Wall -Wextra main.cpp -o rental &amp;&amp; ./rental</code>. Java output (the write and search counts in the last line vary per run):</p>
+<pre class="terminal"><code>== Rent in Bellandur, 20k-40k, 2/3 BHK, by price (2 found) ==
+  #4 2BHK budget flat                 bellandur   RENT     24,000  1076 sqft 2BHK
+  #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK
+== Text "pool gym" (AND), by relevance (3 found) ==
+  #2 Spacious 3BHK family flat        bellandur   RENT     45,000  1650 sqft 3BHK  score=3
+  #7 2BHK with balcony, pet friendly  koramangala RENT     38,000  1000 sqft 2BHK  score=2
+  #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK  score=2
+== Rent in HSR Layout incl. nearby (nearby last) (3 found) ==
+  #3 Cosy 1BHK for bachelors          hsr layout  RENT     18,000   550 sqft 1BHK
+  #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK  (nearby)
+  #7 2BHK with balcony, pet friendly  koramangala RENT     38,000  1000 sqft 2BHK  (nearby)
+== Typeahead "balc" (prefix on last word) (3 found) ==
+  #7 2BHK with balcony, pet friendly  koramangala RENT     38,000  1000 sqft 2BHK  score=3
+  #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK  score=3
+  #6 2BHK apartment for sale          hsr layout  SELL  9,500,000  1200 sqft 2BHK  score=1
+== At least 100 sq m (1076 sq ft), 2BHK, by size (3 found) ==
+  #4 2BHK budget flat                 bellandur   RENT     24,000  1076 sqft 2BHK
+  #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK
+  #6 2BHK apartment for sale          hsr layout  SELL  9,500,000  1200 sqft 2BHK
+== Buy, at least 1Cr (1 found) ==
+  #5 3BHK villa for sale              whitefield  SELL 18,000,000  2400 sqft 3BHK
+== Paging through all rentals, 2 per page, newest first ==
+  page 0: [7, 4]
+  page 1: [3, 2]
+  page 2: [1] (last)
+== Shortlist, then the owner marks it sold ==
+  shortlisted #1 2BHK near lake with balcony      bellandur   RENT     32,000  1100 sqft 2BHK  [SOLD]
+  shortlisted #3 Cosy 1BHK for bachelors          hsr layout  RENT     18,000   550 sqft 1BHK
+== Price change re-indexes ==
+== Remove deletes every posting ==
+== Errors ==
+  rejected: ravi is not logged in
+  rejected: asha does not own listing 3
+  rejected: bad price: abc
+  rejected: empty range: 40k-20k
+  rejected: bad page -1/10
+== Blog search (Razorpay variant) with the same TextIndex ==
+  'kafka' by frequency: [1, 2] scores {1=5.0, 2=1.0}
+== Concurrency: 4 writers change prices while 4 readers search 20k-40k ==
+  10850 writes, 5536 searches, 0 inconsistent hits
+checks passed: 26</code></pre>
+  <p>Python tests:</p>
+<pre class="terminal"><code>test_new_reader_waits_behind_a_queued_writer (test_rental.RWLockTests.test_new_reader_waits_behind_a_queued_writer) ... ok
+test_and_text_search_and_relevance (test_rental.RentalTests.test_and_text_search_and_relevance) ... ok
+test_blog_variant_frequency_and_delete (test_rental.RentalTests.test_blog_variant_frequency_and_delete) ... ok
+test_combined_filters_and_price_sort (test_rental.RentalTests.test_combined_filters_and_price_sort) ... ok
+test_nearby_ranked_last (test_rental.RentalTests.test_nearby_ranked_last) ... ok
+test_pagination_is_stable_and_complete (test_rental.RentalTests.test_pagination_is_stable_and_complete) ... ok
+test_permissions (test_rental.RentalTests.test_permissions) ... ok
+test_prefix_typeahead (test_rental.RentalTests.test_prefix_typeahead) ... ok
+test_price_change_reindexes (test_rental.RentalTests.test_price_change_reindexes) ... ok
+test_readers_never_see_half_updates (test_rental.RentalTests.test_readers_never_see_half_updates) ... ok
+test_remove_cleans_every_index (test_rental.RentalTests.test_remove_cleans_every_index) ... ok
+test_sold_hidden_from_search_but_kept_in_shortlist (test_rental.RentalTests.test_sold_hidden_from_search_but_kept_in_shortlist) ... ok
+test_units (test_rental.RentalTests.test_units) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.522s
+
+OK</code></pre>
+  <p>C++14 (single-threaded; <code>READ</code> and <code>WRITE</code> comments mark where a threaded build takes the reader-writer lock):</p>
+<pre class="terminal"><code>  rejected: bad price: abc
+== Rent in Bellandur, 20k-40k, 2/3 BHK, by price (2 found) ==
+  #4 2BHK budget flat                 bellandur   RENT      24000  1076 sqft 2BHK
+  #1 2BHK near lake with balcony      bellandur   RENT      32000  1100 sqft 2BHK
+== Text "pool gym" (AND), by relevance (3 found) ==
+  #2 Spacious 3BHK family flat        bellandur   RENT      45000  1650 sqft 3BHK
+  #7 2BHK with balcony, pet friendly  koramangala RENT      38000  1000 sqft 2BHK
+  #1 2BHK near lake with balcony      bellandur   RENT      32000  1100 sqft 2BHK
+== HSR Layout incl. nearby (nearby last) (3 found) ==
+  #3 Cosy 1BHK for bachelors          hsr layout  RENT      18000   550 sqft 1BHK
+  #1 2BHK near lake with balcony      bellandur   RENT      32000  1100 sqft 2BHK  (nearby)
+  #7 2BHK with balcony, pet friendly  koramangala RENT      38000  1000 sqft 2BHK  (nearby)
+== Paging, 2 per page, newest first ==
+all C++ checks passed</code></pre>
+  <div class="bridge">
+    <h4>From your world</h4>
+    <p>The C++ <code>Spec</code> is a <code>std::function</code> and <code>&amp;&amp;</code> builds a new one that calls both: a linked chain of predicate callbacks, like a netfilter hook list where each hook can return "drop" and the packet stops there. Using a <code>std::map</code> for postings buys sorted keys, so a prefix lookup is <code>lower_bound(prefix)</code> plus a forward walk, the same way a routing table finds the first entry that can match.</p>
+  </div>
